@@ -26,10 +26,17 @@ stack_bottom:
         resb 16384
 stack_top:
 
+align 8
+global multiboot_magic_saved
+multiboot_magic_saved:
+        resq 1
+global multiboot_info_saved
+multiboot_info_saved:
+        resq 1
+
 section .text
 global _start
 extern kernel_main
-
 bits 32
 _start:
         mov esp, stack_top
@@ -45,8 +52,8 @@ _start:
 
         pop eax
         pop ebx
-        mov edi, eax
-        mov esi, ebx
+        mov [multiboot_magic_saved], eax
+        mov [multiboot_info_saved], ebx
 
         mov edi, boot_msg_before_pt
         call print_vga
@@ -398,6 +405,8 @@ long_mode_start:
 	; -------------------------------
 	
 	cli
+        mov edi, dword [rel multiboot_magic_saved]
+        mov esi, dword [rel multiboot_info_saved]
         call kernel_main
 
         cli

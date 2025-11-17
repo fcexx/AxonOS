@@ -204,6 +204,14 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
     /* Регистрируем файловую систему */
     ramfs_register();
     ext2_register();
+#include <initfs.h>
+    /* If an initfs module was provided by the bootloader, unpack it into ramfs */
+    {
+        int r = initfs_process_multiboot_module(multiboot_magic, multiboot_info, "initfs");
+        if (r == 0) kprintf("initfs: unpacked successfully\n");
+        else if (r == 1) kprintf("initfs: initfs module not found or not multiboot2\n");
+        else kprintf("initfs: error while unpacking (%d)\n", r);
+    }
 
     ps2_keyboard_init();
     rtc_init();
@@ -211,18 +219,6 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
     asm volatile("sti");
 
     kprintf("kernel base: done\n");
-
-    static const char license_text[] = "#!osh\n"
-
-"hostname=\"<(0f)>axonos<(07)>\"\n"
-"PS1=\"$hostname:[\\w]> \"\n"
-"osh\n"
-"shutdown\n";
-    struct fs_file *license_file = fs_create_file("/start");
-    if (license_file) {
-        fs_write(license_file, license_text, strlen(license_text), 0);
-        fs_file_free(license_file);
-    }
     ascii_art();
     
     kprintf("\n<(0f)>Welcome to %s <(0b)>%s<(0f)>!\n", OS_NAME, OS_VERSION);
