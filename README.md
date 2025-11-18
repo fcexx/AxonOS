@@ -29,12 +29,19 @@
 ---
 
 ### ✨ Features
-- ⚙️ Custom kernel written in C  
-- 💻 Built-in Ring0 shell  
-- 🧠 Smart memory & task management  
-- ⏱️ Fast boot & clean modular design  
-- 🧩 Fully open source — learn, modify, improve  
+- ⚙️ Custom kernel fully written in C
+- 🧩 Low-level architecture: GDT, IDT, PIC, PIT, RTC, Paging
+- 🧠 Dynamic heap allocator + virtual memory manager
+- 🧵 Threading system with full context switching
+- ⌨️ Hardware drivers: Keyboard, Serial, PCI, RTC, PIT
+- 🌐 Experimental Intel E1000 network driver + basic ARP/ICMP stack
+- 🖥 VGA text-mode UI with built-in apps (Snake, Tetris, Neofetch, Clock, System Info)
+- 💻 Built-in Ring0 shell with core commands
+- 📝 Integrated OSH interpreter (Axon Shell)
+- 🏃 Task management & lightweight scheduler
+- 🚀 Fast boot and clean modular codebase
 - 🐍 Cross-platform build support (Linux / Windows via WSL)
+- 🧩 Fully open-source — learn, modify, improve оно?
 
 ---
 
