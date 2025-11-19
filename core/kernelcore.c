@@ -22,12 +22,68 @@
 #include <fs.h>
 #include <ext2.h>
 #include <ramfs.h>
+#include <sysfs.h>
+#include <initfs.h>
 #include <editor.h>
 #include <intel_chipset.h>
 
 int exit = 0;
 
 static char g_cwd[256] = "/";
+
+static ssize_t sysfs_show_const(char *buf, size_t size, void *priv) {
+    if (!buf || size == 0) return 0;
+    const char *text = (const char*)priv;
+    if (!text) text = "";
+    size_t len = strlen(text);
+    if (len > size) len = size;
+    memcpy(buf, text, len);
+    if (len < size) buf[len++] = '\n';
+    return (ssize_t)len;
+}
+
+static ssize_t sysfs_show_cpu_name_attr(char *buf, size_t size, void *priv) {
+    (void)priv;
+    if (!buf || size == 0) return 0;
+    const char *name = sysinfo_cpu_name();
+    size_t len = strlen(name);
+    if (len > size) len = size;
+    memcpy(buf, name, len);
+    if (len < size) buf[len++] = '\n';
+    return (ssize_t)len;
+}
+
+static size_t sysfs_write_int(char *buf, size_t size, int value) {
+    if (!buf || size == 0) return 0;
+    char tmp[32];
+    size_t n = 0;
+    unsigned int v;
+    int neg = 0;
+    if (value < 0) { neg = 1; v = (unsigned int)(-value); }
+    else v = (unsigned int)value;
+    do {
+        tmp[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    } while (v && n < sizeof(tmp));
+    if (neg && n < sizeof(tmp)) tmp[n++] = '-';
+    size_t written = 0;
+    while (n && written < size) {
+        buf[written++] = tmp[--n];
+    }
+    return written;
+}
+
+static ssize_t sysfs_show_ram_mb_attr(char *buf, size_t size, void *priv) {
+    (void)priv;
+    if (!buf || size == 0) return 0;
+    int mb = sysinfo_ram_mb();
+    if (mb < 0) {
+        return sysfs_show_const(buf, size, (void*)"unknown");
+    }
+    size_t written = sysfs_write_int(buf, size, mb);
+    if (written < size) buf[written++] = '\n';
+    return (ssize_t)written;
+}
 
 static void resolve_path(const char *cwd, const char *arg, char *out, size_t outlen) {
     if (!arg || arg[0] == '\0') {
@@ -201,10 +257,40 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
 
     thread_init();
     iothread_init();
-    /* Регистрируем файловую систему */
+    /* Регистрируем файловые системы */
     ramfs_register();
     ext2_register();
-#include <initfs.h>
+    if (sysfs_register() == 0) {
+        ramfs_mkdir("/sys");
+        sysfs_mkdir("/sys");
+        sysfs_mkdir("/sys/kernel");
+        sysfs_mkdir("/sys/kernel/cpu");
+        sysfs_mkdir("/sys/class");
+        sysfs_mkdir("/sys/class/input");
+        sysfs_mkdir("/sys/class/tty");
+        sysfs_mkdir("/sys/class/block");
+        sysfs_mkdir("/sys/class/net");
+        sysfs_mkdir("/sys/bus");
+        sysfs_mkdir("/sys/bus/pci");
+        sysfs_mkdir("/sys/bus/pci/devices");
+        sysfs_mkdir("/sys/class");
+        sysfs_mkdir("/sys/class/input");
+        sysfs_mkdir("/sys/class/tty");
+        sysfs_mkdir("/sys/class/block");
+        sysfs_mkdir("/sys/class/net");
+        struct sysfs_attr attr_os_name = { sysfs_show_const, NULL, (void*)OS_NAME };
+        struct sysfs_attr attr_os_version = { sysfs_show_const, NULL, (void*)OS_VERSION };
+        struct sysfs_attr attr_cpu_name = { sysfs_show_cpu_name_attr, NULL, NULL };
+        struct sysfs_attr attr_ram_mb = { sysfs_show_ram_mb_attr, NULL, NULL };
+        sysfs_create_file("/sys/kernel/sysname", &attr_os_name);
+        sysfs_create_file("/sys/kernel/sysver", &attr_os_version);
+        sysfs_create_file("/sys/kernel/cpu/name", &attr_cpu_name);
+        sysfs_create_file("/sys/kernel/ram", &attr_ram_mb);
+        sysfs_mount("/sys");
+        pci_sysfs_init();
+    } else {
+        kprintf("sysfs: failed to register\n");
+    }
     /* If an initfs module was provided by the bootloader, unpack it into ramfs */
     {
         int r = initfs_process_multiboot_module(multiboot_magic, multiboot_info, "initfs");
@@ -219,9 +305,8 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
     asm volatile("sti");
 
     kprintf("kernel base: done\n");
-    ascii_art();
     
-    kprintf("\n<(0f)>Welcome to %s <(0b)>%s<(0f)>!\n", OS_NAME, OS_VERSION);
+    kprintf("\n%s v%s\n", OS_NAME, OS_VERSION);
     // autostart: run /start script once if present
     {
         struct fs_file *f = fs_open("/start");

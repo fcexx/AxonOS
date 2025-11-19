@@ -270,62 +270,128 @@ static void osh_write(char **out, size_t *len, size_t *cap, const char *s) {
 }
 
 // very simple join: if arg starts with '/', copy; else cwd + '/' + arg (no normalization)
+static void resolve_path(const char *cwd, const char *arg, char *out, size_t outlen);
+
 static void join_cwd(const char* cwd, const char* arg, char* out, size_t outsz) {
-    if (!arg || !arg[0]) { strncpy(out, cwd, outsz-1); out[outsz-1]='\0'; return; }
-    if (arg[0] == '/') { strncpy(out, arg, outsz-1); out[outsz-1]='\0'; return; }
-    size_t cl = strlen(cwd);
-    if (cl == 1 && cwd[0] == '/') {
-        size_t al = strlen(arg); size_t copy = (al+2 < outsz) ? al+2 : outsz; if (outsz) { out[0]='/'; if (copy>1) memcpy(out+1, arg, copy-2); out[copy-1]='\0'; }
-        return;
-    }
-    // strip trailing '/'
-    char base[512]; strncpy(base, cwd, sizeof(base)-1); base[sizeof(base)-1]='\0';
-    while (cl>1 && base[cl-1]=='/') { base[--cl]='\0'; }
-    size_t al = strlen(arg);
-    size_t need = cl + 1 + al + 1;
-    if (outsz) {
-        size_t pos=0; size_t copy = (need < outsz) ? need : outsz; memcpy(out+pos, base, cl); pos+=cl; out[pos++]='/';
-        size_t rem = copy - pos - 1; if ((int)rem < 0) rem = 0; if (rem > al) rem = al; if (rem) memcpy(out+pos, arg, rem); pos += rem; out[pos]='\0';
-    }
+    resolve_path(cwd, arg, out, outsz);
 }
 
 static void resolve_path(const char *cwd, const char *arg, char *out, size_t outlen) {
-    if (!arg || arg[0] == '\0') { strncpy(out, cwd, outlen-1); out[outlen-1] = '\0'; return; }
-    if (arg[0] == '/') { strncpy(out, arg, outlen-1); out[outlen-1] = '\0'; return; }
-    const char *p = arg; if (p[0]=='.' && p[1]=='/') p+=2;
+    if (!out || outlen == 0) return;
+    if (!cwd || !cwd[0]) cwd = "/";
+    if (!arg || !arg[0]) {
+        size_t copy = strlen(cwd);
+        if (copy >= outlen) copy = outlen - 1;
+        memcpy(out, cwd, copy);
+        out[copy] = '\0';
+        return;
+    }
+
     char tmp[512];
-    if (strcmp(cwd, "/") == 0) {
-        tmp[0] = '/'; size_t n = strlen(p); if (n > sizeof(tmp)-2) n = sizeof(tmp)-2; memcpy(tmp+1, p, n); tmp[1+n]='\0';
+    size_t pos = 0;
+    if (arg[0] == '/') {
+        size_t copy = strlen(arg);
+        if (copy >= sizeof(tmp)) copy = sizeof(tmp) - 1;
+        memcpy(tmp, arg, copy);
+        tmp[copy] = '\0';
     } else {
-        size_t a = strlen(cwd); if (a > sizeof(tmp)-2) a = sizeof(tmp)-2; memcpy(tmp, cwd, a); tmp[a] = '/';
-        size_t n = strlen(p); if (n > sizeof(tmp)-a-2) n = sizeof(tmp)-a-2; memcpy(tmp + a + 1, p, n); tmp[a+1+n] = '\0';
-    }
-    // normalize
-    char *parts[64]; int pc=0; char *s = tmp; if (*s!='/') { parts[pc++] = s; }
-    s++; while (*s) {
-        char *seg = s; while (*s && *s!='/') s++; size_t L = (size_t)(s - seg);
-        if (L>0) {
-            char save = seg[L]; seg[L] = '\0';
-            if (strcmp(seg, ".") == 0) {}
-            else if (strcmp(seg, "..") == 0) { if (pc>0) pc--; }
-            else { parts[pc++] = seg; }
-            seg[L] = save;
+        size_t base_len = strlen(cwd);
+        if (base_len >= sizeof(tmp)) base_len = sizeof(tmp) - 1;
+        if (cwd[0] != '/') {
+            tmp[pos++] = '/';
         }
-        if (*s) s++;
+        if (base_len == 0) {
+            tmp[pos++] = '/';
+        } else {
+            size_t bl = base_len;
+            while (bl > 1 && cwd[bl - 1] == '/') bl--;
+            if (pos + bl >= sizeof(tmp)) bl = sizeof(tmp) - 1 - pos;
+            if (bl > 0) {
+                memcpy(tmp + pos, cwd, bl);
+                pos += bl;
+            }
+        }
+        if (pos == 0) {
+            tmp[pos++] = '/';
+        }
+        if (tmp[pos - 1] != '/' && pos < sizeof(tmp) - 1) {
+            tmp[pos++] = '/';
+        }
+        size_t arg_len = strlen(arg);
+        if (pos + arg_len >= sizeof(tmp)) arg_len = sizeof(tmp) - 1 - pos;
+        memcpy(tmp + pos, arg, arg_len);
+        pos += arg_len;
+        tmp[pos] = '\0';
     }
-    if (pc == 0) { strncpy(out, "/", outlen-1); out[outlen-1] = '\0'; return; }
-    size_t pos=0; out[0]='\0';
-    for (int i=0;i<pc;i++) {
-        size_t need = pos + 1 + strlen(parts[i]) + 1; if (need > outlen) break;
-        out[pos++] = '/'; size_t n = strlen(parts[i]); memcpy(out+pos, parts[i], n); pos += n; out[pos] = '\0';
+
+    char *parts[64];
+    size_t plen[64];
+    int pc = 0;
+    char *cursor = tmp;
+    while (*cursor) {
+        while (*cursor == '/') cursor++;
+        if (!*cursor) break;
+        char *seg = cursor;
+        while (*cursor && *cursor != '/') cursor++;
+        size_t len = (size_t)(cursor - seg);
+        if (len == 0) { if (*cursor == '/') cursor++; continue; }
+        if (len == 1 && seg[0] == '.') {
+            /* skip '.' */
+        } else if (len == 2 && seg[0] == '.' && seg[1] == '.') {
+            if (pc > 0) pc--;
+        } else {
+            if (pc < (int)(sizeof(parts)/sizeof(parts[0]))) {
+                parts[pc] = seg;
+                plen[pc] = len;
+                pc++;
+            }
+        }
+        if (*cursor == '/') cursor++;
     }
+
+    if (pc == 0) {
+        out[0] = '/';
+        out[1] = '\0';
+        return;
+    }
+
+    size_t w = 0;
+    for (int i = 0; i < pc; i++) {
+        size_t seg_len = plen[i];
+        if (w + 1 >= outlen) {
+            out[outlen - 1] = '\0';
+            return;
+        }
+        out[w++] = '/';
+        size_t copy = seg_len;
+        if (w + copy >= outlen) copy = outlen - 1 - w;
+        if (copy > 0) {
+            memcpy(out + w, parts[i], copy);
+            w += copy;
+        }
+    }
+    out[w] = '\0';
 }
 
 static int is_dir_path(const char *path) {
-    struct fs_file *f = fs_open(path); if (!f) return 0; int dir = (f->type == FS_TYPE_DIR);
+    if (!path || !path[0]) return 0;
+    /* Trim trailing slashes to avoid confusing drivers with "/dir///" */
+    char norm[256];
+    strncpy(norm, path, sizeof(norm)-1);
+    norm[sizeof(norm)-1] = '\0';
+    size_t nl = strlen(norm);
+    while (nl > 1 && norm[nl - 1] == '/') { norm[--nl] = '\0'; }
+    struct fs_file *f = fs_open(norm);
+    if (!f) return 0;
+    int dir = (f->type == FS_TYPE_DIR);
     if (!dir && f->type == FS_TYPE_UNKNOWN) {
         size_t want = f->size ? f->size : 512; if (want > 8192) want = 8192; void *buf = kmalloc(want+1);
-        if (buf) { ssize_t r = fs_read(f, buf, want, 0); if (r > 0) { struct ext2_dir_entry *de = (struct ext2_dir_entry*)buf; if (de->rec_len) dir = 1; } kfree(buf);} }
+        if (buf) {
+            ssize_t r = fs_read(f, buf, want, 0);
+            if (r > 0) { struct ext2_dir_entry *de = (struct ext2_dir_entry*)buf; if (de->rec_len) dir = 1; }
+            kfree(buf);
+        }
+    }
     fs_file_free(f); return dir;
 }
 
@@ -1065,7 +1131,12 @@ static int bi_pwd(cmd_ctx *c) { (void)c; char tmp[300]; strncpy(tmp, g_cwd, size
 static int bi_cd(cmd_ctx *c) {
     const char *arg = c->argc>1 ? c->argv[1] : "/";
     char path[256]; join_cwd(g_cwd, arg, path, sizeof(path));
-    if (!is_dir_path(path)) { osh_write(c->out, c->out_len, c->out_cap, "cd: not a directory\n"); return 1; }
+    if (!is_dir_path(path)) {
+        osh_write(c->out, c->out_len, c->out_cap, "cd: not a directory: ");
+        osh_write(c->out, c->out_len, c->out_cap, path);
+        osh_write(c->out, c->out_len, c->out_cap, "\n");
+        return 1;
+    }
     size_t l = strlen(path); if (l>1 && path[l-1]=='/') path[l-1]='\0'; strncpy(g_cwd, path, sizeof(g_cwd)-1); g_cwd[sizeof(g_cwd)-1]='\0'; return 0;
 }
 
@@ -1220,10 +1291,10 @@ static int bi_about(cmd_ctx *c) {
     (void)c;
     kprintf("%s v%s\n", OS_NAME, OS_VERSION);
     kprintf("Copyright (c) 2025 %s Team\n", OS_AUTHORS);
-    kprintf("fcexx, kotazz, neosporimy, dasteldi\n");
-    kprintf("<(09)>The operating system is licensed under the MIT license.\n");
-    kprintf("<(0f)>GitHub: <(0b)>https://github.com/fcexx/AxonOS\n");
-    kprintf("<(0f)>Website: <(0b)>https://wh27961.web4.maze-tech.ru\n");
+    kprintf("fcexx, kotazz, neosporimy, dasteldi, xeroxdev\n");
+    kprintf("The operating system is licensed under the MIT license.\n");
+    kprintf("GitHub: https://github.com/fcexx/AxonOS\n");
+    kprintf("Website: https://wh27961.web4.maze-tech.ru\n");
     return 0;
     }
 

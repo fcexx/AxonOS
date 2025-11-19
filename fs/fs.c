@@ -4,9 +4,36 @@
 #include "../inc/fs.h"
 
 #define MAX_FS_DRIVERS 8
+#define MAX_FS_MOUNTS 8
 
 static struct fs_driver *g_drivers[MAX_FS_DRIVERS];
 static int g_drivers_count = 0;
+struct mount_entry {
+    char path[64];
+    size_t path_len;
+    struct fs_driver *driver;
+};
+
+static struct mount_entry g_mounts[MAX_FS_MOUNTS];
+static int g_mount_count = 0;
+
+static struct fs_driver *fs_match_mount(const char *path) {
+    struct fs_driver *best = NULL;
+    size_t best_len = 0;
+    for (int i = 0; i < g_mount_count; i++) {
+        struct mount_entry *m = &g_mounts[i];
+        if (!m->driver) continue;
+        if (strncmp(path, m->path, m->path_len) == 0) {
+            if (path[m->path_len] == '\0' || path[m->path_len] == '/') {
+                if (m->path_len > best_len) {
+                    best = m->driver;
+                    best_len = m->path_len;
+                }
+            }
+        }
+    }
+    return best;
+}
 
 int fs_register_driver(struct fs_driver *drv) {
     if (!drv || !drv->ops) return -1;
@@ -26,9 +53,26 @@ int fs_unregister_driver(struct fs_driver *drv) {
     return -1;
 }
 
+int fs_mount(const char *path, struct fs_driver *drv) {
+    if (!path || !drv) return -1;
+    if (g_mount_count >= MAX_FS_MOUNTS) return -1;
+    size_t len = strlen(path);
+    if (len == 0 || len >= sizeof(g_mounts[0].path)) return -1;
+    strcpy(g_mounts[g_mount_count].path, path);
+    g_mounts[g_mount_count].path_len = len;
+    g_mounts[g_mount_count].driver = drv;
+    g_mount_count++;
+    return 0;
+}
+
 /* Try drivers in registration order. Drivers should return -1 if they do not handle the path. */
 struct fs_file *fs_create_file(const char *path) {
     if (!path) return NULL;
+    struct fs_driver *mount_drv = fs_match_mount(path);
+    if (mount_drv && mount_drv->ops && mount_drv->ops->create) {
+        struct fs_file *file = NULL;
+        if (mount_drv->ops->create(path, &file) == 0) return file;
+    }
     for (int i = 0; i < g_drivers_count; i++) {
         struct fs_driver *drv = g_drivers[i];
         if (!drv || !drv->ops || !drv->ops->create) continue;
@@ -49,6 +93,11 @@ struct fs_file *fs_create_file(const char *path) {
 
 struct fs_file *fs_open(const char *path) {
     if (!path) return NULL;
+    struct fs_driver *mount_drv = fs_match_mount(path);
+    if (mount_drv && mount_drv->ops && mount_drv->ops->open) {
+        struct fs_file *file = NULL;
+        if (mount_drv->ops->open(path, &file) == 0 && file) return file;
+    }
     for (int i = 0; i < g_drivers_count; i++) {
         struct fs_driver *drv = g_drivers[i];
         if (!drv || !drv->ops || !drv->ops->open) continue;

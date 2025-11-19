@@ -48,6 +48,7 @@ struct fs_driver {
 /* Public VFS API */
 int fs_register_driver(struct fs_driver *drv);
 int fs_unregister_driver(struct fs_driver *drv);
+int fs_mount(const char *path, struct fs_driver *drv);
 
 /* High-level helpers which dispatch to registered drivers in registration order */
 struct fs_file *fs_create_file(const char *path);

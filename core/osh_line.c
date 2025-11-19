@@ -57,8 +57,6 @@ static void redraw_line_xy(uint32_t sx, uint32_t sy, const char* prompt, const c
     static uint32_t last_sx = 0;
     static uint32_t last_prompt_len = 0;
     static uint32_t last_buf_len = 0;
-    static uint32_t last_sugg_start = 0;
-    static uint32_t last_sugg_len = 0;
     static char last_prompt[OSH_PROMPT_CACHE];
 
     int need_full = 0;
@@ -91,39 +89,6 @@ static void redraw_line_xy(uint32_t sx, uint32_t sy, const char* prompt, const c
             if (clear_to > MAX_COLS) clear_to = MAX_COLS;
             for (uint32_t x = clear_from; x < clear_to; x++) vga_putch_xy(x, sy, ' ', GRAY_ON_BLACK);
         }
-    }
-
-    uint32_t cur_sugg_start = px + (uint32_t)len + 1;
-    if (cur_sugg_start > MAX_COLS) cur_sugg_start = MAX_COLS;
-
-    if (sugg && sugg_len > 0 && cur_sugg_start < MAX_COLS) {
-        uint32_t clear_start = cur_sugg_start;
-        uint32_t clear_end = cur_sugg_start + (uint32_t)sugg_len;
-        if (clear_end > MAX_COLS) clear_end = MAX_COLS;
-        if (last_sugg_len > 0) {
-            if (last_sugg_start < clear_start) clear_start = last_sugg_start;
-            uint32_t prev_end = last_sugg_start + last_sugg_len;
-            if (prev_end > MAX_COLS) prev_end = MAX_COLS;
-            if (prev_end > clear_end) clear_end = prev_end;
-        }
-        for (uint32_t x = clear_start; x < clear_end; x++) vga_putch_xy(x, sy, ' ', GRAY_ON_BLACK);
-        for (int i = 0; i < sugg_len && (cur_sugg_start + (uint32_t)i) < MAX_COLS; i++) {
-            vga_putch_xy(cur_sugg_start + (uint32_t)i, sy, (uint8_t)sugg[i], GRAY_ON_BLACK);
-        }
-        last_sugg_start = cur_sugg_start;
-        last_sugg_len = (uint32_t)sugg_len;
-        if (last_sugg_start + last_sugg_len > MAX_COLS) {
-            last_sugg_len = MAX_COLS - last_sugg_start;
-        }
-    } else {
-        if (last_sugg_len > 0) {
-            uint32_t clear_start = last_sugg_start;
-            uint32_t clear_end = last_sugg_start + last_sugg_len;
-            if (clear_end > MAX_COLS) clear_end = MAX_COLS;
-            for (uint32_t x = clear_start; x < clear_end; x++) vga_putch_xy(x, sy, ' ', GRAY_ON_BLACK);
-        }
-        last_sugg_len = 0;
-        last_sugg_start = cur_sugg_start;
     }
 
     last_sy = sy;
@@ -199,14 +164,9 @@ static void complete_token(const char* cwd, char* buf, int* io_len, int* io_cur,
     } else {
         strcpy(dir, "."); strncpy(base, token, sizeof(base)-1); base[sizeof(base)-1]='\0';
     }
-    // построим абсолютный путь для dir
+    // построим абсолютный нормализованный путь для dir с учётом '.', '..' и cwd
     char abs[512];
-    if (dir[0]=='/' ) { strncpy(abs, dir, sizeof(abs)-1); abs[sizeof(abs)-1]='\0'; }
-    else {
-        size_t cl = strlen(cwd);
-        if (cl==1 && cwd[0]=='/') { abs[0]='/'; size_t dl=strlen(dir); size_t cp = (dl < sizeof(abs)-2)?dl:(sizeof(abs)-2); if (cp) memcpy(abs+1, dir, cp); abs[1+cp]='\0'; }
-        else { size_t dl=strlen(dir), cp1 = (cl < sizeof(abs)-1)?cl:(sizeof(abs)-1); memcpy(abs, cwd, cp1); size_t pos = cp1; if (pos < sizeof(abs)-1) abs[pos++]='/'; size_t rem = sizeof(abs)-pos-1; size_t cp2 = (dl<rem)?dl:rem; if (cp2) memcpy(abs+pos, dir, cp2); abs[pos+cp2]='\0'; }
-    }
+    osh_resolve_path(cwd, dir, abs, sizeof(abs));
     // получим список файлов
     const char** fs_names = NULL; int fs_count = 0;
     (void)list_dir_entries(abs, &fs_names, &fs_count); // игнорируем ошибку, просто 0 кандидатов
@@ -311,7 +271,15 @@ int osh_line_read(const char* prompt, const char* cwd, char* out, int out_size) 
         }
         else if ((unsigned char)c == KEY_DELETE) { if (cur < len) { memmove(buf+cur, buf+cur+1, (size_t)(len-cur)); len--; buf[len]='\0'; } }
         else if (c == 8 || c == 127) { if (cur>0) { memmove(buf+cur-1, buf+cur, (size_t)(len-cur+1)); cur--; len--; } }
-        else if ((unsigned char)c == KEY_TAB) { complete_token(cwd, buf, &len, &cur, sugg, (int)sizeof(sugg), &sugg_len); }
+        else if ((unsigned char)c == KEY_TAB) {
+            complete_token(cwd, buf, &len, &cur, sugg, (int)sizeof(sugg), &sugg_len);
+            if (sugg_len > 0) {
+                /* Печатаем список совпадений под текущей строкой и
+                   переносим строку ввода в самый низ, как в bash. */
+                kprintf("\n%s\n", sugg);
+                vga_get_cursor(&sx, &sy);
+            }
+        }
         else if (c >= 32 && c < 127) {
             if (len+1 < OSH_MAX_LINE) {
                 memmove(buf+cur+1, buf+cur, (size_t)(len-cur+1));
