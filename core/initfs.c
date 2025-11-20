@@ -129,60 +129,49 @@ static int create_file_with_data(const char *path, const void *data, size_t size
 static int unpack_cpio_newc(const void *archive, size_t archive_size) {
     const uint8_t *base = (const uint8_t*)archive;
     size_t offset = 0;
-    /* Search the entire module for ASCII magic "070701" or "070702"
-       and begin parsing from the first match. This handles any leading
-       metadata, NULs or wrappers around the archive. */
-    size_t found = (size_t)-1;
-    if (archive_size >= 6) {
-        for (size_t i = 0; i + 6 <= archive_size; i++) {
-            if (memcmp(base + i, "070701", 6) == 0 || memcmp(base + i, "070702", 6) == 0) { found = i; break; }
-        }
-    }
-    if (found == (size_t)-1) {
-        kprintf("initfs: cpio magic not found in module (size %u)\n", (unsigned)archive_size);
-        if (archive_size > 0) {
-            kprintf("initfs: head:");
-            size_t d = archive_size < 32 ? archive_size : 32;
-            for (size_t i = 0; i < d; i++) kprintf(" %02x", (unsigned)base[i]);
-            kprintf("\n");
-        }
+    /* Найдём самое первое вхождение "070701"/"070702" (cpio newc) и дальше
+       идём строго последовательно, как по обычному архиву initramfs. */
+    if (archive_size < sizeof(struct cpio_newc_header)) {
+        kprintf("initfs: module too small for cpio header\n");
         return -1;
     }
-    if (found != 0) kprintf("initfs: cpio magic found at offset %u inside module, starting parse there\n", (unsigned)found);
-    offset = found;
+    size_t start = (size_t)-1;
+    for (size_t i = 0; i + 6 <= archive_size; i++) {
+        if (memcmp(base + i, "070701", 6) == 0 || memcmp(base + i, "070702", 6) == 0) {
+            start = i;
+            break;
+        }
+    }
+    if (start == (size_t)-1) {
+        return -1;
+    }
+    offset = start;
 
     while (offset + sizeof(struct cpio_newc_header) <= archive_size) {
         const struct cpio_newc_header *h = (const struct cpio_newc_header*)(base + offset);
-        /* header.magic is 6 bytes ASCII "070701" (newc) or "070702" (newc with CRC).
-           Compare raw bytes from the module to avoid any struct/padding surprises. */
-        const uint8_t *magic = base + offset;
-        if (!((memcmp(magic, "070701", 6) == 0) || (memcmp(magic, "070702", 6) == 0))) {
-            /* Quietly skip this partial/non-matching occurrence and search forward
-               for the next complete ASCII magic. This avoids noisy '.07070' debug lines. */
-            size_t next_found = (size_t)-1;
-            for (size_t j = offset + 1; j + 6 <= archive_size; j++) {
-                if (memcmp(base + j, "070701", 6) == 0 || memcmp(base + j, "070702", 6) == 0) { next_found = j; break; }
+        if (!(memcmp(h->c_magic, "070701", 6) == 0 || memcmp(h->c_magic, "070702", 6) == 0)) {
+            /* Если встретили мусор вместо магии, аккуратно пытаемся найти
+               следующий заголовок вперёд по потоку, чтобы не отрезать архив
+               после первого файла. */
+            size_t scan = offset + 1;
+            size_t found = (size_t)-1;
+            while (scan + 6 <= archive_size) {
+                if (memcmp(base + scan, "070701", 6) == 0 || memcmp(base + scan, "070702", 6) == 0) {
+                    found = scan;
+                    break;
+                }
+                scan++;
             }
-            if (next_found != (size_t)-1) {
-                offset = next_found;
-                continue;
+            if (found == (size_t)-1) {
+                break;
             }
-            return -1;
+            offset = found;
+            continue;
         }
-        /* additional plausibility check to avoid false positives where "070701"
-           appears inside file data */
-        if (!plausible_cpio_header(h, archive_size - offset)) {
-            kprintf("initfs: header not plausible at offset %u, searching next\n", (unsigned)offset);
-            size_t next_found = (size_t)-1;
-            for (size_t j = offset + 1; j + 6 <= archive_size; j++) {
-                if (memcmp(base + j, "070701", 6) == 0 || memcmp(base + j, "070702", 6) == 0) { next_found = j; break; }
-            }
-            if (next_found != (size_t)-1) {
-                offset = next_found;
-                continue;
-            }
-            return -1;
-        }
+        /* We trust headers once we've locked onto the first magic; the archive
+           is expected to be well-formed, and we walk sequentially until
+           TRAILER!!!. Previous "plausibility" checks sometimes rejected valid
+           large files (like /bin/busybox), so they are intentionally removed. */
         uint32_t namesize = hex_to_uint(h->c_namesize, 8);
         uint32_t filesize = hex_to_uint(h->c_filesize, 8);
         size_t header_size = sizeof(struct cpio_newc_header);
@@ -193,7 +182,21 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
         }
         const char *name = (const char*)(base + name_offset);
         /* end of archive marker */
-        if (strcmp(name, "TRAILER!!!") == 0) break;
+        if (strcmp(name, "TRAILER!!!") == 0) {
+            break;
+        }
+        /* пропускаем пустые имена и голый корень */
+        if (name[0] == '\0' || (name[0] == '.' && name[1] == '\0')) {
+            size_t after_name = name_offset + namesize;
+            size_t file_data_offset = (after_name + 3) & ~3u;
+            size_t next = (file_data_offset + filesize + 3) & ~3u;
+            offset = next;
+            continue;
+        }
+        /* убираем префикс "./" как в обычном initramfs */
+        if (name[0] == '.' && name[1] == '/') {
+            name += 2;
+        }
         /* compute data offset (header + namesize aligned to 4) */
         size_t after_name = name_offset + namesize;
         size_t file_data_offset = (after_name + 3) & ~3u;
@@ -214,9 +217,15 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
             memcpy(target+1, name, n);
             target[1+n] = '\0';
         }
+        /* Always ensure parent directories exist for this path.
+           Это гарантирует, что /bin появится хотя бы из записи bin/busybox,
+           даже если отдельная запись каталога bin будет пропущена. */
+        ensure_parent_dirs(target);
+
         /* determine mode */
         uint32_t mode = hex_to_uint(h->c_mode, 8);
-        if ((mode & 0170000u) == 0040000u || (target[strlen(target)-1] == '/')) {
+        uint32_t type = mode & 0170000u;
+        if (type == 0040000u || (target[strlen(target)-1] == '/')) {
             /* directory */
             /* strip trailing slash */
             size_t tl = strlen(target);
@@ -224,15 +233,25 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
             if (ramfs_mkdir(target) < 0) {
                 /* ignore existing or other minor errors */
             }
-        } else if ((mode & 0170000u) == 0100000u) {
+        } else if (type == 0100000u) {
             /* regular file */
-            ensure_parent_dirs(target);
             const void *file_data = base + file_data_offset;
             if (create_file_with_data(target, file_data, filesize) != 0) {
                 kprintf("initfs: failed to create %s\n", target);
             }
+        } else if (type == 0120000u) {
+            /* symlink: ensure parent directories and create a small text file
+               containing the link target. This is not a real VFS symlink yet,
+               but at least /bin and /bin/sh appear in the tree. */
+            const char *link_target = (const char*)(base + file_data_offset);
+            size_t link_len = filesize;
+            if (link_len > 0 && link_target[link_len-1] == '\0') link_len--;
+            if (create_file_with_data(target, link_target, link_len) != 0) {
+                kprintf("initfs: failed to materialize symlink %s -> %.*s\n",
+                        target, (int)link_len, link_target);
+            }
         } else {
-            /* other types (symlink, device...) - skip for now */
+            /* other types (device nodes, fifos, etc.) - skip for now */
             kprintf("initfs: skipping special file %s (mode %o)\n", target, mode);
         }
         /* advance offset to next header (file data aligned to 4) */

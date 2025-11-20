@@ -7,6 +7,7 @@
 #include <string.h>
 #include <thread.h>
 #include <sysfs.h>
+#include <devfs.h>
 
 // Вспомогательные функции для ожидания статусов контроллера PS/2
 static int ps2_wait_input_empty(void) {
@@ -104,6 +105,35 @@ static void keyboard_register_sysfs(void) {
         sysfs_create_file("/sys/class/input/keyboard0/ctrlc_pending", &attr_ctrlc);
         keyboard_sysfs_registered = true;
 }
+
+/* ---- devfs integration: expose /dev/kbd as simple character device ---- */
+
+static ssize_t devfs_kbd_read(void *priv, void *buf, size_t size, size_t offset) {
+        (void)priv; (void)offset;
+        if (!buf || size == 0) return 0;
+        char *out = (char*)buf;
+        size_t done = 0;
+        /* Blocking semantics similar to kgetc()/kgets: read at least 1 byte. */
+        while (done < size) {
+                char c = kgetc();
+                out[done++] = c;
+                /* For now stop at newline to make it convenient for cat/osh scripts */
+                if (c == '\n') break;
+        }
+        return (ssize_t)done;
+}
+
+static ssize_t devfs_kbd_write(void *priv, const void *buf, size_t size, size_t offset) {
+        (void)priv; (void)buf; (void)size; (void)offset;
+        /* Keyboard is input-only device */
+        return -1;
+}
+
+static const struct devfs_ops devfs_kbd_ops = {
+        devfs_kbd_read,
+        devfs_kbd_write,
+        NULL
+};
 
 // Добавить символ в буфер
 static void add_to_buffer(char c) {
@@ -286,6 +316,8 @@ void ps2_keyboard_init() {
         if (!ps2_wait_input_empty()) qemu_debug_printf("ps2_keyboard_init: warning input buffer busy before sending 0xF4\n");
         outb(0x60, 0xF4);
         keyboard_register_sysfs();
+        /* Register /dev/kbd if devfs is available */
+        (void)devfs_register_chr("/dev/kbd", &devfs_kbd_ops, NULL);
 }
 
 // Получить символ (блокирующая функция, как в Unix)
