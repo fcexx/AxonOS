@@ -1,4 +1,4 @@
-FROM ubuntu:22.04
+FROM debian:stable-slim
 
 #docker build -t axonos
 #docker run axonos
@@ -19,11 +19,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     qemu-system-gui \
     xorriso \
     qemu-system-x86 \
-    gcc-multilib \
+    gcc-12 g++-12 gcc-12-multilib libc6-dev-i386 \
     xorg \
     git \
     make \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* && \
+    update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 && \
+    update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-12 100
 
 WORKDIR /workspace
 
