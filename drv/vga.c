@@ -4,12 +4,8 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stddef.h>
-#include <devfs.h>
 
 static uint8_t parse_color_code(char bg, char fg);
-static uint8_t ansi_apply_sgr(uint8_t cur, int code);
-static const char* ansi_parse_sgr(const char *p, uint8_t *pcolor);
-static int __vsnprintf(char* out, size_t outsz, const char* fmt, va_list ap_in);
 
 /* Fast direct VGA helpers */
 void vga_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
@@ -55,11 +51,6 @@ uint32_t vga_write_colorized_xy(uint32_t x, uint32_t y, const char *s, uint8_t d
     uint32_t vx = 0;
     const char* p = s;
     while (*p && (x + vx) < MAX_COLS) {
-        /* ANSI SGR escape sequences: \x1b[...m */
-        if (*p == '\x1b') {
-            const char *np = ansi_parse_sgr(p, &color);
-            if (np != p) { p = np; continue; }
-        }
         size_t ahead = strnlen(p, 6);
         if (ahead >= 6 && p[0] == '<' && p[1] == '(' && p[4] == ')' && p[5] == '>') {
             color = parse_color_code(p[2], p[3]);
@@ -99,16 +90,6 @@ void	kputchar(uint8_t character, uint8_t attribute_byte)
         kputchar(' ', attribute_byte);
         set_cursor(get_cursor() - 2);
     }
-    else if (character == '\t')
-    {
-        /* Табуляция: перейти к следующей таб-стопе (каждые 8 столбцов),
-           как это делает терминал Linux. */
-        uint32_t cx = 0, cy = 0;
-        vga_get_cursor(&cx, &cy);
-        uint32_t spaces = 8 - (cx % 8);
-        if (spaces == 0) spaces = 8;
-        for (uint32_t i = 0; i < spaces; i++) kputchar(' ', attribute_byte);
-    }
 	else 
 	{
 		if (offset == (MAX_COLS * MAX_ROWS * 2)) scroll_line();
@@ -122,11 +103,6 @@ void kprint_colorized(const char* str)
     uint8_t color = 0x07;
     const char* p = str;
     while (*p) {
-        /* ANSI SGR: \x1b[...m */
-        if (*p == '\x1b') {
-            const char *np = ansi_parse_sgr(p, &color);
-            if (np != p) { p = np; continue; }
-        }
         // Чтобы исключить чтение за пределы буфера, проверяем доступную длину вперёд
         // и лишь затем считаем это цветовым тегом.
         size_t ahead = strnlen(p, 6);
@@ -295,117 +271,6 @@ static uint8_t parse_color_code(char bg, char fg) {
     return (background << 4) | foreground;
 }
 
-/* Apply single ANSI SGR code (like 0, 1, 31, 42, 91, ...) to current VGA color. */
-static uint8_t ansi_apply_sgr(uint8_t cur, int code) {
-    uint8_t fg = cur & 0x0F;
-    uint8_t bg = (cur >> 4) & 0x0F;
-    switch (code) {
-    case 0: /* reset */
-        return GRAY_ON_BLACK;
-    case 1: /* bold/bright foreground */
-        fg |= 0x08;
-        return (uint8_t)((bg << 4) | (fg & 0x0F));
-    case 22: /* normal intensity */
-        fg &= 0x07;
-        return (uint8_t)((bg << 4) | fg);
-    default:
-        break;
-    }
-    /* Map ANSI base colors to VGA palette explicitly:
-       ANSI: 30=black,31=red,32=green,33=yellow,34=blue,35=magenta,36=cyan,37=white
-       VGA : 0=black,4=red,2=green,6=brown/yellow,1=blue,5=magenta,3=cyan,7=light gray */
-    if (code >= 30 && code <= 37) {
-        static const uint8_t ansi_to_vga_fg[8] = {
-            0, /* 30 black  -> 0 */
-            4, /* 31 red    -> 4 */
-            2, /* 32 green  -> 2 */
-            6, /* 33 yellow -> 6 (brown/yellow) */
-            1, /* 34 blue   -> 1 */
-            5, /* 35 magenta-> 5 */
-            3, /* 36 cyan   -> 3 */
-            7  /* 37 white  -> 7 (light gray) */
-        };
-        fg = ansi_to_vga_fg[code - 30];
-        return (uint8_t)((bg << 4) | (fg & 0x0F));
-    }
-    if (code >= 90 && code <= 97) {
-        /* bright versions: just set high bit on base color */
-        static const uint8_t ansi_to_vga_fg[8] = {
-            0,4,2,6,1,5,3,7
-        };
-        fg = (uint8_t)(ansi_to_vga_fg[code - 90] | 0x08);
-        return (uint8_t)((bg << 4) | (fg & 0x0F));
-    }
-    if (code >= 40 && code <= 47) {
-        static const uint8_t ansi_to_vga_bg[8] = {
-            0,4,2,6,1,5,3,7
-        };
-        bg = ansi_to_vga_bg[code - 40];
-        return (uint8_t)(((bg & 0x0F) << 4) | (fg & 0x0F));
-    }
-    if (code >= 100 && code <= 107) {
-        static const uint8_t ansi_to_vga_bg[8] = {
-            0,4,2,6,1,5,3,7
-        };
-        bg = (uint8_t)(ansi_to_vga_bg[code - 100] | 0x08);
-        return (uint8_t)(((bg & 0x0F) << 4) | (fg & 0x0F));
-    }
-    return cur;
-}
-
-/* Parse ANSI SGR sequence starting at ESC '[' and update color.
- * Returns pointer to first char after the sequence, or original p if not handled.
- */
-static const char* ansi_parse_sgr(const char *p, uint8_t *pcolor) {
-    if (!p || !pcolor) return p;
-    if (p[0] != '\x1b' || p[1] != '[') return p;
-    const char *s = p + 2;
-    int codes[8];
-    int n_codes = 0;
-    int cur = 0;
-    int have = 0;
-
-    for (;;) {
-        char ch = *s;
-        if (!ch) {
-            /* Unterminated sequence — treat literally. */
-            return p;
-        }
-        if (ch >= '0' && ch <= '9') {
-            cur = cur * 10 + (ch - '0');
-            have = 1;
-            s++;
-            continue;
-        }
-        if (ch == ';') {
-            if (have && n_codes < (int)(sizeof(codes)/sizeof(codes[0]))) {
-                codes[n_codes++] = cur;
-            }
-            cur = 0;
-            have = 0;
-            s++;
-            continue;
-        }
-        if (ch == 'm') {
-            if (have && n_codes < (int)(sizeof(codes)/sizeof(codes[0]))) {
-                codes[n_codes++] = cur;
-            }
-            s++; /* consume 'm' */
-            break;
-        }
-        /* Unknown final char — not an SGR we understand. */
-        return p;
-    }
-
-    if (n_codes == 0) {
-        codes[n_codes++] = 0; /* plain ESC[m] means reset */
-    }
-    for (int i = 0; i < n_codes; i++) {
-        *pcolor = ansi_apply_sgr(*pcolor, codes[i]);
-    }
-    return s;
-}
-
 void ftos(double n, char *buf, int precision) {
     int i = 0;
     int sign = 1;
@@ -467,25 +332,6 @@ void kprintf(const char* fmt, ...)
 	va_list ap;
 	va_start(ap, fmt);
 
-    /* Если devfs-консоль уже инициализирована, сначала пробуем писать туда.
-       В этом случае VGA-драйвер tty0 сам отрендерит вывод, и мы избежим
-       дублирования текста (kprintf + /dev/tty0). */
-    {
-        char out_buf[512];
-        va_list ap2;
-        va_copy(ap2, ap);
-        int n = __vsnprintf(out_buf, sizeof(out_buf), fmt, ap2);
-        va_end(ap2);
-        if (n > 0) {
-            if ((size_t)n >= sizeof(out_buf)) n = (int)sizeof(out_buf) - 1;
-            out_buf[n] = '\0';
-            if (devfs_console_write(out_buf, (size_t)n) > 0) {
-                va_end(ap);
-                return;
-            }
-        }
-    }
-
     uint8_t color = 0x07; // светло-серый на чёрном
     for (const char *p = fmt; *p; ) {
         // inline цветовой код <(bgfg)> — два шестнадцатеричных символа
@@ -493,12 +339,6 @@ void kprintf(const char* fmt, ...)
             color = parse_color_code(p[2], p[3]);
             p += 6;
             continue;
-        }
-
-        // ANSI SGR escape sequences: \x1b[...m
-        if (*p == '\x1b') {
-            const char *np = ansi_parse_sgr(p, &color);
-            if (np != p) { p = np; continue; }
         }
 
         // support tab character: move to next tab stop (8 columns) like Linux
@@ -648,24 +488,9 @@ PRINT_NUMBER_BASE10:
  			for (int i = num_digits - 1; i >= 0; i--) kputchar(tmp[i], color);
  			if (left) kputn(' ', pad, color);
  			break;
-		}
-		}
-	}
-
-    /* дополнительно отправим тот же формат в консоль devfs (/dev/tty0),
-       используя vsnprintf -> devfs_console_write */
-    {
-        char out_buf[512];
-        va_list ap2;
-        va_start(ap2, fmt);
-        int n = __vsnprintf(out_buf, sizeof(out_buf), fmt, ap2);
-        va_end(ap2);
-        if (n > 0) {
-            if ((size_t)n >= sizeof(out_buf)) n = (int)sizeof(out_buf) - 1;
-            out_buf[n] = '\0';
-            devfs_console_write(out_buf, (size_t)n);
-        }
-    }
+ 		}
+ 		}
+ 	}
 
 	va_end(ap);
 }

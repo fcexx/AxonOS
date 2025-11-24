@@ -339,7 +339,7 @@ static void resolve_path(const char *cwd, const char *arg, char *out, size_t out
             /* skip '.' */
         } else if (len == 2 && seg[0] == '.' && seg[1] == '.') {
             if (pc > 0) pc--;
-    } else {
+        } else {
             if (pc < (int)(sizeof(parts)/sizeof(parts[0]))) {
                 parts[pc] = seg;
                 plen[pc] = len;
@@ -1261,131 +1261,22 @@ static int bi_ls(cmd_ctx *c) {
     char path[256]; if (c->argc<2) resolve_path(g_cwd, "", path, sizeof(path)); else resolve_path(g_cwd, c->argv[1], path, sizeof(path));
     struct fs_file *f = fs_open(path); if (!f) { osh_write(c->out, c->out_len, c->out_cap, "ls: cannot access\n"); return 1; }
     if (f->type != FS_TYPE_DIR) { osh_write(c->out, c->out_len, c->out_cap, c->argv[1] ? c->argv[1] : path); osh_write(c->out, c->out_len, c->out_cap, "\n"); fs_file_free(f); return 0; }
-    size_t want = f->size ? f->size : 4096;
-    void *buf = kmalloc(want+1);
-    ssize_t r = buf ? fs_read(f, buf, want, 0) : 0;
-    if (r > 0) {
-        /* First pass: collect entries and compute max printed width */
-        typedef struct {
-            char name[256];
-            uint8_t type;
-            int disp_len;
-        } ls_entry;
-
-        const int MAX_ENTRIES = 1024;
-        ls_entry *list = (ls_entry*)kmalloc(sizeof(ls_entry) * (size_t)MAX_ENTRIES);
-        int count = 0;
-        int max_len = 0;
-        uint32_t off = 0;
-        while ((size_t)off < (size_t)r && count < MAX_ENTRIES) {
-            struct ext2_dir_entry *de = (struct ext2_dir_entry*)((uint8_t*)buf + off);
-            if (de->inode == 0 || de->rec_len == 0) break;
-            int nlen = de->name_len;
-            if (nlen <= 0) { off += de->rec_len; continue; }
-            if (nlen > 255) nlen = 255;
-
-            ls_entry *e = &list[count];
-            memcpy(e->name, (uint8_t*)buf + off + sizeof(*de), (size_t)nlen);
-            e->name[nlen] = '\0';
-            e->type = de->file_type;
-
-            /* append '/' for directories to make them visually distinct */
-            int disp_len = nlen;
-            if (de->file_type == EXT2_FT_DIR && disp_len < (int)sizeof(e->name) - 1) {
-                e->name[disp_len++] = '/';
-                e->name[disp_len] = '\0';
-            }
-            e->disp_len = disp_len;
-            if (disp_len > max_len) max_len = disp_len;
-            count++;
-            off += de->rec_len;
+    size_t want = f->size ? f->size : 4096; void *buf = kmalloc(want+1); ssize_t r = buf?fs_read(f, buf, want, 0):0; if (r>0) {
+        uint32_t off=0; while ((size_t)off < (size_t)r) {
+            struct ext2_dir_entry *de = (struct ext2_dir_entry*)((uint8_t*)buf+off); if (de->inode==0 || de->rec_len==0) break; int nlen=de->name_len; if (nlen>255)nlen=255; char name[256]; memcpy(name, (uint8_t*)buf+off+sizeof(*de), (size_t)nlen); name[nlen]='\0';
+            osh_write(c->out, c->out_len, c->out_cap, name); if (de->file_type==EXT2_FT_DIR) osh_write(c->out, c->out_len, c->out_cap, "/"); osh_write(c->out, c->out_len, c->out_cap, "\n"); off += de->rec_len;
         }
-
-        /* Simple alphabetical sort */
-        for (int i = 0; i < count - 1; i++) {
-            for (int j = i + 1; j < count; j++) {
-                if (strcmp(list[i].name, list[j].name) > 0) {
-                    ls_entry tmp = list[i];
-                    list[i] = list[j];
-                    list[j] = tmp;
-                }
-            }
-        }
-
-        /* Columnar output that keeps within 80 visible columns. */
-        const int SCREEN_COLS = 80;
-        if (max_len < 1) max_len = 1;
-        int col_width = max_len + 2; /* small padding between columns */
-        if (col_width < 4) col_width = 4;
-        int cols = SCREEN_COLS / col_width;
-        if (cols < 1) cols = 1;
-        int rows = (count + cols - 1) / cols;
-
-        for (int row = 0; row < rows; row++) {
-            for (int col = 0; col < cols; col++) {
-                int idx = col * rows + row;
-                if (idx >= count) break;
-                ls_entry *e = &list[idx];
-
-                const char *color = "";
-                const char *reset = "\x1b[0m";
-                if (e->type == EXT2_FT_DIR) {
-                    color = "\x1b[94m";      /* bright blue */
-                } else if (e->type == EXT2_FT_REG_FILE) {
-                    color = "\x1b[92m";      /* bright green */
-                } else {
-                    color = "\x1b[96m";      /* bright cyan / light blue */
-                }
-
-                osh_write(c->out, c->out_len, c->out_cap, color);
-                osh_write(c->out, c->out_len, c->out_cap, e->name);
-                osh_write(c->out, c->out_len, c->out_cap, reset);
-
-                /* pad with spaces up to column width (except last column) */
-                if (col + 1 < cols && (idx + rows) < count) {
-                    int pad = col_width - e->disp_len;
-                    if (pad < 1) pad = 1;
-                    for (int p = 0; p < pad; p++) {
-                        osh_write(c->out, c->out_len, c->out_cap, " ");
-                    }
-                }
-            }
-            osh_write(c->out, c->out_len, c->out_cap, "\n");
-        }
-
-        if (list) kfree(list);
     }
-    if (buf) kfree(buf);
-    fs_file_free(f);
-    return 0;
+    if (buf) kfree(buf); fs_file_free(f); return 0;
 }
 
 static int bi_cat(cmd_ctx *c) {
     if (c->argc <= 1) { if (c->in) { osh_write(c->out, c->out_len, c->out_cap, c->in); } return 0; }
     int rc = 0;
     for (int i=1;i<c->argc;i++) {
-        char path[256]; join_cwd(g_cwd, c->argv[i], path, sizeof(path));
-        struct fs_file *f = fs_open(path);
+        char path[256]; join_cwd(g_cwd, c->argv[i], path, sizeof(path)); struct fs_file *f = fs_open(path);
         if (!f) { osh_write(c->out, c->out_len, c->out_cap, "cat: no such file\n"); rc=1; continue; }
-
-        /* For regular files with known size read once; for devices/streams (size==0)
-           read in chunks until EOF or read returns 0. */
-        size_t chunk = f->size ? f->size : 4096;
-        if (chunk == 0) chunk = 4096;
-        char *buf = (char*)kmalloc(chunk + 1);
-        if (!buf) { fs_file_free(f); rc = 1; continue; }
-        size_t off = 0;
-        for (;;) {
-            ssize_t r = fs_read(f, buf, chunk, off);
-            if (r <= 0) break;
-            buf[r] = '\0';
-            osh_write(c->out, c->out_len, c->out_cap, buf);
-            off += (size_t)r;
-            if (f->size && off >= f->size) break;
-            if (!f->size && (size_t)r < chunk) break; /* for TTY: one line at a time */
-        }
-        kfree(buf);
-        fs_file_free(f);
+        size_t want = f->size ? f->size : 0; char *buf = (char*)kmalloc(want+1); if (buf) { ssize_t r = fs_read(f, buf, want, 0); if (r>0) { buf[r]='\0'; osh_write(c->out, c->out_len, c->out_cap, buf); } kfree(buf);} fs_file_free(f);
     }
     return rc;
 }
@@ -1843,25 +1734,8 @@ static int osh_assign_value(const char* name, char* rhs) {
 }
 
 // -------- executor --------
-
-/* Cooperative Ctrl+C handling: любая команда osh периодически проверяет
- * глобальный флаг от клавиатуры. Если во время выполнения пользователь
- * нажал Ctrl+C, мы помечаем выполнение как ABORT и возвращаемся в оболочку.
- */
-static int osh_check_ctrlc_interrupt(void) {
-    if (keyboard_ctrlc_pending()) {
-        keyboard_consume_ctrlc();
-        return OSH_SCRIPT_ABORT;
-    }
-    return 0;
-}
-
 static int exec_simple(char **argv, int argc, const char *in, char **out, size_t *out_len, size_t *out_cap) {
     if (argc==0) return 0;
-    /* Если Ctrl+C был нажат пока команда уже крутится (например, в
-       бесконечном цикле без ввода), по возможности выходим. */
-    int intr = osh_check_ctrlc_interrupt();
-    if (intr != 0) return intr;
     // handle assignment: name = rhs ...  OR  name=rhs (single word)
     if (argc >= 3 && strcmp(argv[1], "=") == 0 && is_valid_varname(argv[0])) {
         // join rhs with spaces
@@ -1939,12 +1813,6 @@ static int exec_pipeline(token *toks, int l, int r, const char *stdin_data, char
     // Execute stages left-to-right
     char *cur_out = NULL; size_t cur_len=0, cur_cap=0;
     for (int pi=0; pi<parts_count; pi+=2) {
-        int intr = osh_check_ctrlc_interrupt();
-        if (intr != 0) {
-            if (stage_in) { kfree(stage_in); stage_in = NULL; }
-            if (cur_out) { kfree(cur_out); cur_out = NULL; }
-            return intr;
-        }
         int pl = parts_idx[pi], pr = parts_idx[pi+1];
         // build argv from [pl,pr)
         char *argv[32]; int argc=0;
@@ -2353,15 +2221,11 @@ int exec_line(const char *line) {
             // ensure 0-termination using a small temporary buffer to avoid heap resizing stalls
             char *plain_tmp = (char*)kmalloc(out_len + 1);
             if (plain_tmp) { memcpy(plain_tmp, out, out_len); plain_tmp[out_len] = '\0'; }
-            // If output contains Axon color tags <(...)> or ANSI SGR (\x1b[...m),
-            // use colorized printer; иначе — plain kprint.
+            // If output contains Axon color tags <(...)>, use colorized printer;
+            // otherwise use plain kprint. Do not interpret when redirected/ piped.
             int use_color = 0;
             for (size_t ci = 0; ci + 1 < out_len; ci++) {
-                if ((out[ci] == '<' && out[ci+1] == '(') ||  /* Axon color tag */
-                    (out[ci] == '\x1b' && out[ci+1] == '[')) { /* ANSI SGR */
-                    use_color = 1;
-                    break;
-                }
+                if (out[ci] == '<' && out[ci+1] == '(') { use_color = 1; break; }
             }
             if (use_color) {
                 // print from temporary padded buffer (avoid heap resizing)

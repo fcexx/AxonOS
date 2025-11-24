@@ -14,7 +14,6 @@
 #include <tetris.h>
 #include <clock.h>
 #include <sysinfo.h>
-#include <devfs.h>
 #include <thread.h>
 #include <neofetch.h>
 #include <axosh.h>
@@ -291,13 +290,6 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
         pci_sysfs_init();
     } else {
         kprintf("sysfs: failed to register\n");
-    }
-    /* devfs: /dev-style POSIX device filesystem */
-    if (devfs_register() == 0) {
-        ramfs_mkdir("/dev");
-        devfs_mount("/dev");
-    } else {
-        kprintf("devfs: failed to register\n");
     }
     /* If an initfs module was provided by the bootloader, unpack it into ramfs */
     {

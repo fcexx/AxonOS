@@ -63,11 +63,9 @@ struct ext2_dir_entry {
 };
 
 /* File types (file_type in dir entry) */
-#define EXT2_FT_UNKNOWN   0
-#define EXT2_FT_REG_FILE  1
-#define EXT2_FT_DIR       2
-/* Reserve code 7 for symlinks, matching ext2 spec, for future use */
-#define EXT2_FT_SYMLINK   7
+#define EXT2_FT_UNKNOWN  0
+#define EXT2_FT_REG_FILE 1
+#define EXT2_FT_DIR      2
 
 /* Magic */
 #define EXT2_SUPER_MAGIC 0xEF53
