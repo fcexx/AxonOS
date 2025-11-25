@@ -234,6 +234,35 @@ static void complete_token(const char* cwd, char* buf, int* io_len, int* io_cur,
         }
         sugg[pos] = '\0'; *sugg_len = pos;
     }
+    // Если единственное совпадение — файл и это директория, добавим '/' как в bash
+    if (matches == 1) {
+        // common содержит имя совпадения; abs — абсолютный путь к каталогу для поиска
+        char candidate[1024];
+        size_t alen = strlen(abs);
+        size_t clen = strlen(common);
+        if (alen + 1 + clen + 1 < sizeof(candidate)) {
+            // сформируем путь abs + '/' + common (без дублирования '/')
+            strcpy(candidate, abs);
+            if (alen > 0 && candidate[alen-1] != '/') {
+                candidate[alen] = '/';
+                candidate[alen+1] = '\0';
+            }
+            strncat(candidate, common, sizeof(candidate) - strlen(candidate) - 1);
+            struct fs_file* cf = fs_open(candidate);
+            if (cf) {
+                int is_dir = (cf->type == FS_TYPE_DIR);
+                fs_file_free(cf);
+                if (is_dir) {
+                    // вставим '/' если его ещё нет после текущего курсора
+                    if (len + 1 < OSH_MAX_LINE-1) {
+                        memmove(buf + cur + 1, buf + cur, (size_t)(len - cur + 1));
+                        buf[cur] = '/';
+                        cur++; len++;
+                    }
+                }
+            }
+        }
+    }
     *io_len = len; *io_cur = cur;
     if (fs_names) free_name_list(fs_names, fs_count);
 }
@@ -264,7 +293,7 @@ int osh_line_read(const char* prompt, const char* cwd, char* out, int out_size) 
         else if ((unsigned char)c == KEY_HOME) { cur = 0; }
         else if ((unsigned char)c == KEY_END) { cur = len; }
         else if ((unsigned char)c == KEY_UP) {
-            if (g_hist_count>0) { if (g_hist_pos>0) g_hist_pos--; strncpy(buf, g_hist[g_hist_pos], OSH_MAX_LINE-1); buf[OSH_MAX_LINE-1]='\0'; len = (int)strlen(buf); cur = len; }
+            if (g_hist_count > 0) { if (g_hist_pos > 0) g_hist_pos--; strncpy(buf, g_hist[g_hist_pos], OSH_MAX_LINE - 1); buf[OSH_MAX_LINE-1]='\0'; len = (int)strlen(buf); cur = len; }
         }
         else if ((unsigned char)c == KEY_DOWN) {
             if (g_hist_count>0) { if (g_hist_pos < g_hist_count-1) g_hist_pos++; strncpy(buf, g_hist[g_hist_pos], OSH_MAX_LINE-1); buf[OSH_MAX_LINE-1]='\0'; len = (int)strlen(buf); cur = len; }

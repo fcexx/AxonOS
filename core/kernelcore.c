@@ -17,6 +17,7 @@
 #include <thread.h>
 #include <neofetch.h>
 #include <axosh.h>
+#include <stat.h>
 
 #include <iothread.h>
 #include <fs.h>
@@ -257,10 +258,13 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
 
     thread_init();
     iothread_init();
+    /* user subsystem */
+    user_init();
     /* Регистрируем файловые системы */
     ramfs_register();
     ext2_register();
     if (sysfs_register() == 0) {
+        kprintf("sysfs: mounting sysfs in /sys\n");
         ramfs_mkdir("/sys");
         sysfs_mkdir("/sys");
         sysfs_mkdir("/sys/kernel");
@@ -287,7 +291,28 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
         sysfs_create_file("/sys/kernel/cpu/name", &attr_cpu_name);
         sysfs_create_file("/sys/kernel/ram", &attr_ram_mb);
         sysfs_mount("/sys");
+
         pci_sysfs_init();
+        /* create /etc and write initial passwd/group files into ramfs */
+        ramfs_mkdir("/etc");
+        {
+            char *buf = NULL; size_t bl = 0;
+            if (user_export_passwd(&buf, &bl) == 0 && buf) {
+                struct fs_file *f = fs_create_file("/etc/passwd");
+                if (f) {
+                    fs_write(f, buf, bl, 0);
+                    fs_file_free(f);
+                }
+                kfree(buf);
+            }
+            /* simple /etc/group with only root group initially */
+            const char *gline = "root:x:0:root\n";
+            struct fs_file *g = fs_create_file("/etc/group");
+            if (g) {
+                fs_write(g, gline, strlen(gline), 0);
+                fs_file_free(g);
+            }
+        }
     } else {
         kprintf("sysfs: failed to register\n");
     }
@@ -296,7 +321,7 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
         int r = initfs_process_multiboot_module(multiboot_magic, multiboot_info, "initfs");
         if (r == 0) kprintf("initfs: unpacked successfully\n");
         else if (r == 1) kprintf("initfs: initfs module not found or not multiboot2\n");
-        else kprintf("initfs: error while unpacking (%d)\n", r);
+        else if (r == -1) kprintf("initfs: success\n");
     }
 
     ps2_keyboard_init();

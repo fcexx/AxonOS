@@ -84,6 +84,18 @@ void	kputchar(uint8_t character, uint8_t attribute_byte)
 		else
 			set_cursor((offset - offset % (MAX_COLS*2)) + MAX_COLS*2);
 	}
+	else if (character == '\t')
+	{
+		// move to next tab stop (8 columns)
+		uint16_t col = (uint16_t)((offset / 2) % MAX_COLS);
+		uint16_t spaces = (uint16_t)(8 - (col % 8));
+		for (uint16_t i = 0; i < spaces; i++) {
+			if (offset == (MAX_COLS * MAX_ROWS * 2)) scroll_line();
+			write(' ', attribute_byte, offset);
+			offset += 2;
+		}
+		set_cursor(offset);
+	}
 	else if (character == '\b')
     {
         set_cursor(get_cursor() - 1);
