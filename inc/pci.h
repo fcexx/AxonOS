@@ -36,6 +36,7 @@ typedef struct pci_device {
  * pci_init - enumerate PCI buses and populate internal device list
  */
 void pci_init(void);
+void pci_sysfs_init(void);
 
 /*
  * pci_config_read_dword/pci_config_write_dword - access PCI config space

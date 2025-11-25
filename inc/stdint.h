@@ -1,4 +1,6 @@
 #pragma once
+/* If a system stdint already provided limits, skip redefinition to avoid conflicts */
+#ifndef UINT64_MAX
 
 /* Most commonly used types */
 #ifndef NULL
@@ -24,8 +26,8 @@ typedef unsigned short     uint16_t;
 typedef   signed short      int16_t;
 typedef unsigned int       uint32_t;
 typedef   signed int        int32_t;
-typedef unsigned long long uint64_t;
-typedef   signed long long  int64_t;
+typedef unsigned long uint64_t;
+typedef   signed long  int64_t;
 typedef unsigned long     uintptr_t;
 typedef   signed long      intptr_t;
 
@@ -39,3 +41,5 @@ typedef   signed long         off_t;
 typedef   signed long     blksize_t;
 typedef   signed long      blkcnt_t;
 typedef   signed long        time_t;
+
+#endif /* UINT64_MAX */

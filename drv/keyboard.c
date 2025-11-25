@@ -6,6 +6,7 @@
 #include <serial.h>
 #include <string.h>
 #include <thread.h>
+#include <sysfs.h>
 
 // Вспомогательные функции для ожидания статусов контроллера PS/2
 static int ps2_wait_input_empty(void) {
@@ -68,6 +69,41 @@ static volatile bool shift_pressed = false;
 static volatile bool ctrl_pressed = false;
 static volatile bool alt_pressed = false;
 static volatile bool ctrlc_pending = false;
+static bool keyboard_sysfs_registered = false;
+
+static ssize_t keyboard_sysfs_show_text(char *buf, size_t size, void *priv) {
+        if (!buf || size == 0) return 0;
+        const char *txt = priv ? (const char*)priv : "";
+        size_t len = strlen(txt);
+        if (len > size) len = size;
+        memcpy(buf, txt, len);
+        if (len < size) buf[len++] = '\n';
+        return (ssize_t)len;
+}
+
+static ssize_t keyboard_sysfs_show_ctrlc(char *buf, size_t size, void *priv) {
+        (void)priv;
+        if (!buf || size == 0) return 0;
+        const char *state = ctrlc_pending ? "1\n" : "0\n";
+        size_t len = strlen(state);
+        if (len > size) len = size;
+        memcpy(buf, state, len);
+        return (ssize_t)len;
+}
+
+static void keyboard_register_sysfs(void) {
+        if (keyboard_sysfs_registered) return;
+        sysfs_mkdir("/sys/class");
+        sysfs_mkdir("/sys/class/input");
+        sysfs_mkdir("/sys/class/input/keyboard0");
+        struct sysfs_attr attr_name = { keyboard_sysfs_show_text, NULL, (void*)"AT PS/2 keyboard" };
+        struct sysfs_attr attr_driver = { keyboard_sysfs_show_text, NULL, (void*)"ps2-keyboard" };
+        struct sysfs_attr attr_ctrlc = { keyboard_sysfs_show_ctrlc, NULL, NULL };
+        sysfs_create_file("/sys/class/input/keyboard0/name", &attr_name);
+        sysfs_create_file("/sys/class/input/keyboard0/driver", &attr_driver);
+        sysfs_create_file("/sys/class/input/keyboard0/ctrlc_pending", &attr_ctrlc);
+        keyboard_sysfs_registered = true;
+}
 
 // Добавить символ в буфер
 static void add_to_buffer(char c) {
@@ -249,6 +285,7 @@ void ps2_keyboard_init() {
         outb(0x60, cmd);
         if (!ps2_wait_input_empty()) qemu_debug_printf("ps2_keyboard_init: warning input buffer busy before sending 0xF4\n");
         outb(0x60, 0xF4);
+        keyboard_register_sysfs();
 }
 
 // Получить символ (блокирующая функция, как в Unix)

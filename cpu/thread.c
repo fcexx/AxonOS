@@ -27,6 +27,9 @@ void thread_init() {
         threads[0] = &main_thread;
         thread_count = 1;
         strncpy(main_thread.name, "idle", sizeof(main_thread.name));
+        /* default credentials: root */
+        main_thread.euid = 0;
+        main_thread.egid = 0;
         kprintf("thread_init: idle thread created with pid %d\n", main_thread.tid);
         init = 1;
 }
@@ -76,6 +79,9 @@ thread_t* thread_create(void (*entry)(void), const char* name) {
         t->sleep_until = 0;
         t->tid = thread_count;
         strncpy(t->name, name, sizeof(t->name));
+        /* default credentials (root) */
+        t->euid = 0;
+        t->egid = 0;
         threads[thread_count++] = t;
         return t;
 }
@@ -99,6 +105,8 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         t->sleep_until = 0;
         t->tid = thread_count;
         strncpy(t->name, name ? name : "user", sizeof(t->name));
+        /* inherit credentials from current thread if available */
+        if (current) { t->euid = current->euid; t->egid = current->egid; } else { t->euid = 0; t->egid = 0; }
         threads[thread_count++] = t;
         current_user = t;
         return t;

@@ -710,7 +710,16 @@ static int file_load(Editor *E, const char *path) {
         if (!buf) { fs_file_free(f); return -1; }
         ssize_t rd = fs_read(f, buf, sz, 0);
         if (rd < 0) { kfree(buf); fs_file_free(f); return -1; }
-        buf[rd] = '\0'; sz = (size_t)rd;
+        /* Treat embedded NUL as logical end of text file.
+           This hides padding/garbage bytes from cpio archives. */
+        if (rd > 0) {
+            size_t used = strnlen(buf, (size_t)rd);
+            sz = used;
+            buf[used] = '\0';
+        } else {
+            buf[0] = '\0';
+            sz = 0;
+        }
     } else {
         // fallback: unknown size, read in chunks until EOF
         size_t cap = 4096; buf = (char*)kmalloc(cap + 1); if (!buf) { fs_file_free(f); return -1; }
@@ -720,7 +729,14 @@ static int file_load(Editor *E, const char *path) {
             ssize_t rd = fs_read(f, buf + sz, 4096, sz);
             if (rd <= 0) break; sz += (size_t)rd;
         }
-        buf[sz] = '\0';
+        /* same rule: stop at first NUL */
+        if (sz > 0) {
+            size_t used = strnlen(buf, sz);
+            sz = used;
+            buf[used] = '\0';
+        } else {
+            buf[0] = '\0';
+        }
     }
 	fs_file_free(f);
 	// parse into lines
