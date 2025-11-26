@@ -16,6 +16,7 @@ struct fs_file {
     size_t size;
     off_t pos;
     int type;                 /* FS_TYPE_* (set by driver) */
+    int refcount;             /* VFS reference count for this handle */
 };
 
 /* Filesystem driver operations (minimal set) */

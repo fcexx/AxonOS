@@ -1955,6 +1955,14 @@ typedef int (*builtin_fn)(cmd_ctx*);
 typedef struct { const char* name; builtin_fn fn; } builtin;
 /* forward declaration for chmod builtin */
 static int bi_chmod(cmd_ctx *c);
+/* forward declaration for chvt builtin */
+static int bi_chvt(cmd_ctx *c);
+/* fd builtins */
+static int bi_open(cmd_ctx *c);
+static int bi_close(cmd_ctx *c);
+static int bi_dup(cmd_ctx *c);
+static int bi_dup2(cmd_ctx *c);
+static int bi_isatty(cmd_ctx *c);
 
 static const builtin builtin_table[] = {
     {"echo", bi_echo}, {"kprint", bi_kprint}, {"readline", bi_readline}, {"readkey", bi_readkey},
@@ -1965,7 +1973,8 @@ static const builtin builtin_table[] = {
     {"reboot", bi_reboot}, {"shutdown", bi_shutdown}, {"neofetch", bi_neofetch}, {"mem", bi_mem},
     {"osh", bi_osh}, {"art", bi_art}, {"pause", bi_pause}, {"chipset", bi_chipset}, {"help", bi_help},
     {"passwd", bi_passwd}, {"su", bi_su}, {"whoami", bi_whoami}, {"mkpasswd", bi_mkpasswd}, {"groups", bi_groups},
-    {"useradd", bi_useradd}, {"groupadd", bi_groupadd}, {"chmod", bi_chmod}
+    {"useradd", bi_useradd}, {"groupadd", bi_groupadd}, {"chmod", bi_chmod}, {"chvt", bi_chvt},
+    {"open", bi_open}, {"close", bi_close}, {"dup", bi_dup}, {"dup2", bi_dup2}, {"isatty", bi_isatty}
 };
 static int bi_chmod(cmd_ctx *c) {
     if (c->argc < 3) { kprintf("usage: chmod <mode> <path>\n"); return 1; }
@@ -2004,6 +2013,61 @@ static int bi_chmod(cmd_ctx *c) {
     if (fs_chmod(fullpath, newmode) == 0) { kprintf("ok\n"); return 0; }
     kprintf("chmod: failed\n");
     return 1;
+}
+
+static int bi_chvt(cmd_ctx *c) {
+    if (c->argc < 2) { kprintf("usage: chvt <n>\n"); return 1; }
+    int n = parse_uint(c->argv[1]);
+    if (n < 0) { kprintf("chvt: invalid number\n"); return 1; }
+    extern void devfs_switch_tty(int index);
+    devfs_switch_tty(n);
+    return 0;
+}
+
+static int bi_open(cmd_ctx *c) {
+    if (c->argc < 2) { kprintf("usage: open <path>\n"); return 1; }
+    const char *path = c->argv[1];
+    struct fs_file *f = fs_open(path);
+    if (!f) { kprintf("open: failed\n"); return 1; }
+    int fd = thread_fd_alloc(f);
+    if (fd < 0) { fs_file_free(f); kprintf("open: no fds\n"); return 1; }
+    kprintf("%d\n", fd);
+    return 0;
+}
+
+static int bi_close(cmd_ctx *c) {
+    if (c->argc < 2) { kprintf("usage: close <fd>\n"); return 1; }
+    int fd = parse_uint(c->argv[1]);
+    if (fd < 0) { kprintf("close: invalid fd\n"); return 1; }
+    if (thread_fd_close(fd) == 0) return 0;
+    kprintf("close: failed\n");
+    return 1;
+}
+
+static int bi_dup(cmd_ctx *c) {
+    if (c->argc < 2) { kprintf("usage: dup <oldfd>\n"); return 1; }
+    int oldfd = parse_uint(c->argv[1]);
+    int nfd = thread_fd_dup(oldfd);
+    if (nfd < 0) { kprintf("dup: failed\n"); return 1; }
+    kprintf("%d\n", nfd);
+    return 0;
+}
+
+static int bi_dup2(cmd_ctx *c) {
+    if (c->argc < 3) { kprintf("usage: dup2 <oldfd> <newfd>\n"); return 1; }
+    int oldfd = parse_uint(c->argv[1]);
+    int newfd = parse_uint(c->argv[2]);
+    int r = thread_fd_dup2(oldfd, newfd);
+    if (r < 0) { kprintf("dup2: failed\n"); return 1; }
+    return 0;
+}
+
+static int bi_isatty(cmd_ctx *c) {
+    if (c->argc < 2) { kprintf("usage: isatty <fd>\n"); return 1; }
+    int fd = parse_uint(c->argv[1]);
+    int r = thread_fd_isatty(fd);
+    kprintf("%d\n", r ? 1 : 0);
+    return 0;
 }
 
 static builtin_fn find_builtin(const char* name) {

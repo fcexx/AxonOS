@@ -323,6 +323,35 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
         else if (r == 1) kprintf("initfs: initfs module not found or not multiboot2\n");
         else if (r == -1) kprintf("initfs: success\n");
     }
+    /* register and mount devfs at /dev */
+    if (devfs_register() == 0) {
+        kprintf("devfs: registering devfs\n");
+        ramfs_mkdir("/dev");
+        devfs_mount("/dev");
+        /* initialize stdio fds for current thread (main) */
+        struct fs_file *console = fs_open("/dev/console");
+        if (console) {
+            /* allocate fd slots for main thread using helper to manage refcounts */
+            int fd0 = thread_fd_alloc(console);
+            if (fd0 >= 0) {
+                /* ensure we have fd 0..2 set; if not, duplicate */
+                thread_t* t = thread_current();
+                if (t) {
+                    if (fd0 != 0) { /* move to 0 */
+                        if (t->fds[0]) fs_file_free(t->fds[0]);
+                        t->fds[0] = t->fds[fd0];
+                        t->fds[fd0] = NULL;
+                    }
+                    if (!t->fds[1]) { t->fds[1] = t->fds[0]; if (t->fds[1]) t->fds[1]->refcount++; }
+                    if (!t->fds[2]) { t->fds[2] = t->fds[0]; if (t->fds[2]) t->fds[2]->refcount++; }
+                }
+            } else {
+                fs_file_free(console);
+            }
+        }
+    } else {
+        kprintf("devfs: failed to register\n");
+    }
 
     ps2_keyboard_init();
     rtc_init();

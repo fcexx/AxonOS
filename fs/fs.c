@@ -84,6 +84,7 @@ struct fs_file *fs_create_file(const char *path) {
         int r = drv->ops->create(path, &file);
         if (r == 0 && file) {
             /* driver should set file->fs_private to drv->driver_data if needed */
+            file->refcount = 1;
             return file;
         }
         if (r < 0 && r != -1) {
@@ -137,15 +138,20 @@ ssize_t fs_write(struct fs_file *file, const void *buf, size_t size, size_t offs
 
 void fs_file_free(struct fs_file *file) {
     if (!file) return;
-    /* let driver release internal resources if provided */
+    /* reference-counted: decrement and only free when zero */
+    if (file->refcount > 1) { file->refcount--; return; }
+    /* file->refcount <= 1 -> release resources */
     for (int i = 0; i < g_drivers_count; i++) {
         struct fs_driver *drv = g_drivers[i];
         if (!drv || !drv->ops) continue;
         if (file->fs_private == drv->driver_data) {
             if (drv->ops->release) drv->ops->release(file);
-            break;
+            return;
         }
     }
+    /* If no driver handled it, free memory */
+    kfree((void*)file->path);
+    kfree(file);
 }
 
 int fs_chmod(const char *path, mode_t mode) {

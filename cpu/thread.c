@@ -6,6 +6,7 @@
 #include <vga.h>
 #include <context.h>
 #include <debug.h>
+#include <devfs.h>
 
 #define MAX_THREADS 32
 thread_t* threads[MAX_THREADS];
@@ -30,6 +31,7 @@ void thread_init() {
         /* default credentials: root */
         main_thread.euid = 0;
         main_thread.egid = 0;
+        main_thread.attached_tty = devfs_get_active();
         kprintf("thread_init: idle thread created with pid %d\n", main_thread.tid);
         init = 1;
 }
@@ -82,6 +84,7 @@ thread_t* thread_create(void (*entry)(void), const char* name) {
         /* default credentials (root) */
         t->euid = 0;
         t->egid = 0;
+        t->attached_tty = -1;
         threads[thread_count++] = t;
         return t;
 }
@@ -105,11 +108,84 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         t->sleep_until = 0;
         t->tid = thread_count;
         strncpy(t->name, name ? name : "user", sizeof(t->name));
-        /* inherit credentials from current thread if available */
-        if (current) { t->euid = current->euid; t->egid = current->egid; } else { t->euid = 0; t->egid = 0; }
+        /* inherit credentials, file descriptors and attached tty from current thread if available */
+        if (current) {
+                t->euid = current->euid;
+                t->egid = current->egid;
+                /* copy fd table */
+                for (int i = 0; i < THREAD_MAX_FD; i++) t->fds[i] = current->fds[i];
+                t->attached_tty = current->attached_tty >= 0 ? current->attached_tty : devfs_get_active();
+        } else { t->euid = 0; t->egid = 0; t->attached_tty = devfs_get_active(); }
         threads[thread_count++] = t;
         current_user = t;
         return t;
+}
+
+int thread_fd_alloc(struct fs_file *file) {
+    if (!file) return -1;
+    thread_t *cur = thread_current();
+    if (!cur) return -1;
+    for (int i = 0; i < THREAD_MAX_FD; i++) {
+        if (cur->fds[i] == NULL) {
+            cur->fds[i] = file;
+            /* take ownership - increase refcount */
+            if (file->refcount <= 0) file->refcount = 1;
+            else file->refcount++;
+            return i;
+        }
+    }
+    return -1;
+}
+
+int thread_fd_close(int fd) {
+    thread_t *cur = thread_current();
+    if (!cur || fd < 0 || fd >= THREAD_MAX_FD) return -1;
+    struct fs_file *f = cur->fds[fd];
+    if (!f) return -1;
+    cur->fds[fd] = NULL;
+    fs_file_free(f);
+    return 0;
+}
+
+int thread_fd_dup(int oldfd) {
+    thread_t *cur = thread_current();
+    if (!cur || oldfd < 0 || oldfd >= THREAD_MAX_FD) return -1;
+    struct fs_file *f = cur->fds[oldfd];
+    if (!f) return -1;
+    for (int i = 0; i < THREAD_MAX_FD; i++) {
+        if (cur->fds[i] == NULL) {
+            cur->fds[i] = f;
+            if (f->refcount <= 0) f->refcount = 1;
+            else f->refcount++;
+            return i;
+        }
+    }
+    return -1;
+}
+
+int thread_fd_dup2(int oldfd, int newfd) {
+    thread_t *cur = thread_current();
+    if (!cur || oldfd < 0 || oldfd >= THREAD_MAX_FD || newfd < 0 || newfd >= THREAD_MAX_FD) return -1;
+    if (oldfd == newfd) return newfd;
+    struct fs_file *f = cur->fds[oldfd];
+    if (!f) return -1;
+    /* close newfd if open */
+    if (cur->fds[newfd]) {
+        fs_file_free(cur->fds[newfd]);
+        cur->fds[newfd] = NULL;
+    }
+    cur->fds[newfd] = f;
+    if (f->refcount <= 0) f->refcount = 1;
+    else f->refcount++;
+    return newfd;
+}
+
+int thread_fd_isatty(int fd) {
+    thread_t *cur = thread_current();
+    if (!cur || fd < 0 || fd >= THREAD_MAX_FD) return 0;
+    struct fs_file *f = cur->fds[fd];
+    if (!f) return 0;
+    return devfs_is_tty_file(f);
 }
 
 thread_t* thread_current() {
@@ -221,3 +297,9 @@ int thread_get_count() {
 
 thread_t* thread_get_current_user(){ return current_user; }
 void thread_set_current_user(thread_t* t){ current_user = t; }
+thread_t* thread_find_by_tty(int tty) {
+    for (int i = 0; i < thread_count; ++i) {
+        if (threads[i] && threads[i]->attached_tty == tty) return threads[i];
+    }
+    return NULL;
+}

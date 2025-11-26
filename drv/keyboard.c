@@ -7,6 +7,7 @@
 #include <string.h>
 #include <thread.h>
 #include <sysfs.h>
+#include "../inc/devfs.h"
 
 // Вспомогательные функции для ожидания статусов контроллера PS/2
 static int ps2_wait_input_empty(void) {
@@ -32,13 +33,7 @@ void keyboard_process_scancode(uint8_t scancode);
 #define KEYBOARD_BUFFER_SIZE 256
 
 // Буфер для хранения символов
-static char keyboard_buffer[KEYBOARD_BUFFER_SIZE];
-static volatile int buffer_head = 0;
-static volatile int buffer_tail = 0;
-static volatile int buffer_count = 0;
-
-// Спинлок для синхронизации доступа к буферу
-static spinlock_t keyboard_lock = {0};
+// We no longer maintain a separate global keyboard buffer; input is routed into devfs tty buffers.
 
 // Таблица сканкодов для преобразования в ASCII
 static const char scancode_to_ascii[128] = {
@@ -107,35 +102,8 @@ static void keyboard_register_sysfs(void) {
 
 // Добавить символ в буфер
 static void add_to_buffer(char c) {
-        // В ISR нельзя блокироваться на обычном спинлоке (риск deadlock),
-        // поэтому пытаемся захватить неблокирующе; если не получается —
-        // символ отбрасывается.
-        if (!try_acquire(&keyboard_lock)) {
-                return; // drop char to avoid deadlock
-        }
-        if (buffer_count < KEYBOARD_BUFFER_SIZE) {
-                keyboard_buffer[buffer_tail] = c;
-                buffer_tail = (buffer_tail + 1) % KEYBOARD_BUFFER_SIZE;
-                buffer_count++;
-        }
-        release(&keyboard_lock);
-}
-
-// Получить символ из буфера
-static char get_from_buffer() {
-        char c = 0;
-        unsigned long _flags = 0;
-        acquire_irqsave(&keyboard_lock, &_flags);
-
-        if (buffer_count > 0) {
-                c = keyboard_buffer[buffer_head];
-                buffer_head = (buffer_head + 1) % KEYBOARD_BUFFER_SIZE;
-                buffer_count--;
-        }
-
-        release_irqrestore(&keyboard_lock, _flags);
-
-        return c;
+    /* Legacy wrapper kept for compatibility; push to devfs active tty non-blocking */
+    devfs_tty_push_input_noblock(devfs_get_active(), c);
 }
 
 // Обработчик прерывания клавиатуры
@@ -227,6 +195,25 @@ void keyboard_process_scancode(uint8_t scancode) {
                 case 0x01: // Escape
                         add_to_buffer(27); // ASCII ESC
                         break;
+                case 0x3B: // F1
+                case 0x3C: // F2
+                case 0x3D: // F3
+                case 0x3E: // F4
+                case 0x3F: // F5
+                case 0x40: // F6
+                        if (alt_pressed) {
+                                int idx = 0;
+                                if (scancode == 0x3B) idx = 0;
+                                else if (scancode == 0x3C) idx = 1;
+                                else if (scancode == 0x3D) idx = 2;
+                                else if (scancode == 0x3E) idx = 3;
+                                else if (scancode == 0x3F) idx = 4;
+                                else if (scancode == 0x40) idx = 5;
+                                devfs_switch_tty(idx);
+                        } else {
+                                /* treat as no-op for now */
+                        }
+                        break;
                 default:
                         // Обычная клавиша
                         if (scancode < 128) {
@@ -253,14 +240,6 @@ void keyboard_process_scancode(uint8_t scancode) {
 
 // Инициализация PS/2 клавиатуры
 void ps2_keyboard_init() {
-        // Инициализируем спинлок
-        keyboard_lock = (spinlock_t){0};
-        
-        // Очищаем буфер
-        buffer_head = 0;
-        buffer_tail = 0;
-        buffer_count = 0;
-        
         // Сбрасываем флаги
         shift_pressed = false;
         ctrl_pressed = false;
@@ -290,18 +269,22 @@ void ps2_keyboard_init() {
 
 // Получить символ (блокирующая функция, как в Unix)
 char kgetc() {
-        // Блокирующее ожидание: если нет символов, выполняем HLT с включёнными прерываниями
-        // процессор проснётся на аппаратное IRQ (PIT/PS2)
-        while (buffer_count == 0) {
+        int tty = devfs_get_active();
+        if (tty < 0) tty = 0;
+        int c;
+        for (;;) {
+                c = devfs_tty_pop_nb(tty);
+                if (c >= 0) return (char)c;
+                /* no data — sleep until IRQ wakes us */
                 asm volatile("sti; hlt" ::: "memory");
         }
-
-        return get_from_buffer();
 }
 
 // Проверить, есть ли доступные символы (неблокирующая)
 int kgetc_available() {
-        return buffer_count;
+        int tty = devfs_get_active();
+        if (tty < 0) tty = 0;
+        return devfs_tty_available(tty);
 }
 
 int keyboard_ctrlc_pending(void) {

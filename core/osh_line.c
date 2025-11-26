@@ -7,31 +7,46 @@
 #include "../inc/axosh.h"
 #include <stdint.h>
 #include <string.h>
+#include "../inc/devfs.h"
+/* kprintf used for debug in some flows */
+int kprintf(const char* fmt, ...);
 
 #define OSH_MAX_HISTORY 32
 #define OSH_MAX_LINE 512
-
-static char g_hist[OSH_MAX_HISTORY][OSH_MAX_LINE];
-static int g_hist_count = 0;
-static int g_hist_pos = 0;
+static char g_hist[DEVFS_TTY_COUNT][OSH_MAX_HISTORY][OSH_MAX_LINE];
+static int g_hist_count[DEVFS_TTY_COUNT];
+static int g_hist_pos[DEVFS_TTY_COUNT];
 static int g_last_ctrlc = 0;
+/* navigation state per-tty: saved current line when starting navigation,
+   current navigation index and active flag */
+static char g_nav_saved[DEVFS_TTY_COUNT][OSH_MAX_LINE];
+static int g_nav_index[DEVFS_TTY_COUNT];
+static int g_nav_active[DEVFS_TTY_COUNT];
 
-void osh_history_init(void) { g_hist_count = 0; g_hist_pos = 0; }
+void osh_history_init(void) {
+    for (int i = 0; i < DEVFS_TTY_COUNT; i++) { g_hist_count[i] = 0; g_hist_pos[i] = 0; }
+    for (int i = 0; i < DEVFS_TTY_COUNT; i++) { g_nav_active[i] = 0; g_nav_index[i] = 0; g_nav_saved[i][0] = '\0'; }
+}
 
 void osh_history_add(const char* line) {
     if (!line || !line[0]) return;
+    int t = devfs_get_active();
+    if (t < 0 || t >= DEVFS_TTY_COUNT) t = 0;
     // skip duplicate of last
-    if (g_hist_count > 0 && strncmp(g_hist[g_hist_count-1], line, OSH_MAX_LINE)==0) return;
-    if (g_hist_count < OSH_MAX_HISTORY) {
-        strncpy(g_hist[g_hist_count++], line, OSH_MAX_LINE-1);
-        g_hist[g_hist_count-1][OSH_MAX_LINE-1] = '\0';
+    if (g_hist_count[t] > 0 && strncmp(g_hist[t][g_hist_count[t]-1], line, OSH_MAX_LINE)==0) return;
+    if (g_hist_count[t] < OSH_MAX_HISTORY) {
+        strncpy(g_hist[t][g_hist_count[t]++], line, OSH_MAX_LINE-1);
+        g_hist[t][g_hist_count[t]-1][OSH_MAX_LINE-1] = '\0';
     } else {
         // shift up
-        for (int i=1;i<OSH_MAX_HISTORY;i++) strncpy(g_hist[i-1], g_hist[i], OSH_MAX_LINE);
-        strncpy(g_hist[OSH_MAX_HISTORY-1], line, OSH_MAX_LINE-1);
-        g_hist[OSH_MAX_HISTORY-1][OSH_MAX_LINE-1] = '\0';
+        for (int i=1;i<OSH_MAX_HISTORY;i++) strncpy(g_hist[t][i-1], g_hist[t][i], OSH_MAX_LINE);
+        strncpy(g_hist[t][OSH_MAX_HISTORY-1], line, OSH_MAX_LINE-1);
+        g_hist[t][OSH_MAX_HISTORY-1][OSH_MAX_LINE-1] = '\0';
     }
-    g_hist_pos = g_hist_count;
+    g_hist_pos[t] = g_hist_count[t];
+    /* reset navigation state on new entry */
+    g_nav_active[t] = 0;
+    g_nav_index[t] = g_hist_count[t];
 }
 
 // helpers
@@ -212,27 +227,71 @@ static void complete_token(const char* cwd, char* buf, int* io_len, int* io_cur,
             cur += add; len += add;
         }
     } else if (matches > 1 && sugg && sugg_cap>0) {
-        // собрать варианты в строку подсказок, вывести на той же строке
-        int pos = 0;
-        // builtin
-        for (int i=0;i<bcount;i++) {
-            if (strncmp(bnames[i], base, strlen(base))==0) {
-                int need = (int)strlen(bnames[i]) + 2;
-                if (pos + need >= sugg_cap) break;
-                memcpy(sugg + pos, bnames[i], strlen(bnames[i])); pos += (int)strlen(bnames[i]);
-                sugg[pos++] = ' '; sugg[pos++] = ' ';
+        /* build list of matches and print them in columns */
+        int max_candidates = bcount + fs_count;
+        char **candidates = (char**)kmalloc(sizeof(char*) * (size_t)max_candidates);
+        int cand = 0;
+        int maxlen = 0;
+        size_t baselen = strlen(base);
+        for (int i = 0; i < bcount; i++) {
+            if (strncmp(bnames[i], base, baselen) == 0) {
+                candidates[cand++] = (char*)bnames[i];
+                int L = (int)strlen(bnames[i]);
+                if (L > maxlen) maxlen = L;
             }
         }
-        // fs
-        for (int i=0;i<fs_count;i++) {
-            if (strncmp(fs_names[i], base, strlen(base))==0) {
-                int need = (int)strlen(fs_names[i]) + 2;
-                if (pos + need >= sugg_cap) break;
-                memcpy(sugg + pos, fs_names[i], strlen(fs_names[i])); pos += (int)strlen(fs_names[i]);
-                sugg[pos++] = ' '; sugg[pos++] = ' ';
+        for (int i = 0; i < fs_count; i++) {
+            if (strncmp(fs_names[i], base, baselen) == 0) {
+                candidates[cand++] = (char*)fs_names[i];
+                int L = (int)strlen(fs_names[i]);
+                if (L > maxlen) maxlen = L;
             }
         }
-        sugg[pos] = '\0'; *sugg_len = pos;
+        if (cand > 0) {
+            int colw = maxlen + 2;
+            if (colw < 8) colw = 8;
+            int cols = (int)(MAX_COLS / colw);
+            if (cols < 1) cols = 1;
+            int rows = (cand + cols - 1) / cols;
+            /* build lines into sugg buffer without extra leading/trailing blank lines */
+            int outpos = 0;
+            for (int r = 0; r < rows; r++) {
+                int p = 0;
+                for (int c = 0; c < cols; c++) {
+                    int idx = c * rows + r;
+                    if (idx >= cand) break;
+                    const char *nm = candidates[idx];
+                    int L = (int)strlen(nm);
+                    /* if next name won't fit into MAX_COLS, stop adding more to this line */
+                    if (p + L >= MAX_COLS) break;
+                    /* append name to a temporary line buffer and then to sugg */
+                    if (outpos + L >= (int)sugg_cap) break;
+                    memcpy(sugg + outpos, nm, (size_t)L);
+                    outpos += L;
+                    p += L;
+                    /* pad */
+                    int pad = colw - L;
+                    if (pad < 0) pad = 0;
+                    if (p + pad > MAX_COLS) pad = MAX_COLS - p;
+                    if (outpos + pad >= (int)sugg_cap) pad = sugg_cap - outpos - 1;
+                    for (int z = 0; z < pad; z++) {
+                        sugg[outpos++] = ' ';
+                        p++;
+                    }
+                }
+                /* terminate line */
+                if (outpos + 1 < (int)sugg_cap) {
+                    sugg[outpos++] = '\n';
+                } else {
+                    break;
+                }
+            }
+            if (outpos < (int)sugg_cap) sugg[outpos] = '\0'; else sugg[sugg_cap-1] = '\0';
+            *sugg_len = outpos;
+        } else {
+            *sugg_len = 0;
+        }
+        kfree(candidates);
     }
     // Если единственное совпадение — файл и это директория, добавим '/' как в bash
     if (matches == 1) {
@@ -286,6 +345,12 @@ int osh_line_read(const char* prompt, const char* cwd, char* out, int out_size) 
         if (c == '\n' || c == '\r') {
             buf[len]='\0'; strncpy(out, buf, (size_t)out_size-1); out[out_size-1]='\0';
             kprint((uint8_t*)"\n");
+            /* reset history navigation/position for current tty */
+            int t = devfs_get_active(); if (t < 0 || t >= DEVFS_TTY_COUNT) t = 0;
+            g_hist_pos[t] = g_hist_count[t];
+            g_nav_active[t] = 0;
+            g_nav_index[t] = g_hist_count[t];
+            g_nav_saved[t][0] = '\0';
             return len;
         }
         if ((unsigned char)c == KEY_LEFT) { if (cur>0) cur--; }
@@ -293,23 +358,84 @@ int osh_line_read(const char* prompt, const char* cwd, char* out, int out_size) 
         else if ((unsigned char)c == KEY_HOME) { cur = 0; }
         else if ((unsigned char)c == KEY_END) { cur = len; }
         else if ((unsigned char)c == KEY_UP) {
-            if (g_hist_count > 0) { if (g_hist_pos > 0) g_hist_pos--; strncpy(buf, g_hist[g_hist_pos], OSH_MAX_LINE - 1); buf[OSH_MAX_LINE-1]='\0'; len = (int)strlen(buf); cur = len; }
+            int t = devfs_get_active(); if (t < 0 || t >= DEVFS_TTY_COUNT) t = 0;
+            if (g_hist_count[t] == 0) {
+                /* nothing to show */
+            } else {
+                /* start navigation if not active */
+                if (!g_nav_active[t]) {
+                    g_nav_active[t] = 1;
+                    g_nav_index[t] = g_hist_count[t]; /* one-past-last */
+                    /* save current line */
+                    strncpy(g_nav_saved[t], buf, OSH_MAX_LINE-1);
+                    g_nav_saved[t][OSH_MAX_LINE-1] = '\0';
+                }
+                /* move up */
+                if (g_nav_index[t] > 0) g_nav_index[t]--;
+                /* show entry or saved */
+                if (g_nav_index[t] >= 0 && g_nav_index[t] < g_hist_count[t]) {
+                    strncpy(buf, g_hist[t][g_nav_index[t]], OSH_MAX_LINE - 1);
+                    buf[OSH_MAX_LINE-1] = '\0';
+                    len = (int)strlen(buf); cur = len;
+                } else {
+                    /* one-past-last -> show saved original */
+                    strncpy(buf, g_nav_saved[t], OSH_MAX_LINE-1);
+                    buf[OSH_MAX_LINE-1] = '\0';
+                    len = (int)strlen(buf); cur = len;
+                }
+            }
         }
         else if ((unsigned char)c == KEY_DOWN) {
-            if (g_hist_count>0) { if (g_hist_pos < g_hist_count-1) g_hist_pos++; strncpy(buf, g_hist[g_hist_pos], OSH_MAX_LINE-1); buf[OSH_MAX_LINE-1]='\0'; len = (int)strlen(buf); cur = len; }
+            int t = devfs_get_active(); if (t < 0 || t >= DEVFS_TTY_COUNT) t = 0;
+            if (g_hist_count[t] == 0) {
+                buf[0] = '\0'; len = 0; cur = 0;
+                g_nav_active[t] = 0;
+                g_nav_index[t] = g_hist_count[t];
+            } else {
+                if (!g_nav_active[t]) {
+                    g_nav_active[t] = 1;
+                    g_nav_index[t] = g_hist_count[t]; /* start from saved */
+                    strncpy(g_nav_saved[t], buf, OSH_MAX_LINE-1);
+                    g_nav_saved[t][OSH_MAX_LINE-1] = '\0';
+                }
+                if (g_nav_index[t] < g_hist_count[t]) g_nav_index[t]++;
+                if (g_nav_index[t] >= 0 && g_nav_index[t] < g_hist_count[t]) {
+                    strncpy(buf, g_hist[t][g_nav_index[t]], OSH_MAX_LINE - 1);
+                    buf[OSH_MAX_LINE-1] = '\0';
+                    len = (int)strlen(buf); cur = len;
+                } else {
+                    /* one-past-last -> saved/or empty */
+                    strncpy(buf, g_nav_saved[t], OSH_MAX_LINE-1);
+                    buf[OSH_MAX_LINE-1] = '\0';
+                    len = (int)strlen(buf); cur = len;
+                }
+            }
         }
-        else if ((unsigned char)c == KEY_DELETE) { if (cur < len) { memmove(buf+cur, buf+cur+1, (size_t)(len-cur)); len--; buf[len]='\0'; } }
-        else if (c == 8 || c == 127) { if (cur>0) { memmove(buf+cur-1, buf+cur, (size_t)(len-cur+1)); cur--; len--; } }
+        else if ((unsigned char)c == KEY_DELETE) {
+            int t = devfs_get_active(); if (t < 0 || t >= DEVFS_TTY_COUNT) t = 0;
+            g_nav_active[t] = 0;
+            if (cur < len) { memmove(buf+cur, buf+cur+1, (size_t)(len-cur)); len--; buf[len]='\0'; }
+        }
+        else if (c == 8 || c == 127) {
+            int t = devfs_get_active(); if (t < 0 || t >= DEVFS_TTY_COUNT) t = 0;
+            g_nav_active[t] = 0;
+            if (cur>0) { memmove(buf+cur-1, buf+cur, (size_t)(len-cur+1)); cur--; len--; }
+        }
         else if ((unsigned char)c == KEY_TAB) {
             complete_token(cwd, buf, &len, &cur, sugg, (int)sizeof(sugg), &sugg_len);
             if (sugg_len > 0) {
-                /* Печатаем список совпадений под текущей строкой и
-                   переносим строку ввода в самый низ, как в bash. */
-                kprintf("\n%s\n", sugg);
+                /* Print matches in columns; only insert leading newline if prompt not at column 0 */
+                uint32_t cx = 0, cy = 0;
+                vga_get_cursor(&cx, &cy);
+                if (cx != 0) kprintf("\n");
+                kprintf("%s\n", sugg);
                 vga_get_cursor(&sx, &sy);
             }
         }
         else if (c >= 32 && c < 127) {
+            int t = devfs_get_active(); if (t < 0 || t >= DEVFS_TTY_COUNT) t = 0;
+            /* typing clears history navigation state */
+            g_nav_active[t] = 0;
             if (len+1 < OSH_MAX_LINE) {
                 memmove(buf+cur+1, buf+cur, (size_t)(len-cur+1));
                 buf[cur]=c; cur++; len++;
@@ -326,5 +452,7 @@ int osh_line_was_ctrlc(void) {
     g_last_ctrlc = 0;
     return v;
 }
+
+
 
 
