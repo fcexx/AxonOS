@@ -239,7 +239,7 @@ void ascii_art() {
     kprintf("<(0f)>\xB0\xB1\xB2\xDB\xB2\xB1\xB0\xB0\xB1\xB2\xDB\xB2\xB1\xB0\xB1\xB2\xDB\xB2\xB1\xB0\xB0\xB1\xB2\xDB\xB2\xB1\xB0\xB0\xB1\xB2\xDB\xDB\xDB\xDB\xDB\xDB\xB2\xB1\xB0\xB0\xB1\xB2\xDB\xB2\xB1\xB0\xB0\xB1\xB2\xDB\xB2\xB1<(0b)>\xB0\xB0\xB1\xB2\xDB\xDB\xDB\xDB\xDB\xDB\xB2\xB1\xB0\xB0\xB1\xB2\xDB\xDB\xDB\xDB\xDB\xDB\xDB\xB2\xB1\xB0\n\n");
 }
 
-void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
+void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     kclear();
     kprint("Initializing kernel...\n");
     sysinfo_init(multiboot_magic, multiboot_info);
@@ -365,6 +365,7 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
     {
         struct fs_file *f = fs_open("/start");
         if (f) { fs_file_free(f); (void)exec_line("osh /start"); }
+        else { kprintf("FATAL: /start file not found; fallback to osh\n"); exec_line("PS1=\"\\w # \""); exec_line("osh"); }
     }
 
     kprint("\nShutting down in 5 seconds...");
