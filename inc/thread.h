@@ -27,6 +27,9 @@ typedef struct thread {
         uint32_t sleep_until;          // sleep until (in timer ticks)
         uint64_t clear_child_tid;      // clear child tid
         //fs_file_t* fds[THREAD_MAX_FD];
+        /* POSIX credentials */
+        uid_t euid;
+        gid_t egid;
 } thread_t;
 
 extern int init;

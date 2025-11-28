@@ -5,12 +5,22 @@
 #include "../inc/ext2.h"
 #include "../inc/ramfs.h"
 #include "../inc/heap.h"
+#include "../inc/stat.h"
+#include "../inc/thread.h"
 
 struct ramfs_node {
     char *name;
     int is_dir;
     char *data;
     size_t size;
+    unsigned long ino;
+    unsigned int mode;
+    unsigned int uid;
+    unsigned int gid;
+    unsigned int nlink;
+    time_t atime;
+    time_t mtime;
+    time_t ctime;
     struct ramfs_node *parent;
     struct ramfs_node *children; /* linked list of children */
     struct ramfs_node *next; /* sibling */
@@ -33,6 +43,13 @@ static struct ramfs_node *ramfs_alloc_node(const char *name, int is_dir) {
     n->name = (char*)kmalloc(l);
     memcpy(n->name, name, l);
     n->is_dir = is_dir;
+    n->ino = ramfs_next_inode++;
+    n->mode = is_dir ? (S_IFDIR | 0755) : (S_IFREG | 0644);
+    n->uid = 0;
+    n->gid = 0;
+    n->nlink = is_dir ? 2u : 1u;
+    n->size = 0;
+    n->atime = n->mtime = n->ctime = 0;
     return n;
 }
 
@@ -85,6 +102,9 @@ static int ramfs_create(const char *path, struct fs_file **out_file) {
     if (ramfs_find_child(parent, name)) { kfree(tmp); return -4; }
     struct ramfs_node *n = ramfs_alloc_node(name, 0);
     if (!n) { kfree(tmp); return -5; }
+    /* set owner to current thread euid/egid */
+    thread_t* ct = thread_current();
+    if (ct) { n->uid = ct->euid; n->gid = ct->egid; }
     n->parent = parent;
     /* insert at head */
     n->next = parent->children;
@@ -131,23 +151,33 @@ static ssize_t ramfs_read(struct fs_file *file, void *buf, size_t size, size_t o
     struct ramfs_file_handle *fh = (struct ramfs_file_handle*)file->driver_private;
     struct ramfs_node *n = fh->node;
     if (n->is_dir) {
-        /* produce ext2-like dir entries */
+        /* produce ext2-like dir entries, respect offset */
         size_t pos = 0;
-        uint32_t inode = 1;
+        size_t written = 0;
         struct ext2_dir_entry de;
         uint8_t *out = (uint8_t*)buf;
         for (struct ramfs_node *c = n->children; c; c = c->next) {
             size_t namelen = strlen(c->name);
-            de.inode = inode++;
-            de.rec_len = (uint16_t)(8 + namelen);
+            size_t rec_len = (size_t)(8 + namelen);
+            if (pos + rec_len <= (size_t)offset) { pos += rec_len; continue; }
+            if (written >= size) break;
+            uint8_t tmp[512];
+            de.inode = (uint32_t)(c->ino & 0xFFFFFFFFu);
+            de.rec_len = (uint16_t)rec_len;
             de.name_len = (uint8_t)namelen;
             de.file_type = c->is_dir ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
-            if (pos + de.rec_len > size) break;
-            memcpy(out + pos, &de, 8);
-            memcpy(out + pos + 8, c->name, namelen);
-            pos += de.rec_len;
+            memcpy(tmp, &de, 8);
+            memcpy(tmp + 8, c->name, namelen);
+            size_t entry_off = 0;
+            if (offset > (ssize_t)pos) entry_off = (size_t)offset - pos;
+            size_t avail = size - written;
+            size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
+            if (tocopy > avail) tocopy = avail;
+            memcpy(out + written, tmp + entry_off, tocopy);
+            written += tocopy;
+            pos += rec_len;
         }
-        return (ssize_t)pos;
+        return (ssize_t)written;
     } else {
         if (offset >= n->size) return 0;
         if (offset + size > n->size) size = n->size - offset;
@@ -156,11 +186,43 @@ static ssize_t ramfs_read(struct fs_file *file, void *buf, size_t size, size_t o
     }
 }
 
+int ramfs_chmod(const char *path, mode_t mode) {
+    if (!path) return -1;
+    struct ramfs_node *n = ramfs_lookup(path);
+    if (!n) return -1;
+    /* permission: only owner or root */
+    thread_t* ct = thread_current();
+    uid_t uid = ct ? ct->euid : 0;
+    if (uid != 0 && uid != n->uid) return -1;
+    n->mode = mode;
+    return 0;
+}
+
+int ramfs_fill_stat(struct fs_file *file, struct stat *st) {
+    if (!file || !st || !file->driver_private) return -1;
+    struct ramfs_file_handle *fh = (struct ramfs_file_handle*)file->driver_private;
+    if (!fh || !fh->node) return -1;
+    struct ramfs_node *n = fh->node;
+    st->st_ino = 0; /* ramfs does not expose persistent ino yet */
+    st->st_mode = n->is_dir ? (S_IFDIR | 0755) : (S_IFREG | 0644);
+    st->st_nlink = 1;
+    st->st_uid = 0;
+    st->st_gid = 0;
+    st->st_size = (off_t)n->size;
+    st->st_atime = 0;
+    st->st_mtime = 0;
+    st->st_ctime = 0;
+    return 0;
+}
+
 static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, size_t offset) {
     if (!file || !file->driver_private) return -1;
     struct ramfs_file_handle *fh = (struct ramfs_file_handle*)file->driver_private;
     struct ramfs_node *n = fh->node;
     if (n->is_dir) return -1;
+    /* only root can write to ramfs by default */
+    thread_t* ct = thread_current();
+    if (!ct || ct->euid != 0) return -1;
     size_t new_size = offset + size;
     if (new_size > n->size) {
         char *d = (char*)krealloc(n->data, new_size);
@@ -209,6 +271,9 @@ int ramfs_mkdir(const char *path) {
 int ramfs_remove(const char *path) {
     if (!path) return -1;
     if (strcmp(path, "/") == 0) return -2;
+    /* only root can remove files from ramfs by default */
+    thread_t* ct = thread_current();
+    if (!ct || ct->euid != 0) return -1;
     struct ramfs_node *n = ramfs_lookup(path);
     if (!n) return -3;
     struct ramfs_node *p = n->parent;
@@ -248,6 +313,7 @@ int ramfs_register(void) {
     ramfs_ops.open = ramfs_open;
     ramfs_ops.read = ramfs_read;
     ramfs_ops.write = ramfs_write;
+    ramfs_ops.chmod = ramfs_chmod;
     ramfs_ops.release = ramfs_release;
 
     return fs_register_driver(&ramfs_driver);

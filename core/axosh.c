@@ -1,5 +1,5 @@
 // AxonOS shell (osh): bash-like minimal interpreter with pipes and redirections
-#include <stdint.h>
+#include "../inc/stdint.h"
 #include <stddef.h>
 #include <string.h>
 #include "../inc/axosh.h"
@@ -9,10 +9,15 @@
 #include "../inc/fs.h"
 #include "../inc/ext2.h"
 #include "../inc/ramfs.h"
-#include <stdint.h> // for rtc types forward-declared below
 #include "../inc/osh_line.h"
+#include "../inc/user.h"
 // local prototype for kprintf
 void kprintf(const char* fmt, ...);
+/* snprintf is implemented in drv/vga.c, declare it here */
+int snprintf(char* out, size_t outsz, const char* fmt, ...);
+/* forward declare password reader and util */
+static int read_password(const char *prompt, char *buf, int bufsize);
+static unsigned int parse_uint(const char *s);
 // forward decls for optional chipset commands
 void intel_print_chipset_info(void);
 void intel_chipset_reset(void);
@@ -270,62 +275,128 @@ static void osh_write(char **out, size_t *len, size_t *cap, const char *s) {
 }
 
 // very simple join: if arg starts with '/', copy; else cwd + '/' + arg (no normalization)
+static void resolve_path(const char *cwd, const char *arg, char *out, size_t outlen);
+
 static void join_cwd(const char* cwd, const char* arg, char* out, size_t outsz) {
-    if (!arg || !arg[0]) { strncpy(out, cwd, outsz-1); out[outsz-1]='\0'; return; }
-    if (arg[0] == '/') { strncpy(out, arg, outsz-1); out[outsz-1]='\0'; return; }
-    size_t cl = strlen(cwd);
-    if (cl == 1 && cwd[0] == '/') {
-        size_t al = strlen(arg); size_t copy = (al+2 < outsz) ? al+2 : outsz; if (outsz) { out[0]='/'; if (copy>1) memcpy(out+1, arg, copy-2); out[copy-1]='\0'; }
-        return;
-    }
-    // strip trailing '/'
-    char base[512]; strncpy(base, cwd, sizeof(base)-1); base[sizeof(base)-1]='\0';
-    while (cl>1 && base[cl-1]=='/') { base[--cl]='\0'; }
-    size_t al = strlen(arg);
-    size_t need = cl + 1 + al + 1;
-    if (outsz) {
-        size_t pos=0; size_t copy = (need < outsz) ? need : outsz; memcpy(out+pos, base, cl); pos+=cl; out[pos++]='/';
-        size_t rem = copy - pos - 1; if ((int)rem < 0) rem = 0; if (rem > al) rem = al; if (rem) memcpy(out+pos, arg, rem); pos += rem; out[pos]='\0';
-    }
+    resolve_path(cwd, arg, out, outsz);
 }
 
 static void resolve_path(const char *cwd, const char *arg, char *out, size_t outlen) {
-    if (!arg || arg[0] == '\0') { strncpy(out, cwd, outlen-1); out[outlen-1] = '\0'; return; }
-    if (arg[0] == '/') { strncpy(out, arg, outlen-1); out[outlen-1] = '\0'; return; }
-    const char *p = arg; if (p[0]=='.' && p[1]=='/') p+=2;
+    if (!out || outlen == 0) return;
+    if (!cwd || !cwd[0]) cwd = "/";
+    if (!arg || !arg[0]) {
+        size_t copy = strlen(cwd);
+        if (copy >= outlen) copy = outlen - 1;
+        memcpy(out, cwd, copy);
+        out[copy] = '\0';
+        return;
+    }
+
     char tmp[512];
-    if (strcmp(cwd, "/") == 0) {
-        tmp[0] = '/'; size_t n = strlen(p); if (n > sizeof(tmp)-2) n = sizeof(tmp)-2; memcpy(tmp+1, p, n); tmp[1+n]='\0';
+    size_t pos = 0;
+    if (arg[0] == '/') {
+        size_t copy = strlen(arg);
+        if (copy >= sizeof(tmp)) copy = sizeof(tmp) - 1;
+        memcpy(tmp, arg, copy);
+        tmp[copy] = '\0';
     } else {
-        size_t a = strlen(cwd); if (a > sizeof(tmp)-2) a = sizeof(tmp)-2; memcpy(tmp, cwd, a); tmp[a] = '/';
-        size_t n = strlen(p); if (n > sizeof(tmp)-a-2) n = sizeof(tmp)-a-2; memcpy(tmp + a + 1, p, n); tmp[a+1+n] = '\0';
-    }
-    // normalize
-    char *parts[64]; int pc=0; char *s = tmp; if (*s!='/') { parts[pc++] = s; }
-    s++; while (*s) {
-        char *seg = s; while (*s && *s!='/') s++; size_t L = (size_t)(s - seg);
-        if (L>0) {
-            char save = seg[L]; seg[L] = '\0';
-            if (strcmp(seg, ".") == 0) {}
-            else if (strcmp(seg, "..") == 0) { if (pc>0) pc--; }
-            else { parts[pc++] = seg; }
-            seg[L] = save;
+        size_t base_len = strlen(cwd);
+        if (base_len >= sizeof(tmp)) base_len = sizeof(tmp) - 1;
+        if (cwd[0] != '/') {
+            tmp[pos++] = '/';
         }
-        if (*s) s++;
+        if (base_len == 0) {
+            tmp[pos++] = '/';
+        } else {
+            size_t bl = base_len;
+            while (bl > 1 && cwd[bl - 1] == '/') bl--;
+            if (pos + bl >= sizeof(tmp)) bl = sizeof(tmp) - 1 - pos;
+            if (bl > 0) {
+                memcpy(tmp + pos, cwd, bl);
+                pos += bl;
+            }
+        }
+        if (pos == 0) {
+            tmp[pos++] = '/';
+        }
+        if (tmp[pos - 1] != '/' && pos < sizeof(tmp) - 1) {
+            tmp[pos++] = '/';
+        }
+        size_t arg_len = strlen(arg);
+        if (pos + arg_len >= sizeof(tmp)) arg_len = sizeof(tmp) - 1 - pos;
+        memcpy(tmp + pos, arg, arg_len);
+        pos += arg_len;
+        tmp[pos] = '\0';
     }
-    if (pc == 0) { strncpy(out, "/", outlen-1); out[outlen-1] = '\0'; return; }
-    size_t pos=0; out[0]='\0';
-    for (int i=0;i<pc;i++) {
-        size_t need = pos + 1 + strlen(parts[i]) + 1; if (need > outlen) break;
-        out[pos++] = '/'; size_t n = strlen(parts[i]); memcpy(out+pos, parts[i], n); pos += n; out[pos] = '\0';
+
+    char *parts[64];
+    size_t plen[64];
+    int pc = 0;
+    char *cursor = tmp;
+    while (*cursor) {
+        while (*cursor == '/') cursor++;
+        if (!*cursor) break;
+        char *seg = cursor;
+        while (*cursor && *cursor != '/') cursor++;
+        size_t len = (size_t)(cursor - seg);
+        if (len == 0) { if (*cursor == '/') cursor++; continue; }
+        if (len == 1 && seg[0] == '.') {
+            /* skip '.' */
+        } else if (len == 2 && seg[0] == '.' && seg[1] == '.') {
+            if (pc > 0) pc--;
+        } else {
+            if (pc < (int)(sizeof(parts)/sizeof(parts[0]))) {
+                parts[pc] = seg;
+                plen[pc] = len;
+                pc++;
+            }
+        }
+        if (*cursor == '/') cursor++;
     }
+
+    if (pc == 0) {
+        out[0] = '/';
+        out[1] = '\0';
+        return;
+    }
+
+    size_t w = 0;
+    for (int i = 0; i < pc; i++) {
+        size_t seg_len = plen[i];
+        if (w + 1 >= outlen) {
+            out[outlen - 1] = '\0';
+            return;
+        }
+        out[w++] = '/';
+        size_t copy = seg_len;
+        if (w + copy >= outlen) copy = outlen - 1 - w;
+        if (copy > 0) {
+            memcpy(out + w, parts[i], copy);
+            w += copy;
+        }
+    }
+    out[w] = '\0';
 }
 
 static int is_dir_path(const char *path) {
-    struct fs_file *f = fs_open(path); if (!f) return 0; int dir = (f->type == FS_TYPE_DIR);
+    if (!path || !path[0]) return 0;
+    /* Trim trailing slashes to avoid confusing drivers with "/dir///" */
+    char norm[256];
+    strncpy(norm, path, sizeof(norm)-1);
+    norm[sizeof(norm)-1] = '\0';
+    size_t nl = strlen(norm);
+    while (nl > 1 && norm[nl - 1] == '/') { norm[--nl] = '\0'; }
+    struct fs_file *f = fs_open(norm);
+    if (!f) return 0;
+    int dir = (f->type == FS_TYPE_DIR);
     if (!dir && f->type == FS_TYPE_UNKNOWN) {
         size_t want = f->size ? f->size : 512; if (want > 8192) want = 8192; void *buf = kmalloc(want+1);
-        if (buf) { ssize_t r = fs_read(f, buf, want, 0); if (r > 0) { struct ext2_dir_entry *de = (struct ext2_dir_entry*)buf; if (de->rec_len) dir = 1; } kfree(buf);} }
+        if (buf) {
+            ssize_t r = fs_read(f, buf, want, 0);
+            if (r > 0) { struct ext2_dir_entry *de = (struct ext2_dir_entry*)buf; if (de->rec_len) dir = 1; }
+            kfree(buf);
+        }
+    }
     fs_file_free(f); return dir;
 }
 
@@ -1065,7 +1136,12 @@ static int bi_pwd(cmd_ctx *c) { (void)c; char tmp[300]; strncpy(tmp, g_cwd, size
 static int bi_cd(cmd_ctx *c) {
     const char *arg = c->argc>1 ? c->argv[1] : "/";
     char path[256]; join_cwd(g_cwd, arg, path, sizeof(path));
-    if (!is_dir_path(path)) { osh_write(c->out, c->out_len, c->out_cap, "cd: not a directory\n"); return 1; }
+    if (!is_dir_path(path)) {
+        osh_write(c->out, c->out_len, c->out_cap, "cd: not a directory: ");
+        osh_write(c->out, c->out_len, c->out_cap, path);
+        osh_write(c->out, c->out_len, c->out_cap, "\n");
+        return 1;
+    }
     size_t l = strlen(path); if (l>1 && path[l-1]=='/') path[l-1]='\0'; strncpy(g_cwd, path, sizeof(g_cwd)-1); g_cwd[sizeof(g_cwd)-1]='\0'; return 0;
 }
 
@@ -1132,6 +1208,142 @@ static int bi_readkey(cmd_ctx *c) {
     return 0;
 }
 
+static int bi_whoami(cmd_ctx *c) {
+    (void)c;
+    const char *name = user_get_current_name();
+    if (!name) name = ROOT_USER_NAME;
+    kprintf("%s\n", name);
+    return 0;
+}
+
+static int bi_mkpasswd(cmd_ctx *c) {
+    if (c->argc < 3) { kprintf("usage: mkpasswd <user> <password>\n"); return 1; }
+    const char *name = c->argv[1];
+    const char *pass = c->argv[2];
+    struct user *u = user_find(name);
+    if (!u) { kprintf("mkpasswd: user not found\n"); return 1; }
+    if (user_set_password(name, pass) == 0) { kprintf("ok\n"); return 0; }
+    kprintf("mkpasswd: failed\n");
+    return 1;
+}
+
+static int bi_groups(cmd_ctx *c) {
+    const char *name = NULL;
+    if (c->argc >= 2) name = c->argv[1];
+    else name = user_get_current_name();
+    struct user *u = user_find(name);
+    if (!u) { kprintf("groups: user not found\n"); return 1; }
+    if (u->groups && u->groups[0]) kprintf("%s\n", u->groups);
+    else kprintf("\n");
+    return 0;
+}
+
+static int bi_passwd(cmd_ctx *c) {
+    const char *name = NULL;
+    if (c->argc >= 2) name = c->argv[1];
+    else name = user_get_current_name();
+    struct user *u = user_find(name);
+    if (!u) { kprintf("passwd: user not found\n"); return 1; }
+    char prompt[64];
+    char passbuf[128];
+    snprintf(prompt, sizeof(prompt), "New password for %s: ", name);
+    if (read_password(prompt, passbuf, (int)sizeof(passbuf)) < 0) { kprintf("passwd: abort\n"); return 1; }
+    if (user_set_password(name, passbuf) == 0) { kprintf("passwd: OK\n"); return 0; }
+    kprintf("passwd: failed\n");
+    return 1;
+}
+
+static int bi_su(cmd_ctx *c) {
+    if (c->argc < 2) { kprintf("usage: su <user>\n"); return 1; }
+    const char *name = c->argv[1];
+    struct user *u = user_find(name);
+    if (!u) { kprintf("su: user not found\n"); return 1; }
+    char prompt[64]; char passbuf[128];
+    snprintf(prompt, sizeof(prompt), "Password for %s: ", name);
+    if (read_password(prompt, passbuf, (int)sizeof(passbuf)) < 0) { kprintf("su: abort\n"); return 1; }
+    if (user_check_password(name, passbuf)) {
+        user_set_current(name);
+        /* set thread credentials so subsequent checks use per-thread euid/egid */
+        thread_t* ct = thread_current();
+        if (ct) { ct->euid = u->uid; ct->egid = u->gid; }
+        kprintf("su: switched to %s\n", name);
+        return 0;
+    } else {
+        kprintf("su: authentication failed\n");
+        return 1;
+    }
+}
+
+static int bi_useradd(cmd_ctx *c) {
+    if (c->argc < 2) { kprintf("usage: useradd <user> [uid] [gid]\n"); return 1; }
+    const char *name = c->argv[1];
+    uid_t uid_val = 0;
+    unsigned int gid_val = 1000;
+    if (c->argc >= 3) uid_val = (uid_t)parse_uint(c->argv[2]);
+    if (c->argc >= 4) gid_val = parse_uint(c->argv[3]);
+    if (uid_val == 0) uid_val = user_get_next_uid();
+    if (user_add(name, uid_val, gid_val, "") != 0) { kprintf("useradd: failed\n"); return 1; }
+    /* regenerate /etc/passwd */
+    char *buf = NULL; size_t bl = 0;
+    if (user_export_passwd(&buf, &bl) == 0 && buf) {
+        struct fs_file *f = fs_open("/etc/passwd");
+        if (!f) f = fs_create_file("/etc/passwd");
+        if (f) { fs_write(f, buf, bl, 0); fs_file_free(f); }
+        kfree(buf);
+    }
+    kprintf("useradd: created %s\n", name);
+    return 0;
+}
+
+static int bi_groupadd(cmd_ctx *c) {
+    if (c->argc < 2) { kprintf("usage: groupadd <group> [gid]\n"); return 1; }
+    const char *name = c->argv[1];
+    unsigned int gid_val = 1000;
+    if (c->argc >= 3) gid_val = parse_uint(c->argv[2]);
+    char line[128];
+    int n = snprintf(line, sizeof(line), "%s:x:%u:\n", name, gid_val);
+    if (n <= 0) { kprintf("groupadd: failed\n"); return 1; }
+    struct fs_file *f = fs_open("/etc/group");
+    if (!f) f = fs_create_file("/etc/group");
+    if (!f) { kprintf("groupadd: cannot open /etc/group\n"); return 1; }
+    /* append at end */
+    size_t off = f->size;
+    fs_write(f, line, (size_t)n, off);
+    fs_file_free(f);
+    kprintf("groupadd: created %s\n", name);
+    return 0;
+}
+
+/* Read password without echo into buf (NUL-terminated). Returns length or -1 on abort. */
+static int read_password(const char *prompt, char *buf, int bufsize) {
+    if (!buf || bufsize <= 1) return -1;
+    kprintf("%s", prompt);
+    int pos = 0;
+    while (1) {
+        char c = kgetc();
+        if (c == 3) { keyboard_consume_ctrlc(); kprintf("\n"); return -1; } // Ctrl-C
+        if (c == '\n' || c == '\r') { kprintf("\n"); break; }
+        if (c == 8 || c == 127) { if (pos > 0) pos--; continue; }
+        if (c >= 32 && c < 127) {
+            if (pos + 1 < bufsize) {
+                buf[pos++] = c;
+            }
+        }
+    }
+    buf[(pos < bufsize) ? pos : (bufsize-1)] = '\0';
+    return pos;
+}
+
+static unsigned int parse_uint(const char *s) {
+    unsigned int v = 0;
+    if (!s) return 0;
+    for (const char *p = s; *p; p++) {
+        if (*p >= '0' && *p <= '9') v = v * 10 + (unsigned int)(*p - '0');
+        else break;
+    }
+    return v;
+}
+
 static int bi_kprint(cmd_ctx *c) {
     if (c->argc <= 1) return 0;
     size_t alloc = 1;
@@ -1190,10 +1402,127 @@ static int bi_ls(cmd_ctx *c) {
     char path[256]; if (c->argc<2) resolve_path(g_cwd, "", path, sizeof(path)); else resolve_path(g_cwd, c->argv[1], path, sizeof(path));
     struct fs_file *f = fs_open(path); if (!f) { osh_write(c->out, c->out_len, c->out_cap, "ls: cannot access\n"); return 1; }
     if (f->type != FS_TYPE_DIR) { osh_write(c->out, c->out_len, c->out_cap, c->argv[1] ? c->argv[1] : path); osh_write(c->out, c->out_len, c->out_cap, "\n"); fs_file_free(f); return 0; }
-    size_t want = f->size ? f->size : 4096; void *buf = kmalloc(want+1); ssize_t r = buf?fs_read(f, buf, want, 0):0; if (r>0) {
-        uint32_t off=0; while ((size_t)off < (size_t)r) {
-            struct ext2_dir_entry *de = (struct ext2_dir_entry*)((uint8_t*)buf+off); if (de->inode==0 || de->rec_len==0) break; int nlen=de->name_len; if (nlen>255)nlen=255; char name[256]; memcpy(name, (uint8_t*)buf+off+sizeof(*de), (size_t)nlen); name[nlen]='\0';
-            osh_write(c->out, c->out_len, c->out_cap, name); if (de->file_type==EXT2_FT_DIR) osh_write(c->out, c->out_len, c->out_cap, "/"); osh_write(c->out, c->out_len, c->out_cap, "\n"); off += de->rec_len;
+    size_t want = f->size ? f->size : 4096;
+    void *buf = kmalloc(want+1);
+    ssize_t r = buf ? fs_read(f, buf, want, 0) : 0;
+    if (r > 0) {
+        // Соберём все имена в список, сохраняя информацию о директориях
+        int cap = 64, cnt = 0;
+        char **names = (char**)kmalloc(sizeof(char*) * cap);
+        int *is_dir = (int*)kmalloc(sizeof(int) * cap);
+        uint32_t off = 0;
+        while ((size_t)off < (size_t)r) {
+            struct ext2_dir_entry *de = (struct ext2_dir_entry*)((uint8_t*)buf+off);
+            if (de->inode==0 || de->rec_len==0) break;
+            int nlen = de->name_len; if (nlen>255) nlen = 255;
+            if (cnt >= cap) {
+                int ncap = cap * 2;
+                char **nn = (char**)kmalloc(sizeof(char*) * ncap);
+                int *nd = (int*)kmalloc(sizeof(int) * ncap);
+                for (int i=0;i<cnt;i++) { nn[i] = names[i]; nd[i] = is_dir[i]; }
+                kfree(names); kfree(is_dir);
+                names = nn; is_dir = nd; cap = ncap;
+            }
+            char *s = (char*)kmalloc(nlen + 2); // +1 for possible '/' +1 for '\0'
+            if (!s) { off += de->rec_len; continue; }
+            memcpy(s, (uint8_t*)buf+off+sizeof(*de), (size_t)nlen);
+            s[nlen] = '\0';
+            names[cnt] = s;
+            is_dir[cnt] = (de->file_type == EXT2_FT_DIR) ? 1 : 0;
+            cnt++;
+            off += de->rec_len;
+        }
+
+        // Если нет элементов — ничего не делаем
+        if (cnt == 0) {
+            if (names) kfree(names);
+            if (is_dir) kfree(is_dir);
+        } else {
+            // Вычислим ширину столбца
+            int maxlen = 0;
+            for (int i=0;i<cnt;i++) {
+                int L = (int)strlen(names[i]) + (is_dir[i] ? 1 : 0);
+                if (L > maxlen) maxlen = L;
+            }
+            int colw = maxlen + 2; if (colw < 8) colw = 8;
+            int cols = MAX_COLS / colw; if (cols < 1) cols = 1;
+            int rows = (cnt + cols - 1) / cols;
+
+            // Формируем список с stat'ами и выводим в формате столбцов (права uid gid size name)
+            typedef struct { char *name; int is_dir; struct stat st; } ent_t;
+            ent_t *ents = (ent_t*)kmalloc(sizeof(ent_t) * cnt);
+            int nents = 0;
+            for (int i=0;i<cnt;i++) {
+                if (strcmp(names[i], ".")==0 || strcmp(names[i],"..")==0) continue;
+                ents[nents].name = names[i];
+                ents[nents].is_dir = is_dir[i];
+                char childpath[512];
+                if (path[strlen(path)-1] == '/') {
+                    snprintf(childpath, sizeof(childpath), "%s%s", path, names[i]);
+                } else {
+                    snprintf(childpath, sizeof(childpath), "%s/%s", path, names[i]);
+                }
+                if (vfs_stat(childpath, &ents[nents].st) != 0) {
+                    memset(&ents[nents].st, 0, sizeof(ents[nents].st));
+                }
+                nents++;
+            }
+            // простой сортировщик (bubble) по имени
+            for (int a = 0; a < nents; a++) {
+                for (int b = a+1; b < nents; b++) {
+                    if (strcmp(ents[a].name, ents[b].name) > 0) {
+                        ent_t tmp = ents[a]; ents[a] = ents[b]; ents[b] = tmp;
+                    }
+                }
+            }
+            /* compute column widths for uid/gid/size to align like linux ls */
+            int uid_w = 0, gid_w = 0, size_w = 0;
+            for (int i = 0; i < nents; i++) {
+                struct stat *s = &ents[i].st;
+                unsigned long u = (unsigned long)s->st_uid;
+                unsigned long g = (unsigned long)s->st_gid;
+                unsigned long z = (unsigned long)s->st_size;
+                int du = 1, dg = 1, dz = 1;
+                unsigned long tmp;
+                tmp = u; while (tmp >= 10) { du++; tmp /= 10; }
+                tmp = g; while (tmp >= 10) { dg++; tmp /= 10; }
+                tmp = z; while (tmp >= 10) { dz++; tmp /= 10; }
+                if (du > uid_w) uid_w = du;
+                if (dg > gid_w) gid_w = dg;
+                if (dz > size_w) size_w = dz;
+            }
+            if (uid_w < 3) uid_w = 3;
+            if (gid_w < 3) gid_w = 3;
+            if (size_w < 4) size_w = 4;
+
+            char line[512];
+            for (int i = 0; i < nents; i++) {
+                struct stat *s = &ents[i].st;
+                char perms[11];
+                perms[0] = (s->st_mode & S_IFDIR) ? 'd' : '-';
+                perms[1] = (s->st_mode & 0400) ? 'r' : '-';
+                perms[2] = (s->st_mode & 0200) ? 'w' : '-';
+                perms[3] = (s->st_mode & 0100) ? 'x' : '-';
+                perms[4] = (s->st_mode & 0040) ? 'r' : '-';
+                perms[5] = (s->st_mode & 0020) ? 'w' : '-';
+                perms[6] = (s->st_mode & 0010) ? 'x' : '-';
+                perms[7] = (s->st_mode & 0004) ? 'r' : '-';
+                perms[8] = (s->st_mode & 0002) ? 'w' : '-';
+                perms[9] = (s->st_mode & 0001) ? 'x' : '-';
+                perms[10] = '\0';
+                int uid = (int)s->st_uid;
+                int gid = (int)s->st_gid;
+                long sizev = (long)s->st_size;
+                int n = snprintf(line, sizeof(line), "%s %*d %*d %*ld %s%s\n",
+                    perms, uid_w, uid, gid_w, gid, size_w, sizev, ents[i].name, ents[i].is_dir ? "/" : "");
+                if (n > 0) osh_write(c->out, c->out_len, c->out_cap, line);
+            }
+            // свободим вспомогательные массивы (names элементы уже используются в ents)
+            kfree(is_dir);
+            kfree(ents);
+            // освободим имена, так как они были kmalloc'ированы
+            for (int i=0;i<cnt;i++) if (names[i]) kfree(names[i]);
+            kfree(names);
         }
     }
     if (buf) kfree(buf); fs_file_free(f); return 0;
@@ -1624,6 +1953,9 @@ extern void ascii_art(void);
 static int bi_art(cmd_ctx *c){ (void)c; ascii_art(); return 0; }
 typedef int (*builtin_fn)(cmd_ctx*);
 typedef struct { const char* name; builtin_fn fn; } builtin;
+/* forward declaration for chmod builtin */
+static int bi_chmod(cmd_ctx *c);
+
 static const builtin builtin_table[] = {
     {"echo", bi_echo}, {"kprint", bi_kprint}, {"readline", bi_readline}, {"readkey", bi_readkey},
     {"pwd", bi_pwd}, {"cd", bi_cd}, {"clear", bi_cls}, {"cls", bi_cls},
@@ -1632,7 +1964,47 @@ static const builtin builtin_table[] = {
     {"edit", bi_edit}, {"snake", bi_snake}, {"tetris", bi_tetris}, {"clock", bi_clock},
     {"reboot", bi_reboot}, {"shutdown", bi_shutdown}, {"neofetch", bi_neofetch}, {"mem", bi_mem},
     {"osh", bi_osh}, {"art", bi_art}, {"pause", bi_pause}, {"chipset", bi_chipset}, {"help", bi_help},
+    {"passwd", bi_passwd}, {"su", bi_su}, {"whoami", bi_whoami}, {"mkpasswd", bi_mkpasswd}, {"groups", bi_groups},
+    {"useradd", bi_useradd}, {"groupadd", bi_groupadd}, {"chmod", bi_chmod}
 };
+static int bi_chmod(cmd_ctx *c) {
+    if (c->argc < 3) { kprintf("usage: chmod <mode> <path>\n"); return 1; }
+    const char *mode_s = c->argv[1];
+    const char *path = c->argv[2];
+    char fullpath[512];
+    join_cwd(g_cwd, path, fullpath, sizeof(fullpath));
+    /* use fullpath for operations from here */
+    /* If symbolic mode like +x or -x — handle simple case for execute bits */
+    mode_t newmode = 0;
+    struct stat st;
+    if (vfs_stat(fullpath, &st) != 0) { kprintf("chmod: cannot stat %s\n", path); return 1; }
+    uid_t cur = user_get_current_uid();
+    /* permission check: only root or owner can chmod */
+    if (cur != 0 && cur != st.st_uid) { kprintf("chmod: permission denied\n"); return 1; }
+
+    if (mode_s[0] == '+' || mode_s[0] == '-') {
+        /* support +x and -x (all users) */
+        int add = (mode_s[0] == '+');
+        int want_x = 0;
+        for (const char *p = mode_s+1; *p; p++) if (*p == 'x') want_x = 1;
+        if (!want_x) { kprintf("chmod: invalid mode\n"); return 1; }
+        if (add) newmode = (mode_t)(st.st_mode | 0111);
+        else newmode = (mode_t)(st.st_mode & ~0111);
+    } else {
+        /* parse octal mode */
+        mode_t mode = 0;
+        const char *p = mode_s;
+        if (!p || !(*p >= '0' && *p <= '7')) { kprintf("chmod: invalid mode\n"); return 1; }
+        for (; *p; p++) {
+            if (*p >= '0' && *p <= '7') { mode = (mode << 3) + (mode_t)(*p - '0'); }
+            else { kprintf("chmod: invalid mode\n"); return 1; }
+        }
+        newmode = mode;
+    }
+    if (fs_chmod(fullpath, newmode) == 0) { kprintf("ok\n"); return 0; }
+    kprintf("chmod: failed\n");
+    return 1;
+}
 
 static builtin_fn find_builtin(const char* name) {
     for (size_t i=0;i<sizeof(builtin_table)/sizeof(builtin_table[0]);i++) if (strcmp(builtin_table[i].name, name)==0) return builtin_table[i].fn;

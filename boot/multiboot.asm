@@ -33,6 +33,29 @@ multiboot_magic_saved:
 global multiboot_info_saved
 multiboot_info_saved:
         resq 1
+; page tables in BSS (aligned to 4096)
+align 4096
+global page_table_l4
+page_table_l4:
+        resb 4096
+global page_table_l3
+page_table_l3:
+        resb 4096
+global page_table_l3_fb
+page_table_l3_fb:
+        resb 4096
+global page_table_pd0
+page_table_pd0:
+        resb 4096
+global page_table_pd1
+page_table_pd1:
+        resb 4096
+global page_table_pd2
+page_table_pd2:
+        resb 4096
+global page_table_pd3
+page_table_pd3:
+        resb 4096
 
 section .text
 global _start
@@ -316,30 +339,6 @@ print_vga: ; takes string in edi
         jmp .loop
 .done:
         ret
-section .bss
-align 4096
-global page_table_l4
-page_table_l4:
-        resb 4096
-global page_table_l3
-page_table_l3:
-        resb 4096
-global page_table_l3_fb
-page_table_l3_fb:
-        resb 4096
-global page_table_pd0
-page_table_pd0:
-        resb 4096
-global page_table_pd1
-page_table_pd1:
-        resb 4096
-global page_table_pd2
-page_table_pd2:
-        resb 4096
-global page_table_pd3
-page_table_pd3:
-        resb 4096
-
 section .rodata
 
 error1_msg: db "Error loading kernel: no cpuid support.", 0
