@@ -8,6 +8,7 @@
 //#include <thread.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <apic_timer.h>
 #include <debug.h>
 // Avoid including <cstdint> because cross-toolchain headers may not provide it; use uint64_t instead
 
@@ -181,6 +182,8 @@ void idt_init() {
         
         // Register RTC handler (IRQ 8 = vector 40)
         idt_set_handler(40, rtc_handler);
+
+        idt_set_handler(APIC_TIMER_VECTOR, apic_timer_handler);
         
         asm volatile("lidt %0" : : "m"(idt_ptr));
 }

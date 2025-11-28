@@ -1223,7 +1223,7 @@ static int bi_about(cmd_ctx *c) {
     kprintf("fcexx, kotazz, neosporimy, dasteldi\n");
     kprintf("<(09)>The operating system is licensed under the MIT license.\n");
     kprintf("<(0f)>GitHub: <(0b)>https://github.com/fcexx/AxonOS\n");
-    kprintf("<(0f)>Website: <(0b)>https://wh27961.web4.maze-tech.ru\n");
+    kprintf("<(0f)>Website: <(0b)>https://dasteldi.ru\n");
     return 0;
     }
 

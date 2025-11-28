@@ -17,13 +17,15 @@
 #include <thread.h>
 #include <neofetch.h>
 #include <axosh.h>
+#include <apic.h>
+#include <apic_timer.h>
 
 #include <iothread.h>
 #include <fs.h>
 #include <ext2.h>
 #include <ramfs.h>
 #include <editor.h>
-#include <intel_chipset.h>
+#include <intel_chipset.h>s
 
 int exit = 0;
 
@@ -189,48 +191,60 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
 
     gdt_init();
     idt_init();
-    pic_init(); 
+    pic_init();
     pit_init();
 
+    // Регистрируем обработчик APIC таймера
+    idt_set_handler(APIC_TIMER_VECTOR, apic_timer_handler);
+
+    apic_init();
+    apic_timer_init();
+    
     paging_init();
     heap_init(0, 0);
 
-    pci_init();
-    pci_dump_devices();
-    intel_chipset_init();
-
-    thread_init();
-    iothread_init();
-    /* Регистрируем файловую систему */
-    ramfs_register();
-    ext2_register();
-#include <initfs.h>
-    /* If an initfs module was provided by the bootloader, unpack it into ramfs */
-    {
-        int r = initfs_process_multiboot_module(multiboot_magic, multiboot_info, "initfs");
-        if (r == 0) kprintf("initfs: unpacked successfully\n");
-        else if (r == 1) kprintf("initfs: initfs module not found or not multiboot2\n");
-        else kprintf("initfs: error while unpacking (%d)\n", r);
-    }
-
-    ps2_keyboard_init();
-    rtc_init();
-    
+    // Включаем прерывания
     asm volatile("sti");
 
-    kprintf("kernel base: done\n");
-    ascii_art();
+    // Тест APIC таймера
+    kprintf("Testing APIC Timer...\n");
+    apic_timer_start(100);
     
-    kprintf("\n<(0f)>Welcome to %s <(0b)>%s<(0f)>!\n", OS_NAME, OS_VERSION);
-    // autostart: run /start script once if present
-    {
-        struct fs_file *f = fs_open("/start");
-        if (f) { fs_file_free(f); (void)exec_line("osh /start"); }
+    // Ждем прерываний
+    for (int i = 0; i < 50; i++) {
+        pit_sleep_ms(10);
+        if (apic_timer_ticks > 0) break;
+    }
+    
+    if (apic_timer_ticks > 0) {
+        kprintf("APIC Timer: SUCCESS (%lu ticks)\n", apic_timer_ticks);
+        apic_timer_stop();
+        pit_disable();
+        pic_mask_irq(0);
+        apic_timer_start(1000);
+        kprintf("Switched to APIC Timer\n");
+    } else {
+        kprintf("APIC Timer: FAILED - using PIT\n");
+        apic_timer_stop();
     }
 
-    kprint("\nShutting down in 5 seconds...");
-    pit_sleep_ms(5000);
+    kprintf("kernel base: done\n");
+
+    kprintf("\nWelcome to %s %s!\n", OS_NAME, OS_VERSION);
+
+    // Запуск оболочки
+    struct fs_file *f = fs_open("/start");
+    if (f) { 
+        fs_file_free(f); 
+        (void)exec_line("osh /start"); 
+    }
+
+    // Завершение
+    kprint("\nShutting down...");
+    pit_sleep_ms(3000);
     shutdown_system();
-    kprintf("Shutdown. If PC is not ACPI turn off power manually");
-    for(;;);
+    
+    for(;;) {
+        asm volatile("hlt");
+    }
 }
