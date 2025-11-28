@@ -2,6 +2,8 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <apic.h>
+#include <apic_timer.h>
 #include "../inc/sysfs.h"
 #include "../inc/serial.h"
 extern void kprintf(const char *fmt, ...);
@@ -245,27 +247,29 @@ static void create_attr_file(const char *base, const char *name, const struct sy
 
 void pci_sysfs_init(void) {
     if (pci_sysfs_initialized) return;
+    
     sysfs_mkdir("/sys/bus");
     sysfs_mkdir("/sys/bus/pci");
     sysfs_mkdir("/sys/bus/pci/devices");
     pci_device_t *devs = pci_get_devices();
     int count = pci_get_device_count();
+    
     for (int i = 0; i < count; i++) {
         pci_device_t *dev = &devs[i];
         char dir_path[64];
-        format_pci_device_dir(dir_path, sizeof(dir_path), dev);
+        snprintf(dir_path, sizeof(dir_path), "/sys/bus/pci/devices/%02x:%02x.%x", 
+                dev->bus, dev->device, dev->function);        
         sysfs_mkdir(dir_path);
         struct sysfs_attr vendor = { sysfs_show_pci_vendor, NULL, dev };
-        struct sysfs_attr device = { sysfs_show_pci_device, NULL, dev };
+        struct sysfs_attr device_attr = { sysfs_show_pci_device, NULL, dev };
         struct sysfs_attr class_attr = { sysfs_show_pci_class, NULL, dev };
         struct sysfs_attr irq_attr = { sysfs_show_pci_irq, NULL, dev };
         struct sysfs_attr bars_attr = { sysfs_show_pci_bars, NULL, dev };
         create_attr_file(dir_path, "vendor", &vendor);
-        create_attr_file(dir_path, "device", &device);
+        create_attr_file(dir_path, "device", &device_attr);
         create_attr_file(dir_path, "class", &class_attr);
         create_attr_file(dir_path, "irq", &irq_attr);
         create_attr_file(dir_path, "bars", &bars_attr);
     }
     pci_sysfs_initialized = 1;
 }
-

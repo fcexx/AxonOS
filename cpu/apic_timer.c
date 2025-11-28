@@ -1,17 +1,149 @@
 #include <apic_timer.h>
 #include <apic.h>
-#include <stdio.h>
 #include <pit.h>
+#include <stdio.h>
 
 volatile uint64_t apic_timer_ticks = 0;
-static uint32_t apic_current_frequency = 0;
-static bool apic_timer_running = false;
-static uint32_t apic_timer_calib_count = 0;
+apic_timer_state_t apic_timer_state = {0};
 
-// Обработчик прерывания ДОЛЖЕН быть объявлен как ISR
+// Timer divider values (encoded for APIC timer divider register)
+static const uint8_t apic_dividers[] = {0x3, 0x0, 0x1, 0x2, 0x8, 0x9, 0xA, 0xB};
+static const uint32_t divider_values[] = {16, 2, 4, 8, 32, 64, 128, 1};
+
+// Find best divider for target frequency
+static uint8_t find_best_divider(uint32_t target_freq, uint32_t base_freq, uint32_t* out_count) {
+    for (int i = 0; i < 8; i++) {
+        uint32_t div = divider_values[i];
+        uint32_t count = (base_freq / div) / target_freq;
+        
+        if (count > 0 && count <= 0xFFFFF) {
+            *out_count = count;
+            return apic_dividers[i];
+        }
+    }
+    
+    // Fallback to divider 16
+    *out_count = base_freq / 16 / target_freq;
+    return 0x3;
+}
+
+// Quick calibration using busy loop
+static uint32_t quick_calibrate(void) {
+    kprintf("APIC Timer: Quick calibration...\n");
+    
+    // Setup timer for one-shot
+    apic_set_lvt_timer(APIC_TIMER_VECTOR, APIC_TIMER_ONESHOT, false);
+    apic_write(LAPIC_TIMER_DIV_REG, 0x3); // Divider 16
+    
+    // Set maximum count
+    apic_write(LAPIC_TIMER_INIT_REG, 0xFFFFFFFF);
+    
+    // Busy wait for ~10ms
+    for (volatile int i = 0; i < 100000; i++) {
+        asm volatile("pause");
+    }
+    
+    // Calculate elapsed ticks
+    uint32_t remaining = apic_read(LAPIC_TIMER_CURRENT_REG);
+    uint32_t elapsed = 0xFFFFFFFF - remaining;
+    
+    // Stop timer
+    apic_write(LAPIC_TIMER_INIT_REG, 0);
+    
+    kprintf("APIC Timer: Calibration result: %u ticks/10ms\n", elapsed);
+    return elapsed * 100; // Convert to Hz
+}
+
 void apic_timer_handler(void) {
     apic_timer_ticks++;
-    apic_eoi(); // Важно: отправляем EOI в APIC
+    apic_timer_state.ticks = apic_timer_ticks;
+    apic_eoi();
+}
+
+void apic_timer_init(void) {
+    kprintf("APIC Timer: Initializing...\n");
+    
+    // Initialize state
+    apic_timer_ticks = 0;
+    apic_timer_state.ticks = 0;
+    apic_timer_state.frequency = 0;
+    apic_timer_state.running = false;
+    apic_timer_state.calibrated = false;
+    apic_timer_state.mode = APIC_TIMER_PERIODIC;
+    
+    // Perform quick calibration
+    apic_timer_state.base_frequency = quick_calibrate();
+    apic_timer_state.calibration_value = apic_timer_state.base_frequency / 100;
+    apic_timer_state.calibrated = true;
+    
+    // Stop timer initially
+    apic_timer_stop();
+    
+    kprintf("APIC Timer: Ready (base freq: %u Hz)\n", apic_timer_state.base_frequency);
+}
+
+void apic_timer_start(uint32_t freq_hz) {
+    if (!apic_timer_state.calibrated) {
+        kprintf("APIC Timer: Not calibrated, cannot start\n");
+        return;
+    }
+    
+    if (apic_timer_state.running) {
+        apic_timer_stop();
+    }
+    
+    kprintf("APIC Timer: Starting at %u Hz\n", freq_hz);
+    
+    uint32_t count;
+    uint8_t divider = find_best_divider(freq_hz, apic_timer_state.base_frequency, &count);
+    
+    // Apply limits
+    if (count < 10) count = 10;
+    if (count > 0xFFFFF) count = 0xFFFFF;
+    
+    kprintf("APIC Timer: Divider: %u, Count: %u\n", divider_values[divider & 0x7], count);
+    
+    // Configure timer
+    apic_write(LAPIC_TIMER_DIV_REG, divider);
+    apic_write(LAPIC_TIMER_INIT_REG, count);
+    apic_set_lvt_timer(APIC_TIMER_VECTOR, APIC_TIMER_PERIODIC, false);
+    
+    // Update state
+    apic_timer_state.frequency = freq_hz;
+    apic_timer_state.running = true;
+    apic_timer_state.mode = APIC_TIMER_PERIODIC;
+    apic_timer_ticks = 0;
+    
+    kprintf("APIC Timer: Started successfully\n");
+}
+
+void apic_timer_start_oneshot(uint32_t microseconds) {
+    if (!apic_timer_state.calibrated) return;
+    
+    uint32_t count = (apic_timer_state.base_frequency * microseconds) / 1000000;
+    if (count < 10) count = 10;
+    
+    apic_write(LAPIC_TIMER_DIV_REG, 0x3); // Divider 16
+    apic_write(LAPIC_TIMER_INIT_REG, count);
+    apic_set_lvt_timer(APIC_TIMER_VECTOR, APIC_TIMER_ONESHOT, false);
+    
+    apic_timer_state.running = true;
+    apic_timer_state.mode = APIC_TIMER_ONESHOT;
+}
+
+void apic_timer_stop(void) {
+    apic_set_lvt_timer(0, 0, true); // Mask timer
+    apic_write(LAPIC_TIMER_INIT_REG, 0); // Stop counter
+    apic_timer_state.running = false;
+    kprintf("APIC Timer: Stopped\n");
+}
+
+void apic_timer_set_frequency(uint32_t freq_hz) {
+    if (apic_timer_state.running) {
+        apic_timer_start(freq_hz);
+    } else {
+        apic_timer_state.frequency = freq_hz;
+    }
 }
 
 uint64_t apic_timer_get_ticks(void) {
@@ -19,142 +151,57 @@ uint64_t apic_timer_get_ticks(void) {
 }
 
 uint64_t apic_timer_get_time_ms(void) {
-    if (apic_current_frequency == 0) return 0;
-    return (apic_timer_ticks * 1000) / apic_current_frequency;
+    if (apic_timer_state.frequency == 0) return 0;
+    return (apic_timer_ticks * 1000) / apic_timer_state.frequency;
 }
 
-bool apic_timer_is_running(void) {
-    return apic_timer_running;
+uint64_t apic_timer_get_time_us(void) {
+    if (apic_timer_state.frequency == 0) return 0;
+    return (apic_timer_ticks * 1000000) / apic_timer_state.frequency;
 }
 
 uint32_t apic_timer_get_frequency(void) {
-    return apic_current_frequency;
+    return apic_timer_state.frequency;
 }
 
-void apic_timer_stop(void) {
-    // Маскируем таймер и останавливаем
-    apic_write(LAPIC_LVT_TIMER_REG, LAPIC_TIMER_MASKED);
-    apic_write(LAPIC_TIMER_INIT_REG, 0);
-    apic_timer_running = false;
-    kprintf("APIC Timer: Stopped\n");
+bool apic_timer_is_running(void) {
+    return apic_timer_state.running;
 }
 
-void apic_timer_calibrate_with_pit(void) {
-    kprintf("APIC Timer: Calibrating with PIT...\n");
+bool apic_timer_is_calibrated(void) {
+    return apic_timer_state.calibrated;
+}
+
+void apic_timer_sleep_ms(uint32_t ms) {
+    if (!apic_timer_state.running) {
+        pit_sleep_ms(ms);
+        return;
+    }
     
-    // Останавливаем таймер
-    apic_timer_stop();
-    
-    // Настраиваем APIC таймер в oneshot режиме
-    apic_write(LAPIC_LVT_TIMER_REG, APIC_TIMER_VECTOR | APIC_TIMER_ONESHOT);
-    apic_write(LAPIC_TIMER_DIV_REG, APIC_DIV_16);
-    
-    // Устанавливаем большое значение
-    uint32_t initial_count = 0xFFFFF;
-    apic_write(LAPIC_TIMER_INIT_REG, initial_count);
-    
-    // Ждем 10ms через PIT
-    uint64_t start = pit_get_ticks();
-    while (pit_get_ticks() - start < 10) {
+    uint64_t target_ticks = apic_timer_ticks + (ms * apic_timer_state.frequency) / 1000;
+    while (apic_timer_ticks < target_ticks) {
         asm volatile("pause");
     }
-    
-    // Читаем оставшееся значение
-    uint32_t remaining = apic_read(LAPIC_TIMER_CURRENT_REG);
-    uint32_t elapsed = initial_count - remaining;
-    
-    // Сохраняем калибровочное значение (тиков на 10ms)
-    apic_timer_calib_count = elapsed;
-    
-    kprintf("APIC Timer: Calibration: %u ticks in 10ms\n", apic_timer_calib_count);
-    
-    // Останавливаем таймер
-    apic_timer_stop();
 }
 
-void apic_timer_start(uint32_t freq_hz) {
-    if (!apic_is_initialized()) {
-        kprintf("APIC Timer: APIC not initialized\n");
+void apic_timer_sleep_us(uint32_t us) {
+    if (!apic_timer_state.running) {
+        // Busy wait fallback
+        for (volatile uint32_t i = 0; i < us; i++) {
+            asm volatile("pause");
+        }
         return;
     }
     
-    kprintf("APIC Timer: Starting at %u Hz\n", freq_hz);
-    
-    // Если не откалиброван, используем разумное значение
-    if (apic_timer_calib_count == 0) {
-        apic_timer_calib_count = 100000; // Эмпирическое значение для 10ms
-        kprintf("APIC Timer: Using default calibration\n");
+    uint64_t target_ticks = apic_timer_ticks + (us * apic_timer_state.frequency) / 1000000;
+    while (apic_timer_ticks < target_ticks) {
+        asm volatile("pause");
     }
-    
-    // Вычисляем начальное значение счетчика
-    // apic_timer_calib_count = ticks per 10ms
-    // Для freq_hz: ticks per second = freq_hz
-    // initial_count = (calib_count * freq_hz) / 100
-    uint32_t initial_count = (apic_timer_calib_count * freq_hz) / 100;
-    
-    // Ограничиваем разумными значениями
-    if (initial_count < 100) initial_count = 100;
-    if (initial_count > 0xFFFFF) initial_count = 0xFFFFF;
-    
-    kprintf("APIC Timer: Initial count: %u\n", initial_count);
-    
-    // 1. Маскируем таймер перед настройкой
-    apic_write(LAPIC_LVT_TIMER_REG, LAPIC_TIMER_MASKED);
-    
-    // 2. Настраиваем делитель
-    apic_write(LAPIC_TIMER_DIV_REG, APIC_DIV_16);
-    
-    // 3. Устанавливаем начальное значение
-    apic_write(LAPIC_TIMER_INIT_REG, initial_count);
-    
-    // 4. Настраиваем LVT (vector + periodic mode + unmasked)
-    uint32_t lvt_value = APIC_TIMER_VECTOR | APIC_TIMER_PERIODIC;
-    apic_write(LAPIC_LVT_TIMER_REG, lvt_value);
-    
-    kprintf("APIC Timer: LVT configured to 0x%x\n", lvt_value);
-    
-    // Проверяем настройки
-    uint32_t verify_lvt = apic_read(LAPIC_LVT_TIMER_REG);
-    uint32_t verify_div = apic_read(LAPIC_TIMER_DIV_REG);
-    uint32_t verify_init = apic_read(LAPIC_TIMER_INIT_REG);
-    
-    kprintf("APIC Timer: Verify - LVT: 0x%x, DIV: 0x%x, INIT: %u\n", 
-            verify_lvt, verify_div, verify_init);
-    
-    // Проверяем что таймер не маскирован
-    if ((verify_lvt & LAPIC_TIMER_MASKED) != 0) {
-        kprintf("APIC Timer: ERROR - Timer is masked!\n");
-        return;
-    }
-    
-    apic_current_frequency = freq_hz;
-    apic_timer_running = true;
-    apic_timer_ticks = 0;
-    
-    kprintf("APIC Timer: Started successfully\n");
 }
 
-void apic_timer_init(void) {
-    if (!apic_is_initialized()) {
-        kprintf("APIC Timer: APIC not initialized\n");
-        return;
-    }
-    
-    kprintf("APIC Timer: Initializing\n");
-    
-    // Проверяем что APIC работает
-    uint32_t apic_id = apic_get_id();
-    uint32_t svr = apic_read(LAPIC_SVR_REG);
-    
-    kprintf("APIC Timer: APIC ID: 0x%x, SVR: 0x%x\n", apic_id, svr);
-    
-    if (!(svr & LAPIC_SVR_ENABLE)) {
-        kprintf("APIC Timer: WARNING - APIC not enabled in SVR!\n");
-        return;
-    }
-    
-    // Калибруем таймер
-    apic_timer_calibrate_with_pit();
-    
-    kprintf("APIC Timer: Ready\n");
+void apic_timer_calibrate(void) {
+    apic_timer_state.base_frequency = quick_calibrate();
+    apic_timer_state.calibration_value = apic_timer_state.base_frequency / 100;
+    apic_timer_state.calibrated = true;
+    kprintf("APIC Timer: Recalibrated (base freq: %u Hz)\n", apic_timer_state.base_frequency);
 }

@@ -251,7 +251,6 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
     pic_init();
     pit_init();
 
-    // Регистрируем обработчик APIC таймера
     idt_set_handler(APIC_TIMER_VECTOR, apic_timer_handler);
 
     apic_init();
@@ -259,14 +258,13 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
     
     paging_init();
     heap_init(0, 0);
+
     // Включаем прерывания
     asm volatile("sti");
 
-    // Тест APIC таймера
     kprintf("Testing APIC Timer...\n");
     apic_timer_start(100);
-    
-    // Ждем прерываний
+
     for (int i = 0; i < 50; i++) {
         pit_sleep_ms(10);
         if (apic_timer_ticks > 0) break;
@@ -282,16 +280,19 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
     } else {
         kprintf("APIC Timer: FAILED - using PIT\n");
         apic_timer_stop();
+    }
+
     pci_init();
     pci_dump_devices();
     intel_chipset_init();
     thread_init();
     iothread_init();
+    
     /* user subsystem */
     user_init();
-    /* Регистрируем файловые системы */
     ramfs_register();
     ext2_register();
+    
     if (sysfs_register() == 0) {
         kprintf("sysfs: mounting sysfs in /sys\n");
         ramfs_mkdir("/sys");
@@ -322,6 +323,7 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
         sysfs_mount("/sys");
 
         pci_sysfs_init();
+        
         /* create /etc and write initial passwd/group files into ramfs */
         ramfs_mkdir("/etc");
         {
@@ -345,6 +347,7 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
     } else {
         kprintf("sysfs: failed to register\n");
     }
+    
     /* If an initfs module was provided by the bootloader, unpack it into ramfs */
     {
         int r = initfs_process_multiboot_module(multiboot_magic, multiboot_info, "initfs");
@@ -356,28 +359,18 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
     ps2_keyboard_init();
     rtc_init();
     
-    asm volatile("sti");
-
     kprintf("kernel base: done\n");
     
     kprintf("\n%s v%s\n", OS_NAME, OS_VERSION);
+    
     // autostart: run /start script once if present
-    {
-        struct fs_file *f = fs_open("/start");
-        if (f) { fs_file_free(f); (void)exec_line("osh /start"); }
->>>>>>> origin/main
-    }
-
-    kprintf("kernel base: done\n");
-
-    kprintf("\nWelcome to %s %s!\n", OS_NAME, OS_VERSION);
-
-    // Запуск оболочки
     struct fs_file *f = fs_open("/start");
     if (f) { 
         fs_file_free(f); 
         (void)exec_line("osh /start"); 
     }
+
+    kprintf("\nWelcome to %s %s!\n", OS_NAME, OS_VERSION);
 
     // Завершение
     kprint("\nShutting down...");
