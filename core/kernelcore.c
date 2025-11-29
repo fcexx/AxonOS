@@ -248,6 +248,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     idt_init();
     pic_init(); 
     pit_init();
+    
 
     paging_init();
     heap_init(0, 0);
