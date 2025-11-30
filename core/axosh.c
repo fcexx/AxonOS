@@ -23,10 +23,6 @@ void intel_print_chipset_info(void);
 void intel_chipset_reset(void);
 #include "../inc/thread.h"
 #include "../inc/editor.h"
-#include "../inc/snake.h"
-#include "../inc/tetris.h"
-#include "../inc/clock.h"
-#include "../inc/neofetch.h"
 #include "../inc/sysinfo.h"
 
 typedef long ssize_t;

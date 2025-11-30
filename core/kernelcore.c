@@ -10,12 +10,8 @@
 #include <rtc.h>
 #include <heap.h>
 #include <paging.h>
-#include <snake.h>
-#include <tetris.h>
-#include <clock.h>
 #include <sysinfo.h>
 #include <thread.h>
-#include <neofetch.h>
 #include <axosh.h>
 #include <apic.h>
 #include <apic_timer.h>
