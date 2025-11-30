@@ -2,6 +2,7 @@
 #include <apic.h>
 #include <pit.h>
 #include <stdio.h>
+#include <string.h>
 
 volatile uint64_t apic_timer_ticks = 0;
 apic_timer_state_t apic_timer_state = {0};
@@ -52,6 +53,117 @@ static uint32_t quick_calibrate(void) {
     
     kprintf("APIC Timer: Calibration result: %u ticks/10ms\n", elapsed);
     return elapsed * 100; // Convert to Hz
+}
+
+// Simple integer to string conversion
+static void uint_to_str(uint64_t value, char* buffer) {
+    if (value == 0) {
+        buffer[0] = '0';
+        buffer[1] = '\0';
+        return;
+    }
+    
+    char temp[20];
+    int i = 0;
+    
+    while (value > 0) {
+        temp[i++] = '0' + (value % 10);
+        value /= 10;
+    }
+    
+    for (int j = 0; j < i; j++) {
+        buffer[j] = temp[i - j - 1];
+    }
+    buffer[i] = '\0';
+}
+
+// Simple string copy
+static void str_copy(char* dest, const char* src) {
+    while (*src) {
+        *dest++ = *src++;
+    }
+    *dest = '\0';
+}
+
+// Format uptime into human readable string
+void apic_timer_format_uptime(char* buffer, size_t buffer_size) {
+    uint64_t seconds = apic_timer_get_uptime_seconds();
+    
+    if (seconds == 0) {
+        str_copy(buffer, "00:00:00");
+        return;
+    }
+    
+    uint64_t days = seconds / (24 * 3600);
+    uint64_t hours = (seconds % (24 * 3600)) / 3600;
+    uint64_t minutes = (seconds % 3600) / 60;
+    uint64_t secs = seconds % 60;
+    
+    char days_str[10];
+    char hours_str[3];
+    char minutes_str[3];
+    char secs_str[3];
+    
+    // Format hours, minutes, seconds with leading zeros
+    uint_to_str(hours, hours_str);
+    uint_to_str(minutes, minutes_str);
+    uint_to_str(secs, secs_str);
+    
+    // Ensure two digits
+    if (hours < 10) {
+        char temp[3];
+        temp[0] = '0';
+        temp[1] = hours_str[0];
+        temp[2] = '\0';
+        str_copy(hours_str, temp);
+    }
+    
+    if (minutes < 10) {
+        char temp[3];
+        temp[0] = '0';
+        temp[1] = minutes_str[0];
+        temp[2] = '\0';
+        str_copy(minutes_str, temp);
+    }
+    
+    if (secs < 10) {
+        char temp[3];
+        temp[0] = '0';
+        temp[1] = secs_str[0];
+        temp[2] = '\0';
+        str_copy(secs_str, temp);
+    }
+    
+    if (days > 0) {
+        uint_to_str(days, days_str);
+        // Format: Xd HH:MM:SS
+        char* ptr = buffer;
+        str_copy(ptr, days_str);
+        ptr += strlen(days_str);
+        *ptr++ = 'd';
+        *ptr++ = ' ';
+        str_copy(ptr, hours_str);
+        ptr += 2;
+        *ptr++ = ':';
+        str_copy(ptr, minutes_str);
+        ptr += 2;
+        *ptr++ = ':';
+        str_copy(ptr, secs_str);
+    } else {
+        // Format: HH:MM:SS
+        char* ptr = buffer;
+        str_copy(ptr, hours_str);
+        ptr += 2;
+        *ptr++ = ':';
+        str_copy(ptr, minutes_str);
+        ptr += 2;
+        *ptr++ = ':';
+        str_copy(ptr, secs_str);
+    }
+}
+
+uint64_t apic_timer_get_uptime_seconds(void) {
+    return apic_timer_get_time_ms() / 1000;
 }
 
 void apic_timer_handler(void) {

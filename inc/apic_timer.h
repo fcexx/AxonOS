@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #define APIC_TIMER_VECTOR     0x30
 
@@ -42,6 +43,10 @@ void apic_timer_calibrate(void);
 void apic_timer_set_frequency(uint32_t freq_hz);
 void apic_timer_sleep_ms(uint32_t ms);
 void apic_timer_sleep_us(uint32_t us);
+
+// Uptime functions
+uint64_t apic_timer_get_uptime_seconds(void);
+void apic_timer_format_uptime(char* buffer, size_t buffer_size);
 
 // Global state
 extern volatile uint64_t apic_timer_ticks;

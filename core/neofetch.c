@@ -2,12 +2,17 @@
 #include <thread.h>
 #include <stdint.h>
 #include <axonos.h>
+#include <apic_timer.h>
 
 void neofetch_run(void) {
     const char *cpu = sysinfo_cpu_name();
     int ram = sysinfo_ram_mb();
     int threads = thread_get_count();
     const char *boot = sysinfo_pc_type() ? "BIOS / Multiboot" : "UEFI";
+    
+    // Get formatted uptime
+    char uptime_str[32];
+    apic_timer_format_uptime(uptime_str, sizeof(uptime_str));
 
     kprintf("\n");
 
@@ -35,6 +40,7 @@ void neofetch_run(void) {
 
     kprintf("<(0f)> <(0e)>Boot:     <(0b)>%s\n", boot);
     kprintf("<(0f)> <(0e)>Threads:  <(0b)>%d\n", threads);
+    kprintf("<(0f)> <(0e)>Uptime:   <(0b)>%s\n", uptime_str);
     kprintf("<(0f)> <(0e)>Heap:     <(0b)>enabled\n");
     kprintf("<(0f)> <(0e)>Paging:   <(0b)>active\n");
     kprintf("<(0f)>========================================\n\n");
