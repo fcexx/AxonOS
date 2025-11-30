@@ -251,10 +251,10 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
     pic_init();
     pit_init();
 
-    idt_set_handler(APIC_TIMER_VECTOR, apic_timer_handler);
-
+    
     apic_init();
     apic_timer_init();
+    idt_set_handler(APIC_TIMER_VECTOR, apic_timer_handler);
     
     paging_init();
     heap_init(0, 0);
@@ -262,23 +262,20 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
     // Включаем прерывания
     asm volatile("sti");
 
-    kprintf("Testing APIC Timer...\n");
     apic_timer_start(100);
 
     for (int i = 0; i < 50; i++) {
         pit_sleep_ms(10);
         if (apic_timer_ticks > 0) break;
     }
-    
     if (apic_timer_ticks > 0) {
-        kprintf("APIC Timer: SUCCESS (%lu ticks)\n", apic_timer_ticks);
         apic_timer_stop();
         pit_disable();
         pic_mask_irq(0);
         apic_timer_start(1000);
         kprintf("Switched to APIC Timer\n");
     } else {
-        kprintf("APIC Timer: FAILED - using PIT\n");
+        kprintf("APIC: using PIT\n");
         apic_timer_stop();
     }
 

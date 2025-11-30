@@ -17,7 +17,7 @@ static void msr_write(uint32_t msr, uint64_t value) {
 }
 
 void apic_init(void) {
-    kprintf("APIC: Initializing...\n");
+    kprintf("APIC: Initializing timer\n");
     
     // Enable APIC in MSR
     uint64_t apic_base_msr = msr_read(0x1B);
@@ -33,7 +33,7 @@ void apic_init(void) {
     apic_write(LAPIC_SVR_REG, svr | LAPIC_SVR_ENABLE | APIC_SPURIOUS_VECTOR);
     
     apic_initialized = true;
-    kprintf("APIC: Initialized at 0x%x\n", base_addr);
+    kprintf("APIC: at 0x%x\n", base_addr);
 }
 
 uint32_t apic_read(uint32_t reg) {
