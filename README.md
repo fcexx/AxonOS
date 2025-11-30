@@ -1,4 +1,5 @@
-<h1 align="center">🐊 Axon OS</h1>
+---
+<h1 align="center">🐊 <b>Axon OS</b></h1>
 
 <p align="center">
   <b>Minimal. Fast. Open.</b><br>
@@ -28,13 +29,27 @@
 
 ---
 
-### ✨ Features
-- ⚙️ Custom kernel written in C  
-- 💻 Built-in Ring0 shell  
-- 🧠 Smart memory & task management  
-- ⏱️ Fast boot & clean modular design  
-- 🧩 Fully open source — learn, modify, improve  
-- 🐍 Cross-platform build support (Linux / Windows via WSL)
+<h2 align="center">✨ Features</h2>
+
+<div align="center">
+
+| Category | Description |
+|---------|-------------|
+| ⚙️ Kernel | Custom kernel fully written in C |
+| 🧩 Architecture | GDT, IDT, PIC, PIT, RTC, Paging |
+| 🧠 Memory | Dynamic heap allocator + virtual memory manager |
+| 🧵 Threads | Threading system with full context switching |
+| ⌨️ Drivers | Keyboard, Serial, PCI, RTC, PIT |
+| 🌐 Networking | Experimental Intel E1000 driver + ARP/ICMP |
+| 🖥 UI | VGA text-mode UI with built-in apps |
+| 💻 Shell | Built-in Ring0 shell with core commands |
+| 📝 Interpreter | Integrated OSH interpreter (Axon Shell) |
+| 🏃 Scheduler | Task management & lightweight scheduler |
+| 🚀 Boot | Fast boot and clean modular codebase |
+| 🐍 Build | Cross-platform build support |
+| 🧩 Open | Fully open-source — learn, modify, improve оно? |
+
+</div>
 
 ---
 
@@ -61,10 +76,11 @@ make clean && make && make run
 
 ---
 
-### ⭐ Star Us!
-If you like **Axon OS**, don’t forget to **⭐ star the repo** — it really helps visibility!  
+<h2 align="center">⭐ Star Us!</h2>
 
 <p align="center">
+  If you like <b>Axon OS</b>, don’t forget to <b>⭐ star the repo</b> — it really helps visibility!  
+  <br><br>
   ⭐⭐⭐⭐⭐  
   <br><i>“A tiny kernel with big ambitions.”</i>
 </p>
@@ -74,3 +90,4 @@ If you like **Axon OS**, don’t forget to **⭐ star the repo** — it really h
 <p align="center">
   © 2025 AxonOS Project — Made with 🖤 by the community
 </p>
+---

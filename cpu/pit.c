@@ -32,6 +32,17 @@ void pit_init() {
         idt_set_handler(32, pit_handler); // IRQ 0 = vector 32
 }
 
+// Disable PIT - stop timer interrupts
+void pit_disable(void) {
+    // Stop PIT by setting channel 0 to mode 0 (interrupt on terminal count)
+    // with maximum divisor (0 = 65536) which effectively stops the timer
+    outb(PIT_COMMAND, PIT_CMD_CHANNEL0 | PIT_CMD_ACCESS_BOTH | PIT_CMD_MODE0 | PIT_CMD_BINARY);
+    outb(PIT_CHANNEL0, 0);   // Low byte = 0
+    outb(PIT_CHANNEL0, 0);   // High byte = 0
+    
+    kprintf("PIT: Disabled\n");
+}
+
 // Set PIT frequency in Hz
 void pit_set_frequency(uint32_t frequency) {
         if (frequency == 0) return;

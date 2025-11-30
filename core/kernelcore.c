@@ -17,6 +17,8 @@
 #include <thread.h>
 #include <neofetch.h>
 #include <axosh.h>
+#include <apic.h>
+#include <apic_timer.h>
 #include <stat.h>
 
 #include <iothread.h>
@@ -26,7 +28,7 @@
 #include <sysfs.h>
 #include <initfs.h>
 #include <editor.h>
-#include <intel_chipset.h>
+#include <intel_chipset.h>s
 
 int exit = 0;
 
@@ -246,24 +248,49 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 
     gdt_init();
     idt_init();
-    pic_init(); 
+    pic_init();
     pit_init();
     
 
+    
+    apic_init();
+    apic_timer_init();
+    idt_set_handler(APIC_TIMER_VECTOR, apic_timer_handler);
+    
     paging_init();
     heap_init(0, 0);
+
+    // Включаем прерывания
+    asm volatile("sti");
+
+    apic_timer_start(100);
+
+    for (int i = 0; i < 50; i++) {
+        pit_sleep_ms(10);
+        if (apic_timer_ticks > 0) break;
+    }
+    if (apic_timer_ticks > 0) {
+        apic_timer_stop();
+        pit_disable();
+        pic_mask_irq(0);
+        apic_timer_start(1000);
+        kprintf("Switched to APIC Timer\n");
+    } else {
+        kprintf("APIC: using PIT\n");
+        apic_timer_stop();
+    }
 
     pci_init();
     pci_dump_devices();
     intel_chipset_init();
-
     thread_init();
     iothread_init();
+    
     /* user subsystem */
     user_init();
-    /* Регистрируем файловые системы */
     ramfs_register();
     ext2_register();
+    
     if (sysfs_register() == 0) {
         kprintf("sysfs: mounting sysfs in /sys\n");
         ramfs_mkdir("/sys");
@@ -294,6 +321,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         sysfs_mount("/sys");
 
         pci_sysfs_init();
+        
         /* create /etc and write initial passwd/group files into ramfs */
         ramfs_mkdir("/etc");
         {
@@ -317,6 +345,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     } else {
         kprintf("sysfs: failed to register\n");
     }
+    
     /* If an initfs module was provided by the bootloader, unpack it into ramfs */
     {
         int r = initfs_process_multiboot_module(multiboot_magic, multiboot_info, "initfs");
@@ -357,11 +386,10 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     ps2_keyboard_init();
     rtc_init();
     
-    asm volatile("sti");
-
     kprintf("kernel base: done\n");
     
     kprintf("\n%s v%s\n", OS_NAME, OS_VERSION);
+    
     // autostart: run /start script once if present
     {
         struct fs_file *f = fs_open("/start");
@@ -369,9 +397,14 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         else { kprintf("FATAL: /start file not found; fallback to osh\n"); exec_line("PS1=\"\\w # \""); exec_line("osh"); }
     }
 
-    kprint("\nShutting down in 5 seconds...");
-    pit_sleep_ms(5000);
+    kprintf("\nWelcome to %s %s!\n", OS_NAME, OS_VERSION);
+
+    // Завершение
+    kprint("\nShutting down...");
+    pit_sleep_ms(3000);
     shutdown_system();
-    kprintf("Shutdown. If PC is not ACPI turn off power manually");
-    for(;;);
+    
+    for(;;) {
+        asm volatile("hlt");
+    }
 }

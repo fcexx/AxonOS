@@ -233,7 +233,7 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
             }
         } else {
             /* other types (symlink, device...) - skip for now */
-            kprintf("initfs: skipping special file %s (mode %o)\n", target, mode);
+            //kprintf("initfs: skipping special file %s (mode %o)\n", target, mode);
         }
         /* advance offset to next header (file data aligned to 4).
            Protect against malformed tag_size/filesize that would yield zero

@@ -26,6 +26,7 @@
 
 // function declarations
 void pit_init();
+void pit_disable(void);  // Добавь эту строку
 void pit_set_frequency(uint32_t frequency);
 void pit_set_divisor(uint16_t divisor);
 uint16_t pit_get_current_count();
