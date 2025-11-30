@@ -1922,9 +1922,6 @@ static int bi_help(cmd_ctx *c) {
     kprint((uint8_t*)"reboot - reboot the system\n");
     kprint((uint8_t*)"shutdown - shutdown the system\n");
     kprint((uint8_t*)"echo <text> - print text\n");
-    kprint((uint8_t*)"snake - run the snake game\n");
-    kprint((uint8_t*)"tetris - run the tetris game\n");
-    kprint((uint8_t*)"clock - run the analog clock\n");
     kprint((uint8_t*)"time - show current time from RTC\n");
     kprint((uint8_t*)"date - show current date from RTC\n");
     kprint((uint8_t*)"uptime - show system uptime based on RTC ticks\n");
@@ -1938,7 +1935,6 @@ static int bi_help(cmd_ctx *c) {
     kprint((uint8_t*)"pause - pause the shell and wait for a key press\n");
     kprint((uint8_t*)"chipset info - print chipset information\n");
     kprint((uint8_t*)"chipset reset - reset chipset\n");
-    kprint((uint8_t*)"neofetch - show system information\n");
     kprint((uint8_t*)"osh - run a script file\n");
     kprint((uint8_t*)"art - show ASCII art\n");
     kprint((uint8_t*)"exit - exit the shell\n");
@@ -1957,8 +1953,7 @@ static const builtin builtin_table[] = {
     {"pwd", bi_pwd}, {"cd", bi_cd}, {"clear", bi_cls}, {"cls", bi_cls},
     {"ls", bi_ls}, {"cat", bi_cat}, {"mkdir", bi_mkdir}, {"touch", bi_touch}, {"rm", bi_rm},
     {"about", bi_about}, {"time", bi_time}, {"date", bi_date}, {"uptime", bi_uptime},
-    {"edit", bi_edit}, {"snake", bi_snake}, {"tetris", bi_tetris}, {"clock", bi_clock},
-    {"reboot", bi_reboot}, {"shutdown", bi_shutdown}, {"neofetch", bi_neofetch}, {"mem", bi_mem},
+    {"edit", bi_edit}, {"reboot", bi_reboot}, {"shutdown", bi_shutdown}, {"mem", bi_mem},
     {"osh", bi_osh}, {"art", bi_art}, {"pause", bi_pause}, {"chipset", bi_chipset}, {"help", bi_help},
     {"passwd", bi_passwd}, {"su", bi_su}, {"whoami", bi_whoami}, {"mkpasswd", bi_mkpasswd}, {"groups", bi_groups},
     {"useradd", bi_useradd}, {"groupadd", bi_groupadd}, {"chmod", bi_chmod}
