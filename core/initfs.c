@@ -229,11 +229,11 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
             ensure_parent_dirs(target);
             const void *file_data = base + file_data_offset;
             if (create_file_with_data(target, file_data, filesize) != 0) {
-                kprintf("initfs: failed to create %s\n", target);
+                kprintf("initfs: failed to create %s (ignore)\n", target);
             }
         } else {
             /* other types (symlink, device...) - skip for now */
-            kprintf("initfs: skipping special file %s (mode %o)\n", target, mode);
+            //kprintf("initfs: skipping special file %s (mode %o)\n", target, mode);
         }
         /* advance offset to next header (file data aligned to 4) */
         size_t next = file_data_offset + filesize;
