@@ -8,6 +8,7 @@
 #include <stddef.h>
 #include "../inc/spinlock.h"
 #include "../inc/ext2.h"
+#include "../inc/keyboard.h"
 
 #define DEVFS_TTY_COUNT 6
 
@@ -33,6 +34,15 @@ static int devfs_active = 0;
 static struct fs_driver devfs_driver;
 static struct fs_driver_ops devfs_ops;
 static void *devfs_driver_data = NULL;
+
+/* simple block device node registry for /dev/hdN */
+struct devfs_block {
+    char path[32];
+    int device_id;
+    uint32_t sectors;
+};
+static struct devfs_block dev_blocks[16];
+static int dev_block_count = 0;
 
 /* helper: get tty index from path like /dev/ttyN */
 static int devfs_path_to_tty(const char *path) {
@@ -89,6 +99,22 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
         *out_file = f;
         return 0;
     }
+    /* block device? */
+    int bi = devfs_find_block_by_path(path);
+    if (bi >= 0) {
+        struct fs_file *f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
+        if (!f) return -1;
+        memset(f, 0, sizeof(*f));
+        f->path = (const char*)kmalloc(strlen(path) + 1);
+        strcpy((char*)f->path, path);
+        f->fs_private = &devfs_driver_data;
+        f->driver_private = (void*)&dev_blocks[bi];
+        f->type = FS_TYPE_REG;
+        f->size = (off_t)dev_blocks[bi].sectors * 512;
+        f->pos = 0;
+        *out_file = f;
+        return 0;
+    }
     int tty = devfs_path_to_tty(path);
     if (tty < 0) return -1;
     struct fs_file *f = devfs_alloc_file(path, tty);
@@ -100,18 +126,82 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
 static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t offset) {
     (void)offset;
     if (!file || !buf) return -1;
+    /* block device file handling */
+    for (int bi = 0; bi < dev_block_count; bi++) {
+        if (file->driver_private == &dev_blocks[bi]) {
+            struct devfs_block *b = (struct devfs_block*)file->driver_private;
+            /* compute sector-aligned read */
+            uint64_t dev_size_bytes = (uint64_t)b->sectors * 512ULL;
+            if (offset >= dev_size_bytes) return 0;
+            if ((uint64_t)offset + size > dev_size_bytes) size = (size_t)(dev_size_bytes - offset);
+            uint32_t start_sector = (uint32_t)(offset / 512);
+            uint32_t end_sector = (uint32_t)((offset + size + 511) / 512);
+            uint32_t nsectors = end_sector - start_sector;
+            uint32_t alloc_bytes = 512; /* read one sector at a time */
+            void *tmp = kmalloc(alloc_bytes);
+            if (!tmp) return -1;
+            size_t copied = 0;
+            size_t off_in_first = offset % 512;
+            for (uint32_t s = 0; s < nsectors; s++) {
+                /* allow user to abort via Ctrl-C */
+                if (keyboard_ctrlc_pending()) {
+                    keyboard_consume_ctrlc();
+                    kfree(tmp);
+                    return -1;
+                }
+                if (disk_read_sectors(b->device_id, start_sector + s, tmp, 1) != 0) {
+                    kfree(tmp);
+                    return -1;
+                }
+                /* determine where to copy from this sector */
+                uint8_t *src = (uint8_t*)tmp;
+                uint32_t tocopy = 512;
+                if (s == 0) {
+                    /* first sector - may start at offset within sector */
+                    if (off_in_first >= 512) tocopy = 0;
+                    else {
+                        if (size + off_in_first < 512) tocopy = (uint32_t)size;
+                        else tocopy = 512 - (uint32_t)off_in_first;
+                        memcpy((uint8_t*)buf + copied, src + off_in_first, tocopy);
+                    }
+                } else {
+                    /* subsequent sectors */
+                    uint32_t remaining = (uint32_t)size - (uint32_t)copied;
+                    if (remaining == 0) { break; }
+                    if (remaining < 512) tocopy = remaining;
+                    memcpy((uint8_t*)buf + copied, src, tocopy);
+                }
+                copied += tocopy;
+                if (copied >= size) break;
+            }
+            kfree(tmp);
+            return (ssize_t)copied;
+        }
+    }
     /* directory read */
     if (file->type == FS_TYPE_DIR && file->driver_private) {
         uint8_t *out = (uint8_t*)buf;
         size_t pos = 0;
         size_t written = 0;
-        for (int i = 0; i < DEVFS_TTY_COUNT + 1; i++) {
+    /* include ttys + console + any registered block devices */
+    int total_entries = (DEVFS_TTY_COUNT + 1) + dev_block_count;
+    for (int i = 0; i < total_entries; i++) {
             const char *nm;
-            char tmpn[8];
-            if (i == 0) nm = "console";
-            else {
-                tmpn[0] = 't'; tmpn[1] = 't'; tmpn[2] = 'y'; tmpn[3] = '0' + (char)(i-1); tmpn[4] = '\0';
+            char tmpn[64];
+            if (i == 0) {
+                nm = "console";
+            } else if (i <= DEVFS_TTY_COUNT) {
+                tmpn[0] = 't'; tmpn[1] = 't'; tmpn[2] = 'y';
+                tmpn[3] = '0' + (char)(i-1);
+                tmpn[4] = '\0';
                 nm = tmpn;
+            } else {
+                /* block device entries stored in dev_blocks[] */
+                int bi = i - (DEVFS_TTY_COUNT + 1);
+                const char *path = dev_blocks[bi].path;
+                const char *last = strrchr(path, '/');
+                if (last) nm = last + 1;
+                else nm = path;
             }
             size_t namelen = strlen(nm);
             size_t rec_len = 8 + namelen;
@@ -188,6 +278,29 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
 static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, size_t offset) {
     (void)offset;
     if (!file || !buf) return -1;
+    /* block device write? */
+    for (int bi = 0; bi < dev_block_count; bi++) {
+        if (file->driver_private == &dev_blocks[bi]) {
+            struct devfs_block *b = (struct devfs_block*)file->driver_private;
+            /* compute sector-aligned write: read-modify-write if unaligned */
+            uint64_t dev_size_bytes = (uint64_t)b->sectors * 512ULL;
+            if (offset >= dev_size_bytes) return -1;
+            if ((uint64_t)offset + size > dev_size_bytes) size = (size_t)(dev_size_bytes - offset);
+            uint32_t start_sector = (uint32_t)(offset / 512);
+            uint32_t end_sector = (uint32_t)((offset + size + 511) / 512);
+            uint32_t nsectors = end_sector - start_sector;
+            uint32_t alloc_bytes = nsectors * 512;
+            void *tmp = kmalloc(alloc_bytes);
+            if (!tmp) return -1;
+            /* read existing data for RMW */
+            if (disk_read_sectors(b->device_id, start_sector, tmp, nsectors) != 0) { kfree(tmp); return -1; }
+            size_t off_in_first = offset % 512;
+            memcpy((uint8_t*)tmp + off_in_first, buf, size);
+            if (disk_write_sectors(b->device_id, start_sector, tmp, nsectors) != 0) { kfree(tmp); return -1; }
+            kfree(tmp);
+            return (ssize_t)size;
+        }
+    }
     struct devfs_tty *t = (struct devfs_tty*)file->driver_private;
     if (!t) return -1;
     int idx = t->id;
@@ -366,4 +479,24 @@ int devfs_is_tty_file(struct fs_file *file) {
     return 0;
 }
 
+/* Create a block device node and register mapping */
+int devfs_create_block_node(const char *path, int device_id, uint32_t sectors) {
+    if (!path) return -1;
+    if (dev_block_count >= (int)(sizeof(dev_blocks)/sizeof(dev_blocks[0]))) return -1;
+    strncpy(dev_blocks[dev_block_count].path, path, sizeof(dev_blocks[dev_block_count].path)-1);
+    dev_blocks[dev_block_count].path[sizeof(dev_blocks[dev_block_count].path)-1] = '\0';
+    dev_blocks[dev_block_count].device_id = device_id;
+    dev_blocks[dev_block_count].sectors = sectors;
+    dev_block_count++;
+    return 0;
+}
+
+/* helper: find block index by path */
+int devfs_find_block_by_path(const char *path) {
+    if (!path) return -1;
+    for (int i = 0; i < dev_block_count; i++) {
+        if (strcmp(path, dev_blocks[i].path) == 0) return i;
+    }
+    return -1;
+}
 

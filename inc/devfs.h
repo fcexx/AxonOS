@@ -30,5 +30,9 @@ int devfs_tty_available(int tty);
 /* Check whether an fs_file is a devfs tty device */
 int devfs_is_tty_file(struct fs_file *file);
 
+/* Create a block device node at given path and associate with disk device_id.
+   sectors - total number of 512-byte sectors on device (for size reporting). */
+int devfs_create_block_node(const char *path, int device_id, uint32_t sectors);
+
 
 

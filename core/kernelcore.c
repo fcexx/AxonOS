@@ -29,6 +29,10 @@
 #include <initfs.h>
 #include <editor.h>
 #include <intel_chipset.h>s
+#include <disk.h>
+
+/* ATA DMA driver init (registered here) */
+void ata_dma_init(void);
 
 int exit = 0;
 
@@ -283,8 +287,14 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     pci_init();
     pci_dump_devices();
     intel_chipset_init();
+    /* start threading and I/O subsystem, then initialize disk drivers from a kernel thread
+       to avoid probing hardware too early during boot. */
     thread_init();
     iothread_init();
+    /* create kernel thread to initialize ATA/SATA drivers after scheduler is ready */
+    if (!thread_create(ata_dma_init, "ata_init")) {
+        kprintf("ata: failed to create init thread\n");
+    }
     
     /* user subsystem */
     user_init();

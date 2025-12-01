@@ -6,6 +6,8 @@
 /* driver-specific stat helpers */
 #include "../inc/sysfs.h"
 #include "../inc/ramfs.h"
+/* debug print */
+extern void kprintf(const char *fmt, ...);
 
 #define MAX_FS_DRIVERS 8
 #define MAX_FS_MOUNTS 8
@@ -101,7 +103,8 @@ struct fs_file *fs_open(const char *path) {
     struct fs_driver *mount_drv = fs_match_mount(path);
     if (mount_drv && mount_drv->ops && mount_drv->ops->open) {
         struct fs_file *file = NULL;
-        if (mount_drv->ops->open(path, &file) == 0 && file) return file;
+        int rr = mount_drv->ops->open(path, &file);
+        if (rr == 0 && file) return file;
     }
     for (int i = 0; i < g_drivers_count; i++) {
         struct fs_driver *drv = g_drivers[i];

@@ -1963,6 +1963,8 @@ static int bi_close(cmd_ctx *c);
 static int bi_dup(cmd_ctx *c);
 static int bi_dup2(cmd_ctx *c);
 static int bi_isatty(cmd_ctx *c);
+/* xxd builtin forward declaration */
+static int bi_xxd(cmd_ctx *c);
 
 static const builtin builtin_table[] = {
     {"echo", bi_echo}, {"kprint", bi_kprint}, {"readline", bi_readline}, {"readkey", bi_readkey},
@@ -1974,7 +1976,7 @@ static const builtin builtin_table[] = {
     {"osh", bi_osh}, {"art", bi_art}, {"pause", bi_pause}, {"chipset", bi_chipset}, {"help", bi_help},
     {"passwd", bi_passwd}, {"su", bi_su}, {"whoami", bi_whoami}, {"mkpasswd", bi_mkpasswd}, {"groups", bi_groups},
     {"useradd", bi_useradd}, {"groupadd", bi_groupadd}, {"chmod", bi_chmod}, {"chvt", bi_chvt},
-    {"open", bi_open}, {"close", bi_close}, {"dup", bi_dup}, {"dup2", bi_dup2}, {"isatty", bi_isatty}
+    {"open", bi_open}, {"close", bi_close}, {"dup", bi_dup}, {"dup2", bi_dup2}, {"isatty", bi_isatty}, {"xxd", bi_xxd}
 };
 static int bi_chmod(cmd_ctx *c) {
     if (c->argc < 3) { kprintf("usage: chmod <mode> <path>\n"); return 1; }
@@ -2067,6 +2069,122 @@ static int bi_isatty(cmd_ctx *c) {
     int fd = parse_uint(c->argv[1]);
     int r = thread_fd_isatty(fd);
     kprintf("%d\n", r ? 1 : 0);
+    return 0;
+}
+
+/* xxd: simple hex dump utility
+   usage: xxd <path> [offset] [length]
+*/
+static int bi_xxd(cmd_ctx *c) {
+    /* Parse args: support optional flag -l <length> (anywhere) and a path.
+       Positional offset/length after path are still supported if -l not provided. */
+    size_t specified_len = 0;
+    int has_len_flag = 0;
+    const char *path_arg = NULL;
+    for (int i = 1; i < c->argc; i++) {
+        if (c->argv[i] && strcmp(c->argv[i], "-l") == 0 && i + 1 < c->argc) {
+            specified_len = (size_t)parse_uint(c->argv[i + 1]);
+            has_len_flag = 1;
+            i++; /* skip length token */
+        } else if (!path_arg) {
+            path_arg = c->argv[i];
+        } else {
+            /* ignore extra tokens here; positional parsing happens below */
+        }
+    }
+    if (!path_arg) {
+        osh_write(c->out, c->out_len, c->out_cap, "usage: xxd [-l length] <path> [offset] [length]\n");
+        return 1;
+    }
+    char path[256];
+    join_cwd(g_cwd, path_arg, path, sizeof(path));
+    struct fs_file *f = fs_open(path);
+    if (!f) {
+        osh_write(c->out, c->out_len, c->out_cap, "xxd: cannot open file\n");
+        return 1;
+    }
+    size_t fsize = f->size ? f->size : 0;
+    size_t start = 0;
+    size_t length = fsize;
+    /* If user provided positional offset/length after the path, parse them (only used when -l not present). */
+    if (!has_len_flag) {
+        /* find index of path_arg to read following tokens */
+        int path_idx = -1;
+        for (int i = 1; i < c->argc; i++) {
+            if (c->argv[i] && strcmp(c->argv[i], path_arg) == 0) { path_idx = i; break; }
+        }
+        if (path_idx >= 0) {
+            if (path_idx + 1 < c->argc) start = (size_t)parse_uint(c->argv[path_idx + 1]);
+            if (path_idx + 2 < c->argc) {
+                size_t L = (size_t)parse_uint(c->argv[path_idx + 2]);
+                if (L < length) length = L;
+            }
+        }
+    } else {
+        /* flag -l overrides positional length */
+        length = specified_len;
+    }
+    if (start > fsize) {
+        fs_file_free(f);
+        osh_write(c->out, c->out_len, c->out_cap, "xxd: offset beyond EOF\n");
+        return 1;
+    }
+    size_t remaining = (start + length <= fsize) ? length : (fsize - start);
+    unsigned char buf[16];
+    size_t pos = 0;
+    while (remaining > 0) {
+        if (keyboard_ctrlc_pending()) { keyboard_consume_ctrlc(); break; }
+        size_t want = remaining >= sizeof(buf) ? sizeof(buf) : remaining;
+        ssize_t r = fs_read(f, buf, want, start + pos);
+        if (r <= 0) break;
+        char line[128];
+        char hexbuf[64];
+        const char hexdigits[] = "0123456789abcdef";
+        int hp = 0;
+        for (int i = 0; i < 16; i++) {
+            if (i > 0) {
+                if (i == 8) { hexbuf[hp++] = ' '; hexbuf[hp++] = ' '; }
+                else { hexbuf[hp++] = ' '; }
+            }
+            if (i < r) {
+                unsigned char b = buf[i];
+                if (hp + 2 < (int)sizeof(hexbuf)) {
+                    hexbuf[hp++] = hexdigits[(b >> 4) & 0xF];
+                    hexbuf[hp++] = hexdigits[b & 0xF];
+                }
+            } else {
+                /* two spaces to preserve width for missing byte */
+                if (hp + 2 < (int)sizeof(hexbuf)) { hexbuf[hp++] = ' '; hexbuf[hp++] = ' '; }
+            }
+        }
+        if (hp >= (int)sizeof(hexbuf)) hp = (int)sizeof(hexbuf) - 1;
+        hexbuf[hp] = '\0';
+        /* address + hex area, then two spaces, then ASCII for available bytes */
+        /* format 4-digit hex offset manually to avoid depending on snprintf %zx support */
+        char addrbuf[8 + 1];
+        //const char hexdigits[] = "0123456789abcdef";
+        unsigned long addr_val = (unsigned long)(start + pos);
+        for (int i = 0; i < 4; i++) {
+            int shift = (3 - i) * 4;
+            int nibble = (int)((addr_val >> shift) & 0xF);
+            addrbuf[i] = hexdigits[nibble];
+        }
+        addrbuf[4] = '\0';
+        int lp = snprintf(line, sizeof(line), "%s: %s  ", addrbuf, hexbuf);
+        for (int i = 0; i < r; i++) {
+            unsigned char ch = buf[i];
+            line[lp++] = (ch >= 32 && ch < 127) ? (char)ch : '.';
+            if (lp >= (int)sizeof(line) - 2) break;
+        }
+        /* terminate and add newline */
+        if (lp < (int)sizeof(line) - 1) line[lp++] = '\n';
+        if (lp >= (int)sizeof(line)) lp = (int)sizeof(line) - 1;
+        line[lp] = '\0';
+        osh_write(c->out, c->out_len, c->out_cap, line);
+        pos += (size_t)r;
+        remaining -= (size_t)r;
+    }
+    fs_file_free(f);
     return 0;
 }
 
