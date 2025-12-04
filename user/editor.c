@@ -498,8 +498,8 @@ static int is_shell_ident(char c) { return (c=='_' || (c>='0'&&c<='9') || (c>='a
 static int is_shell_kw(const char* s, size_t st, size_t en) {
     static const char* K[] = {
         "echo","pwd","cd","clear","cls","ls","cat","mkdir","touch","rm",
-        "about","time","date","uptime","edit","snake","tetris","clock",
-        "reboot","shutdown","neofetch","osh","art","pause","chipset","help","mem"
+        "about","time","date","uptime","edit", "reboot","shutdown","osh",
+		"art","pause","chipset","help","mem"
     };
     size_t L = en - st;
     for (size_t i=0;i<sizeof(K)/sizeof(K[0]);i++) {
