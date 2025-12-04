@@ -313,6 +313,7 @@ int ramfs_register(void) {
     ramfs_ops.open = ramfs_open;
     ramfs_ops.read = ramfs_read;
     ramfs_ops.write = ramfs_write;
+    ramfs_ops.mkdir = ramfs_mkdir;
     ramfs_ops.chmod = ramfs_chmod;
     ramfs_ops.release = ramfs_release;
 

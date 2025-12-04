@@ -170,7 +170,8 @@ static void complete_token(const char* cwd, char* buf, int* io_len, int* io_cur,
     char token[256]; int tlen = cur - start; if (tlen<0) tlen=0; if (tlen > 255) tlen = 255;
     memcpy(token, buf+start, (size_t)tlen); token[tlen]='\0';
     // определим каталог для поиска
-    char dir[256], base[256]; dir[0]='\0'; base[0]='\0';
+    char *dir = (char*)kmalloc(256); if (!dir) return; dir[0]='\0';
+    char *base = (char*)kmalloc(256); if (!base) { kfree(dir); return; } base[0]='\0';
     const char* slash = NULL; for (int i=0;i<tlen;i++) if (token[i]=='/') slash = &token[i];
     if (slash) {
         int dlen = (int)(slash - token);
@@ -180,7 +181,8 @@ static void complete_token(const char* cwd, char* buf, int* io_len, int* io_cur,
         strcpy(dir, "."); strncpy(base, token, sizeof(base)-1); base[sizeof(base)-1]='\0';
     }
     // построим абсолютный нормализованный путь для dir с учётом '.', '..' и cwd
-    char abs[512];
+    char *abs = (char*)kmalloc(512);
+    if (!abs) return;
     osh_resolve_path(cwd, dir, abs, sizeof(abs));
     // получим список файлов
     const char** fs_names = NULL; int fs_count = 0;
@@ -296,17 +298,17 @@ static void complete_token(const char* cwd, char* buf, int* io_len, int* io_cur,
     // Если единственное совпадение — файл и это директория, добавим '/' как в bash
     if (matches == 1) {
         // common содержит имя совпадения; abs — абсолютный путь к каталогу для поиска
-        char candidate[1024];
+        char *candidate = (char*)kmalloc(1024); if (!candidate) return;
         size_t alen = strlen(abs);
         size_t clen = strlen(common);
-        if (alen + 1 + clen + 1 < sizeof(candidate)) {
+        if (alen + 1 + clen + 1 < 1024) {
             // сформируем путь abs + '/' + common (без дублирования '/')
             strcpy(candidate, abs);
             if (alen > 0 && candidate[alen-1] != '/') {
                 candidate[alen] = '/';
                 candidate[alen+1] = '\0';
             }
-            strncat(candidate, common, sizeof(candidate) - strlen(candidate) - 1);
+            strncat(candidate, common, 1024 - strlen(candidate) - 1);
             struct fs_file* cf = fs_open(candidate);
             if (cf) {
                 int is_dir = (cf->type == FS_TYPE_DIR);

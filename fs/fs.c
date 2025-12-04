@@ -41,6 +41,59 @@ static struct fs_driver *fs_match_mount(const char *path) {
     return best;
 }
 
+/* Public wrapper to get mounted driver for a given path */
+struct fs_driver *fs_get_mount_driver(const char *path) {
+    return fs_match_mount(path);
+}
+
+/* helper: returns true if file is associated with driver 'drv'.
+   file->fs_private may point to drv->driver_data or to drv itself. */
+static int fs_file_matches_driver(const struct fs_driver *drv, const struct fs_file *file) {
+    if (!drv || !file) return 0;
+    if (file->fs_private == drv->driver_data) return 1;
+    if (file->fs_private == (void*)drv) return 1;
+    return 0;
+}
+
+int fs_get_mount_path(const struct fs_driver *drv, char *out, size_t outlen) {
+    if (!drv || !out || outlen == 0) return -1;
+    for (int i = 0; i < g_mount_count; i++) {
+        if (g_mounts[i].driver == drv) {
+            size_t len = g_mounts[i].path_len;
+            if (len >= outlen) return -1;
+            memcpy(out, g_mounts[i].path, len);
+            out[len] = '\0';
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Return the mount prefix that best matches the provided path (longest match).
+   Writes prefix into out (null-terminated). Returns 0 on success, -1 if none. */
+int fs_get_matching_mount_prefix(const char *path, char *out, size_t outlen) {
+    if (!path || !out || outlen == 0) return -1;
+    size_t best_len = 0;
+    const char *best = NULL;
+    for (int i = 0; i < g_mount_count; i++) {
+        struct mount_entry *m = &g_mounts[i];
+        if (!m->driver) continue;
+        if (strncmp(path, m->path, m->path_len) == 0) {
+            if (path[m->path_len] == '\0' || path[m->path_len] == '/') {
+                if (m->path_len > best_len) {
+                    best_len = m->path_len;
+                    best = m->path;
+                }
+            }
+        }
+    }
+    if (!best) return -1;
+    if (best_len >= outlen) return -1;
+    memcpy(out, best, best_len);
+    out[best_len] = '\0';
+    return 0;
+}
+
 int fs_register_driver(struct fs_driver *drv) {
     if (!drv || !drv->ops) return -1;
     if (g_drivers_count >= MAX_FS_DRIVERS) return -1;
@@ -69,6 +122,41 @@ int fs_mount(const char *path, struct fs_driver *drv) {
     g_mounts[g_mount_count].driver = drv;
     g_mount_count++;
     return 0;
+}
+
+int fs_mkdir(const char *path) {
+    if (!path) return -1;
+    struct fs_driver *mount_drv = fs_match_mount(path);
+    if (mount_drv && mount_drv->ops && mount_drv->ops->mkdir) {
+        int r = mount_drv->ops->mkdir(path);
+        if (r == 0) return 0;
+        if (r < 0) return -1;
+    }
+    /* fallback: try drivers' create if they accept directories */
+    for (int i = 0; i < g_drivers_count; i++) {
+        struct fs_driver *drv = g_drivers[i];
+        if (!drv || !drv->ops || !drv->ops->mkdir) continue;
+        int r = drv->ops->mkdir(path);
+        if (r == 0) return 0;
+        if (r < 0) return -1;
+    }
+    return -1;
+}
+
+int fs_unmount(const char *path) {
+    if (!path) return -1;
+    for (int i = 0; i < g_mount_count; i++) {
+        if (strcmp(g_mounts[i].path, path) == 0) {
+            /* remove this mount by shifting remaining entries */
+            for (int j = i; j + 1 < g_mount_count; j++) g_mounts[j] = g_mounts[j+1];
+            /* clear last */
+            g_mounts[--g_mount_count].driver = NULL;
+            g_mounts[g_mount_count].path[0] = '\0';
+            g_mounts[g_mount_count].path_len = 0;
+            return 0;
+        }
+    }
+    return -1;
 }
 
 /* Try drivers in registration order. Drivers should return -1 if they do not handle the path. */
@@ -104,14 +192,20 @@ struct fs_file *fs_open(const char *path) {
     if (mount_drv && mount_drv->ops && mount_drv->ops->open) {
         struct fs_file *file = NULL;
         int rr = mount_drv->ops->open(path, &file);
-        if (rr == 0 && file) return file;
+        if (rr == 0 && file) {
+            if (!file->fs_private) file->fs_private = (void*)mount_drv;
+            return file;
+        }
     }
     for (int i = 0; i < g_drivers_count; i++) {
         struct fs_driver *drv = g_drivers[i];
         if (!drv || !drv->ops || !drv->ops->open) continue;
         struct fs_file *file = NULL;
         int r = drv->ops->open(path, &file);
-        if (r == 0 && file) return file;
+        if (r == 0 && file) {
+            if (!file->fs_private) file->fs_private = (void*)drv;
+            return file;
+        }
         if (r < 0 && r != -1) return NULL; /* real error */
     }
     return NULL;
@@ -119,9 +213,13 @@ struct fs_file *fs_open(const char *path) {
 
 ssize_t fs_read(struct fs_file *file, void *buf, size_t size, size_t offset) {
     if (!file || !file->path) return -1;
+    /* debug logging removed */
     for (int i = 0; i < g_drivers_count; i++) {
         struct fs_driver *drv = g_drivers[i];
-        if (!drv || !drv->ops || drv->driver_data != file->fs_private) continue;
+        if (!drv || !drv->ops) continue;
+        /* debug logging removed */
+        if (!fs_file_matches_driver(drv, file)) continue;
+        /* debug logging removed */
         if (!drv->ops->read) return -1;
         return drv->ops->read(file, buf, size, offset);
     }
@@ -132,7 +230,7 @@ ssize_t fs_write(struct fs_file *file, const void *buf, size_t size, size_t offs
     if (!file || !file->path) return -1;
     for (int i = 0; i < g_drivers_count; i++) {
         struct fs_driver *drv = g_drivers[i];
-        if (!drv || !drv->ops || drv->driver_data != file->fs_private) continue;
+        if (!drv || !drv->ops || !fs_file_matches_driver(drv, file)) continue;
         if (!drv->ops->write) return -1;
         return drv->ops->write(file, buf, size, offset);
     }
@@ -147,7 +245,7 @@ void fs_file_free(struct fs_file *file) {
     for (int i = 0; i < g_drivers_count; i++) {
         struct fs_driver *drv = g_drivers[i];
         if (!drv || !drv->ops) continue;
-        if (file->fs_private == drv->driver_data) {
+        if (fs_file_matches_driver(drv, file)) {
             if (drv->ops->release) drv->ops->release(file);
             return;
         }
@@ -188,7 +286,7 @@ int vfs_fstat(struct fs_file *file, struct stat *st) {
     for (int i = 0; i < g_drivers_count; i++) {
         struct fs_driver *drv = g_drivers[i];
         if (!drv) continue;
-        if (file->fs_private != drv->driver_data) continue;
+        if (!fs_file_matches_driver(drv, file)) continue;
         const char *name = drv->ops ? drv->ops->name : NULL;
         if (name && strcmp(name, "sysfs") == 0) {
             if (sysfs_fill_stat(file, st) == 0) return 0;

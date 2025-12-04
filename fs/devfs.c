@@ -500,3 +500,10 @@ int devfs_find_block_by_path(const char *path) {
     return -1;
 }
 
+/* Return the underlying disk device_id for a block node path, or -1 if not found */
+int devfs_get_device_id(const char *path) {
+    int idx = devfs_find_block_by_path(path);
+    if (idx < 0) return -1;
+    return dev_blocks[idx].device_id;
+}
+

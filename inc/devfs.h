@@ -11,6 +11,10 @@
 int devfs_register(void);
 int devfs_unregister(void);
 int devfs_mount(const char *path);
+/* Find block device index by path (returns -1 if not found) */
+int devfs_find_block_by_path(const char *path);
+/* Return underlying disk device_id for block node path, or -1 if not found */
+int devfs_get_device_id(const char *path);
 /* Switch current active virtual terminal (0..N-1) */
 void devfs_switch_tty(int index);
 

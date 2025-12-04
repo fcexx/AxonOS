@@ -28,6 +28,7 @@
 #include <sysfs.h>
 #include <initfs.h>
 #include <editor.h>
+#include <fat32.h>
 #include <intel_chipset.h>s
 #include <disk.h>
 
@@ -300,6 +301,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     user_init();
     ramfs_register();
     ext2_register();
+    fat32_register();
     
     if (sysfs_register() == 0) {
         kprintf("sysfs: mounting sysfs in /sys\n");

@@ -9,6 +9,8 @@
 #include "../inc/fs.h"
 #include "../inc/ext2.h"
 #include "../inc/ramfs.h"
+#include "../inc/devfs.h"
+#include "../inc/fat32.h"
 #include "../inc/osh_line.h"
 #include "../inc/user.h"
 // local prototype for kprintf
@@ -1539,7 +1541,7 @@ static int bi_cat(cmd_ctx *c) {
     return rc;
 }
 
-static int bi_mkdir(cmd_ctx *c) { if (c->argc<2) { osh_write(c->out, c->out_len, c->out_cap, "mkdir: missing operand\n"); return 1; } char path[256]; join_cwd(g_cwd, c->argv[1], path, sizeof(path)); int r=ramfs_mkdir(path); return r==0?0:1; }
+static int bi_mkdir(cmd_ctx *c) { if (c->argc<2) { osh_write(c->out, c->out_len, c->out_cap, "mkdir: missing operand\n"); return 1; } char path[256]; join_cwd(g_cwd, c->argv[1], path, sizeof(path)); int r=fs_mkdir(path); return r==0?0:1; }
 static int bi_touch(cmd_ctx *c) { if (c->argc<2) { osh_write(c->out, c->out_len, c->out_cap, "touch: missing operand\n"); return 1; } char path[256]; join_cwd(g_cwd, c->argv[1], path, sizeof(path)); struct fs_file *f = fs_create_file(path); if (!f) return 1; fs_file_free(f); return 0; }
 static int bi_rm(cmd_ctx *c) { if (c->argc<2) { osh_write(c->out, c->out_len, c->out_cap, "rm: missing operand\n"); return 1; } char path[256]; join_cwd(g_cwd, c->argv[1], path, sizeof(path)); int r=ramfs_remove(path); return r==0?0:1; }
 
@@ -1965,6 +1967,8 @@ static int bi_dup2(cmd_ctx *c);
 static int bi_isatty(cmd_ctx *c);
 /* xxd builtin forward declaration */
 static int bi_xxd(cmd_ctx *c);
+static int bi_mount(cmd_ctx *c);
+static int bi_umount(cmd_ctx *c);
 
 static const builtin builtin_table[] = {
     {"echo", bi_echo}, {"kprint", bi_kprint}, {"readline", bi_readline}, {"readkey", bi_readkey},
@@ -1976,7 +1980,7 @@ static const builtin builtin_table[] = {
     {"osh", bi_osh}, {"art", bi_art}, {"pause", bi_pause}, {"chipset", bi_chipset}, {"help", bi_help},
     {"passwd", bi_passwd}, {"su", bi_su}, {"whoami", bi_whoami}, {"mkpasswd", bi_mkpasswd}, {"groups", bi_groups},
     {"useradd", bi_useradd}, {"groupadd", bi_groupadd}, {"chmod", bi_chmod}, {"chvt", bi_chvt},
-    {"open", bi_open}, {"close", bi_close}, {"dup", bi_dup}, {"dup2", bi_dup2}, {"isatty", bi_isatty}, {"xxd", bi_xxd}
+    {"open", bi_open}, {"close", bi_close}, {"dup", bi_dup}, {"dup2", bi_dup2}, {"isatty", bi_isatty}, {"xxd", bi_xxd}, {"mount", bi_mount}, {"umount", bi_umount}
 };
 static int bi_chmod(cmd_ctx *c) {
     if (c->argc < 3) { kprintf("usage: chmod <mode> <path>\n"); return 1; }
@@ -2035,6 +2039,76 @@ static int bi_open(cmd_ctx *c) {
     if (fd < 0) { fs_file_free(f); kprintf("open: no fds\n"); return 1; }
     kprintf("%d\n", fd);
     return 0;
+}
+
+static int bi_mount(cmd_ctx *c) {
+    if (c->argc < 3) {
+        kprintf("usage: mount [-t type] <device> <mountpoint>\n");
+        return 1;
+    }
+    const char *fstype = NULL;
+    const char *devpath = NULL;
+    const char *mntpath = NULL;
+    int i = 1;
+    while (i < c->argc) {
+        if (strcmp(c->argv[i], "-t") == 0 && i + 1 < c->argc) {
+            fstype = c->argv[i+1];
+            i += 2;
+            continue;
+        }
+        if (!devpath) { devpath = c->argv[i++]; continue; }
+        if (!mntpath) { mntpath = c->argv[i++]; continue; }
+        i++;
+    }
+    if (!devpath || !mntpath) {
+        kprintf("mount: missing device or mountpoint\n");
+        return 1;
+    }
+    char full_dev[256]; char full_mnt[256];
+    join_cwd(g_cwd, devpath, full_dev, sizeof(full_dev));
+    join_cwd(g_cwd, mntpath, full_mnt, sizeof(full_mnt));
+    int dev_index = devfs_find_block_by_path(full_dev);
+    if (dev_index < 0) { kprintf("mount: device not found: %s\n", full_dev); return 1; }
+    int device_id = devfs_get_device_id(full_dev);
+    if (device_id < 0) { kprintf("mount: cannot resolve device id for %s\n", full_dev); return 1; }
+    struct fs_driver *drv = NULL;
+    if (!fstype || strcmp(fstype, "auto") == 0 || strcmp(fstype, "fat32") == 0) {
+        /* try fat32 on the underlying device id */
+        if (fat32_probe_and_mount(device_id) == 0) {
+            drv = fat32_get_driver();
+        }
+    }
+    if (!drv) { kprintf("mount: filesystem not recognized or not supported\n"); return 1; }
+    /* ensure mountpoint exists in ramfs */
+    ramfs_mkdir(full_mnt);
+    if (fs_mount(full_mnt, drv) == 0) {
+        kprintf("mount: mounted %s at %s\n", full_dev, full_mnt);
+        return 0;
+    } else {
+        kprintf("mount: failed to mount %s at %s\n", full_dev, full_mnt);
+        return 1;
+    }
+}
+
+static int bi_umount(cmd_ctx *c) {
+    if (c->argc < 2) {
+        kprintf("usage: umount <mountpoint>\n");
+        return 1;
+    }
+    char full_mnt[512];
+    join_cwd(g_cwd, c->argv[1], full_mnt, sizeof(full_mnt));
+    struct fs_driver *mount_drv = fs_get_mount_driver(full_mnt);
+    if (fs_unmount(full_mnt) == 0) {
+        kprintf("umount: %s unmounted\n", full_mnt);
+        if (mount_drv && mount_drv->ops && mount_drv->ops->name && strcmp(mount_drv->ops->name, "fat32") == 0) {
+            extern void fat32_unmount_cleanup(void);
+            fat32_unmount_cleanup();
+        }
+        return 0;
+    } else {
+        kprintf("umount: failed to unmount %s\n", full_mnt);
+        return 1;
+    }
 }
 
 static int bi_close(cmd_ctx *c) {

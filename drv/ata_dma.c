@@ -19,6 +19,8 @@
 #include <devfs.h>
 #include <keyboard.h>
 
+#include "../inc/fat32.h"
+
 #define ATA_PRIMARY_IO      0x1F0
 #define ATA_PRIMARY_CTRL    0x3F6
 #define ATA_SECONDARY_IO    0x170
@@ -289,6 +291,23 @@ static void ata_register_device(uint16_t io_base, uint16_t ctrl_base, int is_sla
 	if (id >= 0 && id < 26) {
 		snprintf(devpath2, sizeof(devpath2), "/dev/sd%c", 'a' + id);
 		devfs_create_block_node(devpath2, id, sectors);
+	}
+	/* Attempt to auto-mount FAT32 devices under /mnt (Linux-like behavior) */
+	/* Probe device for FAT32 and mount at /mnt/sdX if successful */
+	if (fat32_probe_and_mount(id) == 0) {
+		char mntpath[32];
+		if (id >= 0 && id < 26) snprintf(mntpath, sizeof(mntpath), "/mnt/sd%c", 'a' + id);
+		else snprintf(mntpath, sizeof(mntpath), "/mnt/disk%d", id);
+		ramfs_mkdir("/mnt");
+		ramfs_mkdir(mntpath);
+		struct fs_driver *drv = fat32_get_driver();
+		if (drv) {
+			if (fs_mount(mntpath, drv) == 0) {
+				kprintf("fat32: auto-mounted device %d at %s\n", id, mntpath);
+			} else {
+				kprintf("fat32: auto-mount failed for device %d at %s\n", id, mntpath);
+			}
+		}
 	}
 	kprintf("ATA: found pio disk: \"%s\" model: \"%s\" size: %u MB\n", ata_devices[id].model, ata_devices[id].model, size_mb);
 }
