@@ -56,3 +56,7 @@ pci_device_t *pci_get_devices(void);
  * pci_find_device_by_id - find first device matching vendor/device id
  */
 pci_device_t *pci_find_device_by_id(uint16_t vendor_id, uint16_t device_id);
+
+uint16_t pci_config_read_word(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset);
+void pci_config_write_word(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint16_t value);
+uint8_t pci_config_read_byte(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset);

@@ -1,6 +1,172 @@
 #include <string.h>
 #include <heap.h>
 
+// Простое преобразование hex строки в число (без 0x префикса)
+uint32_t simple_hex_to_u32(const char* str) {
+    uint32_t result = 0;
+    
+    if (!str) return 0;
+    
+    // Пропускаем пробелы
+    while (*str == ' ' || *str == '\t') str++;
+    
+    // Пропускаем "0x" если есть
+    if (str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) {
+        str += 2;
+    }
+    
+    while (*str) {
+        char c = *str;
+        uint8_t digit;
+        
+        if (c >= '0' && c <= '9') {
+            digit = c - '0';
+        } else if (c >= 'a' && c <= 'f') {
+            digit = c - 'a' + 10;
+        } else if (c >= 'A' && c <= 'F') {
+            digit = c - 'A' + 10;
+        } else {
+            break;
+        }
+        
+        result = (result << 4) | digit;
+        str++;
+    }
+    
+    return result;
+}
+
+// Простое преобразование dec строки в число  
+uint32_t simple_dec_to_u32(const char* str) {
+    uint32_t result = 0;
+    
+    if (!str) return 0;
+    
+    // Пропускаем пробелы
+    while (*str == ' ' || *str == '\t') str++;
+    
+    while (*str >= '0' && *str <= '9') {
+        result = result * 10 + (*str - '0');
+        str++;
+    }
+    
+    return result;
+}
+
+// Копирование строки с выделением памяти
+char* strdup(const char* str) {
+    if (!str) return NULL;
+    
+    size_t len = strlen(str) + 1;
+    char* copy = kmalloc(len);
+    if (copy) {
+        memcpy(copy, str, len);
+    }
+    return copy;
+}
+
+// Проверка символа на hex цифру
+int isxdigit(int c) {
+    return (c >= '0' && c <= '9') || 
+           (c >= 'a' && c <= 'f') || 
+           (c >= 'A' && c <= 'F');
+}
+
+// Проверка символа на пробел (табуляция и т.д.)
+int isspace(int c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+// Проверка символа на цифру
+int isdigit(int c) {
+    return (c >= '0' && c <= '9');
+}
+
+// Сравнение строк без учета регистра
+int strcasecmp(const char* s1, const char* s2) {
+    if (!s1 || !s2) {
+        if (!s1 && !s2) return 0;
+        return s1 ? 1 : -1;
+    }
+    
+    while (*s1 && *s2) {
+        char c1 = *s1, c2 = *s2;
+        
+        // Приводим к нижнему регистру
+        if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+        if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+        
+        if (c1 != c2) return (int)(unsigned char)c1 - (int)(unsigned char)c2;
+        s1++;
+        s2++;
+    }
+    
+    return (int)(unsigned char)*s1 - (int)(unsigned char)*s2;
+}
+
+// Поиск символа в строке (для разделителей)
+char* strpbrk(const char* s, const char* accept) {
+    if (!s || !accept) return NULL;
+    
+    while (*s) {
+        const char* a = accept;
+        while (*a) {
+            if (*s == *a) return (char*)s;
+            a++;
+        }
+        s++;
+    }
+    return NULL;
+}
+
+// Поиск последнего вхождения любого символа из accept
+char* strrpbrk(const char* s, const char* accept) {
+    if (!s || !accept) return NULL;
+    
+    char* last = NULL;
+    while (*s) {
+        const char* a = accept;
+        while (*a) {
+            if (*s == *a) {
+                last = (char*)s;
+                break;
+            }
+            a++;
+        }
+        s++;
+    }
+    return last;
+}
+
+// Преобразует hex строку в число (с поддержкой 0x)
+uint32_t hex_str_to_u32(const char* str) {
+    return simple_hex_to_u32(str);
+}
+
+// Преобразует dec строку в число
+uint32_t dec_str_to_u32(const char* str) {
+    return simple_dec_to_u32(str);
+}
+
+// Функция для быстрого парсинга чисел из строк (десятичных или шестнадцатеричных)
+int parse_number(const char* str, uint32_t* result) {
+    if (!str || !result) return -1;
+    
+    // Пропускаем пробелы
+    while (isspace(*str)) str++;
+    
+    if (*str == '\0') return -1;
+    
+    // Проверяем формат
+    if (str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) {
+        *result = hex_str_to_u32(str);
+    } else {
+        *result = dec_str_to_u32(str);
+    }
+    
+    return 0;
+}
+
 // Вычисляет длину строки
 size_t strlen(const char* str) {
         size_t len = 0;

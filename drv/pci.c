@@ -25,12 +25,48 @@ static inline uint32_t pci_make_address(uint8_t bus, uint8_t device,
                       (offset & 0xFC));
 }
 
+// ==================== Чтение конфигурационного пространства PCI ====================
+
 uint32_t pci_config_read_dword(uint8_t bus, uint8_t device,
                                uint8_t function, uint8_t offset)
 {
     uint32_t addr = pci_make_address(bus, device, function, offset);
     outportl(PCI_CONFIG_ADDRESS, addr);
     return inportl(PCI_CONFIG_DATA);
+}
+
+// ДОБАВЛЕНО: Чтение 16-битного слова из конфигурационного пространства PCI
+uint16_t pci_config_read_word(uint8_t bus, uint8_t device,
+                              uint8_t function, uint8_t offset)
+{
+    // Читаем полное 32-битное значение
+    uint32_t dword = pci_config_read_dword(bus, device, function, offset & 0xFC);
+    
+    // Извлекаем нужное 16-битное слово
+    if (offset & 0x02) {
+        // Верхнее слово (биты 16-31)
+        return (uint16_t)(dword >> 16);
+    } else {
+        // Нижнее слово (биты 0-15)
+        return (uint16_t)dword;
+    }
+}
+
+// ДОБАВЛЕНО: Чтение 8-битного байта из конфигурационного пространства PCI
+uint8_t pci_config_read_byte(uint8_t bus, uint8_t device,
+                             uint8_t function, uint8_t offset)
+{
+    // Читаем полное 32-битное значение
+    uint32_t dword = pci_config_read_dword(bus, device, function, offset & 0xFC);
+    
+    // Извлекаем нужный байт
+    switch (offset & 0x03) {
+        case 0: return (uint8_t)(dword & 0xFF);
+        case 1: return (uint8_t)((dword >> 8) & 0xFF);
+        case 2: return (uint8_t)((dword >> 16) & 0xFF);
+        case 3: return (uint8_t)((dword >> 24) & 0xFF);
+    }
+    return 0;
 }
 
 void pci_config_write_dword(uint8_t bus, uint8_t device,
@@ -40,6 +76,8 @@ void pci_config_write_dword(uint8_t bus, uint8_t device,
     outportl(PCI_CONFIG_ADDRESS, addr);
     outportl(PCI_CONFIG_DATA, value);
 }
+
+// ==================== Инициализация PCI ====================
 
 void pci_init(void)
 {
@@ -110,6 +148,120 @@ pci_device_t *pci_find_device_by_id(uint16_t vendor_id, uint16_t device_id)
     return NULL;
 }
 
+// ==================== Утилиты PCI ====================
+
+// ДОБАВЛЕНО: Получение типа BAR (IO или MMIO)
+int pci_bar_is_io(uint32_t bar) {
+    return (bar & 0x1) != 0;
+}
+
+// ДОБАВЛЕНО: Получение адреса из BAR
+uintptr_t pci_bar_get_address(uint32_t bar) {
+    if (bar & 0x1) {
+        // IO порт
+        return bar & ~0x3;
+    } else {
+        // MMIO
+        return bar & ~0xF;
+    }
+}
+
+// ДОБАВЛЕНО: Получение размера BAR
+uint32_t pci_bar_get_size(uint8_t bus, uint8_t device, uint8_t function, int bar_num) {
+    uint32_t bar = pci_config_read_dword(bus, device, function, 0x10 + bar_num * 4);
+    if (bar == 0 || bar == 0xFFFFFFFF) {
+        return 0;
+    }
+    
+    // Сохраняем оригинальное значение
+    pci_config_write_dword(bus, device, function, 0x10 + bar_num * 4, 0xFFFFFFFF);
+    
+    // Читаем размер
+    uint32_t size_mask = pci_config_read_dword(bus, device, function, 0x10 + bar_num * 4);
+    
+    // Восстанавливаем оригинальное значение
+    pci_config_write_dword(bus, device, function, 0x10 + bar_num * 4, bar);
+    
+    // Обрабатываем IO порты
+    if (bar & 0x1) {
+        size_mask &= ~0x3;
+        size_mask = ~size_mask + 1;
+        return size_mask & 0xFFFF;
+    }
+    
+    // Обрабатываем MMIO
+    size_mask &= ~0xF;
+    size_mask = ~size_mask + 1;
+    return size_mask;
+}
+
+// ДОБАВЛЕНО: Поиск всех устройств по vendor ID
+int pci_find_devices_by_vendor(uint16_t vendor_id, pci_device_t** result, int max_results) {
+    int found = 0;
+    for (int i = 0; i < pci_device_count && found < max_results; i++) {
+        if (pci_devices[i].vendor_id == vendor_id) {
+            result[found++] = &pci_devices[i];
+        }
+    }
+    return found;
+}
+
+// ДОБАВЛЕНО: Поиск устройств по классу
+int pci_find_devices_by_class(uint8_t class_code, uint8_t subclass, pci_device_t** result, int max_results) {
+    int found = 0;
+    for (int i = 0; i < pci_device_count && found < max_results; i++) {
+        if (pci_devices[i].class_code == class_code && pci_devices[i].subclass == subclass) {
+            result[found++] = &pci_devices[i];
+        }
+    }
+    return found;
+}
+
+// ДОБАВЬТЕ в pci.c после функции pci_config_read_byte:
+
+// Запись 16-битного слова в конфигурационное пространство PCI
+void pci_config_write_word(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint16_t value) {
+    // Читаем текущее 32-битное значение
+    uint32_t dword = pci_config_read_dword(bus, device, function, offset & 0xFC);
+    
+    // Изменяем нужное 16-битное слово
+    if (offset & 0x02) {
+        // Верхнее слово (биты 16-31)
+        dword = (dword & 0x0000FFFF) | ((uint32_t)value << 16);
+    } else {
+        // Нижнее слово (биты 0-15)
+        dword = (dword & 0xFFFF0000) | (uint32_t)value;
+    }
+    
+    // Записываем обратно
+    pci_config_write_dword(bus, device, function, offset & 0xFC, dword);
+}
+
+// Запись 8-битного байта в конфигурационное пространство PCI
+void pci_config_write_byte(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint8_t value) {
+    // Читаем текущее 32-битное значение
+    uint32_t dword = pci_config_read_dword(bus, device, function, offset & 0xFC);
+    
+    // Изменяем нужный байт
+    switch (offset & 0x03) {
+        case 0:
+            dword = (dword & 0xFFFFFF00) | (uint32_t)value;
+            break;
+        case 1:
+            dword = (dword & 0xFFFF00FF) | ((uint32_t)value << 8);
+            break;
+        case 2:
+            dword = (dword & 0xFF00FFFF) | ((uint32_t)value << 16);
+            break;
+        case 3:
+            dword = (dword & 0x00FFFFFF) | ((uint32_t)value << 24);
+            break;
+    }
+    
+    // Записываем обратно
+    pci_config_write_dword(bus, device, function, offset & 0xFC, dword);
+}
+
 void pci_dump_devices(void)
 {
     pci_device_t *devs = pci_get_devices();
@@ -127,8 +279,24 @@ void pci_dump_devices(void)
                     d->vendor_id, d->device_id,
                     d->class_code, d->subclass, d->prog_if,
                     d->header_type, d->irq);
+        
+        // ДОБАВЛЕНО: Вывод BAR информации
+        for (int bar = 0; bar < 6; bar++) {
+            if (d->bar[bar] != 0 && d->bar[bar] != 0xFFFFFFFF) {
+                if (d->bar[bar] & 0x1) {
+                    kprintf("    BAR%d: IO port 0x%04x\n", bar, d->bar[bar] & ~0x3);
+                } else {
+                    kprintf("    BAR%d: MMIO 0x%08x", bar, d->bar[bar] & ~0xF);
+                    if (d->bar[bar] & 0x4) kprintf(" (64-bit)");
+                    if (d->bar[bar] & 0x2) kprintf(" (prefetchable)");
+                    kprintf("\n");
+                }
+            }
+        }
     }
 }
+
+// ==================== SysFS поддержка ====================
 
 static char hex_digit(uint8_t v) {
     return (v < 10) ? ('0' + v) : ('a' + (v - 10));

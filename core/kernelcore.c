@@ -16,6 +16,7 @@
 #include <apic.h>
 #include <apic_timer.h>
 #include <stat.h>
+#include <mmio.h>
 
 #include <iothread.h>
 #include <fs.h>
@@ -255,6 +256,9 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
     paging_init();
     heap_init(0, 0);
 
+    // MMIO инициализация (ДОБАВЛЕНО)
+    mmio_init();
+
     // Включаем прерывания
     asm volatile("sti");
 
@@ -274,9 +278,68 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
         kprintf("APIC: using PIT\n");
         apic_timer_stop();
     }
-
+    
     pci_init();
     pci_dump_devices();
+
+    kprintf("\nScanning for network cards...\n");
+    int network_cards = 0;
+    int rtl8139_found = 0;
+    int intel_cards = 0;
+    
+    for (int bus = 0; bus < 256; bus++) {
+        for (int slot = 0; slot < 32; slot++) {
+            uint32_t pci_data = pci_config_read_dword(bus, slot, 0, 0);
+            uint16_t vendor = pci_data & 0xFFFF;
+            if (vendor == 0xFFFF) continue;
+            
+            uint16_t device = (pci_data >> 16) & 0xFFFF;
+            
+            // Проверяем класс устройства
+            uint32_t class_data = pci_config_read_dword(bus, slot, 0, 0x08);
+            uint8_t class_code = (class_data >> 24) & 0xFF;
+            
+            if (class_code == 0x02) {  // Network controller
+                network_cards++;
+                
+                if (vendor == 0x10EC && device == 0x8139) {
+                    kprintf("  RTL8139 at %02x:%02x.0\n", bus, slot);
+                    rtl8139_found++;
+                    
+                    // Инициализация RTL8139 (ДОБАВЛЕНО)
+                    if (rtl8139_found == 1) { // Инициализируем только первую найденную
+                        if (rtl8139_init(bus, slot, 0) == 0) {
+                            uint8_t mac[6];
+                            rtl8139_get_mac(mac);
+                            kprintf("    MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+                        }
+                    }
+                } 
+                else if (vendor == 0x8086) {
+                    kprintf("  Intel %04x at %02x:%02x.0\n", device, bus, slot);
+                    intel_cards++;
+                }
+                else {
+                    kprintf("  Network: %04x:%04x at %02x:%02x.0\n", 
+                           vendor, device, bus, slot);
+                }
+            }
+        }
+    }
+    
+    if (network_cards == 0) {
+        kprintf("  No network cards found\n");
+    } else {
+        kprintf("  Found %d network card(s)\n", network_cards);
+        if (intel_cards > 0) {
+            kprintf("  Intel network card ready for driver development\n");
+        }
+        if (rtl8139_found > 0) {
+            kprintf("  RTL8139 driver initialized\n");
+        }
+    }
+    
     intel_chipset_init();
     thread_init();
     iothread_init();

@@ -11,6 +11,7 @@
 #include "../inc/ramfs.h"
 #include "../inc/osh_line.h"
 #include "../inc/user.h"
+#include "../inc/mmio.h"
 // local prototype for kprintf
 void kprintf(const char* fmt, ...);
 /* snprintf is implemented in drv/vga.c, declare it here */
@@ -67,6 +68,8 @@ static const char* var_get(const char* name){
     (void)var_lookup(name, &val);
     return val;
 }
+
+extern int mmio_command(int argc, char** argv);
 
 static void var_set(const char* name, const char* value){
     if (!name) return;
@@ -1941,6 +1944,14 @@ static int bi_help(cmd_ctx *c) {
     return 0;
 }
 
+static int bi_mmio(cmd_ctx *c) {
+    return mmio_command(c->argc, c->argv);
+}
+
+static int bi_rtl8139(cmd_ctx *c) {
+    return rtl8139_command(c->argc, c->argv);
+}
+
 extern void ascii_art(void);
 static int bi_art(cmd_ctx *c){ (void)c; ascii_art(); return 0; }
 typedef int (*builtin_fn)(cmd_ctx*);
@@ -1956,7 +1967,8 @@ static const builtin builtin_table[] = {
     {"edit", bi_edit}, {"reboot", bi_reboot}, {"shutdown", bi_shutdown}, {"mem", bi_mem},
     {"osh", bi_osh}, {"art", bi_art}, {"pause", bi_pause}, {"chipset", bi_chipset}, {"help", bi_help},
     {"passwd", bi_passwd}, {"su", bi_su}, {"whoami", bi_whoami}, {"mkpasswd", bi_mkpasswd}, {"groups", bi_groups},
-    {"useradd", bi_useradd}, {"groupadd", bi_groupadd}, {"chmod", bi_chmod}
+    {"useradd", bi_useradd}, {"groupadd", bi_groupadd}, {"chmod", bi_chmod}, {"mmio", bi_mmio},
+    {"rtl8139", bi_rtl8139}
 };
 static int bi_chmod(cmd_ctx *c) {
     if (c->argc < 3) { kprintf("usage: chmod <mode> <path>\n"); return 1; }

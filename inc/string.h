@@ -32,8 +32,14 @@ void itoa(int value, char* str, int base);
 void utoa(uint32_t value, char* str, int base);
 int atoi(const char* str);
 void reverse(char* str, size_t length);
-
 size_t strnlen(const char* s, size_t maxlen);
 
+uint32_t simple_hex_to_u32(const char* str);
+uint32_t simple_dec_to_u32(const char* str);
+char* strdup(const char* str);
+int isxdigit(int c);
+int isspace(int c);
+int strcasecmp(const char* s1, const char* s2);
+char* strpbrk(const char* s, const char* accept);
 
 #endif // STRING_H
