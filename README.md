@@ -47,7 +47,7 @@
 | 🏃 Scheduler | Task management & lightweight scheduler |
 | 🚀 Boot | Fast boot and clean modular codebase |
 | 🐍 Build | Cross-platform build support |
-| 🧩 Open | Fully open-source — learn, modify, improve оно? |
+| 🧩 Open | Fully open-source — learn, modify, improve |
 
 </div>
 
@@ -90,4 +90,3 @@ make clean && make && make run
 <p align="center">
   © 2025 AxonOS Project — Made with 🖤 by the community
 </p>
----
