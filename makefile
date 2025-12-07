@@ -75,7 +75,7 @@ iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg
 	}
 
 run: iso
-	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 64M -serial stdio
+	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 64M -net nic,model=rtl8139 -net user -serial stdio
 
 clean:
 	@rm -rf $(BUILD_DIR)
