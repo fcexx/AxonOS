@@ -43,6 +43,27 @@ struct devfs_block {
 };
 static struct devfs_block dev_blocks[16];
 static int dev_block_count = 0;
+static uint32_t devfs_rand_state = 0x12345678;
+/* special device names exposed under /dev */
+static const char *devfs_special_names[] = { "null", "zero", "random", "stdin", "stdout", "stderr", "urandom" };
+static const int devfs_special_count = sizeof(devfs_special_names) / sizeof(devfs_special_names[0]);
+
+/* entropy and RNG state */
+static uint32_t devfs_entropy = 0;
+static int devfs_random_waiters[16];
+static int devfs_random_waiters_count = 0;
+
+/* simple ring buffers for /dev/stdout and /dev/stderr to allow reading */
+typedef struct {
+    char *buf;
+    size_t head;
+    size_t tail;
+    size_t cap;
+    spinlock_t lock;
+    int waiters[8];
+    int waiters_count;
+} stdio_ring_t;
+static stdio_ring_t stdio_bufs[2]; /* 0 = stdout, 1 = stderr */
 
 /* helper: get tty index from path like /dev/ttyN */
 static int devfs_path_to_tty(const char *path) {
@@ -115,6 +136,27 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
         *out_file = f;
         return 0;
     }
+    /* special device nodes like /dev/null, /dev/zero, /dev/random, /dev/stdin/out/err */
+    for (int si = 0; si < devfs_special_count; si++) {
+        char spath[32];
+        snprintf(spath, sizeof(spath), "/dev/%s", devfs_special_names[si]);
+        if (strcmp(path, spath) == 0) {
+            struct fs_file *f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
+            if (!f) return -1;
+            memset(f, 0, sizeof(*f));
+            f->path = (const char*)kmalloc(strlen(path) + 1);
+            strcpy((char*)f->path, path);
+            f->fs_private = &devfs_driver_data;
+            int *ptype = (int*)kmalloc(sizeof(int));
+            if (!ptype) { kfree((void*)f->path); kfree(f); return -1; }
+            *ptype = 0x80000000 | si;
+            f->driver_private = (void*)ptype;
+            f->type = FS_TYPE_REG;
+            f->size = 0;
+            *out_file = f;
+            return 0;
+        }
+    }
     int tty = devfs_path_to_tty(path);
     if (tty < 0) return -1;
     struct fs_file *f = devfs_alloc_file(path, tty);
@@ -178,6 +220,83 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             return (ssize_t)copied;
         }
     }
+    /* special devices via driver_private marker */
+    if (file->driver_private) {
+        int marker = *(int*)file->driver_private;
+        if ((marker & 0x80000000) == 0x80000000) {
+            int si = marker & 0x7FFFFFFF;
+            switch (si) {
+                case 0: return 0; /* /dev/null */
+                case 1: memset(buf, 0, size); return (ssize_t)size; /* /dev/zero */
+                case 2: { /* /dev/random: non-blocking like /dev/urandom (always generate) */
+                    uint8_t *p = (uint8_t*)buf;
+                    for (size_t i = 0; i < size; i++) {
+                        devfs_rand_state ^= devfs_rand_state << 13;
+                        devfs_rand_state ^= devfs_rand_state >> 17;
+                        devfs_rand_state ^= devfs_rand_state << 5;
+                        p[i] = (uint8_t)(devfs_rand_state & 0xFF);
+                    }
+                    return (ssize_t)size;
+                }
+                case 3: { /* /dev/stdin -> map to console tty */
+                    /* Map /dev/stdin to the tty attached to current thread if present,
+                       otherwise to the active console. */
+                    thread_t *cur = thread_current();
+                    int tty_idx = (cur && cur->attached_tty >= 0) ? cur->attached_tty : devfs_get_active();
+                    struct devfs_tty *tstdin = &dev_ttys[tty_idx];
+                    file->driver_private = (void*)tstdin;
+                    break;
+                }
+                case 6: { /* /dev/urandom - non-blocking random */
+                    uint8_t *p = (uint8_t*)buf;
+                    for (size_t i=0;i<size;i++) {
+                        devfs_rand_state ^= devfs_rand_state << 13;
+                        devfs_rand_state ^= devfs_rand_state >> 17;
+                        devfs_rand_state ^= devfs_rand_state << 5;
+                        p[i] = (uint8_t)(devfs_rand_state & 0xFF);
+                    }
+                    return (ssize_t)size;
+                }
+                default: break;
+            }
+        }
+    }
+    /* Support reading from /dev/stdout and /dev/stderr ring buffers */
+    if (file->path) {
+        if (strcmp(file->path, "/dev/stdout") == 0 || strcmp(file->path, "/dev/stderr") == 0) {
+            int which = (strcmp(file->path, "/dev/stdout") == 0) ? 0 : 1;
+            stdio_ring_t *rb = &stdio_bufs[which];
+            size_t got = 0;
+            char *outp = (char*)buf;
+            for (;;) {
+                unsigned long flags = 0;
+                acquire_irqsave(&rb->lock, &flags);
+                if (rb->head != rb->tail) {
+                    outp[got++] = rb->buf[rb->head];
+                    rb->head = (rb->head + 1) % rb->cap;
+                    /* wake writers not needed */
+                    release_irqrestore(&rb->lock, flags);
+                    if (got >= size) break;
+                    continue;
+                }
+                /* empty: block current thread until data written */
+                thread_t *cur = thread_current();
+                if (cur && cur->tid != 0) {
+                    if (rb->waiters_count < (int)(sizeof(rb->waiters)/sizeof(rb->waiters[0]))) {
+                        rb->waiters[rb->waiters_count++] = (int)cur->tid;
+                    }
+                    release_irqrestore(&rb->lock, flags);
+                    thread_block((int)cur->tid);
+                    thread_yield();
+                    continue;
+                } else {
+                    release_irqrestore(&rb->lock, flags);
+                    break;
+                }
+            }
+            return (ssize_t)got;
+        }
+    }
     /* directory read */
     if (file->type == FS_TYPE_DIR && file->driver_private) {
         uint8_t *out = (uint8_t*)buf;
@@ -185,7 +304,8 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
         size_t written = 0;
     /* include ttys + console + any registered block devices */
     int total_entries = (DEVFS_TTY_COUNT + 1) + dev_block_count;
-    for (int i = 0; i < total_entries; i++) {
+    int total_with_special = (DEVFS_TTY_COUNT + 1) + devfs_special_count + dev_block_count;
+    for (int i = 0; i < total_with_special; i++) {
             const char *nm;
             char tmpn[64];
             if (i == 0) {
@@ -195,9 +315,13 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                 tmpn[3] = '0' + (char)(i-1);
                 tmpn[4] = '\0';
                 nm = tmpn;
+            } else if (i <= DEVFS_TTY_COUNT + devfs_special_count) {
+                int si = i - (DEVFS_TTY_COUNT + 1);
+                if (si >=0 && si < devfs_special_count) nm = devfs_special_names[si];
+                else nm = "";
             } else {
                 /* block device entries stored in dev_blocks[] */
-                int bi = i - (DEVFS_TTY_COUNT + 1);
+                int bi = i - (DEVFS_TTY_COUNT + 1 + devfs_special_count);
                 const char *path = dev_blocks[bi].path;
                 const char *last = strrchr(path, '/');
                 if (last) nm = last + 1;
@@ -278,6 +402,40 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
 static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, size_t offset) {
     (void)offset;
     if (!file || !buf) return -1;
+    /* special devices via driver_private marker: handle /dev/null, /dev/zero, /dev/random writes */
+    if (file->driver_private) {
+        uintptr_t dp = (uintptr_t)file->driver_private;
+        if (!(dp >= (uintptr_t)&dev_ttys[0] && dp < (uintptr_t)&dev_ttys[DEVFS_TTY_COUNT])) {
+            /* likely a marker pointer */
+            int marker = *(int*)file->driver_private;
+            if ((marker & 0x80000000) == 0x80000000) {
+                int si = marker & 0x7FFFFFFF;
+                switch (si) {
+                    case 0: /* /dev/null */ return (ssize_t)size;
+                    case 1: /* /dev/zero */ return (ssize_t)size;
+                    case 2: /* /dev/random - mix written bytes into RNG state and accept */
+                    {
+                        const uint8_t *p = (const uint8_t*)buf;
+                        for (size_t i = 0; i < size; i++) {
+                            devfs_rand_state ^= (uint32_t)p[i];
+                            devfs_rand_state = (devfs_rand_state << 5) | (devfs_rand_state >> 27);
+                        }
+                        /* increase entropy estimate and wake any random waiters */
+                        devfs_entropy += (uint32_t)size;
+                        if (devfs_random_waiters_count > 0) {
+                            for (int wi = 0; wi < devfs_random_waiters_count; wi++) {
+                                int tid = devfs_random_waiters[wi];
+                                if (tid >= 0) thread_unblock(tid);
+                            }
+                            devfs_random_waiters_count = 0;
+                        }
+                        return (ssize_t)size;
+                    }
+                    default: break;
+                }
+            }
+        }
+    }
     /* block device write? */
     for (int bi = 0; bi < dev_block_count; bi++) {
         if (file->driver_private == &dev_blocks[bi]) {
@@ -301,7 +459,38 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
             return (ssize_t)size;
         }
     }
-    struct devfs_tty *t = (struct devfs_tty*)file->driver_private;
+    /* Resolve driver_private: it may be either a pointer into dev_ttys (tty handle)
+       or a pointer to an allocated int marker for special devices (/dev/null, /dev/stdout, etc). */
+    void *dp = file->driver_private;
+    if (!dp) return -1;
+    struct devfs_tty *t = NULL;
+    uintptr_t p = (uintptr_t)dp;
+    if (p >= (uintptr_t)&dev_ttys[0] && p < (uintptr_t)&dev_ttys[DEVFS_TTY_COUNT]) {
+        /* already a tty pointer */
+        t = (struct devfs_tty*)dp;
+    } else {
+        /* assume marker pointer (allocated int) */
+        int marker = *(int*)dp;
+        if ((marker & 0x80000000) == 0x80000000) {
+            int si = marker & 0x7FFFFFFF;
+            if (si == 4 || si == 5) { /* stdout or stderr */
+                thread_t *cur = thread_current();
+                int tty = (cur && cur->attached_tty >= 0) ? cur->attached_tty : devfs_get_active();
+                t = &dev_ttys[tty];
+                /* update file handle to point directly to tty to avoid repeated marker derefs */
+                file->driver_private = (void*)t;
+            } else if (si == 3) {
+                /* /dev/stdin used for writing — map to console tty */
+                t = &dev_ttys[0];
+                file->driver_private = (void*)t;
+            } else {
+                /* other special devices are not writable here */
+                return -1;
+            }
+        } else {
+            return -1;
+        }
+    }
     if (!t) return -1;
     int idx = t->id;
     const char *s = (const char*)buf;
@@ -327,12 +516,54 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                 }
             }
         }
+        /* Also append written chars to stdout/stderr ring buffers if applicable */
+        if (file->path) {
+            int which = -1;
+            if (strcmp(file->path, "/dev/stdout") == 0) which = 0;
+            else if (strcmp(file->path, "/dev/stderr") == 0) which = 1;
+            if (which >= 0) {
+                stdio_ring_t *rb = &stdio_bufs[which];
+                unsigned long flags = 0;
+                acquire_irqsave(&rb->lock, &flags);
+                for (size_t ii = 0; ii < size; ii++) {
+                    char ch = ((const char*)buf)[ii];
+                    size_t next = (rb->tail + 1) % rb->cap;
+                    if (next != rb->head) {
+                        rb->buf[rb->tail] = ch;
+                        rb->tail = next;
+                    } else {
+                        /* buffer full: drop oldest */
+                        rb->head = (rb->head + 1) % rb->cap;
+                        rb->buf[rb->tail] = ch;
+                        rb->tail = (rb->tail + 1) % rb->cap;
+                    }
+                }
+                /* wake readers */
+                for (int wi = 0; wi < rb->waiters_count; wi++) {
+                    int tid = rb->waiters[wi];
+                    if (tid >= 0) thread_unblock(tid);
+                }
+                rb->waiters_count = 0;
+                release_irqrestore(&rb->lock, flags);
+            }
+        }
     }
     return (ssize_t)size;
 }
 
 static void devfs_release(struct fs_file *file) {
     if (!file) return;
+    // free driver_private if it was allocated for special device markers
+    if (file->driver_private) {
+        uintptr_t dp = (uintptr_t)file->driver_private;
+        uintptr_t base_tty = (uintptr_t)&dev_ttys[0];
+        uintptr_t end_tty = (uintptr_t)&dev_ttys[DEVFS_TTY_COUNT];
+        uintptr_t base_blk = (uintptr_t)&dev_blocks[0];
+        uintptr_t end_blk = (uintptr_t)&dev_blocks[dev_block_count];
+        if (!(dp >= base_tty && dp < end_tty) && !(dp >= base_blk && dp < end_blk)) {
+            kfree(file->driver_private);
+        }
+    }
     if (file->path) kfree((void*)file->path);
     kfree(file);
 }
@@ -351,6 +582,16 @@ int devfs_register(void) {
             for (uint32_t j=0;j<MAX_ROWS*MAX_COLS*2;j+=2) { dev_ttys[i].screen[j] = ' '; dev_ttys[i].screen[j+1] = GRAY_ON_BLACK; }
         }
     }
+    /* init stdio ring buffers */
+    for (int si = 0; si < 2; si++) {
+        stdio_bufs[si].cap = 4096;
+        stdio_bufs[si].buf = (char*)kmalloc(stdio_bufs[si].cap);
+        stdio_bufs[si].head = stdio_bufs[si].tail = 0;
+        stdio_bufs[si].lock.lock = 0;
+        stdio_bufs[si].waiters_count = 0;
+    }
+    devfs_entropy = 0;
+    devfs_random_waiters_count = 0;
     devfs_ops.name = "devfs";
     devfs_ops.create = devfs_create;
     devfs_ops.open = devfs_open;

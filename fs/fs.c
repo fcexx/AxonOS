@@ -165,7 +165,10 @@ struct fs_file *fs_create_file(const char *path) {
     struct fs_driver *mount_drv = fs_match_mount(path);
     if (mount_drv && mount_drv->ops && mount_drv->ops->create) {
         struct fs_file *file = NULL;
-        if (mount_drv->ops->create(path, &file) == 0) return file;
+        if (mount_drv->ops->create(path, &file) == 0) {
+            if (file) file->refcount = 1;
+            return file;
+        }
     }
     for (int i = 0; i < g_drivers_count; i++) {
         struct fs_driver *drv = g_drivers[i];

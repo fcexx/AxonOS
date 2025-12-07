@@ -54,14 +54,7 @@ void osh_history_add(const char* line) {
 
 static uint32_t measure_colorized_visible(const char* s) {
     if (!s) return 0;
-    uint32_t vis = 0;
-    const char* p = s;
-    while (*p) {
-        size_t ahead = strnlen(p, 6);
-        if (ahead >= 6 && p[0]=='<' && p[1]=='(' && p[4]==')' && p[5]=='>') { p += 6; continue; }
-        vis++; p++;
-    }
-    return vis;
+    return (uint32_t)strlen(s);
 }
 
 static void redraw_line_xy(uint32_t sx, uint32_t sy, const char* prompt, const char* buf, int len, int cur, const char* sugg, int sugg_len) {
@@ -85,7 +78,7 @@ static void redraw_line_xy(uint32_t sx, uint32_t sy, const char* prompt, const c
 
     if (need_full) {
         for (uint32_t x = sx; x < MAX_COLS; x++) vga_putch_xy(x, sy, ' ', GRAY_ON_BLACK);
-        (void)vga_write_colorized_xy(sx, sy, prompt, GRAY_ON_BLACK);
+        (void)vga_write_str_xy(sx, sy, prompt, GRAY_ON_BLACK);
     } else {
         if (prompt_len < last_prompt_len) {
             uint32_t clear_from = sx + prompt_len;
@@ -93,7 +86,7 @@ static void redraw_line_xy(uint32_t sx, uint32_t sy, const char* prompt, const c
             if (clear_to > MAX_COLS) clear_to = MAX_COLS;
             for (uint32_t x = clear_from; x < clear_to; x++) vga_putch_xy(x, sy, ' ', GRAY_ON_BLACK);
         }
-        (void)vga_write_colorized_xy(sx, sy, prompt, GRAY_ON_BLACK);
+        (void)vga_write_str_xy(sx, sy, prompt, GRAY_ON_BLACK);
     }
 
     if (px < MAX_COLS) {
@@ -318,6 +311,24 @@ static void complete_token(const char* cwd, char* buf, int* io_len, int* io_cur,
                     if (len + 1 < OSH_MAX_LINE-1) {
                         memmove(buf + cur + 1, buf + cur, (size_t)(len - cur + 1));
                         buf[cur] = '/';
+                        cur++; len++;
+                    }
+                } else {
+                    /* single match and not a directory -> append space (like bash) */
+                    if (len + 1 < OSH_MAX_LINE-1) {
+                        if (cur >= len || !is_sep(buf[cur])) {
+                            memmove(buf + cur + 1, buf + cur, (size_t)(len - cur + 1));
+                            buf[cur] = ' ';
+                            cur++; len++;
+                        }
+                    }
+                }
+            } else {
+                /* candidate not found in filesystem -> likely a builtin; append space */
+                if (len + 1 < OSH_MAX_LINE-1) {
+                    if (cur >= len || !is_sep(buf[cur])) {
+                        memmove(buf + cur + 1, buf + cur, (size_t)(len - cur + 1));
+                        buf[cur] = ' ';
                         cur++; len++;
                     }
                 }

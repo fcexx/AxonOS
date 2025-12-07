@@ -16,6 +16,20 @@
 #endif
 #define kprintf(...) do {} while(0)
 
+/* local helper: strip matching leading/trailing quotes from a string in-place */
+static void strip_matching_quotes_local(char *s) {
+    if (!s) return;
+    size_t len = strlen(s);
+    if (len >= 2) {
+        char first = s[0];
+        char last = s[len - 1];
+        if ((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
+            memmove(s, s + 1, len - 2);
+            s[len - 2] = '\0';
+        }
+    }
+}
+
 /* Minimal read-only FAT32 implementation supporting:
    - mount from a block device (partition or raw)
    - short (8.3) name lookup and directory listing
@@ -205,36 +219,86 @@ static int fat32_open(const char *path, struct fs_file **out_file) {
     while (1) {
         uint32_t lba = cluster_to_lba(g_fat, cluster);
         if (read_sectors(g_fat->device_id, lba, buf, g_fat->sectors_per_cluster) != 0) { kfree(buf); return -1; }
+        /* prepare LFN temporary storage for this sector */
+        uint16_t lfn_u16[20][13];
+        int lfn_u16_len[20];
+        memset(lfn_u16_len, 0, sizeof(lfn_u16_len));
+        int lfn_present = 0, lfn_count = 0;
         for (uint32_t off = 0; off + 32 <= bytes_per_cluster; off += 32) {
             uint8_t first = buf[off];
             if (first == 0x00) { /* end of directory */ kfree(buf); return -1; }
-            if (first == 0xE5) continue; /* deleted */
+            if (first == 0xE5) { lfn_present = 0; lfn_count = 0; continue; } /* deleted */
             uint8_t attr = buf[off + 11];
-            if (attr == 0x0F) continue; /* LFN, skip */
-            char shortname[13];
-            /* build 8.3 name */
-            int p = 0;
-            for (int i = 0; i < 8; i++) {
-                char c = buf[off + i];
-                if (c == ' ') continue;
-                shortname[p++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
-            }
-            if (buf[off+8] != ' ') {
-                int extstart = p;
-                for (int i = 0; i < 3; i++) {
-                    char c = buf[off + 8 + i];
-                    if (c == ' ') continue;
-                    shortname[p++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+            if (attr == 0x0F) {
+                /* LFN entry: store UTF-16LE pieces */
+                uint8_t seq = buf[off] & 0x1F;
+                if (seq == 0 || seq > 20) { lfn_present = 0; lfn_count = 0; continue; }
+                int p = 0;
+                for (int i = 0; i < 5; i++) {
+                    uint16_t ch = *(uint16_t*)(buf + off + 1 + i*2);
+                    if (ch == 0x0000 || ch == 0xFFFF) break;
+                    if (p < 13) lfn_u16[seq-1][p++] = ch;
                 }
+                for (int i = 0; i < 6; i++) {
+                    uint16_t ch = *(uint16_t*)(buf + off + 14 + i*2);
+                    if (ch == 0x0000 || ch == 0xFFFF) break;
+                    if (p < 13) lfn_u16[seq-1][p++] = ch;
+                }
+                for (int i = 0; i < 2; i++) {
+                    uint16_t ch = *(uint16_t*)(buf + off + 28 + i*2);
+                    if (ch == 0x0000 || ch == 0xFFFF) break;
+                    if (p < 13) lfn_u16[seq-1][p++] = ch;
+                }
+                lfn_u16_len[seq-1] = p;
+                lfn_present = 1;
+                if (buf[off] & 0x40) lfn_count = (int)(buf[off] & 0x1F);
+                continue;
             }
-            shortname[p] = '\0';
+            /* short entry: either match via assembled LFN or via shortname */
+            char namebuf[512];
+            if (lfn_present && lfn_count > 0) {
+                int pos = 0;
+                for (int si = 0; si < lfn_count; si++) {
+                    if (lfn_u16_len[si] <= 0) continue;
+                    char tmputf[128];
+                    int conv = utf16le_to_utf8(lfn_u16[si], lfn_u16_len[si], tmputf, sizeof(tmputf));
+                    if (conv > 0) {
+                        for (int k = 0; k < conv && pos < (int)sizeof(namebuf)-1; k++) namebuf[pos++] = tmputf[k];
+                    }
+                }
+                namebuf[pos] = '\0';
+            } else {
+                /* build 8.3 name */
+                int p = 0;
+                for (int i = 0; i < 8; i++) {
+                    char c = buf[off + i];
+                    if (c == ' ') continue;
+                    namebuf[p++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+                }
+                if (buf[off+8] != ' ') {
+                    for (int i = 0; i < 3; i++) {
+                        char c = buf[off + 8 + i];
+                        if (c == ' ') continue;
+                        namebuf[p++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+                    }
+                }
+                namebuf[p] = '\0';
+            }
             /* compare with requested name (case-insensitive) */
-            char lname[64];
+            char lname[256];
             size_t ln = strlen(name);
             if (ln >= sizeof(lname)) ln = sizeof(lname)-1;
             for (size_t i=0;i<ln;i++) { char c = name[i]; lname[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
             lname[ln] = '\0';
-            if (strcmp(shortname, lname) == 0) {
+            /* lowercase namebuf for comparison */
+            char lower_namebuf[512];
+            size_t nb_len = strlen(namebuf);
+            for (size_t i=0;i<nb_len && i<sizeof(lower_namebuf)-1;i++) {
+                char c = namebuf[i];
+                lower_namebuf[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+            }
+            lower_namebuf[nb_len] = '\0';
+            if (strcmp(lower_namebuf, lname) == 0) {
                 /* matched */
                 uint16_t high = *(uint16_t*)(buf + off + 20);
                 uint16_t low = *(uint16_t*)(buf + off + 26);
@@ -261,6 +325,8 @@ static int fat32_open(const char *path, struct fs_file **out_file) {
                 kfree(buf);
                 return 0;
             }
+            /* reset LFN state */
+            lfn_present = 0; lfn_count = 0;
         }
         /* next cluster */
         uint32_t next = fat32_read_fat_entry(g_fat, cluster);
@@ -329,8 +395,11 @@ static ssize_t fat32_read(struct fs_file *file, void *buf, size_t size, size_t o
         /* LFN handling: collect LFN entries that precede a short entry.
            LFN entries have attribute 0x0F and a sequence number (1..n), with last entry flagged 0x40.
         */
-        /* temp storage for LFN parts (max 20 parts -> 260 chars) */
-        char lfn_parts[20][14];
+        /* temp storage for LFN parts as UTF-16LE code units (max 20 parts * 13 u16) */
+        uint16_t lfn_u16[20][13];
+        int lfn_u16_len[20];
+        memset(lfn_u16_len, 0, sizeof(lfn_u16_len));
+        memset(lfn_u16, 0, sizeof(lfn_u16));
         int lfn_present = 0;
         int lfn_count = 0;
         for (uint32_t off = 0; off + 32 <= bytes_per_cluster; off += 32) {
@@ -342,27 +411,28 @@ static ssize_t fat32_read(struct fs_file *file, void *buf, size_t size, size_t o
                 /* LFN entry */
                 uint8_t seq = tmp[off] & 0x1F;
                 if (seq == 0 || seq > 20) { lfn_present = 0; lfn_count = 0; continue; }
-                /* extract up to 13 UTF-16 chars from name1/name2/name3 into lfn_parts[seq-1] as ASCII */
+                /* extract up to 13 UTF-16LE code units from name1/name2/name3 into lfn_u16[seq-1] */
                 int p = 0;
+                lfn_u16_len[seq-1] = 0;
                 /* name1: offsets 1..10 (5 UTF-16) */
                 for (int i = 0; i < 5; i++) {
                     uint16_t ch = *(uint16_t*)(tmp + off + 1 + i*2);
                     if (ch == 0x0000 || ch == 0xFFFF) break;
-                    lfn_parts[seq-1][p++] = (char)(ch & 0xFF);
+                    if (p < 13) lfn_u16[seq-1][p++] = ch;
                 }
                 /* name2: offsets 14..25 (6 UTF-16) */
                 for (int i = 0; i < 6; i++) {
                     uint16_t ch = *(uint16_t*)(tmp + off + 14 + i*2);
                     if (ch == 0x0000 || ch == 0xFFFF) break;
-                    lfn_parts[seq-1][p++] = (char)(ch & 0xFF);
+                    if (p < 13) lfn_u16[seq-1][p++] = ch;
                 }
                 /* name3: offsets 28..31 (2 UTF-16) */
                 for (int i = 0; i < 2; i++) {
                     uint16_t ch = *(uint16_t*)(tmp + off + 28 + i*2);
                     if (ch == 0x0000 || ch == 0xFFFF) break;
-                    lfn_parts[seq-1][p++] = (char)(ch & 0xFF);
+                    if (p < 13) lfn_u16[seq-1][p++] = ch;
                 }
-                lfn_parts[seq-1][p] = '\0';
+                lfn_u16_len[seq-1] = p;
                 lfn_present = 1;
                 if (tmp[off] & 0x40) {
                     /* last LFN entry indicates total count */
@@ -373,11 +443,15 @@ static ssize_t fat32_read(struct fs_file *file, void *buf, size_t size, size_t o
             /* short entry: assemble name from LFN if present */
             char namebuf[512];
             if (lfn_present && lfn_count > 0) {
-                /* assemble from lfn_parts [lfn_count-1 .. 0] */
+                /* assemble from lfn_u16 parts [0 .. lfn_count-1] converting UTF-16LE -> UTF-8 */
                 int pos = 0;
-                for (int si = lfn_count - 1; si >= 0; si--) {
-                    const char *part = lfn_parts[si];
-                    for (int k = 0; part[k]; k++) namebuf[pos++] = part[k];
+                for (int si = 0; si < lfn_count; si++) {
+                    if (lfn_u16_len[si] <= 0) continue;
+                    char tmputf[64];
+                    int conv = utf16le_to_utf8(lfn_u16[si], lfn_u16_len[si], tmputf, (int)sizeof(tmputf));
+                    if (conv > 0) {
+                        for (int k = 0; k < conv && pos < (int)sizeof(namebuf)-1; k++) namebuf[pos++] = tmputf[k];
+                    }
                 }
                 namebuf[pos] = '\0';
             } else {
@@ -569,18 +643,61 @@ static int utf8_to_utf16le(const char *s, uint16_t *out, size_t outcap) {
     return (int)oi;
 }
 
+/* Convert UTF-16LE array (in) of length inlen to UTF-8 bytes in out (outcap).
+   Returns number of bytes written, or -1 on error. */
+int utf16le_to_utf8(const uint16_t *in, int inlen, char *out, int outcap) {
+    if (!in || !out) return -1;
+    int op = 0;
+    for (int i = 0; i < inlen; i++) {
+        uint32_t code = (uint32_t)in[i];
+        if (code == 0xFFFF || code == 0x0000) break;
+        /* handle surrogate pairs */
+        if (code >= 0xD800 && code <= 0xDBFF) {
+            if (i + 1 >= inlen) return -1;
+            uint32_t low = (uint32_t)in[i+1];
+            if (low < 0xDC00 || low > 0xDFFF) return -1;
+            code = 0x10000 + (((code - 0xD800) << 10) | (low - 0xDC00));
+            i++;
+        }
+        if (code <= 0x7F) {
+            if (op + 1 >= outcap) return -1;
+            out[op++] = (char)code;
+        } else if (code <= 0x7FF) {
+            if (op + 2 >= outcap) return -1;
+            out[op++] = (char)(0xC0 | ((code >> 6) & 0x1F));
+            out[op++] = (char)(0x80 | (code & 0x3F));
+        } else if (code <= 0xFFFF) {
+            if (op + 3 >= outcap) return -1;
+            out[op++] = (char)(0xE0 | ((code >> 12) & 0x0F));
+            out[op++] = (char)(0x80 | ((code >> 6) & 0x3F));
+            out[op++] = (char)(0x80 | (code & 0x3F));
+        } else {
+            if (op + 4 >= outcap) return -1;
+            out[op++] = (char)(0xF0 | ((code >> 18) & 0x07));
+            out[op++] = (char)(0x80 | ((code >> 12) & 0x3F));
+            out[op++] = (char)(0x80 | ((code >> 6) & 0x3F));
+            out[op++] = (char)(0x80 | (code & 0x3F));
+        }
+    }
+    if (op >= outcap) return -1;
+    out[op] = '\0';
+    return op;
+}
+
 /* write LFN entries into directory buffer at offset 'off' using UTF-16LE array u16[] len 'ulen'.
    seq_count = number of LFN entries (ceiling(ulen/13)). short_checksum is checksum for 11-byte short name.
 */
 static void fat32_write_lfn_entries_to_buf(uint8_t *dirbuf, uint32_t off, const uint16_t *u16, int ulen, int seq_count, uint8_t short_checksum) {
-    /* write entries in reverse: last part first at off, then earlier */
+    /* write entries so that the entry nearest to the short entry contains seq == seq_count (last) */
     for (int i = 0; i < seq_count; i++) {
-        uint32_t entry_off = off + i * 32;
-        /* zero the entry */
-        for (int k = 0; k < 32; k++) dirbuf[entry_off + k] = 0xFF;
-        int part_index = seq_count - 1 - i; /* which part this entry contains */
+        /* place part i at entry index (seq_count - 1 - i) so that entry with seq==seq_count ends up just before short entry */
+        int entry_index = seq_count - 1 - i;
+        uint32_t entry_off = off + (uint32_t)entry_index * 32;
+        /* zero the entry (clear to 0) */
+        for (int k = 0; k < 32; k++) dirbuf[entry_off + k] = 0x00;
+        int part_index = i; /* which part this entry contains (0..seq_count-1) */
         uint8_t seqnum = (uint8_t)(part_index + 1);
-        if (i == 0) seqnum |= 0x40; /* last LFN entry */
+        if (part_index + 1 == seq_count) seqnum |= 0x40; /* last LFN entry flag on highest-seq */
         dirbuf[entry_off + 0] = seqnum;
         /* fill name1 (5 u16) */
         for (int j = 0; j < 5; j++) {
@@ -591,6 +708,9 @@ static void fat32_write_lfn_entries_to_buf(uint8_t *dirbuf, uint32_t off, const 
         dirbuf[entry_off + 11] = 0x0F;
         dirbuf[entry_off + 12] = 0;
         dirbuf[entry_off + 13] = short_checksum;
+        /* ensure cluster fields in LFN entry are zero */
+        dirbuf[entry_off + 20] = dirbuf[entry_off + 21] = 0;
+        dirbuf[entry_off + 26] = dirbuf[entry_off + 27] = 0;
         /* name2 (6 u16) */
         for (int j = 0; j < 6; j++) {
             int idx = part_index * 13 + 5 + j;
@@ -620,7 +740,10 @@ static int fat32_name_exists(const char *name) {
     while (1) {
         uint32_t lba = cluster_to_lba(g_fat, cluster);
         if (read_sectors(g_fat->device_id, lba, buf, g_fat->sectors_per_cluster) != 0) break;
-        char lfn_parts[20][14];
+        uint16_t lfn_u16[20][13];
+        int lfn_u16_len[20];
+        memset(lfn_u16_len, 0, sizeof(lfn_u16_len));
+        memset(lfn_u16, 0, sizeof(lfn_u16));
         int lfn_present = 0, lfn_count = 0;
         for (uint32_t off=0; off + 32 <= bytes_per_cluster; off += 32) {
             uint8_t first = buf[off];
@@ -631,10 +754,11 @@ static int fat32_name_exists(const char *name) {
                 uint8_t seq = buf[off] & 0x1F;
                 if (seq == 0 || seq > 20) { lfn_present = 0; lfn_count = 0; continue; }
                 int p=0;
-                for (int i=0;i<5;i++){ uint16_t ch = *(uint16_t*)(buf+off+1+i*2); if (ch==0x0000||ch==0xFFFF) break; lfn_parts[seq-1][p++]=(char)(ch&0xFF); }
-                for (int i=0;i<6;i++){ uint16_t ch = *(uint16_t*)(buf+off+14+i*2); if (ch==0x0000||ch==0xFFFF) break; lfn_parts[seq-1][p++]=(char)(ch&0xFF); }
-                for (int i=0;i<2;i++){ uint16_t ch = *(uint16_t*)(buf+off+28+i*2); if (ch==0x0000||ch==0xFFFF) break; lfn_parts[seq-1][p++]=(char)(ch&0xFF); }
-                lfn_parts[seq-1][p]=0;
+                lfn_u16_len[seq-1] = 0;
+                for (int i=0;i<5;i++){ uint16_t ch = *(uint16_t*)(buf+off+1+i*2); if (ch==0x0000||ch==0xFFFF) break; if (p<13) lfn_u16[seq-1][p++]=ch; }
+                for (int i=0;i<6;i++){ uint16_t ch = *(uint16_t*)(buf+off+14+i*2); if (ch==0x0000||ch==0xFFFF) break; if (p<13) lfn_u16[seq-1][p++]=ch; }
+                for (int i=0;i<2;i++){ uint16_t ch = *(uint16_t*)(buf+off+28+i*2); if (ch==0x0000||ch==0xFFFF) break; if (p<13) lfn_u16[seq-1][p++]=ch; }
+                lfn_u16_len[seq-1] = p;
                 lfn_present = 1;
                 if (buf[off] & 0x40) lfn_count = (int)(buf[off] & 0x1F);
                 continue;
@@ -643,7 +767,14 @@ static int fat32_name_exists(const char *name) {
             char namebuf[512];
             if (lfn_present && lfn_count>0) {
                 int pos=0;
-                for (int si=lfn_count-1; si>=0; si--) { const char *part = lfn_parts[si]; for (int k=0; part[k]; k++) namebuf[pos++]=part[k]; }
+                for (int si=lfn_count-1; si>=0; si--) {
+                    if (lfn_u16_len[si] <= 0) continue;
+                    char tmputf[64];
+                    int conv = utf16le_to_utf8(lfn_u16[si], lfn_u16_len[si], tmputf, sizeof(tmputf));
+                    if (conv > 0) {
+                        for (int k=0;k<conv && pos < (int)sizeof(namebuf)-1;k++) namebuf[pos++]=tmputf[k];
+                    }
+                }
                 namebuf[pos]=0;
             } else {
                 int p2=0;
@@ -670,9 +801,16 @@ static int fat32_create(const char *path, struct fs_file **out_file) {
     const char *p = strrchr(path, '/');
     const char *basename = p ? p+1 : path;
     if (!basename || !*basename) return -1;
+    /* Normalize basename: strip surrounding quotes if present */
+    char cleanname[256];
+    size_t bl_in = strlen(basename);
+    if (bl_in >= sizeof(cleanname)) bl_in = sizeof(cleanname) - 1;
+    memcpy(cleanname, basename, bl_in);
+    cleanname[bl_in] = '\0';
+    strip_matching_quotes_local(cleanname);
     /* Prevent duplicate filename */
-    if (fat32_name_exists(basename)) {
-        kprintf("fat32: create failed: name exists %s\n", basename);
+    if (fat32_name_exists(cleanname)) {
+        kprintf("fat32: create failed: name exists %s\n", cleanname);
         return -1;
     }
     uint32_t cluster = g_fat->root_cluster;
@@ -680,10 +818,10 @@ static int fat32_create(const char *path, struct fs_file **out_file) {
     uint8_t *buf = (uint8_t*)kmalloc(bytes_per_cluster);
     if (!buf) return -1;
     uint8_t shortname[11];
-    fat32_make_shortname(basename, shortname);
-    kprintf("fat32: creating %s in root\n", basename);
+    fat32_make_shortname(cleanname, shortname);
+    kprintf("fat32: creating %s in root\n", cleanname);
     /* Always use LFN (no 8.3 support). Compute LFN entries needed (13 u16 per entry). */
-    size_t bl = strlen(basename);
+    size_t bl = strlen(cleanname);
     int need_lfn = 1;
     int lfn_entries = (int)((bl + 12) / 13);
 
@@ -713,7 +851,7 @@ static int fat32_create(const char *path, struct fs_file **out_file) {
                 int ucap = (int)(bl + 4); /* rough cap */
                 uint16_t *u16 = (uint16_t*)kmalloc(sizeof(uint16_t) * ucap);
                 if (!u16) { kfree(buf); return -1; }
-                int ulen = utf8_to_utf16le(basename, u16, (size_t)ucap);
+                int ulen = utf8_to_utf16le(cleanname, u16, (size_t)ucap);
                 if (ulen < 0) { kfree(u16); kfree(buf); return -1; }
                 /* write LFN entries to buffer (they will be written to disk together with short entry) */
                 fat32_write_lfn_entries_to_buf(buf, found_off, u16, ulen, lfn_entries, chk);
@@ -746,7 +884,7 @@ static int fat32_create(const char *path, struct fs_file **out_file) {
             f->driver_private = fh;
             *out_file = f;
             kfree(buf);
-            kprintf("fat32: created file %s (dir lba %u)\n", basename, lba);
+            kprintf("fat32: created file %s (dir lba %u)\n", cleanname, lba);
             /* debug dump of directory sector */
             fat32_hexdump_sector(g_fat->device_id, lba, 256);
             return 0;
@@ -766,12 +904,19 @@ static int fat32_mkdir(const char *path) {
     const char *p = strrchr(path, '/');
     const char *basename = p ? p+1 : path;
     if (!basename || !*basename) return -1;
+    /* normalize basename (strip quotes) */
+    char cleanname[256];
+    size_t bl_in = strlen(basename);
+    if (bl_in >= sizeof(cleanname)) bl_in = sizeof(cleanname) - 1;
+    memcpy(cleanname, basename, bl_in);
+    cleanname[bl_in] = '\0';
+    strip_matching_quotes_local(cleanname);
     /* prevent duplicate dir */
-    if (fat32_name_exists(basename)) return -1;
+    if (fat32_name_exists(cleanname)) return -1;
     /* Always create LFN for directories; shortname placeholder will be written but ignored. */
     uint8_t shortname[11];
-    fat32_make_shortname(basename, shortname);
-    size_t bl = strlen(basename);
+    fat32_make_shortname(cleanname, shortname);
+    size_t bl = strlen(cleanname);
     int lfn_entries = (int)((bl + 12) / 13);
     uint32_t cluster = g_fat->root_cluster;
     uint32_t bytes_per_cluster = g_fat->bytes_per_sector * g_fat->sectors_per_cluster;
