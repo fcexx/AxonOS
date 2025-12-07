@@ -9,6 +9,8 @@
 #include "../inc/fs.h"
 #include "../inc/ext2.h"
 #include "../inc/ramfs.h"
+#include "../inc/devfs.h"
+#include "../inc/fat32.h"
 #include "../inc/osh_line.h"
 #include "../inc/user.h"
 #include "../inc/mmio.h"
@@ -1538,7 +1540,7 @@ static int bi_cat(cmd_ctx *c) {
     return rc;
 }
 
-static int bi_mkdir(cmd_ctx *c) { if (c->argc<2) { osh_write(c->out, c->out_len, c->out_cap, "mkdir: missing operand\n"); return 1; } char path[256]; join_cwd(g_cwd, c->argv[1], path, sizeof(path)); int r=ramfs_mkdir(path); return r==0?0:1; }
+static int bi_mkdir(cmd_ctx *c) { if (c->argc<2) { osh_write(c->out, c->out_len, c->out_cap, "mkdir: missing operand\n"); return 1; } char path[256]; join_cwd(g_cwd, c->argv[1], path, sizeof(path)); int r=fs_mkdir(path); return r==0?0:1; }
 static int bi_touch(cmd_ctx *c) { if (c->argc<2) { osh_write(c->out, c->out_len, c->out_cap, "touch: missing operand\n"); return 1; } char path[256]; join_cwd(g_cwd, c->argv[1], path, sizeof(path)); struct fs_file *f = fs_create_file(path); if (!f) return 1; fs_file_free(f); return 0; }
 static int bi_rm(cmd_ctx *c) { if (c->argc<2) { osh_write(c->out, c->out_len, c->out_cap, "rm: missing operand\n"); return 1; } char path[256]; join_cwd(g_cwd, c->argv[1], path, sizeof(path)); int r=ramfs_remove(path); return r==0?0:1; }
 
@@ -1958,6 +1960,18 @@ typedef int (*builtin_fn)(cmd_ctx*);
 typedef struct { const char* name; builtin_fn fn; } builtin;
 /* forward declaration for chmod builtin */
 static int bi_chmod(cmd_ctx *c);
+/* forward declaration for chvt builtin */
+static int bi_chvt(cmd_ctx *c);
+/* fd builtins */
+static int bi_open(cmd_ctx *c);
+static int bi_close(cmd_ctx *c);
+static int bi_dup(cmd_ctx *c);
+static int bi_dup2(cmd_ctx *c);
+static int bi_isatty(cmd_ctx *c);
+/* xxd builtin forward declaration */
+static int bi_xxd(cmd_ctx *c);
+static int bi_mount(cmd_ctx *c);
+static int bi_umount(cmd_ctx *c);
 
 static const builtin builtin_table[] = {
     {"echo", bi_echo}, {"kprint", bi_kprint}, {"readline", bi_readline}, {"readkey", bi_readkey},
@@ -2007,6 +2021,247 @@ static int bi_chmod(cmd_ctx *c) {
     if (fs_chmod(fullpath, newmode) == 0) { kprintf("ok\n"); return 0; }
     kprintf("chmod: failed\n");
     return 1;
+}
+
+static int bi_chvt(cmd_ctx *c) {
+    if (c->argc < 2) { kprintf("usage: chvt <n>\n"); return 1; }
+    int n = parse_uint(c->argv[1]);
+    if (n < 0) { kprintf("chvt: invalid number\n"); return 1; }
+    extern void devfs_switch_tty(int index);
+    devfs_switch_tty(n);
+    return 0;
+}
+
+static int bi_open(cmd_ctx *c) {
+    if (c->argc < 2) { kprintf("usage: open <path>\n"); return 1; }
+    const char *path = c->argv[1];
+    struct fs_file *f = fs_open(path);
+    if (!f) { kprintf("open: failed\n"); return 1; }
+    int fd = thread_fd_alloc(f);
+    if (fd < 0) { fs_file_free(f); kprintf("open: no fds\n"); return 1; }
+    kprintf("%d\n", fd);
+    return 0;
+}
+
+static int bi_mount(cmd_ctx *c) {
+    if (c->argc < 3) {
+        kprintf("usage: mount [-t type] <device> <mountpoint>\n");
+        return 1;
+    }
+    const char *fstype = NULL;
+    const char *devpath = NULL;
+    const char *mntpath = NULL;
+    int i = 1;
+    while (i < c->argc) {
+        if (strcmp(c->argv[i], "-t") == 0 && i + 1 < c->argc) {
+            fstype = c->argv[i+1];
+            i += 2;
+            continue;
+        }
+        if (!devpath) { devpath = c->argv[i++]; continue; }
+        if (!mntpath) { mntpath = c->argv[i++]; continue; }
+        i++;
+    }
+    if (!devpath || !mntpath) {
+        kprintf("mount: missing device or mountpoint\n");
+        return 1;
+    }
+    char full_dev[256]; char full_mnt[256];
+    join_cwd(g_cwd, devpath, full_dev, sizeof(full_dev));
+    join_cwd(g_cwd, mntpath, full_mnt, sizeof(full_mnt));
+    int dev_index = devfs_find_block_by_path(full_dev);
+    if (dev_index < 0) { kprintf("mount: device not found: %s\n", full_dev); return 1; }
+    int device_id = devfs_get_device_id(full_dev);
+    if (device_id < 0) { kprintf("mount: cannot resolve device id for %s\n", full_dev); return 1; }
+    struct fs_driver *drv = NULL;
+    if (!fstype || strcmp(fstype, "auto") == 0 || strcmp(fstype, "fat32") == 0) {
+        /* try fat32 on the underlying device id */
+        if (fat32_probe_and_mount(device_id) == 0) {
+            drv = fat32_get_driver();
+        }
+    }
+    if (!drv) { kprintf("mount: filesystem not recognized or not supported\n"); return 1; }
+    /* ensure mountpoint exists in ramfs */
+    ramfs_mkdir(full_mnt);
+    if (fs_mount(full_mnt, drv) == 0) {
+        kprintf("mount: mounted %s at %s\n", full_dev, full_mnt);
+        return 0;
+    } else {
+        kprintf("mount: failed to mount %s at %s\n", full_dev, full_mnt);
+        return 1;
+    }
+}
+
+static int bi_umount(cmd_ctx *c) {
+    if (c->argc < 2) {
+        kprintf("usage: umount <mountpoint>\n");
+        return 1;
+    }
+    char full_mnt[512];
+    join_cwd(g_cwd, c->argv[1], full_mnt, sizeof(full_mnt));
+    struct fs_driver *mount_drv = fs_get_mount_driver(full_mnt);
+    if (fs_unmount(full_mnt) == 0) {
+        kprintf("umount: %s unmounted\n", full_mnt);
+        if (mount_drv && mount_drv->ops && mount_drv->ops->name && strcmp(mount_drv->ops->name, "fat32") == 0) {
+            extern void fat32_unmount_cleanup(void);
+            fat32_unmount_cleanup();
+        }
+        return 0;
+    } else {
+        kprintf("umount: failed to unmount %s\n", full_mnt);
+        return 1;
+    }
+}
+
+static int bi_close(cmd_ctx *c) {
+    if (c->argc < 2) { kprintf("usage: close <fd>\n"); return 1; }
+    int fd = parse_uint(c->argv[1]);
+    if (fd < 0) { kprintf("close: invalid fd\n"); return 1; }
+    if (thread_fd_close(fd) == 0) return 0;
+    kprintf("close: failed\n");
+    return 1;
+}
+
+static int bi_dup(cmd_ctx *c) {
+    if (c->argc < 2) { kprintf("usage: dup <oldfd>\n"); return 1; }
+    int oldfd = parse_uint(c->argv[1]);
+    int nfd = thread_fd_dup(oldfd);
+    if (nfd < 0) { kprintf("dup: failed\n"); return 1; }
+    kprintf("%d\n", nfd);
+    return 0;
+}
+
+static int bi_dup2(cmd_ctx *c) {
+    if (c->argc < 3) { kprintf("usage: dup2 <oldfd> <newfd>\n"); return 1; }
+    int oldfd = parse_uint(c->argv[1]);
+    int newfd = parse_uint(c->argv[2]);
+    int r = thread_fd_dup2(oldfd, newfd);
+    if (r < 0) { kprintf("dup2: failed\n"); return 1; }
+    return 0;
+}
+
+static int bi_isatty(cmd_ctx *c) {
+    if (c->argc < 2) { kprintf("usage: isatty <fd>\n"); return 1; }
+    int fd = parse_uint(c->argv[1]);
+    int r = thread_fd_isatty(fd);
+    kprintf("%d\n", r ? 1 : 0);
+    return 0;
+}
+
+/* xxd: simple hex dump utility
+   usage: xxd <path> [offset] [length]
+*/
+static int bi_xxd(cmd_ctx *c) {
+    /* Parse args: support optional flag -l <length> (anywhere) and a path.
+       Positional offset/length after path are still supported if -l not provided. */
+    size_t specified_len = 0;
+    int has_len_flag = 0;
+    const char *path_arg = NULL;
+    for (int i = 1; i < c->argc; i++) {
+        if (c->argv[i] && strcmp(c->argv[i], "-l") == 0 && i + 1 < c->argc) {
+            specified_len = (size_t)parse_uint(c->argv[i + 1]);
+            has_len_flag = 1;
+            i++; /* skip length token */
+        } else if (!path_arg) {
+            path_arg = c->argv[i];
+        } else {
+            /* ignore extra tokens here; positional parsing happens below */
+        }
+    }
+    if (!path_arg) {
+        osh_write(c->out, c->out_len, c->out_cap, "usage: xxd [-l length] <path> [offset] [length]\n");
+        return 1;
+    }
+    char path[256];
+    join_cwd(g_cwd, path_arg, path, sizeof(path));
+    struct fs_file *f = fs_open(path);
+    if (!f) {
+        osh_write(c->out, c->out_len, c->out_cap, "xxd: cannot open file\n");
+        return 1;
+    }
+    size_t fsize = f->size ? f->size : 0;
+    size_t start = 0;
+    size_t length = fsize;
+    /* If user provided positional offset/length after the path, parse them (only used when -l not present). */
+    if (!has_len_flag) {
+        /* find index of path_arg to read following tokens */
+        int path_idx = -1;
+        for (int i = 1; i < c->argc; i++) {
+            if (c->argv[i] && strcmp(c->argv[i], path_arg) == 0) { path_idx = i; break; }
+        }
+        if (path_idx >= 0) {
+            if (path_idx + 1 < c->argc) start = (size_t)parse_uint(c->argv[path_idx + 1]);
+            if (path_idx + 2 < c->argc) {
+                size_t L = (size_t)parse_uint(c->argv[path_idx + 2]);
+                if (L < length) length = L;
+            }
+        }
+    } else {
+        /* flag -l overrides positional length */
+        length = specified_len;
+    }
+    if (start > fsize) {
+        fs_file_free(f);
+        osh_write(c->out, c->out_len, c->out_cap, "xxd: offset beyond EOF\n");
+        return 1;
+    }
+    size_t remaining = (start + length <= fsize) ? length : (fsize - start);
+    unsigned char buf[16];
+    size_t pos = 0;
+    while (remaining > 0) {
+        if (keyboard_ctrlc_pending()) { keyboard_consume_ctrlc(); break; }
+        size_t want = remaining >= sizeof(buf) ? sizeof(buf) : remaining;
+        ssize_t r = fs_read(f, buf, want, start + pos);
+        if (r <= 0) break;
+        char line[128];
+        char hexbuf[64];
+        const char hexdigits[] = "0123456789abcdef";
+        int hp = 0;
+        for (int i = 0; i < 16; i++) {
+            if (i > 0) {
+                if (i == 8) { hexbuf[hp++] = ' '; hexbuf[hp++] = ' '; }
+                else { hexbuf[hp++] = ' '; }
+            }
+            if (i < r) {
+                unsigned char b = buf[i];
+                if (hp + 2 < (int)sizeof(hexbuf)) {
+                    hexbuf[hp++] = hexdigits[(b >> 4) & 0xF];
+                    hexbuf[hp++] = hexdigits[b & 0xF];
+                }
+            } else {
+                /* two spaces to preserve width for missing byte */
+                if (hp + 2 < (int)sizeof(hexbuf)) { hexbuf[hp++] = ' '; hexbuf[hp++] = ' '; }
+            }
+        }
+        if (hp >= (int)sizeof(hexbuf)) hp = (int)sizeof(hexbuf) - 1;
+        hexbuf[hp] = '\0';
+        /* address + hex area, then two spaces, then ASCII for available bytes */
+        /* format 4-digit hex offset manually to avoid depending on snprintf %zx support */
+        char addrbuf[8 + 1];
+        //const char hexdigits[] = "0123456789abcdef";
+        unsigned long addr_val = (unsigned long)(start + pos);
+        for (int i = 0; i < 4; i++) {
+            int shift = (3 - i) * 4;
+            int nibble = (int)((addr_val >> shift) & 0xF);
+            addrbuf[i] = hexdigits[nibble];
+        }
+        addrbuf[4] = '\0';
+        int lp = snprintf(line, sizeof(line), "%s: %s  ", addrbuf, hexbuf);
+        for (int i = 0; i < r; i++) {
+            unsigned char ch = buf[i];
+            line[lp++] = (ch >= 32 && ch < 127) ? (char)ch : '.';
+            if (lp >= (int)sizeof(line) - 2) break;
+        }
+        /* terminate and add newline */
+        if (lp < (int)sizeof(line) - 1) line[lp++] = '\n';
+        if (lp >= (int)sizeof(line)) lp = (int)sizeof(line) - 1;
+        line[lp] = '\0';
+        osh_write(c->out, c->out_len, c->out_cap, line);
+        pos += (size_t)r;
+        remaining -= (size_t)r;
+    }
+    fs_file_free(f);
+    return 0;
 }
 
 static builtin_fn find_builtin(const char* name) {

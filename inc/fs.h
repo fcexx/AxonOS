@@ -16,6 +16,7 @@ struct fs_file {
     size_t size;
     off_t pos;
     int type;                 /* FS_TYPE_* (set by driver) */
+    int refcount;             /* VFS reference count for this handle */
 };
 
 /* Filesystem driver operations (minimal set) */
@@ -26,6 +27,8 @@ struct fs_driver_ops {
        If success, allocate and return fs_file via out_file (caller frees with fs_file_free).
        Drivers may choose to accept or reject paths (return -1 to indicate not-handled). */
     int (*create)(const char *path, struct fs_file **out_file);
+    /* Make directory (create directory entry). Return 0 on success. Optional. */
+    int (*mkdir)(const char *path);
 
     /* Open existing file. Return 0 on success and set out_file. Return -1 if driver does not handle path.
        Return negative errno-like on other errors. */
@@ -56,6 +59,14 @@ struct fs_driver {
 int fs_register_driver(struct fs_driver *drv);
 int fs_unregister_driver(struct fs_driver *drv);
 int fs_mount(const char *path, struct fs_driver *drv);
+/* Unmount previously mounted path. Returns 0 on success, -1 on error */
+int fs_unmount(const char *path);
+/* Return driver mounted for path (NULL if none) */
+struct fs_driver *fs_get_mount_driver(const char *path);
+/* Get mount path for a registered driver. Returns 0 on success and fills out, -1 if not found. */
+int fs_get_mount_path(const struct fs_driver *drv, char *out, size_t outlen);
+/* Get the matching mount prefix for a given path (longest prefix). Returns 0 on success. */
+int fs_get_matching_mount_prefix(const char *path, char *out, size_t outlen);
 
 /* High-level helpers which dispatch to registered drivers in registration order */
 struct fs_file *fs_create_file(const char *path);

@@ -113,7 +113,6 @@ static void ensure_parent_dirs(const char *path) {
 static int create_file_with_data(const char *path, const void *data, size_t size) {
     struct fs_file *f = fs_create_file(path);
     if (!f) {
-        kprintf("initfs: cannot create file %s\n", path);
         return -1;
     }
     ssize_t written = fs_write(f, data, size, 0);
@@ -172,7 +171,8 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
         /* additional plausibility check to avoid false positives where "070701"
            appears inside file data */
         if (!plausible_cpio_header(h, archive_size - offset)) {
-            kprintf("initfs: header not plausible at offset %u, searching next\n", (unsigned)offset);
+            /* header not plausible: search for next magic and continue */
+            //kprintf("initfs: header not plausible at offset %u, searching next\n", (unsigned)offset);
             size_t next_found = (size_t)-1;
             for (size_t j = offset + 1; j + 6 <= archive_size; j++) {
                 if (memcmp(base + j, "070701", 6) == 0 || memcmp(base + j, "070702", 6) == 0) { next_found = j; break; }
@@ -229,40 +229,80 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
             ensure_parent_dirs(target);
             const void *file_data = base + file_data_offset;
             if (create_file_with_data(target, file_data, filesize) != 0) {
-                kprintf("initfs: failed to create %s\n", target);
+                kprintf("initfs: warn: failed to create %s (ingore)\n", target);
             }
         } else {
             /* other types (symlink, device...) - skip for now */
-            kprintf("initfs: skipping special file %s (mode %o)\n", target, mode);
+            //kprintf("initfs: skipping special file %s (mode %o)\n", target, mode);
         }
-        /* advance offset to next header (file data aligned to 4) */
+        /* advance offset to next header (file data aligned to 4).
+           Protect against malformed tag_size/filesize that would yield zero
+           or overflow and cause an infinite loop. */
         size_t next = file_data_offset + filesize;
+        /* Basic sanity: next must be greater than current offset and within archive */
+        if (next <= offset || next > archive_size) {
+            return -1;
+        }
         next = (next + 3) & ~3u;
+        if (next <= offset) {
+            return -1;
+        }
         offset = next;
     }
     return 0;
 }
 
 /* Scan multiboot2 tags for module named `module_name` and unpack it. */
-int initfs_process_multiboot_module(uint32_t multiboot_magic, uint32_t multiboot_info, const char *module_name) {
+int initfs_process_multiboot_module(uint32_t multiboot_magic, uint64_t multiboot_info, const char *module_name) {
     if (multiboot_magic != 0x36d76289u) return 1; /* not multiboot2 */
     if (multiboot_info == 0) return 1;
     uint8_t *p = (uint8_t*)(uintptr_t)multiboot_info;
     uint32_t total_size = *(uint32_t*)p;
+    /* Deep diagnostic: dump first part of multiboot info so we can compare between VMs */
+    size_t dump_len = total_size < 512 ? (size_t)total_size : 512;
     uint32_t offset = 8; /* tags start after total_size + reserved */
+    uint32_t tag_count = 0;
     while (offset + 8 <= total_size) {
+        if (++tag_count > 1024) break;
         uint32_t tag_type = *(uint32_t*)(p + offset);
         uint32_t tag_size = *(uint32_t*)(p + offset + 4);
+        /* Basic sanity checks to avoid infinite loops on malformed multiboot data */
+        if (tag_size < 8) break;
+        if ((uint64_t)offset + (uint64_t)tag_size > (uint64_t)total_size) break;
         if (tag_type == 0) break; /* end */
         if (tag_type == 3) { /* module */
-            uint32_t mod_start = *(uint32_t*)(p + offset + 8);
-            uint32_t mod_end = *(uint32_t*)(p + offset + 12);
-            const char *name = (const char*)(p + offset + 16);
+            uint64_t mod_start = 0, mod_end = 0;
+            const uint8_t *field_ptr = p + offset + 8;
+            if (tag_size >= 24) {
+                memcpy(&mod_start, field_ptr, sizeof(uint64_t));
+                memcpy(&mod_end, field_ptr + sizeof(uint64_t), sizeof(uint64_t));
+            } else {
+                uint32_t ms32 = *(uint32_t*)(field_ptr);
+                uint32_t me32 = *(uint32_t*)(field_ptr + 4);
+                mod_start = (uint64_t)ms32;
+                mod_end = (uint64_t)me32;
+            }
+            /* Determine name offset: conservative guess */
+            size_t name_field_offset = offset + 16;
+            if (tag_size >= 24) name_field_offset = offset + 24;
+            const char *name = (const char*)(p + name_field_offset);
             if (strcmp(name, module_name) == 0) {
                 size_t mod_size = mod_end > mod_start ? (size_t)(mod_end - mod_start) : 0;
                 const void *mod_ptr = (const void*)(uintptr_t)mod_start;
                 kprintf("initfs: found module '%s' at %p size %u\n", module_name, mod_ptr, (unsigned)mod_size);
                 if (mod_size == 0) return -2;
+                /* Diagnostic / robustness: attempt to copy module into heap and unpack from there.
+                   This can bypass issues with remapped/readonly regions in some VMs. */
+                void *buf = kmalloc(mod_size);
+                if (buf) {
+                    memcpy(buf, mod_ptr, mod_size);
+                    int r = unpack_cpio_newc(buf, mod_size);
+                    kfree(buf);
+                    if (r == 0) return 0;
+                } else {
+                    /* kmalloc failed - will try direct unpack */
+                }
+                /* fallback: try direct unpack from module pointer */
                 return unpack_cpio_newc(mod_ptr, mod_size);
             }
         }
@@ -270,7 +310,24 @@ int initfs_process_multiboot_module(uint32_t multiboot_magic, uint32_t multiboot
         uint32_t next = (tag_size + 7) & ~7u;
         offset += next;
     }
+    /* If we didn't find a multiboot module, attempt a tolerant fallback:
+       scan low physical memory for a cpio newc magic ("070701"/"070702")
+       and try to unpack from there. This handles environments where the
+       bootloader did not provide multiboot module tags (some VMs/loaders). */
+    {
+        const uintptr_t scan_start = 0x10000; /* 64KB */
+        const uintptr_t scan_end = 0x4000000; /* 64MB (increased from 16MB for deeper scan) */
+        const uint8_t *mem = (const uint8_t*)(uintptr_t)scan_start;
+        for (uintptr_t a = scan_start; a + 6 <= scan_end; a++) {
+            const uint8_t *p6 = (const uint8_t*)(uintptr_t)a;
+            if (memcmp(p6, "070701", 6) == 0 || memcmp(p6, "070702", 6) == 0) {
+                size_t remaining = (size_t)(scan_end - a);
+                if (remaining >= sizeof(struct cpio_newc_header) && plausible_cpio_header((const struct cpio_newc_header*)p6, remaining)) {
+                    int r = unpack_cpio_newc(p6, remaining);
+                    if (r == 0) return 0;
+                }
+            }
+        }
+    }
     return 1; /* module not found */
 }
-
-

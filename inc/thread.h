@@ -2,6 +2,7 @@
 #define THREAD_H
 #include <stdint.h>
 #include "context.h"
+#include "fs.h"
 
 typedef enum {
         THREAD_READY,
@@ -26,10 +27,12 @@ typedef struct thread {
         char name[32];                 // thread name (urmomissofaturmomissofaturmomiss)
         uint32_t sleep_until;          // sleep until (in timer ticks)
         uint64_t clear_child_tid;      // clear child tid
-        //fs_file_t* fds[THREAD_MAX_FD];
+        struct fs_file* fds[THREAD_MAX_FD];
         /* POSIX credentials */
         uid_t euid;
         gid_t egid;
+        /* attached tty index or -1 */
+        int attached_tty;
 } thread_t;
 
 extern int init;
@@ -54,5 +57,14 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
 // access to current user thread
 thread_t* thread_get_current_user();
 void thread_set_current_user(thread_t* t);
+// find a user thread attached to given tty (or NULL)
+thread_t* thread_find_by_tty(int tty);
+
+// per-thread fd helpers
+int thread_fd_alloc(struct fs_file *file); /* returns fd or -1 */
+int thread_fd_close(int fd);
+int thread_fd_dup(int oldfd);
+int thread_fd_dup2(int oldfd, int newfd);
+int thread_fd_isatty(int fd);
 
 #endif // THREAD_H 

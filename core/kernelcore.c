@@ -25,7 +25,12 @@
 #include <sysfs.h>
 #include <initfs.h>
 #include <editor.h>
+#include <fat32.h>
 #include <intel_chipset.h>s
+#include <disk.h>
+
+/* ATA DMA driver init (registered here) */
+void ata_dma_init(void);
 
 int exit = 0;
 
@@ -238,7 +243,7 @@ void ascii_art() {
     kprintf("<(0f)>\xB0\xB1\xB2\xDB\xB2\xB1\xB0\xB0\xB1\xB2\xDB\xB2\xB1\xB0\xB1\xB2\xDB\xB2\xB1\xB0\xB0\xB1\xB2\xDB\xB2\xB1\xB0\xB0\xB1\xB2\xDB\xDB\xDB\xDB\xDB\xDB\xB2\xB1\xB0\xB0\xB1\xB2\xDB\xB2\xB1\xB0\xB0\xB1\xB2\xDB\xB2\xB1<(0b)>\xB0\xB0\xB1\xB2\xDB\xDB\xDB\xDB\xDB\xDB\xB2\xB1\xB0\xB0\xB1\xB2\xDB\xDB\xDB\xDB\xDB\xDB\xDB\xB2\xB1\xB0\n\n");
 }
 
-void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
+void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     kclear();
     kprint("Initializing kernel...\n");
     sysinfo_init(multiboot_magic, multiboot_info);
@@ -247,6 +252,7 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
     idt_init();
     pic_init();
     pit_init();
+    
 
     
     apic_init();
@@ -341,13 +347,20 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
     }
     
     intel_chipset_init();
+    /* start threading and I/O subsystem, then initialize disk drivers from a kernel thread
+       to avoid probing hardware too early during boot. */
     thread_init();
     iothread_init();
+    /* create kernel thread to initialize ATA/SATA drivers after scheduler is ready */
+    if (!thread_create(ata_dma_init, "ata_init")) {
+        kprintf("ata: failed to create init thread\n");
+    }
     
     /* user subsystem */
     user_init();
     ramfs_register();
     ext2_register();
+    fat32_register();
     
     if (sysfs_register() == 0) {
         kprintf("sysfs: mounting sysfs in /sys\n");
@@ -411,6 +424,35 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
         else if (r == 1) kprintf("initfs: initfs module not found or not multiboot2\n");
         else if (r == -1) kprintf("initfs: success\n");
     }
+    /* register and mount devfs at /dev */
+    if (devfs_register() == 0) {
+        kprintf("devfs: registering devfs\n");
+        ramfs_mkdir("/dev");
+        devfs_mount("/dev");
+        /* initialize stdio fds for current thread (main) */
+        struct fs_file *console = fs_open("/dev/console");
+        if (console) {
+            /* allocate fd slots for main thread using helper to manage refcounts */
+            int fd0 = thread_fd_alloc(console);
+            if (fd0 >= 0) {
+                /* ensure we have fd 0..2 set; if not, duplicate */
+                thread_t* t = thread_current();
+                if (t) {
+                    if (fd0 != 0) { /* move to 0 */
+                        if (t->fds[0]) fs_file_free(t->fds[0]);
+                        t->fds[0] = t->fds[fd0];
+                        t->fds[fd0] = NULL;
+                    }
+                    if (!t->fds[1]) { t->fds[1] = t->fds[0]; if (t->fds[1]) t->fds[1]->refcount++; }
+                    if (!t->fds[2]) { t->fds[2] = t->fds[0]; if (t->fds[2]) t->fds[2]->refcount++; }
+                }
+            } else {
+                fs_file_free(console);
+            }
+        }
+    } else {
+        kprintf("devfs: failed to register\n");
+    }
 
     ps2_keyboard_init();
     rtc_init();
@@ -420,10 +462,10 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info) {
     kprintf("\n%s v%s\n", OS_NAME, OS_VERSION);
     
     // autostart: run /start script once if present
-    struct fs_file *f = fs_open("/start");
-    if (f) { 
-        fs_file_free(f); 
-        (void)exec_line("osh /start"); 
+    {
+        struct fs_file *f = fs_open("/start");
+        if (f) { fs_file_free(f); (void)exec_line("osh /start"); }
+        else { kprintf("FATAL: /start file not found; fallback to osh\n"); exec_line("PS1=\"\\w # \""); exec_line("osh"); }
     }
 
     kprintf("\nWelcome to %s %s!\n", OS_NAME, OS_VERSION);

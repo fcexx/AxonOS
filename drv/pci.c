@@ -416,6 +416,7 @@ static void create_attr_file(const char *base, const char *name, const struct sy
 void pci_sysfs_init(void) {
     if (pci_sysfs_initialized) return;
     
+    kprintf("pci: initializing sysfs for %d devices\n", pci_get_device_count());
     sysfs_mkdir("/sys/bus");
     sysfs_mkdir("/sys/bus/pci");
     sysfs_mkdir("/sys/bus/pci/devices");

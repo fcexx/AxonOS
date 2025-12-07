@@ -3,7 +3,7 @@
 #include <debug.h>
 #include <string.h>
 #include <spinlock.h>
-//#include <ata.h>
+#include <disk.h>
 #include <thread.h>
 
 // I/O планировщик
@@ -69,24 +69,31 @@ static void io_worker_thread(void) {
 
 // Обработка I/O запроса
 static void process_io_request(io_request_t* request) {
-        int rc = -1;
-        switch (request->type) {
-                case IO_OP_READ:
-                        if (request->device_id < 4) {
-                                //rc = ata_read_sector(request->device_id, request->offset, request->buffer);
-                        }
-                        break;
-                case IO_OP_WRITE:
-                        if (request->device_id < 4) {
-                                //rc = ata_write_sector(request->device_id, request->offset, request->buffer);
-                        }
-                        break;
-                default:
-                        rc = -1;
-                        break;
-        }
-        // статус операции: 0 = успех, -1 = ошибка; считаем завершённой всегда
-        request->status = (rc == 0) ? 1 : -1;
+	int rc = -1;
+	switch (request->type) {
+		case IO_OP_READ: {
+			int devs = disk_count();
+			if (request->device_id < devs) {
+				/* convert size bytes -> sectors (round up) */
+				uint32_t sectors = (request->size + DISK_SECTOR_SIZE - 1) / DISK_SECTOR_SIZE;
+				rc = disk_read_sectors(request->device_id, request->offset, request->buffer, sectors);
+			}
+			break;
+		}
+		case IO_OP_WRITE: {
+			int devs = disk_count();
+			if (request->device_id < devs) {
+				uint32_t sectors = (request->size + DISK_SECTOR_SIZE - 1) / DISK_SECTOR_SIZE;
+				rc = disk_write_sectors(request->device_id, request->offset, request->buffer, sectors);
+			}
+			break;
+		}
+		default:
+			rc = -1;
+			break;
+	}
+	/* статус операции: 0 = успех, -1 = ошибка */
+	request->status = (rc == 0) ? 1 : -1;
 }
 
 // Добавить I/O запрос в очередь (FIFO)
