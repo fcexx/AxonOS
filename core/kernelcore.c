@@ -405,8 +405,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         else { kprintf("FATAL: /start file not found; fallback to osh\n"); exec_line("PS1=\"\\w # \""); exec_line("osh"); }
     }
 
-    kprintf("\nWelcome to %s %s!\n", OS_NAME, OS_VERSION);
-
     // Завершение
     kprint("\nShutting down...");
     pit_sleep_ms(3000);

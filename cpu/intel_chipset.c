@@ -63,9 +63,6 @@ static void intel_enable_device(intel_device_t* dev) {
     uint32_t command = intel_pci_read_config(dev->bus, dev->device, dev->function, 0x04);
     command |= 0x0007;
     intel_pci_write_config(dev->bus, dev->device, dev->function, 0x04, command);
-
-
-    kprintf("Intel: Enabled %s\n", dev->name);
 }
 
 
@@ -197,9 +194,6 @@ static void intel_enable_acpi(void) {
     if (!intel_chipset.lpc_controller) return;
 
 
-    kprintf("Intel: Enabling ACPI\n");
-
-
     uint32_t acpi_cntl = intel_pci_read_config(
         intel_chipset.lpc_controller->bus,
         intel_chipset.lpc_controller->device,
@@ -225,9 +219,6 @@ static void intel_enable_power_management(void) {
     if (!intel_chipset.lpc_controller) return;
 
 
-    kprintf("Intel: Enabling power management\n");
-
-
     uint32_t pm_cntl = intel_pci_read_config(
         intel_chipset.lpc_controller->bus,
         intel_chipset.lpc_controller->device,
@@ -251,7 +242,6 @@ static void intel_enable_power_management(void) {
 
 static void intel_setup_usb_controllers(void) {
     if (intel_chipset.usb_controller) {
-        kprintf("Intel: Setting up USB (%d ports)\n", intel_chipset.usb_ports);
         intel_enable_device(intel_chipset.usb_controller);
     }
 }
@@ -259,7 +249,6 @@ static void intel_setup_usb_controllers(void) {
 
 static void intel_setup_sata_controllers(void) {
     if (intel_chipset.sata_controller) {
-        kprintf("Intel: Setting up SATA (%d ports)\n", intel_chipset.sata_ports);
         intel_enable_device(intel_chipset.sata_controller);
     }
 }
@@ -267,7 +256,6 @@ static void intel_setup_sata_controllers(void) {
 
 static void intel_setup_audio_controller(void) {
     if (intel_chipset.audio_controller) {
-        kprintf("Intel: Setting up audio controller\n");
         intel_enable_device(intel_chipset.audio_controller);
     }
 }
@@ -278,9 +266,6 @@ static void intel_setup_smbus(void) {
 
 
     if (intel_chipset.supported_features & INTEL_FEATURE_SMBUS) {
-        kprintf("Intel: Setting up SMBus\n");
-
-
         uint32_t smb_base = intel_pci_read_config(
             intel_chipset.lpc_controller->bus,
             intel_chipset.lpc_controller->device,
@@ -304,9 +289,6 @@ static void intel_setup_smbus(void) {
 
 
 void intel_chipset_reset(void) {
-    kprintf("Intel Chipset: Resetting system...\n");
-
-
     outb(0xCF9, 0x0E);
 
 
@@ -319,59 +301,56 @@ void intel_chipset_reset(void) {
 
 void intel_print_chipset_info(void) {
     if (!intel_detected) {
-        kprintf("<(0c)>Intel chipset not detected\n");
+        kprintf("Intel chipset not detected\n");
         return;
     }
 
 
-    kprintf("\n<(0b)>=== Intel Chipset ===<(0f)>\n");
-
-
     if (intel_chipset.chipset_name) {
-        kprintf("Chipset: <(0b)>%s<(0f)>\n", intel_chipset.chipset_name);
+        kprintf("Chipset: %s\n", intel_chipset.chipset_name);
     }
 
 
     if (intel_chipset.lpc_controller) {
-        kprintf("LPC: <(0b)>%04X:%04X<(0f)>\n", 
+        kprintf("LPC: %04X:%04X\n", 
                intel_chipset.lpc_controller->vendor_id,
                intel_chipset.lpc_controller->device_id);
     }
 
 
     if (intel_chipset.usb_controller) {
-        kprintf("USB: <(0b)>%d ports<(0f)>\n", intel_chipset.usb_ports);
+        kprintf("USB: %d ports\n", intel_chipset.usb_ports);
     }
 
 
     if (intel_chipset.sata_controller) {
-        kprintf("SATA: <(0b)>%d ports<(0f)>\n", intel_chipset.sata_ports);
+        kprintf("SATA: %d ports\n", intel_chipset.sata_ports);
     }
 
 
     if (intel_chipset.ethernet_controller) {
-        kprintf("Ethernet: <(0b)>Present<(0f)>\n");
+        kprintf("Ethernet: Present\n");
     }
 
 
     if (intel_chipset.graphics_controller) {
-        kprintf("Graphics: <(0b)>Present<(0f)>\n");
+        kprintf("Graphics: Present\n");
     }
 
 
     if (intel_chipset.audio_controller) {
-        kprintf("Audio: <(0b)>Present<(0f)>\n");
+        kprintf("Audio: Present\n");
     }
 
 
     kprintf("Features: ");
-    if (intel_chipset.supported_features & INTEL_FEATURE_ACPI) kprintf("<(0b)>ACPI<(0f)> ");
-    if (intel_chipset.supported_features & INTEL_FEATURE_USB) kprintf("<(0b)>USB<(0f)> ");
-    if (intel_chipset.supported_features & INTEL_FEATURE_SATA) kprintf("<(0b)>SATA<(0f)> ");
-    if (intel_chipset.supported_features & INTEL_FEATURE_ETHERNET) kprintf("<(0b)>ETH<(0f)> ");
-    if (intel_chipset.supported_features & INTEL_FEATURE_POWER_MGMT) kprintf("<(0b)>PM<(0f)> ");
-    if (intel_chipset.supported_features & INTEL_FEATURE_SMBUS) kprintf("<(0b)>SMBus<(0f)> ");
-    if (intel_chipset.supported_features & INTEL_FEATURE_HD_AUDIO) kprintf("<(0b)>HDA<(0f)>");
+    if (intel_chipset.supported_features & INTEL_FEATURE_ACPI) kprintf("ACPI ");
+    if (intel_chipset.supported_features & INTEL_FEATURE_USB) kprintf("USB ");
+    if (intel_chipset.supported_features & INTEL_FEATURE_SATA) kprintf("SATA ");
+    if (intel_chipset.supported_features & INTEL_FEATURE_ETHERNET) kprintf("ETH ");
+    if (intel_chipset.supported_features & INTEL_FEATURE_POWER_MGMT) kprintf("PM ");
+    if (intel_chipset.supported_features & INTEL_FEATURE_SMBUS) kprintf("SMBus ");
+    if (intel_chipset.supported_features & INTEL_FEATURE_HD_AUDIO) kprintf("HDA");
     kprintf("\n");
 }
 
@@ -380,15 +359,9 @@ void intel_chipset_init(void) {
     if (intel_detected) return;
 
 
-    kprintf("Intel: Initializing chipset support\n");
-
-
     if (!intel_detect_chipset()) {
         return;
     }
-
-
-    kprintf("Intel: Configuring chipset features\n");
 
 
     if (intel_chipset.supported_features & INTEL_FEATURE_ACPI) {
@@ -421,7 +394,6 @@ void intel_chipset_init(void) {
     }
 
 
-    kprintf("Intel: Chipset initialization complete\n");
 }
 
 
