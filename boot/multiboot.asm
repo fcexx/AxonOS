@@ -75,8 +75,10 @@ _start:
 
         pop eax
         pop ebx
-        mov [multiboot_magic_saved], eax
-        mov [multiboot_info_saved], ebx
+        mov dword [multiboot_magic_saved], eax
+        mov dword [multiboot_magic_saved + 4], 0
+        mov dword [multiboot_info_saved], ebx
+        mov dword [multiboot_info_saved + 4], 0
 
         mov edi, boot_msg_before_pt
         call print_vga
@@ -404,8 +406,8 @@ long_mode_start:
 	; -------------------------------
 	
 	cli
-        mov edi, dword [rel multiboot_magic_saved]
-        mov esi, dword [rel multiboot_info_saved]
+        mov rdi, qword [rel multiboot_magic_saved]
+        mov rsi, qword [rel multiboot_info_saved]
         call kernel_main
 
         cli

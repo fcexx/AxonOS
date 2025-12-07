@@ -9,7 +9,7 @@ extern int sys_ram_mb; // -1 если неизвестно
 extern int sys_pc_type;
 
 // Инициализация — вызывается из kernel_main
-void sysinfo_init(uint32_t multiboot_magic, uint32_t multiboot_info_ptr);
+void sysinfo_init(uint32_t multiboot_magic, uint64_t multiboot_info_ptr);
 
 // Получатели
 const char* sysinfo_cpu_name(void);

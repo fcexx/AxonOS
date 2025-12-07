@@ -75,7 +75,11 @@ iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg
 	}
 
 run: iso
-	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 64M -serial stdio
+	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 64M -serial stdio -hda ../disk.img -boot d
+
+disk:
+	@dd if=/dev/zero of=../disk.img bs=1M count=10
+	@mkfs.fat -F 32 ../disk.img
 
 clean:
 	@rm -rf $(BUILD_DIR)

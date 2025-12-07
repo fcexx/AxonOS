@@ -12,7 +12,7 @@ static void cpuid(uint32_t leaf, uint32_t subleaf, uint32_t *a, uint32_t *b, uin
                  : "a"(leaf), "c"(subleaf));
 }
 
-void sysinfo_init(uint32_t multiboot_magic, uint32_t multiboot_info_ptr) {
+void sysinfo_init(uint32_t multiboot_magic, uint64_t multiboot_info_ptr) {
     // Попытка получить бренд-строку (0x80000002..0x80000004)
     uint32_t a,b,c,d;
     uint32_t max_ext = 0;

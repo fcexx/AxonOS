@@ -17,8 +17,11 @@ void pic_init() {
         outb(0xA1, 0x02);
         outb(0x21, 0x01);
         outb(0xA1, 0x01);
-        outb(0x21, 0x00);
-        outb(0xA1, 0x00);
+        /* Mask all IRQs except IRQ0 (timer) to avoid spurious interrupts
+           from devices before their drivers are ready. Drivers should
+           unmask their IRQ line when they have installed handlers. */
+        outb(0x21, 0xFE); /* 11111110 - only IRQ0 unmasked */
+        outb(0xA1, 0xFF); /* 11111111 - all slave IRQs masked */
 }
 
 void pic_send_eoi(uint8_t irq) {

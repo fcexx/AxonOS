@@ -775,7 +775,23 @@ static int file_save(Editor *E, const char *path) {
 		if (i + 1 < E->line_count) buf[off++] = '\n';
 	}
     char abs[512];
+    char path_copy[512];
     const char *use_path = path;
+    if (path) {
+        size_t plen = strlen(path);
+        if (plen >= sizeof(path_copy)) plen = sizeof(path_copy) - 1;
+        memcpy(path_copy, path, plen);
+        path_copy[plen] = '\0';
+        // strip quotes if present
+        if (path_copy[0] == '"' || path_copy[0] == '\'') {
+            size_t ln = strlen(path_copy);
+            if (ln >= 2 && path_copy[ln-1] == path_copy[0]) {
+                memmove(path_copy, path_copy+1, ln-2);
+                path_copy[ln-2] = '\0';
+            }
+        }
+        use_path = path_copy;
+    }
     if (path && path[0] != '/') {
         char cwd[256]; osh_get_cwd(cwd, sizeof(cwd));
         osh_resolve_path(cwd, path, abs, sizeof(abs));
@@ -905,8 +921,19 @@ void editor_run(const char *path) {
 	apply_theme(0);
 	if (path && path[0]) {
 		char abs[512]; const char* use = path;
-		if (path[0] != '/') { char cwd[256]; osh_get_cwd(cwd, sizeof(cwd)); make_absolute_path(cwd, path, abs, sizeof(abs)); use = abs; }
-		if (file_load(&E, use) == 0) { strncpy(E.filename, use, sizeof(E.filename)-1); E.filename[sizeof(E.filename)-1]='\0'; fix_duplicate_tail(E.filename); editor_update_syntax(&E); }
+        if (path[0] != '/') { char cwd[256]; osh_get_cwd(cwd, sizeof(cwd)); make_absolute_path(cwd, path, abs, sizeof(abs)); use = abs; }
+        // strip surrounding quotes from use
+        char use_copy[512];
+        strncpy(use_copy, use, sizeof(use_copy)-1); use_copy[sizeof(use_copy)-1]='\0';
+        if ((use_copy[0] == '"' || use_copy[0] == '\'') && strlen(use_copy) >= 2) {
+            size_t ln = strlen(use_copy);
+            if (use_copy[ln-1] == use_copy[0]) {
+                memmove(use_copy, use_copy+1, ln-2);
+                use_copy[ln-2] = '\0';
+            }
+        }
+        use = use_copy;
+        if (file_load(&E, use) == 0) { strncpy(E.filename, use, sizeof(E.filename)-1); E.filename[sizeof(E.filename)-1]='\0'; fix_duplicate_tail(E.filename); editor_update_syntax(&E); }
 		else { strncpy(E.filename, use, sizeof(E.filename)-1); E.filename[sizeof(E.filename)-1]='\0'; fix_duplicate_tail(E.filename); editor_update_syntax(&E); }
 	}
 	// initial draw

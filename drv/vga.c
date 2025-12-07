@@ -28,10 +28,16 @@ void vga_clear_screen_attr(uint8_t attr) {
 void vga_write_str_xy(uint32_t x, uint32_t y, const char *s, uint8_t attr) {
     uint8_t *vga = (uint8_t*)VIDEO_ADDRESS;
     if (y >= MAX_ROWS) return;
-    uint32_t off = (y * MAX_COLS + x) * 2;
-    for (size_t i = 0; s[i] && (x + i) < MAX_COLS; i++) {
-        vga[off + i*2] = (uint8_t)s[i];
-        vga[off + i*2 + 1] = attr;
+    uint32_t px = x;
+    uint32_t py = y;
+    for (size_t i = 0; s[i]; i++) {
+        if (px >= MAX_COLS) { px = 0; py++; }
+        if (py >= MAX_ROWS) {
+            scroll_line();
+            py = MAX_ROWS - 1;
+        }
+        vga_putch_xy(px, py, (uint8_t)s[i], attr);
+        px++;
     }
 }
 
@@ -47,20 +53,10 @@ void vga_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t ch, u
 
 uint32_t vga_write_colorized_xy(uint32_t x, uint32_t y, const char *s, uint8_t default_attr) {
     if (y >= MAX_ROWS) return 0;
-    uint8_t color = default_attr;
-    uint32_t vx = 0;
-    const char* p = s;
-    while (*p && (x + vx) < MAX_COLS) {
-        size_t ahead = strnlen(p, 6);
-        if (ahead >= 6 && p[0] == '<' && p[1] == '(' && p[4] == ')' && p[5] == '>') {
-            color = parse_color_code(p[2], p[3]);
-            p += 6;
-            continue;
-        }
-        vga_putch_xy(x + vx, y, (uint8_t)*p++, color);
-        vx++;
-    }
-    return vx;
+    /* Color tags are no longer supported; print the string as-is. */
+    (void)default_attr;
+    vga_write_str_xy(x, y, s, GRAY_ON_BLACK);
+    return (uint32_t)strlen(s);
 }
 
 void	kprint(uint8_t *str)
@@ -104,27 +100,28 @@ void	kputchar(uint8_t character, uint8_t attribute_byte)
     }
 	else 
 	{
-		if (offset == (MAX_COLS * MAX_ROWS * 2)) scroll_line();
+		/* write char and handle end-of-line / scroll correctly */
+		if (offset >= (MAX_COLS * MAX_ROWS * 2)) {
+			scroll_line();
+			/* reset offset to start of last line */
+			offset = (MAX_ROWS - 1) * MAX_COLS * 2;
+		}
 		write(character, attribute_byte, offset);
-		set_cursor(offset+2);
+		uint32_t new_offset = offset + 2;
+		if (new_offset >= (MAX_COLS * MAX_ROWS * 2)) {
+			/* writing past the last cell: scroll and set cursor to start of last line */
+			scroll_line();
+			set_cursor((MAX_ROWS - 1) * MAX_COLS * 2);
+		} else {
+			set_cursor((uint16_t)new_offset);
+		}
 	}
 }
 
 void kprint_colorized(const char* str)
 {
-    uint8_t color = 0x07;
-    const char* p = str;
-    while (*p) {
-        // Чтобы исключить чтение за пределы буфера, проверяем доступную длину вперёд
-        // и лишь затем считаем это цветовым тегом.
-        size_t ahead = strnlen(p, 6);
-        if (ahead >= 6 && p[0] == '<' && p[1] == '(' && p[4] == ')' && p[5] == '>') {
-            color = parse_color_code(p[2], p[3]);
-            p += 6;
-            continue;
-        }
-        kputchar(*p++, color);
-    }
+    /* Color tags removed: print text literally using default color. */
+    kprint((uint8_t*)str);
 }
 
 void	scroll_line()
@@ -346,13 +343,7 @@ void kprintf(const char* fmt, ...)
 
     uint8_t color = 0x07; // светло-серый на чёрном
     for (const char *p = fmt; *p; ) {
-        // inline цветовой код <(bgfg)> — два шестнадцатеричных символа
-        if (*p == '<' && p[1] == '(' && p[2] && p[3] && p[4] == ')' && p[5] == '>') {
-            color = parse_color_code(p[2], p[3]);
-            p += 6;
-            continue;
-        }
-
+        // Color tags are no longer supported; treat them as normal characters.
         // support tab character: move to next tab stop (8 columns) like Linux
         if (*p == '\t') {
             uint32_t cx = 0, cy = 0;
