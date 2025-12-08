@@ -42,12 +42,14 @@ static inline void read_crs(uint64_t* cr0, uint64_t* cr2, uint64_t* cr3, uint64_
 }
 
 static void dump(const char* what, const char* who, cpu_registers_t* regs, uint64_t cr2, uint64_t err, bool user_mode){
-        (void)what;
-        (void)who;
-        (void)regs;
-        (void)cr2;
-        (void)err;
-        (void)user_mode;
+        kprintf("Oops! %s in %s at RIP=0x%llx err=0x%llx\n", what, who, (unsigned long long)regs->rip, (unsigned long long)regs->error_code);
+        kprintf("RIP: 0x%llx\n", (unsigned long long)regs->rip);
+        kprintf("RSP: 0x%llx\n", (unsigned long long)regs->rsp);
+        kprintf("RBP: 0x%llx\n", (unsigned long long)regs->rbp);
+        kprintf("RDI: 0x%llx\n", (unsigned long long)regs->rdi);
+        kprintf("RSI: 0x%llx\n", (unsigned long long)regs->rsi);
+        kprintf("RDX: 0x%llx\n", (unsigned long long)regs->rdx);
+        kprintf("RCX: 0x%llx\n", (unsigned long long)regs->rcx);
 }
 
 static void ud_fault_handler(cpu_registers_t* regs) {
@@ -77,8 +79,7 @@ static void div_zero_handler(cpu_registers_t* regs) {
 }
 
 static void page_fault_handler(cpu_registers_t* regs) {
-        kprint("PAGE FAULT\n");
-        (void)regs;
+        dump("page fault", "kernel", regs, 0, regs->error_code, false);
         for (;;) { asm volatile("sti; hlt" ::: "memory"); }
 }
 
@@ -87,7 +88,7 @@ static void gp_fault_handler(cpu_registers_t* regs){
         // Строгая семантика для POSIX-подобного поведения: никаких эмуляций в ring3.
         // General Protection Fault в пользовательском процессе рассматривается как фатальная ошибка процесса.
         if ((regs->cs & 3) == 3) {
-                kprintf("<(0c)>\nUser General Protection Fault.\nRIP: %016x\nCODE: %u\nFLAGS: %x\n", regs->rip, regs->error_code, regs->rflags);
+                kprintf("<(0c)>\nGPF.\nRIP: %016x\nCODE: %u\nFLAGS: %x\n", regs->rip, regs->error_code, regs->rflags);
                 asm volatile("sti; hlt" ::: "memory");
                 (void)regs;
         }
@@ -99,6 +100,7 @@ static void gp_fault_handler(cpu_registers_t* regs){
 static void df_fault_handler(cpu_registers_t* regs){
         // Double Fault (#DF) — используем отдельный IST стек, чтобы избежать triple fault
         kprint("DOUBLE FAULT\n");
+        dump("double fault", "kernel", regs, 0, regs->error_code, false);
         // Застываем в безопасной петле с включёнными прерываниями
         for(;;){ asm volatile("sti; hlt" ::: "memory"); }
 }

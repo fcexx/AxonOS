@@ -27,6 +27,7 @@
 #include <fat32.h>
 #include <intel_chipset.h>s
 #include <disk.h>
+#include <mmio.h>
 
 /* ATA DMA driver init (registered here) */
 void ata_dma_init(void);
@@ -298,6 +299,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     ramfs_register();
     ext2_register();
     fat32_register();
+
+    mmio_init();
     
     if (sysfs_register() == 0) {
         kprintf("sysfs: mounting sysfs in /sys\n");
@@ -397,7 +400,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     kprintf("kernel base: done\n");
     
     kprintf("\n%s v%s\n", OS_NAME, OS_VERSION);
-    
+
     // autostart: run /start script once if present
     {
         struct fs_file *f = fs_open("/start");

@@ -59,16 +59,12 @@ uint32_t vga_write_colorized_xy(uint32_t x, uint32_t y, const char *s, uint8_t d
     return (uint32_t)strlen(s);
 }
 
-void	kprint(uint8_t *str)
-{
-	while (*str)
-	{
-		kputchar(*str, GRAY_ON_BLACK);
-		str++;
-	}
+void kprint(uint8_t *str) {
+    if (!str) return;
+    while (*str) kputchar(*str++, GRAY_ON_BLACK);
 }
 
-void	kputchar(uint8_t character, uint8_t attribute_byte)
+void kputchar(uint8_t character, uint8_t attribute_byte)
 {
 	uint16_t offset;
 
