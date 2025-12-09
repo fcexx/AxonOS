@@ -16,6 +16,7 @@
 #include <apic.h>
 #include <apic_timer.h>
 #include <stat.h>
+#include <syscall.h>
 
 #include <iothread.h>
 #include <fs.h>
@@ -249,6 +250,17 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     sysinfo_init(multiboot_magic, multiboot_info);
 
     gdt_init();
+    /* allocate IST1 stack for Double Fault handler to avoid triple-faults */
+    {
+        void *df_stack = kmalloc(8192 + 16);
+        if (df_stack) {
+            uint64_t df_top = (uint64_t)df_stack + 8192 + 16;
+            tss_set_ist(1, df_top);
+            kprintf("kernel: set DF IST1 stack at %p\n", (void*)(uintptr_t)df_top);
+        } else {
+            kprintf("kernel: WARNING: failed to allocate DF IST stack\n");
+        }
+    }
     idt_init();
     pic_init();
     pit_init();
@@ -258,6 +270,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     apic_init();
     apic_timer_init();
     idt_set_handler(APIC_TIMER_VECTOR, apic_timer_handler);
+    /* syscall (int 0x80) initialization */
+    syscall_init();
     
     paging_init();
     heap_init(0, 0);
@@ -400,7 +414,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     kprintf("kernel base: done\n");
     
     kprintf("\n%s v%s\n", OS_NAME, OS_VERSION);
-
+    
     // autostart: run /start script once if present
     {
         struct fs_file *f = fs_open("/start");

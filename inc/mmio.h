@@ -3,6 +3,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Physical addresses below this value are assumed identity-mapped in the kernel.
+   Used by loaders/syscalls that temporarily access user buffers via identity mapping. */
+#define MMIO_IDENTITY_LIMIT ((uint64_t)0x100000000ULL) /* 4GiB */
+
 /* Простая библиотека/драйвер для работы с MMIO.
    Поддерживает прямой доступ для физических адресов < 4GiB (identity mapping),
    и предоставляет компактные функции чтения/записи типов 8/16/32/64 бит.

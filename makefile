@@ -77,6 +77,9 @@ iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg
 run: iso
 	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 512M -serial stdio -hda ../disk.img -boot d
 
+debug: iso
+	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 512M -serial stdio -hda ../disk.img -boot d -s -S & gdb -ex "target remote localhost:1234" $(KERNEL_ELF)
+
 disk:
 	@dd if=/dev/zero of=../disk.img bs=1M count=10
 	@mkfs.fat -F 32 ../disk.img
