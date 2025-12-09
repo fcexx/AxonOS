@@ -79,22 +79,64 @@ static void div_zero_handler(cpu_registers_t* regs) {
 }
 
 static void page_fault_handler(cpu_registers_t* regs) {
-        dump("page fault", "kernel", regs, 0, regs->error_code, false);
+        uint64_t cr2;
+        asm volatile("mov %%cr2, %0" : "=r"(cr2));
+        int user = (regs->cs & 3) == 3;
+        dump("page fault", user ? "user" : "kernel", regs, cr2, regs->error_code, user);
+        kprintf("page fault details: CR2=0x%llx err=0x%llx user=%d\n", (unsigned long long)cr2, (unsigned long long)regs->error_code, user);
         for (;;) { asm volatile("sti; hlt" ::: "memory"); }
 }
 
 static void gp_fault_handler(cpu_registers_t* regs){
     // Никакого рендера/свапа из обработчика GP
-        // Строгая семантика для POSIX-подобного поведения: никаких эмуляций в ring3.
-        // General Protection Fault в пользовательском процессе рассматривается как фатальная ошибка процесса.
-        if ((regs->cs & 3) == 3) {
-                kprintf("<(0c)>\nGPF.\nRIP: %016x\nCODE: %u\nFLAGS: %x\n", regs->rip, regs->error_code, regs->rflags);
-                asm volatile("sti; hlt" ::: "memory");
-                (void)regs;
+    // Строгая семантика для POSIX-подобного поведения: никаких эмуляций в ring3.
+    // General Protection Fault в пользовательском процессе рассматривается как фатальная ошибка процесса.
+    if ((regs->cs & 3) == 3) {
+        kprintf("<(0c)>\nGPF (user-mode) trap.\n");
+        kprintf("RIP: 0x%016llx\n", (unsigned long long)regs->rip);
+        kprintf("RSP: 0x%016llx\n", (unsigned long long)regs->rsp);
+        kprintf("RBP: 0x%016llx\n", (unsigned long long)regs->rbp);
+        kprintf("RDI: 0x%016llx\n", (unsigned long long)regs->rdi);
+        kprintf("RSI: 0x%016llx\n", (unsigned long long)regs->rsi);
+        kprintf("RDX: 0x%016llx\n", (unsigned long long)regs->rdx);
+        kprintf("RCX: 0x%016llx\n", (unsigned long long)regs->rcx);
+        kprintf("RBX: 0x%016llx\n", (unsigned long long)regs->rbx);
+        kprintf("RAX: 0x%016llx\n", (unsigned long long)regs->rax);
+        kprintf("ERR: 0x%016llx  RFLAGS: 0x%016llx  CS: 0x%04x  SS: 0x%04x\n",
+                (unsigned long long)regs->error_code, (unsigned long long)regs->rflags,
+                (uint16_t)(regs->cs & 0xFFFF), (uint16_t)(regs->ss & 0xFFFF));
+        uint64_t cr2 = 0, cr3 = 0;
+        asm volatile("mov %%cr2, %0" : "=r"(cr2));
+        asm volatile("mov %%cr3, %0" : "=r"(cr3));
+        kprintf("CR2=0x%016llx CR3=0x%016llx\n", (unsigned long long)cr2, (unsigned long long)cr3);
+
+        /* Attempt to dump a few instruction bytes at RIP (if in identity region) */
+        if ((uintptr_t)regs->rip < (uintptr_t)0x100000000ULL) {
+            const uint8_t *code = (const uint8_t*)(uintptr_t)regs->rip;
+            kprintf("code @ RIP: ");
+            for (int i = 0; i < 16; i++) kprintf("%02x ", (unsigned)code[i]);
+            kprintf("\n");
+        } else {
+            kprintf("code @ RIP: (outside identity map)\n");
         }
-        // kernel GP — стоп, но оставляем PIT активным для мигания курсора
-        (void)regs;
+
+        /* Dump few stack words */
+        if ((uintptr_t)regs->rsp < (uintptr_t)0x100000000ULL) {
+            const uint64_t *stk = (const uint64_t*)(uintptr_t)regs->rsp;
+            kprintf("stack @ RSP: ");
+            for (int i = 0; i < 8; i++) kprintf("0x%016llx ", (unsigned long long)stk[i]);
+            kprintf("\n");
+        } else {
+            kprintf("stack @ RSP: (outside identity map)\n");
+        }
+
+        kprintf("GPF: killing user thread to avoid returning to faulty user code\n");
+        /* terminate current user thread safely */
         for(;;){ asm volatile("sti; hlt" ::: "memory"); }
+    }
+    // kernel GP — стоп, но оставляем PIT активным для мигания курсора
+    (void)regs;
+    for(;;){ asm volatile("sti; hlt" ::: "memory"); }
 }
 
 static void df_fault_handler(cpu_registers_t* regs){

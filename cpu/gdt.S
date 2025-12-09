@@ -23,6 +23,14 @@ enter_user_mode_asm:
         pop %rax
         or $0x200, %rax                  // IF=1 in user image
         cli
+        // Preserve iret-frame values into callee-saved registers so they survive the call.
+        // rdi=entry, rsi=user_stack, rdx=user_ds, rcx=user_cs, rax=rflags
+        mov %rdi, %r12
+        mov %rsi, %r13
+        mov %rdx, %r14
+        mov %rcx, %r15
+        mov %rax, %rbx
+        call enter_user_pre_iret
 
         // IRET frame: SS, RSP, RFLAGS, CS, RIP
         pushq %rdx                           // SS (user_ds|3)
@@ -30,6 +38,33 @@ enter_user_mode_asm:
         pushq %rax                           // RFLAGS (with IF)
         pushq %rcx                           // CS (user_cs|3)
         pushq %rdi                           // RIP (entry)
+
+        // use preserved callee-saved regs to push the iret frame values
+        // Mask selectors to 16-bit and set RPL=3 to avoid upper-bit garbage.
+        mov %r14, %rax
+        and $0xffff, %rax
+        or $3, %rax
+        pushq %rax                           // SS (user_ds|3)
+
+        pushq %r13                           // RSP (user stack) - full 64-bit
+
+        pushq %rbx                           // RFLAGS (with IF)
+
+        mov %r15, %rax
+        and $0xffff, %rax
+        or $3, %rax
+        pushq %rax                           // CS (user_cs|3)
+
+        pushq %r12                           // RIP (entry)
+
+        // Now call post-iret diagnostic with the words we just pushed.
+        movq %rsp, %r9
+        movq (%r9), %rdi      // SS
+        movq 8(%r9), %rsi     // RSP
+        movq 16(%r9), %rdx    // RFLAGS
+        movq 24(%r9), %rcx    // CS
+        movq 32(%r9), %r8     // RIP
+        call enter_user_post_iret
 
         cld
         iretq
