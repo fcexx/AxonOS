@@ -246,6 +246,7 @@ void ascii_art() {
 
 void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     kclear();
+    enable_cursor();
     kprint("Initializing kernel...\n");
     sysinfo_init(multiboot_magic, multiboot_info);
 

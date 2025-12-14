@@ -70,6 +70,24 @@ static void ata_io_delay(uint16_t ctrl) {
 	(void)inb(ATA_REG_ALTSTATUS(ctrl));
 }
 
+/* Software reset (SRST) pulse on given channel.
+   Writes SRST=1 to control, delays, then clears SRST and waits for BSY clear. */
+static void ata_software_reset(uint16_t io_base, uint16_t ctrl_base) {
+	/* assert SRST */
+	outb(ATA_REG_CONTROL(ctrl_base), 0x04);
+	/* short delay while asserted */
+	ata_io_delay(ctrl_base);
+	ata_io_delay(ctrl_base);
+	/* deassert SRST */
+	outb(ATA_REG_CONTROL(ctrl_base), 0x00);
+	/* wait until device clears BSY or timeout */
+	for (int i = 0; i < 1000; i++) {
+		uint8_t st = inb(ATA_REG_STATUS(io_base));
+		if (st != 0 && !(st & ATA_SR_BSY)) break;
+		ata_io_delay(ctrl_base);
+	}
+}
+
 /* wait until BSY cleared or timeout (simple) */
 static int ata_wait_ready(uint16_t io_base, uint16_t ctrl_base, int timeout_ms) {
 	int loops = timeout_ms * 100; /* rough approximation */
@@ -91,6 +109,8 @@ static int ata_wait_ready(uint16_t io_base, uint16_t ctrl_base, int timeout_ms) 
 static int ata_identify(uint16_t io_base, uint16_t ctrl_base, int is_slave, uint16_t *out_buf) {
 	/* select drive */
 	outb(ATA_REG_DEVSEL(io_base), 0xA0 | (is_slave ? 0x10 : 0x00));
+	/* short delay after selecting drive (some virtual hw needs it) */
+	ata_io_delay(ctrl_base);
 	/* clear registers */
 	outb(ATA_REG_SECCOUNT(io_base), 0);
 	outb(ATA_REG_LBA_LOW(io_base), 0);
@@ -100,7 +120,13 @@ static int ata_identify(uint16_t io_base, uint16_t ctrl_base, int is_slave, uint
 	/* send IDENTIFY */
 	outb(ATA_REG_COMMAND(io_base), ATA_CMD_IDENTIFY);
 	/* read status */
-	uint8_t status = inb(ATA_REG_STATUS(io_base));
+	uint8_t status = 0;
+	/* wait a short while for device to set status != 0 (some VMware builds are slow) */
+	for (int i = 0; i < 2000; i++) {
+		status = inb(ATA_REG_STATUS(io_base));
+		if (status != 0) break;
+		ata_io_delay(ctrl_base);
+	}
 	if (status == 0) return -1; /* no device */
 
 	/* poll until DRQ or ERR, but protect with timeout to avoid infinite hang */
@@ -314,6 +340,16 @@ static void ata_register_device(uint16_t io_base, uint16_t ctrl_base, int is_sla
 
 void ata_dma_init(void) {
 	kprintf("ata: init start\n");
+	/* perform software reset on legacy channels to mimic cold-boot behavior
+	   which helps virtual machines (VMware) that do not reset ATA on soft reboot */
+	{
+		uint16_t bases_reset[2] = { ATA_PRIMARY_IO, ATA_SECONDARY_IO };
+		uint16_t ctrls_reset[2] = { ATA_PRIMARY_CTRL, ATA_SECONDARY_CTRL };
+		for (int ch = 0; ch < 2; ch++) {
+			/* issue SRST on channel */
+			ata_software_reset(bases_reset[ch], ctrls_reset[ch]);
+		}
+	}
 	/* register IRQ handlers for primary (14) and secondary (15) ATA IRQs
 	   before probing so any interrupts generated during IDENTIFY are handled. */
 	idt_set_handler(32 + 14, (void (*)(cpu_registers_t*))(&ata_io_delay)); /* placeholder to set vector now */
@@ -335,8 +371,25 @@ void ata_dma_init(void) {
 			if (ata_identify(bases[ch], ctrls[ch], sl, identbuf) == 0) {
 				char model[41] = {0};
 				ata_model_from_ident(identbuf, model, sizeof(model));
-				/* compute size in MB from words 60..61 (LBA28 total sectors) */
-				uint32_t sectors = (uint32_t)identbuf[60] | ((uint32_t)identbuf[61] << 16);
+				/* compute total sectors:
+				   - prefer 48-bit LBA result in words 100..103 if present
+				   - fallback to 28-bit result in words 60..61
+				   - cap to 32-bit because disk layer uses 32-bit LBAs */
+				uint64_t sectors64 = 0;
+				/* words 100..103 hold total number of user-addressable sectors for 48-bit LBA */
+				sectors64 = (uint64_t)(uint32_t)identbuf[100]
+					| ((uint64_t)(uint32_t)identbuf[101] << 16)
+					| ((uint64_t)(uint32_t)identbuf[102] << 32)
+					| ((uint64_t)(uint32_t)identbuf[103] << 48);
+				uint32_t sectors;
+				if (sectors64 != 0) {
+					/* cap to 32-bit since upper layers use uint32_t LBAs */
+					if (sectors64 > 0xFFFFFFFFULL) sectors = 0xFFFFFFFFU;
+					else sectors = (uint32_t)sectors64;
+				} else {
+					/* fallback to LBA28 words 60..61 */
+					sectors = (uint32_t)identbuf[60] | ((uint32_t)identbuf[61] << 16);
+				}
 				ata_register_device(bases[ch], ctrls[ch], sl, model, sectors);
 			} else {
 				/* no device or identify failed; just continue */

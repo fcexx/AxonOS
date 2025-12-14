@@ -575,6 +575,14 @@ static int __vsnprintf(char* out, size_t outsz, const char* fmt, va_list ap_in) 
 	return (int)W.len;
 }
 
+void enable_cursor() {
+    outb(0x3D4, 0x0A);
+    char curstart = inb(0x3D5) & 0x1F; // get cursor scanline start
+
+    outb(0x3D4, 0x0A);
+    outb(0x3D5, curstart | 0x20); // set enable bit
+}
+
 int vsnprintf(char* out, size_t outsz, const char* fmt, va_list ap) { return __vsnprintf(out, outsz, fmt, ap); }
 int snprintf(char* out, size_t outsz, const char* fmt, ...) { va_list ap; va_start(ap, fmt); int r=__vsnprintf(out,outsz,fmt,ap); va_end(ap); return r; }
 int sprintf(char* out, const char* fmt, ...) { va_list ap; va_start(ap, fmt); int r=__vsnprintf(out,(size_t)-1,fmt,ap); va_end(ap); return r; }
