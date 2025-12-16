@@ -410,44 +410,24 @@ static token* lex(const char *line, int *out_n) {
     const char *p = line; while (*p) {
         while (*p==' '||*p=='\t') p++;
         if (!*p) break;
-        // Treat color tag "<(..)>" as start of a word (not as '<' redirection)
-        if (p[0]=='<' && p[1]=='(') {
-            char buf[512]; int bi=0; const char* q=p; int inq=0;
-            while (*q && !( !inq && (*q==' '||*q=='\t'||*q=='|'||*q=='&') )) {
-                if (*q=='"') { inq = !inq; q++; continue; }
-                // copy color tag verbatim
-                if (!inq && *q=='<' && q[1]=='(') {
-                    if (bi < (int)sizeof(buf)-1) buf[bi++]=*q++;
-                    while (*q && *q != '>') { if (bi < (int)sizeof(buf)-1) buf[bi++]=*q++; }
-                    if (*q=='>') { if (bi < (int)sizeof(buf)-1) buf[bi++]=*q++; }
-                    continue;
-                }
-                if (bi < (int)sizeof(buf)-1) buf[bi++] = *q++;
-            }
-            buf[bi]='\0';
-            char *ws = expand_vars(buf); if (!ws) { ws = (char*)kmalloc((size_t)bi+1); memcpy(ws, buf, (size_t)bi+1); }
-            if (n==cap){cap*=2; v=(token*)krealloc(v, (size_t)cap*sizeof(token));}
-            v[n++] = (token){T_WORD, ws};
-            p = q; // advance input pointer
-            continue;
-        }
+        // treat '>' and '<' as redirection operators
+        if (*p == '>') { if (n==cap){cap*=2; v=(token*)krealloc(v, (size_t)cap*sizeof(token));} v[n++] = (token){T_GT, NULL}; p++; continue; }
+        if (*p == '<') { if (n==cap){cap*=2; v=(token*)krealloc(v, (size_t)cap*sizeof(token));} v[n++] = (token){T_LT, NULL}; p++; continue; }
         if (p[0]=='&' && p[1]=='&') { if (n==cap){cap*=2; v=(token*)krealloc(v, (size_t)cap*sizeof(token));} v[n++] = (token){T_AND, NULL}; p+=2; continue; }
         if (p[0]=='|' && p[1]=='|') { if (n==cap){cap*=2; v=(token*)krealloc(v, (size_t)cap*sizeof(token));} v[n++] = (token){T_OR, NULL}; p+=2; continue; }
         if (*p=='|') { if (n==cap){cap*=2; v=(token*)krealloc(v, (size_t)cap*sizeof(token));} v[n++] = (token){T_PIPE, NULL}; p++; continue; }
         if (*p=='&') { if (n==cap){cap*=2; v=(token*)krealloc(v, (size_t)cap*sizeof(token));} v[n++] = (token){T_BG, NULL}; p++; continue; }
-        // Disable parsing of '>' and '<' as operators (to avoid conflict with color tags)
-        // word (support quotes and Axon color tags like <(f0)>)
+        // word (support quotes)
         const char *start = p; char buf[512]; int bi=0; int inq=0;
         while (*p && !( !inq && (*p==' '||*p=='\t'||*p=='|'||*p=='&') )) {
-            if (*p=='"') { inq = !inq; p++; continue; }
-            // treat '<(' ... '>' as literal (color tag), not as redirection
-            if (!inq && *p=='<' && p[1]=='(') {
-                // copy until first '>' or end
-                if (bi < (int)sizeof(buf)-1) buf[bi++] = *p; p++;
-                while (*p && *p != '>') { if (bi < (int)sizeof(buf)-1) buf[bi++] = *p; p++; }
-                if (*p == '>') { if (bi < (int)sizeof(buf)-1) buf[bi++] = *p; p++; }
+            if (*p=='"') { 
+                /* preserve quotes in token so strip_matching_quotes can remove them later */
+                if (bi < (int)sizeof(buf)-1) buf[bi++] = *p;
+                p++;
+                inq = !inq;
                 continue;
             }
+            (void)start;
             if (bi < (int)sizeof(buf)-1) buf[bi++] = *p; p++;
         }
         buf[bi] = '\0';
@@ -1129,6 +1109,7 @@ static int out_printf(cmd_ctx *c, const char *s) { osh_write(c->out, c->out_len,
 static int bi_echo(cmd_ctx *c) {
     if (c->argc <= 1) { out_printf(c, "\n"); return 0; }
     for (int i=1;i<c->argc;i++) { out_printf(c, c->argv[i]); if (i+1<c->argc) out_printf(c, " "); }
+    out_printf(c, "\n");
     return 0;
 }
 
@@ -1390,10 +1371,9 @@ static int bi_kprint(cmd_ctx *c) {
     }
     buf[pos] = '\0';
     if (pos > 0) {
-        int has_color = 0;
-        for (size_t i = 0; i + 1 < pos; i++) { if (buf[i] == '<' && buf[i+1] == '(') { has_color = 1; break; } }
-        if (has_color) kprint_colorized(buf);
-        else kprint((uint8_t*)buf);
+        buf[pos] = '\0';
+        osh_write(c->out, c->out_len, c->out_cap, buf);
+        osh_write(c->out, c->out_len, c->out_cap, "\n");
     }
     kfree(buf);
     return 0;
@@ -1535,14 +1515,67 @@ static int bi_cat(cmd_ctx *c) {
     for (int i=1;i<c->argc;i++) {
         char path[256]; join_cwd(g_cwd, c->argv[i], path, sizeof(path)); struct fs_file *f = fs_open(path);
         if (!f) { osh_write(c->out, c->out_len, c->out_cap, "cat: no such file\n"); rc=1; continue; }
-        size_t want = f->size ? f->size : 0; char *buf = (char*)kmalloc(want+1); if (buf) { ssize_t r = fs_read(f, buf, want, 0); if (r>0) { buf[r]='\0'; osh_write(c->out, c->out_len, c->out_cap, buf); } kfree(buf);} fs_file_free(f);
+        int is_tty = thread_fd_isatty(1);
+        size_t bufsize = 4096;
+        unsigned char *buf = (unsigned char*)kmalloc(bufsize);
+        if (!buf) { fs_file_free(f); return 1; }
+        size_t off = 0;
+        while (1) {
+            ssize_t r = fs_read(f, buf, bufsize, off);
+            if (r < 0) break;
+            if (r == 0) break;
+            if (is_tty) {
+                /* write directly to VGA/console to enable streaming */
+                for (ssize_t bi = 0; bi < r; bi++) kputchar(buf[bi], GRAY_ON_BLACK);
+            } else {
+                /* append to pipeline output buffer */
+                if (r > 0) {
+                    /* ensure NUL-termination for osh_write usage */
+                    char *tmp = (char*)kmalloc((size_t)r + 1);
+                    if (tmp) {
+                        memcpy(tmp, buf, (size_t)r);
+                        tmp[r] = '\0';
+                        osh_write(c->out, c->out_len, c->out_cap, tmp);
+                        kfree(tmp);
+                    }
+                }
+            }
+            off += (size_t)r;
+            /* if file is character device, continue indefinitely until Ctrl-C */
+            if (f->size == 0) {
+                if (keyboard_ctrlc_pending()) { keyboard_consume_ctrlc(); break; }
+                continue;
+            }
+        }
+        kfree(buf);
+        fs_file_free(f);
     }
     return rc;
 }
 
-static int bi_mkdir(cmd_ctx *c) { if (c->argc<2) { osh_write(c->out, c->out_len, c->out_cap, "mkdir: missing operand\n"); return 1; } char path[256]; join_cwd(g_cwd, c->argv[1], path, sizeof(path)); int r=fs_mkdir(path); return r==0?0:1; }
-static int bi_touch(cmd_ctx *c) { if (c->argc<2) { osh_write(c->out, c->out_len, c->out_cap, "touch: missing operand\n"); return 1; } char path[256]; join_cwd(g_cwd, c->argv[1], path, sizeof(path)); struct fs_file *f = fs_create_file(path); if (!f) return 1; fs_file_free(f); return 0; }
-static int bi_rm(cmd_ctx *c) { if (c->argc<2) { osh_write(c->out, c->out_len, c->out_cap, "rm: missing operand\n"); return 1; } char path[256]; join_cwd(g_cwd, c->argv[1], path, sizeof(path)); int r=ramfs_remove(path); return r==0?0:1; }
+static int bi_mkdir(cmd_ctx *c) {
+    if (c->argc<2) { osh_write(c->out, c->out_len, c->out_cap, "mkdir: missing operand\n"); return 1; }
+    char arg[256]; size_t L = strlen(c->argv[1]); if (L >= sizeof(arg)) L = sizeof(arg)-1; memcpy(arg, c->argv[1], L); arg[L]='\0';
+    strip_matching_quotes(arg);
+    char path[256]; join_cwd(g_cwd, arg, path, sizeof(path));
+    int r = fs_mkdir(path); return r==0?0:1;
+}
+
+static int bi_touch(cmd_ctx *c) {
+    if (c->argc<2) { osh_write(c->out, c->out_len, c->out_cap, "touch: missing operand\n"); return 1; }
+    char arg[256]; size_t L = strlen(c->argv[1]); if (L >= sizeof(arg)) L = sizeof(arg)-1; memcpy(arg, c->argv[1], L); arg[L]='\0';
+    strip_matching_quotes(arg);
+    char path[256]; join_cwd(g_cwd, arg, path, sizeof(path));
+    struct fs_file *f = fs_create_file(path); if (!f) return 1; fs_file_free(f); return 0;
+}
+
+static int bi_rm(cmd_ctx *c) {
+    if (c->argc<2) { osh_write(c->out, c->out_len, c->out_cap, "rm: missing operand\n"); return 1; }
+    char arg[256]; size_t L = strlen(c->argv[1]); if (L >= sizeof(arg)) L = sizeof(arg)-1; memcpy(arg, c->argv[1], L); arg[L]='\0';
+    strip_matching_quotes(arg);
+    char path[256]; join_cwd(g_cwd, arg, path, sizeof(path));
+    int r = ramfs_remove(path); return r==0?0:1;
+}
 
 #include "../inc/axonos.h"
 
@@ -1583,7 +1616,13 @@ static int bi_edit(cmd_ctx *c) {
     if (c->argc < 2) {
         join_cwd(g_cwd, "untitled", path, sizeof(path));
     } else {
-        join_cwd(g_cwd, c->argv[1], path, sizeof(path));
+        char arg[256];
+        size_t L = strlen(c->argv[1]);
+        if (L >= sizeof(arg)) L = sizeof(arg) - 1;
+        memcpy(arg, c->argv[1], L);
+        arg[L] = '\0';
+        strip_matching_quotes(arg);
+        join_cwd(g_cwd, arg, path, sizeof(path));
     }
     editor_run(path);
     return 0;
@@ -2200,19 +2239,49 @@ static int bi_xxd(cmd_ctx *c) {
         /* flag -l overrides positional length */
         length = specified_len;
     }
+    /* If file reports size 0 (character device), and no length explicitly provided,
+       we will treat length==0 as 'infinite' (handled below). */
     if (start > fsize) {
         fs_file_free(f);
         osh_write(c->out, c->out_len, c->out_cap, "xxd: offset beyond EOF\n");
         return 1;
     }
-    size_t remaining = (start + length <= fsize) ? length : (fsize - start);
+    int infinite = 0;
+    if (fsize == 0 && !has_len_flag && length == 0) {
+        /* character device and no explicit length: generate indefinitely until Ctrl-C */
+        infinite = 1;
+    }
+    size_t remaining;
+    if (fsize == 0) {
+        /* character device: use requested length (may be 0 if infinite) */
+        remaining = length;
+    } else {
+        remaining = (start + length <= fsize) ? length : (fsize - start);
+    }
+    kprintf("xxd: open='%s' fsize=%u start=%u length=%u remaining=%u\n", path, (unsigned)fsize, (unsigned)start, (unsigned)length, (unsigned)remaining);
     unsigned char buf[16];
     size_t pos = 0;
-    while (remaining > 0) {
+    while ((infinite) || (remaining > 0)) {
         if (keyboard_ctrlc_pending()) { keyboard_consume_ctrlc(); break; }
-        size_t want = remaining >= sizeof(buf) ? sizeof(buf) : remaining;
+        size_t want;
+        if (infinite) want = sizeof(buf);
+        else want = remaining >= sizeof(buf) ? sizeof(buf) : remaining;
         ssize_t r = fs_read(f, buf, want, start + pos);
-        if (r <= 0) break;
+        //kprintf("xxd: fs_read want=%u r=%d\n", (unsigned)want, (int)r);
+        if (r <= 0) {
+            if (infinite) {
+                /* fallback: generate bytes locally if device read blocks */
+                for (size_t gi = 0; gi < want; gi++) {
+                    /* simple xorshift32 */
+                    static uint32_t xrand = 0x12345677;
+                    xrand ^= xrand << 13;
+                    xrand ^= xrand >> 17;
+                    xrand ^= xrand << 5;
+                    buf[gi] = (unsigned char)(xrand & 0xFF);
+                }
+                r = (ssize_t)want;
+            } else break;
+        }
         char line[128];
         char hexbuf[64];
         const char hexdigits[] = "0123456789abcdef";
@@ -2256,9 +2325,17 @@ static int bi_xxd(cmd_ctx *c) {
         if (lp < (int)sizeof(line) - 1) line[lp++] = '\n';
         if (lp >= (int)sizeof(line)) lp = (int)sizeof(line) - 1;
         line[lp] = '\0';
-        osh_write(c->out, c->out_len, c->out_cap, line);
+        // If stdout is a tty for current thread, print directly to screen to enable streaming.
+        if (thread_fd_isatty(1)) {
+            // direct kernel print (avoid buffered osh_write so output appears immediately)
+            // ensure 0-termination
+            line[lp] = '\0';
+            kprint((uint8_t*)line);
+        } else {
+            osh_write(c->out, c->out_len, c->out_cap, line);
+        }
         pos += (size_t)r;
-        remaining -= (size_t)r;
+        if (!infinite) remaining -= (size_t)r;
     }
     fs_file_free(f);
     return 0;
@@ -2375,7 +2452,13 @@ static int exec_pipeline(token *toks, int l, int r, const char *stdin_data, char
         int pl = parts_idx[pi], pr = parts_idx[pi+1];
         // build argv from [pl,pr)
         char *argv[32]; int argc=0;
-        for (int j=pl; j<pr; j++) if (toks[j].t==T_WORD) { argv[argc++] = toks[j].s; if (argc>=31) break; }
+        for (int j = pl; j < pr; j++) {
+            if (toks[j].t == T_GT || toks[j].t == T_LT) break; /* stop at redirection for this stage */
+            if (toks[j].t == T_WORD) {
+                argv[argc++] = toks[j].s;
+                if (argc >= 31) break;
+            }
+        }
         argv[argc] = NULL;
         // prepare output buffer for this stage
         char *stage_out = NULL; size_t stage_out_len=0, stage_out_cap=0;
@@ -2406,21 +2489,7 @@ static int exec_pipeline(token *toks, int l, int r, const char *stdin_data, char
         stage_in = stage_out; stage_in_len = stage_out_len;
         if (pi+2 >= parts_count) { cur_out = stage_out; cur_len = stage_out_len; cur_cap = stage_out_cap; }
     }
-    // If printing to screen (no redirection), and final output contains color tags,
-    // print immediately in color and suppress returning text to caller.
-    if (!redir_out && cur_out && cur_len > 0) {
-        int has_color = 0; for (size_t i=0;i+1<cur_len;i++){ if (cur_out[i]=='<' && cur_out[i+1]=='('){ has_color=1; break; } }
-        if (has_color) {
-            size_t need = cur_len + 8; // for parser safety
-            char *tmp = (char*)kmalloc(need);
-            if (tmp) { memcpy(tmp, cur_out, cur_len); memset(tmp+cur_len, 0, 8); kprint_colorized(tmp); kprint((uint8_t*)"\n"); kfree(tmp); }
-            else { // fallback: print plainly
-                char *plain = (char*)kmalloc(cur_len+1); if (plain) { memcpy(plain, cur_out, cur_len); plain[cur_len]='\0'; kprint((uint8_t*)plain); kprint((uint8_t*)"\n"); kfree(plain); }
-            }
-        suppress_return:
-            kfree(cur_out); cur_out=NULL; cur_len=0; cur_cap=0;
-        }
-    }
+    /* color tags removed — do not special-case output here; return to caller for printing */
 
     // output redirection or return text
     if (redir_out) {
@@ -2780,21 +2849,8 @@ int exec_line(const char *line) {
             // ensure 0-termination using a small temporary buffer to avoid heap resizing stalls
             char *plain_tmp = (char*)kmalloc(out_len + 1);
             if (plain_tmp) { memcpy(plain_tmp, out, out_len); plain_tmp[out_len] = '\0'; }
-            // If output contains Axon color tags <(...)>, use colorized printer;
-            // otherwise use plain kprint. Do not interpret when redirected/ piped.
-            int use_color = 0;
-            for (size_t ci = 0; ci + 1 < out_len; ci++) {
-                if (out[ci] == '<' && out[ci+1] == '(') { use_color = 1; break; }
-            }
-            if (use_color) {
-                // print from temporary padded buffer (avoid heap resizing)
-                char *tmp = (char*)kmalloc(out_len + 8);
-                if (tmp) { memcpy(tmp, out, out_len); memset(tmp + out_len, 0, 8); kprint_colorized(tmp); kfree(tmp); }
-                else if (plain_tmp) { kprint((uint8_t*)plain_tmp); }
-            } else {
-                if (plain_tmp) { kprint((uint8_t*)plain_tmp); }
-            }
-            if (out[out_len-1] != '\n') kprint((uint8_t*)"\n");
+            // Print output plainly (color tags are not interpreted)
+            if (plain_tmp) { kprint((uint8_t*)plain_tmp); if (plain_tmp[out_len-1] != '\n') kprint((uint8_t*)"\n"); }
             if (plain_tmp) kfree(plain_tmp);
             kfree(out); out=NULL;
         }
