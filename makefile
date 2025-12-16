@@ -76,12 +76,18 @@ iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg
 
 run: iso
 <<<<<<< HEAD
+<<<<<<< HEAD
 	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 64M -net nic,model=rtl8139 -net user -serial stdio
 =======
+=======
+>>>>>>> origin/fcexx
 	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 512M -serial stdio -hda ../disk.img -boot d -vga cirrus
 
 debug: iso
 	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 512M -serial stdio -hda ../disk.img -boot d -s -S & gdb -ex "target remote localhost:1234" $(KERNEL_ELF)
+<<<<<<< HEAD
+>>>>>>> origin/fcexx
+=======
 >>>>>>> origin/fcexx
 
 disk:

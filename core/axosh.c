@@ -2023,6 +2023,9 @@ static const builtin builtin_table[] = {
 =======
     {"useradd", bi_useradd}, {"groupadd", bi_groupadd}, {"chmod", bi_chmod}, {"chvt", bi_chvt},
     {"open", bi_open}, {"close", bi_close}, {"dup", bi_dup}, {"dup2", bi_dup2}, {"isatty", bi_isatty}, {"xxd", bi_xxd}, {"mount", bi_mount}, {"umount", bi_umount}, {"exec", bi_exec}
+<<<<<<< HEAD
+>>>>>>> origin/fcexx
+=======
 >>>>>>> origin/fcexx
 };
 static int bi_chmod(cmd_ctx *c) {
