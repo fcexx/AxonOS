@@ -17,7 +17,7 @@ MULTIBOOT_BIN := $(BUILD_DIR)/multiboot.bin
 ISO_IMAGE := $(BUILD_DIR)/axonos.iso
 
 CC := gcc -m64
-CFLAGS := -ffreestanding -O2 -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=kernel -Iinc -w
+CFLAGS := -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=kernel -Iinc -w
 
 CSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -type f -name '*.c' -print | sed 's|^\./||')
 COBJS := $(patsubst %.c,$(BUILD_DIR)/%.c.o,$(CSRCS))
