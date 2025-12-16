@@ -17,7 +17,7 @@ MULTIBOOT_BIN := $(BUILD_DIR)/multiboot.bin
 ISO_IMAGE := $(BUILD_DIR)/axonos.iso
 
 CC := gcc -m64
-CFLAGS := -ffreestanding -O2 -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=kernel -Iinc -w
+CFLAGS := -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=kernel -Iinc -w
 
 CSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -type f -name '*.c' -print | sed 's|^\./||')
 COBJS := $(patsubst %.c,$(BUILD_DIR)/%.c.o,$(CSRCS))
@@ -75,7 +75,14 @@ iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg
 	}
 
 run: iso
+<<<<<<< HEAD
 	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 64M -net nic,model=rtl8139 -net user -serial stdio
+=======
+	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 512M -serial stdio -hda ../disk.img -boot d -vga cirrus
+
+debug: iso
+	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 512M -serial stdio -hda ../disk.img -boot d -s -S & gdb -ex "target remote localhost:1234" $(KERNEL_ELF)
+>>>>>>> origin/fcexx
 
 disk:
 	@dd if=/dev/zero of=../disk.img bs=1M count=10

@@ -17,6 +17,7 @@
 #include <apic_timer.h>
 #include <stat.h>
 #include <mmio.h>
+#include <syscall.h>
 
 #include <iothread.h>
 #include <fs.h>
@@ -28,6 +29,7 @@
 #include <fat32.h>
 #include <intel_chipset.h>s
 #include <disk.h>
+#include <mmio.h>
 
 /* ATA DMA driver init (registered here) */
 void ata_dma_init(void);
@@ -245,10 +247,22 @@ void ascii_art() {
 
 void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     kclear();
+    enable_cursor();
     kprint("Initializing kernel...\n");
     sysinfo_init(multiboot_magic, multiboot_info);
 
     gdt_init();
+    /* allocate IST1 stack for Double Fault handler to avoid triple-faults */
+    {
+        void *df_stack = kmalloc(8192 + 16);
+        if (df_stack) {
+            uint64_t df_top = (uint64_t)df_stack + 8192 + 16;
+            tss_set_ist(1, df_top);
+            kprintf("kernel: set DF IST1 stack at %p\n", (void*)(uintptr_t)df_top);
+        } else {
+            kprintf("kernel: WARNING: failed to allocate DF IST stack\n");
+        }
+    }
     idt_init();
     pic_init();
     pit_init();
@@ -258,6 +272,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     apic_init();
     apic_timer_init();
     idt_set_handler(APIC_TIMER_VECTOR, apic_timer_handler);
+    /* syscall (int 0x80) initialization */
+    syscall_init();
     
     paging_init();
     heap_init(0, 0);
@@ -361,6 +377,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     ramfs_register();
     ext2_register();
     fat32_register();
+
+    mmio_init();
     
     if (sysfs_register() == 0) {
         kprintf("sysfs: mounting sysfs in /sys\n");
@@ -467,8 +485,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         if (f) { fs_file_free(f); (void)exec_line("osh /start"); }
         else { kprintf("FATAL: /start file not found; fallback to osh\n"); exec_line("PS1=\"\\w # \""); exec_line("osh"); }
     }
-
-    kprintf("\nWelcome to %s %s!\n", OS_NAME, OS_VERSION);
 
     // Завершение
     kprint("\nShutting down...");

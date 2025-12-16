@@ -170,6 +170,11 @@ int fat32_probe_and_mount(int device_id) {
 }
 
 /* open: handle paths under /fat */
+/* forward declarations for helpers implemented later in this file */
+static int fat32_find_entry_in_dir(struct fat32_mount *m, uint32_t dir_cluster, const char *name,
+                                   uint32_t *out_start_cluster, uint32_t *out_size, int *out_is_dir);
+static int fat32_resolve_parent_cluster(struct fat32_mount *m, const char *path, uint32_t *out_parent_cluster, char *out_basename, size_t blen);
+
 static int fat32_open(const char *path, struct fs_file **out_file) {
     kprintf("fat32: open called for path='%s'\n", path ? path : "(null)");
     if (!g_fat) return -1;
@@ -207,134 +212,50 @@ static int fat32_open(const char *path, struct fs_file **out_file) {
         *out_file = f;
         return 0;
     }
-    /* We will support only direct child names (no nested) for simplicity: /mount/NAME */
+    /* Support nested paths: resolve parent directory cluster and search there for the entry */
     /* Skip leading '/' */
     if (name[0] == '/') name++;
-    /* For now, only support short names (8.3) without case sensitivity and without LFN */
-    /* Walk root directory clusters and search for matching short name */
-    uint32_t cluster = g_fat->root_cluster;
-    uint32_t bytes_per_cluster = g_fat->bytes_per_sector * g_fat->sectors_per_cluster;
-    uint8_t *buf = (uint8_t*)kmalloc(bytes_per_cluster);
-    if (!buf) return -1;
-    while (1) {
-        uint32_t lba = cluster_to_lba(g_fat, cluster);
-        if (read_sectors(g_fat->device_id, lba, buf, g_fat->sectors_per_cluster) != 0) { kfree(buf); return -1; }
-        /* prepare LFN temporary storage for this sector */
-        uint16_t lfn_u16[20][13];
-        int lfn_u16_len[20];
-        memset(lfn_u16_len, 0, sizeof(lfn_u16_len));
-        int lfn_present = 0, lfn_count = 0;
-        for (uint32_t off = 0; off + 32 <= bytes_per_cluster; off += 32) {
-            uint8_t first = buf[off];
-            if (first == 0x00) { /* end of directory */ kfree(buf); return -1; }
-            if (first == 0xE5) { lfn_present = 0; lfn_count = 0; continue; } /* deleted */
-            uint8_t attr = buf[off + 11];
-            if (attr == 0x0F) {
-                /* LFN entry: store UTF-16LE pieces */
-                uint8_t seq = buf[off] & 0x1F;
-                if (seq == 0 || seq > 20) { lfn_present = 0; lfn_count = 0; continue; }
-                int p = 0;
-                for (int i = 0; i < 5; i++) {
-                    uint16_t ch = *(uint16_t*)(buf + off + 1 + i*2);
-                    if (ch == 0x0000 || ch == 0xFFFF) break;
-                    if (p < 13) lfn_u16[seq-1][p++] = ch;
-                }
-                for (int i = 0; i < 6; i++) {
-                    uint16_t ch = *(uint16_t*)(buf + off + 14 + i*2);
-                    if (ch == 0x0000 || ch == 0xFFFF) break;
-                    if (p < 13) lfn_u16[seq-1][p++] = ch;
-                }
-                for (int i = 0; i < 2; i++) {
-                    uint16_t ch = *(uint16_t*)(buf + off + 28 + i*2);
-                    if (ch == 0x0000 || ch == 0xFFFF) break;
-                    if (p < 13) lfn_u16[seq-1][p++] = ch;
-                }
-                lfn_u16_len[seq-1] = p;
-                lfn_present = 1;
-                if (buf[off] & 0x40) lfn_count = (int)(buf[off] & 0x1F);
-                continue;
-            }
-            /* short entry: either match via assembled LFN or via shortname */
-            char namebuf[512];
-            if (lfn_present && lfn_count > 0) {
-                int pos = 0;
-                for (int si = 0; si < lfn_count; si++) {
-                    if (lfn_u16_len[si] <= 0) continue;
-                    char tmputf[128];
-                    int conv = utf16le_to_utf8(lfn_u16[si], lfn_u16_len[si], tmputf, sizeof(tmputf));
-                    if (conv > 0) {
-                        for (int k = 0; k < conv && pos < (int)sizeof(namebuf)-1; k++) namebuf[pos++] = tmputf[k];
-                    }
-                }
-                namebuf[pos] = '\0';
-            } else {
-                /* build 8.3 name */
-                int p = 0;
-                for (int i = 0; i < 8; i++) {
-                    char c = buf[off + i];
-                    if (c == ' ') continue;
-                    namebuf[p++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
-                }
-                if (buf[off+8] != ' ') {
-                    for (int i = 0; i < 3; i++) {
-                        char c = buf[off + 8 + i];
-                        if (c == ' ') continue;
-                        namebuf[p++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
-                    }
-                }
-                namebuf[p] = '\0';
-            }
-            /* compare with requested name (case-insensitive) */
-            char lname[256];
-            size_t ln = strlen(name);
-            if (ln >= sizeof(lname)) ln = sizeof(lname)-1;
-            for (size_t i=0;i<ln;i++) { char c = name[i]; lname[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
-            lname[ln] = '\0';
-            /* lowercase namebuf for comparison */
-            char lower_namebuf[512];
-            size_t nb_len = strlen(namebuf);
-            for (size_t i=0;i<nb_len && i<sizeof(lower_namebuf)-1;i++) {
-                char c = namebuf[i];
-                lower_namebuf[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
-            }
-            lower_namebuf[nb_len] = '\0';
-            if (strcmp(lower_namebuf, lname) == 0) {
-                /* matched */
-                uint16_t high = *(uint16_t*)(buf + off + 20);
-                uint16_t low = *(uint16_t*)(buf + off + 26);
-                uint32_t start_cluster = ((uint32_t)high << 16) | (uint32_t)low;
-                uint32_t size = *(uint32_t*)(buf + off + 28);
-                struct fs_file *f = (struct fs_file*)kmalloc(sizeof(*f));
-                if (!f) { kfree(buf); return -1; }
-                memset(f,0,sizeof(*f));
-                size_t plen = strlen(path) + 1;
-                char *pp = (char*)kmalloc(plen);
-                memcpy(pp, path, plen);
-                f->path = pp;
-                f->size = size;
-                f->fs_private = &fat32_driver;
-                f->type = (attr & 0x10) ? FS_TYPE_DIR : FS_TYPE_REG;
-                struct fat32_file_handle *fh = (struct fat32_file_handle*)kmalloc(sizeof(*fh));
-                memset(fh,0,sizeof(*fh));
-                fh->m = g_fat;
-                fh->start_cluster = start_cluster;
-                fh->size = size;
-                fh->cur_cluster = start_cluster;
-                f->driver_private = fh;
-                *out_file = f;
-                kfree(buf);
-                return 0;
-            }
-            /* reset LFN state */
-            lfn_present = 0; lfn_count = 0;
-        }
-        /* next cluster */
-        uint32_t next = fat32_read_fat_entry(g_fat, cluster);
-        if (next >= 0x0FFFFFF8) break;
-        if (next == 0) break;
-        cluster = next;
+    char tmp[512];
+    size_t nl = strlen(name);
+    if (nl >= sizeof(tmp)) return -1;
+    memcpy(tmp, name, nl+1);
+    /* strip trailing '/' if any */
+    if (nl > 1 && tmp[nl-1] == '/') tmp[nl-1] = '\0';
+    /* resolve parent cluster and basename */
+    char basename[256];
+    uint32_t parent_cluster = g_fat->root_cluster;
+    if (fat32_resolve_parent_cluster(g_fat, name, &parent_cluster, basename, sizeof(basename)) != 0) {
+        /* If resolve failed but name may be single component, use name as basename */
+        /* Try single-component fallback */
+        if (strlen(name) >= sizeof(basename)) return -1;
+        strcpy(basename, name[0] == '/' ? name+1 : name);
+        parent_cluster = g_fat->root_cluster;
     }
-    kfree(buf);
+    /* search basename in parent_cluster */
+    uint32_t found_start = 0;
+    uint32_t found_size = 0;
+    int found_is_dir = 0;
+    if (fat32_find_entry_in_dir(g_fat, parent_cluster, basename, &found_start, &found_size, &found_is_dir) == 0) {
+        struct fs_file *f = (struct fs_file*)kmalloc(sizeof(*f));
+        if (!f) return -1;
+        memset(f,0,sizeof(*f));
+        size_t plen = strlen(path) + 1;
+        char *pp = (char*)kmalloc(plen);
+        memcpy(pp, path, plen);
+        f->path = pp;
+        f->size = found_size;
+        f->fs_private = &fat32_driver;
+        f->type = found_is_dir ? FS_TYPE_DIR : FS_TYPE_REG;
+        struct fat32_file_handle *fh = (struct fat32_file_handle*)kmalloc(sizeof(*fh));
+        memset(fh,0,sizeof(*fh));
+        fh->m = g_fat;
+        fh->start_cluster = found_start;
+        fh->size = found_size;
+        fh->cur_cluster = found_start;
+        f->driver_private = fh;
+        *out_file = f;
+        return 0;
+    }
     return -1;
 }
 
@@ -726,6 +647,141 @@ static void fat32_write_lfn_entries_to_buf(uint8_t *dirbuf, uint32_t off, const 
     }
 }
 
+/* Find a directory entry with given name inside directory starting at dir_cluster.
+   Returns 0 on success and fills out_start_cluster/out_size/out_is_dir, -1 if not found or error. */
+static int fat32_find_entry_in_dir(struct fat32_mount *m, uint32_t dir_cluster, const char *name,
+                                   uint32_t *out_start_cluster, uint32_t *out_size, int *out_is_dir) {
+    if (!m || !name) return -1;
+    uint32_t cluster = dir_cluster;
+    uint32_t bytes_per_cluster = m->bytes_per_sector * m->sectors_per_cluster;
+    uint8_t *buf = (uint8_t*)kmalloc(bytes_per_cluster);
+    if (!buf) return -1;
+    /* prepare lowercase target */
+    char target[512];
+    size_t tn = strlen(name);
+    if (tn >= sizeof(target)) { kfree(buf); return -1; }
+    for (size_t i = 0; i < tn; i++) target[i] = (char)((name[i] >= 'A' && name[i] <= 'Z') ? (name[i] + 32) : name[i]);
+    target[tn] = '\0';
+
+    while (1) {
+        uint32_t lba = cluster_to_lba(m, cluster);
+        if (read_sectors(m->device_id, lba, buf, m->sectors_per_cluster) != 0) break;
+        uint16_t lfn_u16[20][13];
+        int lfn_u16_len[20];
+        memset(lfn_u16_len, 0, sizeof(lfn_u16_len));
+        memset(lfn_u16, 0, sizeof(lfn_u16));
+        int lfn_present = 0, lfn_count = 0;
+        for (uint32_t off = 0; off + 32 <= bytes_per_cluster; off += 32) {
+            uint8_t first = buf[off];
+            if (first == 0x00) { kfree(buf); return -1; }
+            if (first == 0xE5) { lfn_present = 0; lfn_count = 0; continue; }
+            uint8_t attr = buf[off + 11];
+            if (attr == 0x0F) {
+                uint8_t seq = buf[off] & 0x1F;
+                if (seq == 0 || seq > 20) { lfn_present = 0; lfn_count = 0; continue; }
+                int p = 0;
+                lfn_u16_len[seq-1] = 0;
+                for (int i = 0; i < 5; i++) { uint16_t ch = *(uint16_t*)(buf + off + 1 + i*2); if (ch==0x0000||ch==0xFFFF) break; if (p<13) lfn_u16[seq-1][p++] = ch; }
+                for (int i = 0; i < 6; i++) { uint16_t ch = *(uint16_t*)(buf + off + 14 + i*2); if (ch==0x0000||ch==0xFFFF) break; if (p<13) lfn_u16[seq-1][p++] = ch; }
+                for (int i = 0; i < 2; i++) { uint16_t ch = *(uint16_t*)(buf + off + 28 + i*2); if (ch==0x0000||ch==0xFFFF) break; if (p<13) lfn_u16[seq-1][p++] = ch; }
+                lfn_u16_len[seq-1] = p;
+                lfn_present = 1;
+                if (buf[off] & 0x40) lfn_count = (int)(buf[off] & 0x1F);
+                continue;
+            }
+            /* assemble name */
+            char namebuf[512];
+            if (lfn_present && lfn_count > 0) {
+                int pos = 0;
+                for (int si = 0; si < lfn_count; si++) {
+                    if (lfn_u16_len[si] <= 0) continue;
+                    char tmputf[128];
+                    int conv = utf16le_to_utf8(lfn_u16[si], lfn_u16_len[si], tmputf, sizeof(tmputf));
+                    if (conv > 0) {
+                        for (int k = 0; k < conv && pos < (int)sizeof(namebuf)-1; k++) namebuf[pos++] = tmputf[k];
+                    }
+                }
+                namebuf[pos] = '\0';
+            } else {
+                int p2 = 0;
+                for (int i = 0; i < 8; i++) { char ch = buf[off + i]; if (ch != ' ') namebuf[p2++] = (char)((ch >= 'a' && ch <= 'z') ? ch - 32 : ch); }
+                if (buf[off+8] != ' ') { namebuf[p2++] = '.'; for (int i = 0; i < 3; i++) { char ch = buf[off + 8 + i]; if (ch != ' ') namebuf[p2++] = (char)((ch >= 'a' && ch <= 'z') ? ch - 32 : ch); } }
+                namebuf[p2] = 0;
+            }
+            /* lowercase for compare */
+            char lower_namebuf[512];
+            size_t nb_len = strlen(namebuf);
+            if (nb_len >= sizeof(lower_namebuf)) nb_len = sizeof(lower_namebuf)-1;
+            for (size_t i=0;i<nb_len;i++) {
+                char c = namebuf[i];
+                lower_namebuf[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+            }
+            lower_namebuf[nb_len] = '\0';
+            if (strcmp(lower_namebuf, target) == 0) {
+                uint16_t high = *(uint16_t*)(buf + off + 20);
+                uint16_t low = *(uint16_t*)(buf + off + 26);
+                uint32_t start_cluster = ((uint32_t)high << 16) | (uint32_t)low;
+                uint32_t size = *(uint32_t*)(buf + off + 28);
+                int is_dir = (buf[off + 11] & 0x10) ? 1 : 0;
+                if (out_start_cluster) *out_start_cluster = start_cluster;
+                if (out_size) *out_size = size;
+                if (out_is_dir) *out_is_dir = is_dir;
+                kfree(buf);
+                return 0;
+            }
+            lfn_present = 0; lfn_count = 0;
+        }
+        uint32_t nxt = fat32_read_fat_entry(m, cluster);
+        if (nxt >= 0x0FFFFFF8 || nxt == 0) break;
+        cluster = nxt;
+    }
+    kfree(buf);
+    return -1;
+}
+
+/* Resolve parent directory cluster and basename for given path under mount.
+   path should be relative to mount (leading '/' optional). Returns 0 on success. */
+static int fat32_resolve_parent_cluster(struct fat32_mount *m, const char *path, uint32_t *out_parent_cluster, char *out_basename, size_t blen) {
+    if (!m || !path || !out_parent_cluster || !out_basename) return -1;
+    char tmp[512];
+    size_t plen = strlen(path);
+    if (plen >= sizeof(tmp)) return -1;
+    memcpy(tmp, path, plen+1);
+    /* strip leading '/' */
+    if (tmp[0] == '/') memmove(tmp, tmp+1, strlen(tmp));
+    /* strip trailing slash */
+    size_t tl = strlen(tmp);
+    if (tl > 0 && tmp[tl-1] == '/') tmp[tl-1] = '\0';
+    /* if empty -> parent is root and basename empty */
+    if (tmp[0] == '\0') return -1;
+    /* find last component */
+    char *last = strrchr(tmp, '/');
+    uint32_t parent = m->root_cluster;
+    if (last) {
+        *last = '\0';
+        char *tok = strtok(tmp, "/");
+        while (tok) {
+            uint32_t found_start = 0;
+            uint32_t found_size = 0;
+            int found_is_dir = 0;
+            if (fat32_find_entry_in_dir(m, parent, tok, &found_start, &found_size, &found_is_dir) != 0) return -1;
+            if (!found_is_dir) return -1;
+            parent = found_start;
+            tok = strtok(NULL, "/");
+        }
+        char *bn = last + 1;
+        if (strlen(bn) >= blen) return -1;
+        strcpy(out_basename, bn);
+    } else {
+        /* single-component path under mount */
+        if (strlen(tmp) >= blen) return -1;
+        strcpy(out_basename, tmp);
+        parent = m->root_cluster;
+    }
+    *out_parent_cluster = parent;
+    return 0;
+}
+
 /* Check whether a name (UTF-8 ASCII) exists in root directory (LFN-aware, case-insensitive) */
 static int fat32_name_exists(const char *name) {
     if (!g_fat || !name) return 0;
@@ -797,29 +853,46 @@ static int fat32_name_exists(const char *name) {
 static int fat32_create(const char *path, struct fs_file **out_file) {
     if (!g_fat) return -1;
     if (!path || path[0] != '/') return -1;
-    /* get basename */
-    const char *p = strrchr(path, '/');
-    const char *basename = p ? p+1 : path;
-    if (!basename || !*basename) return -1;
+    /* Resolve parent directory and basename (path is absolute under mount) */
+    char mount_prefix[128];
+    if (fs_get_matching_mount_prefix(path, mount_prefix, sizeof(mount_prefix)) != 0) mount_prefix[0] = '\0';
+    const char *name = path;
+    if (mount_prefix[0] != '\0') {
+        size_t mp_len = strlen(mount_prefix);
+        if (strncmp(path, mount_prefix, mp_len) == 0) name = path + mp_len;
+        else return -1;
+    }
+    char basename_raw[256];
+    uint32_t parent_cluster = g_fat->root_cluster;
+    if (fat32_resolve_parent_cluster(g_fat, name, &parent_cluster, basename_raw, sizeof(basename_raw)) != 0) {
+        /* support creating directly under root if resolve failed */
+        const char *p = strrchr(name, '/');
+        const char *b = p ? p+1 : (name[0] == '/' ? name+1 : name);
+        if (!b || !*b) return -1;
+        if (strlen(b) >= sizeof(basename_raw)) return -1;
+        strcpy(basename_raw, b);
+        parent_cluster = g_fat->root_cluster;
+    }
     /* Normalize basename: strip surrounding quotes if present */
     char cleanname[256];
-    size_t bl_in = strlen(basename);
+    size_t bl_in = strlen(basename_raw);
     if (bl_in >= sizeof(cleanname)) bl_in = sizeof(cleanname) - 1;
-    memcpy(cleanname, basename, bl_in);
+    memcpy(cleanname, basename_raw, bl_in);
     cleanname[bl_in] = '\0';
     strip_matching_quotes_local(cleanname);
-    /* Prevent duplicate filename */
-    if (fat32_name_exists(cleanname)) {
+    /* Prevent duplicate filename in parent directory */
+    uint32_t tmp_start = 0, tmp_size = 0; int tmp_is_dir = 0;
+    if (fat32_find_entry_in_dir(g_fat, parent_cluster, cleanname, &tmp_start, &tmp_size, &tmp_is_dir) == 0) {
         kprintf("fat32: create failed: name exists %s\n", cleanname);
         return -1;
     }
-    uint32_t cluster = g_fat->root_cluster;
+    uint32_t cluster = parent_cluster;
     uint32_t bytes_per_cluster = g_fat->bytes_per_sector * g_fat->sectors_per_cluster;
     uint8_t *buf = (uint8_t*)kmalloc(bytes_per_cluster);
     if (!buf) return -1;
     uint8_t shortname[11];
     fat32_make_shortname(cleanname, shortname);
-    kprintf("fat32: creating %s in root\n", cleanname);
+    kprintf("fat32: creating %s in dir cluster %u\n", cleanname, cluster);
     /* Always use LFN (no 8.3 support). Compute LFN entries needed (13 u16 per entry). */
     size_t bl = strlen(cleanname);
     int need_lfn = 1;
@@ -901,8 +974,17 @@ static int fat32_create(const char *path, struct fs_file **out_file) {
 static int fat32_mkdir(const char *path) {
     if (!g_fat) return -1;
     if (!path || path[0] != '/') return -1;
-    const char *p = strrchr(path, '/');
-    const char *basename = p ? p+1 : path;
+    /* resolve parent cluster and basename */
+    char mount_prefix[128];
+    if (fs_get_matching_mount_prefix(path, mount_prefix, sizeof(mount_prefix)) != 0) mount_prefix[0] = '\0';
+    const char *name = path;
+    if (mount_prefix[0] != '\0') {
+        size_t mp_len = strlen(mount_prefix);
+        if (strncmp(path, mount_prefix, mp_len) == 0) name = path + mp_len;
+        else return -1;
+    }
+    const char *p = strrchr(name, '/');
+    const char *basename = p ? p+1 : (name[0] == '/' ? name+1 : name);
     if (!basename || !*basename) return -1;
     /* normalize basename (strip quotes) */
     char cleanname[256];
@@ -911,14 +993,21 @@ static int fat32_mkdir(const char *path) {
     memcpy(cleanname, basename, bl_in);
     cleanname[bl_in] = '\0';
     strip_matching_quotes_local(cleanname);
-    /* prevent duplicate dir */
-    if (fat32_name_exists(cleanname)) return -1;
+    /* prevent duplicate dir in parent */
+    uint32_t parent_cluster = g_fat->root_cluster;
+    char basename_raw[256];
+    if (fat32_resolve_parent_cluster(g_fat, name, &parent_cluster, basename_raw, sizeof(basename_raw)) != 0) {
+        /* fallback: treat as under root */
+        parent_cluster = g_fat->root_cluster;
+    }
+    uint32_t tmp_start = 0, tmp_size = 0; int tmp_is_dir = 0;
+    if (fat32_find_entry_in_dir(g_fat, parent_cluster, cleanname, &tmp_start, &tmp_size, &tmp_is_dir) == 0) return -1;
     /* Always create LFN for directories; shortname placeholder will be written but ignored. */
     uint8_t shortname[11];
     fat32_make_shortname(cleanname, shortname);
     size_t bl = strlen(cleanname);
     int lfn_entries = (int)((bl + 12) / 13);
-    uint32_t cluster = g_fat->root_cluster;
+    uint32_t cluster = parent_cluster;
     uint32_t bytes_per_cluster = g_fat->bytes_per_sector * g_fat->sectors_per_cluster;
     uint8_t *buf = (uint8_t*)kmalloc(bytes_per_cluster);
     if (!buf) return -1;
@@ -967,8 +1056,8 @@ static int fat32_mkdir(const char *path) {
                 clbuf[33] = '.';
                 for (int i=34;i<44;i++) clbuf[i] = ' ';
                 clbuf[44] = 0x10;
-                uint16_t parent_high = (uint16_t)((g_fat->root_cluster >> 16) & 0xFFFF);
-                uint16_t parent_low = (uint16_t)(g_fat->root_cluster & 0xFFFF);
+                uint16_t parent_high = (uint16_t)((parent_cluster >> 16) & 0xFFFF);
+                uint16_t parent_low = (uint16_t)(parent_cluster & 0xFFFF);
                 memcpy(clbuf + 52, &parent_high, 2);
                 memcpy(clbuf + 58, &parent_low, 2);
                 if (disk_write_sectors(g_fat->device_id, cluster_to_lba(g_fat, newc), clbuf, g_fat->sectors_per_cluster) != 0) { kfree(clbuf); kfree(buf); return -1; }
@@ -1045,14 +1134,28 @@ static ssize_t fat32_write(struct fs_file *file, const void *buf_in, size_t size
     /* update file size in directory entry */
     fh->size = endpos > fh->size ? endpos : fh->size;
     file->size = fh->size;
-    /* update directory entry in root */
-    /* build shortname from path */
+    /* update directory entry in parent directory */
+    /* build shortname from path and resolve parent cluster */
     const char *path = file->path;
     const char *basename = strrchr(path, '/');
     basename = basename ? basename+1 : path;
+    /* determine mount-relative name for resolve helper */
+    char mount_prefix[128];
+    if (fs_get_matching_mount_prefix(path, mount_prefix, sizeof(mount_prefix)) != 0) mount_prefix[0] = '\0';
+    const char *name = path;
+    if (mount_prefix[0] != '\0') {
+        size_t mp_len = strlen(mount_prefix);
+        if (strncmp(path, mount_prefix, mp_len) == 0) name = path + mp_len;
+    }
+    uint32_t parent_cluster = m->root_cluster;
+    char basename_raw[256];
+    if (fat32_resolve_parent_cluster(m, name, &parent_cluster, basename_raw, sizeof(basename_raw)) != 0) {
+        /* fallback to root */
+        parent_cluster = m->root_cluster;
+    }
     uint8_t sname[11];
     fat32_make_shortname(basename, sname);
-    uint32_t c = m->root_cluster;
+    uint32_t c = parent_cluster;
     uint8_t *d = (uint8_t*)kmalloc(bytes_per_cluster);
     if (!d) return (ssize_t)written;
     while (1) {

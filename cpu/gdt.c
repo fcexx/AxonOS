@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <axonos.h>
 #include <debug.h>
+#include <mmio.h>
 
 #pragma pack(push,1)
 struct gdtr {
@@ -146,5 +147,53 @@ void tss_set_ist(int idx, uint64_t rsp_top) {
 }
 
 void enter_user_mode(uint64_t user_entry, uint64_t user_stack_top) {
+        /* Diagnostic: print values passed to assembly trampoline and a few stack bytes.
+           This helps verify that CS/DS/selectors and stack are correct before iretq. */
+        kprintf("enter_user_mode: entry=0x%llx user_stack_top=0x%llx USER_DS=0x%04x USER_CS=0x%04x\n",
+                (unsigned long long)user_entry, (unsigned long long)user_stack_top,
+                (unsigned)USER_DS, (unsigned)USER_CS);
+        /* dump a few bytes at the top of user stack if identity-mapped */
+        if ((uintptr_t)user_stack_top < (uintptr_t)0x100000000ULL) {
+                const uint8_t *p = (const uint8_t*)(uintptr_t)(user_stack_top - 64);
+                kprintf("stack bytes @ top-64: ");
+                for (int i = 0; i < 64; i++) kprintf("%02x ", (unsigned)p[i]);
+                kprintf("\n");
+        } else {
+                kprintf("stack bytes: (outside identity map)\n");
+        }
         enter_user_mode_asm(user_entry, user_stack_top, USER_DS, USER_CS);
 } 
+
+/* Called from assembly trampoline right before iret frame is pushed.
+   We are still in kernel context; print the exact iret-frame values and a small
+   stack/code dump to diagnose mis-frames or bad mappings. */
+void enter_user_pre_iret(uint64_t entry, uint64_t user_stack, uint16_t user_ds, uint16_t user_cs, uint64_t rflags) {
+    kprintf("enter_user_pre_iret: entry=0x%llx user_stack=0x%llx user_ds=0x%04x user_cs=0x%04x rflags=0x%llx\n",
+            (unsigned long long)entry, (unsigned long long)user_stack, (unsigned)user_ds, (unsigned)user_cs, (unsigned long long)rflags);
+    uint64_t cr3 = 0;
+    asm volatile("mov %%cr3, %0" : "=r"(cr3));
+    kprintf("enter_user_pre_iret: CR3=0x%llx\n", (unsigned long long)cr3);
+    /* dump 64 bytes below user_stack (which will be new RSP after iret) */
+    if (user_stack && user_stack < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+        const uint8_t *p = (const uint8_t*)(uintptr_t)(user_stack - 64);
+        kprintf("enter_user_pre_iret: stack-64..top bytes: ");
+        for (int i = 0; i < 64; i++) kprintf("%02x ", (unsigned)p[i]);
+        kprintf("\n");
+    } else {
+        kprintf("enter_user_pre_iret: stack outside identity map\n");
+    }
+}
+
+void enter_user_post_iret(uint64_t ss, uint64_t user_rsp, uint64_t rflags, uint16_t user_cs, uint64_t rip) {
+    kprintf("enter_user_post_iret: SS=0x%04x RSP=0x%llx RFLAGS=0x%llx CS=0x%04x RIP=0x%llx\n",
+            (uint16_t)ss, (unsigned long long)user_rsp, (unsigned long long)rflags, (uint16_t)user_cs, (unsigned long long)rip);
+    /* dump the 5 qwords at user_rsp (iret frame) if identity mapped */
+    if (user_rsp && user_rsp < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+        uint64_t *p = (uint64_t*)(uintptr_t)user_rsp;
+        kprintf("iret-frame words: ");
+        for (int i = 0; i < 5; i++) kprintf("0x%016llx ", (unsigned long long)p[i]);
+        kprintf("\n");
+    } else {
+        kprintf("enter_user_post_iret: frame outside identity map\n");
+    }
+}

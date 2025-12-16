@@ -729,6 +729,19 @@ int devfs_create_block_node(const char *path, int device_id, uint32_t sectors) {
     dev_blocks[dev_block_count].device_id = device_id;
     dev_blocks[dev_block_count].sectors = sectors;
     dev_block_count++;
+    /*
+     * Make device visible in ramfs as a simple loop/device node so that
+     * tools that list /dev (or userspace reading ramfs) can see the node
+     * even if devfs is not mounted or is layered. We create a ramfs file
+     * via fs_create_file(), which will try mounted drivers first and then
+     * fall back to registered drivers (ramfs) — the created ramfs node
+     * persists in ramfs tree.
+     */
+    struct fs_file *f = fs_create_file(path);
+    if (f) {
+        /* we don't need to keep the open handle; free it */
+        fs_file_free(f);
+    }
     return 0;
 }
 

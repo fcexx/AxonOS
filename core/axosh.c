@@ -1627,13 +1627,9 @@ static int bi_edit(cmd_ctx *c) {
     editor_run(path);
     return 0;
 }
-static int bi_snake(cmd_ctx *c){ (void)c; snake_run(); return 0; }
-static int bi_tetris(cmd_ctx *c){ (void)c; tetris_run(); return 0; }
-static int bi_clock(cmd_ctx *c){ (void)c; clock_run(); return 0; }
 extern void reboot_system(); extern void shutdown_system();
 static int bi_reboot(cmd_ctx *c){ (void)c; reboot_system(); return 0; }
 static int bi_shutdown(cmd_ctx *c){ (void)c; shutdown_system(); return 0; }
-static int bi_neofetch(cmd_ctx *c){ (void)c; neofetch_run(); return 0; }
 
 static int bi_mem(cmd_ctx *c){
     (void)c;
@@ -1652,7 +1648,7 @@ static int bi_mem(cmd_ctx *c){
 static int bi_osh(cmd_ctx *c) {
     if (c->argc < 2) { osh_run(); return 0; }
     // Use the same path join logic as cat/ls to avoid intermittent resolution issues
-    char path[256]; join_cwd(g_cwd, c->argv[1], path, sizeof(path));
+    char *path = kmalloc(256); if (path==0) return; join_cwd(g_cwd, c->argv[1], path, sizeof(path));
     struct fs_file *f = fs_open(path); if (!f) { osh_write(c->out, c->out_len, c->out_cap, "osh: cannot open script\n"); return 1; }
     size_t want = f->size ? f->size : 0; char *buf = (char*)kmalloc(want + 1);
     if (!buf) { fs_file_free(f); return 1; }
@@ -2011,6 +2007,7 @@ static int bi_isatty(cmd_ctx *c);
 static int bi_xxd(cmd_ctx *c);
 static int bi_mount(cmd_ctx *c);
 static int bi_umount(cmd_ctx *c);
+static int bi_exec(cmd_ctx *c);
 
 static const builtin builtin_table[] = {
     {"echo", bi_echo}, {"kprint", bi_kprint}, {"readline", bi_readline}, {"readkey", bi_readkey},
@@ -2020,8 +2017,13 @@ static const builtin builtin_table[] = {
     {"edit", bi_edit}, {"reboot", bi_reboot}, {"shutdown", bi_shutdown}, {"mem", bi_mem},
     {"osh", bi_osh}, {"art", bi_art}, {"pause", bi_pause}, {"chipset", bi_chipset}, {"help", bi_help},
     {"passwd", bi_passwd}, {"su", bi_su}, {"whoami", bi_whoami}, {"mkpasswd", bi_mkpasswd}, {"groups", bi_groups},
+<<<<<<< HEAD
     {"useradd", bi_useradd}, {"groupadd", bi_groupadd}, {"chmod", bi_chmod}, {"mmio", bi_mmio},
     {"rtl8139", bi_rtl8139}
+=======
+    {"useradd", bi_useradd}, {"groupadd", bi_groupadd}, {"chmod", bi_chmod}, {"chvt", bi_chvt},
+    {"open", bi_open}, {"close", bi_close}, {"dup", bi_dup}, {"dup2", bi_dup2}, {"isatty", bi_isatty}, {"xxd", bi_xxd}, {"mount", bi_mount}, {"umount", bi_umount}, {"exec", bi_exec}
+>>>>>>> origin/fcexx
 };
 static int bi_chmod(cmd_ctx *c) {
     if (c->argc < 3) { kprintf("usage: chmod <mode> <path>\n"); return 1; }
@@ -2069,6 +2071,27 @@ static int bi_chvt(cmd_ctx *c) {
     extern void devfs_switch_tty(int index);
     devfs_switch_tty(n);
     return 0;
+}
+
+/* exec builtin: replace current shell with given executable */
+static int bi_exec(cmd_ctx *c) {
+    if (c->argc < 2) { kprintf("usage: exec <path> [args...]\n"); return 1; }
+    char fullpath[512];
+    join_cwd(g_cwd, c->argv[1], fullpath, sizeof(fullpath));
+    /* build argv array for kernel_execve (argv[0] should be program name) */
+    int argcount = c->argc - 1;
+    const char **kargv = (const char **)kmalloc(sizeof(char*) * (size_t)(argcount + 1));
+    if (!kargv) { kprintf("exec: allocation failed\n"); return 1; }
+    for (int i = 0; i < argcount; i++) kargv[i] = c->argv[i+1];
+    kargv[argcount] = NULL;
+    /* call kernel execve; on success this will not return */
+    int r = kernel_execve_from_path(fullpath, kargv, NULL);
+    kfree(kargv);
+    if (r != 0) {
+        kprintf("exec: failed to run %s (rc=%d)\n", fullpath, r);
+        return 1;
+    }
+    return 0; /* not reached on success */
 }
 
 static int bi_open(cmd_ctx *c) {

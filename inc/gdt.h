@@ -18,4 +18,11 @@ extern uint16_t KERNEL_DS;  // Kernel data selector
 extern uint16_t USER_CS;    // user code selector (Ring 3)
 extern uint16_t USER_DS;    // user data selector (Ring3)
 
+/* Diagnostic hook called from assembly trampoline just before iret frame is pushed.
+   Parameters: rdi=entry, rsi=user_stack, rdx=user_ds, rcx=user_cs, r8=rflags */
+void enter_user_pre_iret(uint64_t entry, uint64_t user_stack, uint16_t user_ds, uint16_t user_cs, uint64_t rflags);
+/* Diagnostic hook called after iret-frame is pushed but before iretq.
+   Parameters: rdi=ss, rsi=rsp, rdx=rflags, rcx=cs, r8=rip */
+void enter_user_post_iret(uint64_t ss, uint64_t user_rsp, uint64_t rflags, uint16_t user_cs, uint64_t rip);
+
 #endif
