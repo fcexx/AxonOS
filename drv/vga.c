@@ -494,14 +494,12 @@ PRINT_NUMBER_BASE10:
 	va_end(ap);
 }
 
-void vga_set_cursor(uint32_t x, uint32_t y)
-{
+void vga_set_cursor(uint32_t x, uint32_t y) {
     set_cursor_x(x);
     set_cursor_y(y);
 }
 
-void vga_get_cursor(uint32_t* x, uint32_t* y)
-{
+void vga_get_cursor(uint32_t* x, uint32_t* y) {
     uint16_t pos = get_cursor();
     if (x) *x = (pos % (MAX_COLS * 2)) / 2;
     if (y) *y = pos / (MAX_COLS * 2);
@@ -519,6 +517,14 @@ void draw_text(uint8_t x, uint8_t y, const char* s, uint8_t color) {
     for (uint8_t i = 0; s[i]; i++) draw_cell(x + i, y, (uint8_t)s[i], color);
 }
 
+/* Set hardware cursor shape (scanline start/end). */
+void set_cursor_shape(uint8_t start, uint8_t end) {
+    outb(REG_SCREEN_CTRL, 0x0A);
+    outb(REG_SCREEN_DATA, start & 0x1F);
+    outb(REG_SCREEN_CTRL, 0x0B);
+    outb(REG_SCREEN_DATA, end & 0x1F);
+}
+
 // ---- minimal printf-to-buffer (vsnprintf/snprintf/sprintf) ----
 typedef struct { char* buf; size_t cap; size_t len; } __bufw;
 static void __bw_putc(__bufw* w, char ch) {
@@ -528,7 +534,7 @@ static void __bw_putc(__bufw* w, char ch) {
 
 static char tmp[64];
 
-static int __vsnprintf(char* out, size_t outsz, const char* fmt, va_list ap_in) {
+int __vsnprintf(char* out, size_t outsz, const char* fmt, va_list ap_in) {
 	if (!out || outsz==0) return 0;
 	__bufw W = { .buf = out, .cap = outsz, .len = 0 };
 	va_list ap; va_copy(ap, ap_in);
@@ -577,10 +583,14 @@ static int __vsnprintf(char* out, size_t outsz, const char* fmt, va_list ap_in) 
 
 void enable_cursor() {
     outb(0x3D4, 0x0A);
-    char curstart = inb(0x3D5) & 0x1F; // get cursor scanline start
+    char curstart = inb(0x3D5) & 0x1F; // cursor scanline start (bits 0-4)
 
+    // Clear bit 5 (cursor disable) to enable the cursor
     outb(0x3D4, 0x0A);
-    outb(0x3D5, curstart | 0x20); // set enable bit
+    outb(0x3D5, (curstart & ~0x20));
+
+    // custom shape!
+    set_cursor_shape(14, 15);
 }
 
 int vsnprintf(char* out, size_t outsz, const char* fmt, va_list ap) { return __vsnprintf(out, outsz, fmt, ap); }

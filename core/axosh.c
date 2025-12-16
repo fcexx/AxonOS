@@ -1624,13 +1624,9 @@ static int bi_edit(cmd_ctx *c) {
     editor_run(path);
     return 0;
 }
-static int bi_snake(cmd_ctx *c){ (void)c; snake_run(); return 0; }
-static int bi_tetris(cmd_ctx *c){ (void)c; tetris_run(); return 0; }
-static int bi_clock(cmd_ctx *c){ (void)c; clock_run(); return 0; }
 extern void reboot_system(); extern void shutdown_system();
 static int bi_reboot(cmd_ctx *c){ (void)c; reboot_system(); return 0; }
 static int bi_shutdown(cmd_ctx *c){ (void)c; shutdown_system(); return 0; }
-static int bi_neofetch(cmd_ctx *c){ (void)c; neofetch_run(); return 0; }
 
 static int bi_mem(cmd_ctx *c){
     (void)c;
@@ -1649,7 +1645,7 @@ static int bi_mem(cmd_ctx *c){
 static int bi_osh(cmd_ctx *c) {
     if (c->argc < 2) { osh_run(); return 0; }
     // Use the same path join logic as cat/ls to avoid intermittent resolution issues
-    char path[256]; join_cwd(g_cwd, c->argv[1], path, sizeof(path));
+    char *path = kmalloc(256); if (path==0) return; join_cwd(g_cwd, c->argv[1], path, sizeof(path));
     struct fs_file *f = fs_open(path); if (!f) { osh_write(c->out, c->out_len, c->out_cap, "osh: cannot open script\n"); return 1; }
     size_t want = f->size ? f->size : 0; char *buf = (char*)kmalloc(want + 1);
     if (!buf) { fs_file_free(f); return 1; }
