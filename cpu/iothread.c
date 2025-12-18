@@ -1,4 +1,5 @@
 #include <iothread.h>
+#include <vga.h>
 #include <heap.h>
 #include <debug.h>
 #include <string.h>

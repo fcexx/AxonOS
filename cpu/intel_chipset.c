@@ -1,4 +1,6 @@
 #include <intel_chipset.h>
+#include <string.h>
+#include <vga.h>
 #include <pci.h>
 #include <axonos.h>
 #include <stdint.h>

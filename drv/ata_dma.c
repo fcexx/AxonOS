@@ -18,8 +18,11 @@
 #include <pic.h>
 #include <devfs.h>
 #include <keyboard.h>
+#include <heap.h>
+#include <vga.h>
+#include <ramfs.h>
 
-#include "../inc/fat32.h"
+#include <fat32.h>
 
 #define ATA_PRIMARY_IO      0x1F0
 #define ATA_PRIMARY_CTRL    0x3F6

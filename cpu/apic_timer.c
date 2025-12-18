@@ -1,4 +1,5 @@
 #include <apic_timer.h>
+#include <vga.h>
 #include <apic.h>
 #include <pit.h>
 #include <thread.h>

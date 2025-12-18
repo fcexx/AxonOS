@@ -1,9 +1,9 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
-#include "../inc/heap.h"
-#include "../inc/ext2.h"
-#include "../inc/fs.h"
+#include <heap.h>
+#include <ext2.h>
+#include <fs.h>
 
 /* Minimal ext2 runtime structures */
 struct ext2_mount {

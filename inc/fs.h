@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include "stat.h"
+#include <stat.h>
 
 /* ssize_t may not be available in this kernel environment */
 typedef long ssize_t;
@@ -81,6 +81,7 @@ ssize_t fs_readdir_next(struct fs_file *file, void *buf, size_t size);
 int vfs_fstat(struct fs_file *file, struct stat *st);
 int vfs_stat(const char *path, struct stat *st);
 int fs_chmod(const char *path, mode_t mode);
+int fs_mkdir(const char *path);
 
 /* file types */
 #define FS_TYPE_UNKNOWN 0

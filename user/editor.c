@@ -1,11 +1,11 @@
 // AxonOS fullscreen text editor (Turbo Pascal-like)
-#include "../inc/editor.h"
-#include "../inc/vga.h"
-#include "../inc/keyboard.h"
-#include "../inc/fs.h"
-#include "../inc/string.h"
-#include "../inc/heap.h"
-#include "../inc/axosh.h"
+#include <editor.h>
+#include <vga.h>
+#include <keyboard.h>
+#include <fs.h>
+#include <string.h>
+#include <heap.h>
+#include <axosh.h>
 #include <stdint.h>
 
 // ---- UI layout ----
@@ -54,7 +54,6 @@ static inline void view_cache_invalidate_line_with_viewtop(int view_top, int row
 static void apply_theme(int idx) {
 	if (idx < 0) idx = 0; if (idx >= THEME_COUNT) idx = THEME_COUNT - 1;
 	g_theme_index = idx;
-	// mask out VGA blink bit (bit7) to avoid VMware blinking/flicker
 	g_attr_menu = (uint8_t)(THEMES[idx].menu_attr & 0x7F);
 	g_attr_status = (uint8_t)(THEMES[idx].status_attr & 0x7F);
 	g_attr_text = (uint8_t)(THEMES[idx].text_attr & 0x7F);
@@ -93,11 +92,11 @@ static void ui_draw_view(Editor *E);
 static void ui_place_cursor(Editor *E);
 static void ensure_cursor_visible(Editor *E);
 
-static void buf_init(Editor *E);
+static int buf_init(Editor *E);
 static void buf_free(Editor *E);
-static void buf_clear(Editor *E);
-static void buf_ensure_lines(Editor *E, int need);
-static void line_reserve(Line *L, size_t need_cap);
+static int buf_clear(Editor *E);
+static int buf_ensure_lines(Editor *E, int need);
+static int line_reserve(Line *L, size_t need_cap);
 static void buf_insert_char(Editor *E, int r, int c, char ch);
 static void buf_overwrite_char(Editor *E, int r, int c, char ch);
 static void buf_delete_char(Editor *E, int r, int c);
@@ -115,8 +114,11 @@ static void draw_line_text_asm(uint32_t y, const char *s, size_t len);
 static void draw_line_text_osh(uint32_t y, const char *s, size_t len);
 
 // ---- Buffer management ----
-static void buf_init(Editor *E) {
+static int buf_init(Editor *E) {
+	if (!E) return -1;
+	memset(E, 0, sizeof(*E));
 	E->lines = (Line*)kcalloc(16, sizeof(Line));
+	if (!E->lines) return -1;
 	E->line_cap = 16;
 	E->line_count = 1;
 	E->cursor_row = 0;
@@ -126,10 +128,18 @@ static void buf_init(Editor *E) {
 	E->insert_mode = 1;
 	E->modified = 0;
 	E->filename[0] = '\0';
-    E->syntax_mode = 0;
+	E->syntax_mode = 0;
 	E->lines[0].data = (char*)kcalloc(64, 1);
+	if (!E->lines[0].data) {
+		kfree(E->lines);
+		E->lines = NULL;
+		E->line_cap = 0;
+		E->line_count = 0;
+		return -1;
+	}
 	E->lines[0].len = 0;
 	E->lines[0].cap = 64;
+	return 0;
 }
 
 static void buf_free(Editor *E) {
@@ -139,41 +149,62 @@ static void buf_free(Editor *E) {
 	E->lines = 0; E->line_count = E->line_cap = 0;
 }
 
-static void buf_clear(Editor *E) {
+static int buf_clear(Editor *E) {
+	if (!E || !E->lines || E->line_cap <= 0) return -1;
 	for (int i = 0; i < E->line_count; i++) if (E->lines[i].data) { kfree(E->lines[i].data); E->lines[i].data = 0; }
 	E->line_count = 1;
 	E->lines[0].data = (char*)kcalloc(64, 1);
+	if (!E->lines[0].data) {
+		/* OOM: keep a minimal empty buffer to avoid crashing in UI */
+		E->lines[0].data = (char*)kcalloc(1, 1);
+		if (!E->lines[0].data) {
+			E->lines[0].len = 0;
+			E->lines[0].cap = 0;
+			return -1;
+		}
+		E->lines[0].len = 0;
+		E->lines[0].cap = 1;
+		E->cursor_row = 0; E->cursor_col = 0; E->view_top = 0; E->view_left = 0; E->modified = 0;
+		return -1;
+	}
 	E->lines[0].len = 0;
 	E->lines[0].cap = 64;
 	E->cursor_row = 0; E->cursor_col = 0; E->view_top = 0; E->view_left = 0; E->modified = 0;
+	return 0;
 }
 
-static void buf_ensure_lines(Editor *E, int need) {
-	if (need <= E->line_cap) return;
+static int buf_ensure_lines(Editor *E, int need) {
+	if (!E || !E->lines) return -1;
+	if (need <= E->line_cap) return 0;
 	int cap = E->line_cap ? E->line_cap : 16;
 	while (cap < need) cap *= 2;
-	Line *nl = (Line*)kcalloc(cap, sizeof(Line));
+	Line *nl = (Line*)kcalloc((size_t)cap, sizeof(Line));
+	if (!nl) return -1;
 	for (int i=0;i<E->line_count;i++) nl[i] = E->lines[i];
 	kfree(E->lines);
 	E->lines = nl;
 	E->line_cap = cap;
+	return 0;
 }
 
-static void line_reserve(Line *L, size_t need_cap) {
-	if (need_cap <= L->cap) return;
+static int line_reserve(Line *L, size_t need_cap) {
+	if (!L) return -1;
+	if (need_cap <= L->cap) return 0;
 	size_t cap = L->cap ? L->cap : 16;
 	while (cap < need_cap) cap *= 2;
 	char *nd = (char*)kcalloc(cap, 1);
+	if (!nd) return -1;
 	if (L->data && L->len) memcpy(nd, L->data, L->len);
 	if (L->data) kfree(L->data);
 	L->data = nd; L->cap = cap;
+	return 0;
 }
 
 static void buf_insert_char(Editor *E, int r, int c, char ch) {
 	if (r < 0 || r >= E->line_count) return;
 	Line *L = &E->lines[r];
 	if (c < 0) c = 0; if ((size_t)c > L->len) c = (int)L->len;
-	line_reserve(L, L->len + 2);
+	if (line_reserve(L, L->len + 2) != 0) return;
 	// shift right
 	memmove(L->data + c + 1, L->data + c, L->len - (size_t)c);
 	L->data[c] = ch;
@@ -190,7 +221,7 @@ static void buf_overwrite_char(Editor *E, int r, int c, char ch) {
 		E->modified = 1;
 	} else {
 		// extend with spaces
-		line_reserve(L, (size_t)c + 2);
+		if (line_reserve(L, (size_t)c + 2) != 0) return;
 		while ((size_t)c > L->len) { L->data[L->len++] = ' '; }
 		L->data[L->len++] = ch;
 		E->modified = 1;
@@ -227,12 +258,14 @@ static void buf_newline(Editor *E) {
 	Line *L = &E->lines[E->cursor_row];
 	int c = E->cursor_col; if (c < 0) c = 0; if ((size_t)c > L->len) c = (int)L->len;
 	Line newL = {0};
-	newL.cap = (L->len - (size_t)c) + 16; newL.data = (char*)kcalloc(newL.cap, 1);
+	newL.cap = (L->len - (size_t)c) + 16;
+	newL.data = (char*)kcalloc(newL.cap, 1);
+	if (!newL.data) return;
 	newL.len = L->len - (size_t)c;
 	if (newL.len) memcpy(newL.data, L->data + c, newL.len);
 	L->len = (size_t)c;
 	// insert new line after current
-	buf_ensure_lines(E, E->line_count + 1);
+	if (buf_ensure_lines(E, E->line_count + 1) != 0) { kfree(newL.data); return; }
 	for (int i = E->line_count; i > E->cursor_row + 1; i--) E->lines[i] = E->lines[i - 1];
 	E->lines[E->cursor_row + 1] = newL;
 	E->line_count++;
@@ -244,7 +277,7 @@ static void buf_join_with_next(Editor *E, int r) {
 	if (r < 0 || r + 1 >= E->line_count) return;
 	Line *A = &E->lines[r];
 	Line *B = &E->lines[r + 1];
-	line_reserve(A, A->len + B->len + 1);
+	if (line_reserve(A, A->len + B->len + 1) != 0) return;
 	memcpy(A->data + A->len, B->data, B->len);
 	A->len += B->len;
 	// remove B
@@ -258,35 +291,34 @@ static void buf_join_with_next(Editor *E, int r) {
 static void ui_draw_menu(void) {
 	// верхняя панель с пунктами File / View
 	vga_fill_rect(0, 0, MAX_COLS, 1, ' ', g_attr_menu);
-	char line[128];
-	const char *name = THEMES[g_theme_index].name;
-	strcpy(line, " AxonEdit v1 |  Ctrl+O Open  Ctrl+S Save  Ctrl+N New  Ctrl+G Goto  Ctrl+X Quit  Ctrl+T Theme: ");
-	strcat(line, name);
+	/* Пишем меню без переполнений: строка очень длинная, поэтому используем snprintf
+	   и ограничиваем вывод шириной экрана (с учётом x=2). */
+	char line[(MAX_COLS > 2 ? (MAX_COLS - 2) : MAX_COLS) + 1];
+	const char *name = THEMES[g_theme_index].name ? THEMES[g_theme_index].name : "";
+	snprintf(
+		line, sizeof(line),
+		" AxonEdit v1 |  Ctrl+O Open  Ctrl+S Save  Ctrl+N New  Ctrl+G Goto  Ctrl+X Quit  Ctrl+T Theme: %s",
+		name
+	);
+	line[sizeof(line) - 1] = '\0';
 	vga_write_str_xy(2, 0, line, g_attr_menu);
 }
 
 static void ui_draw_status(Editor *E, const char *msg) {
-	char buf[128];
 	vga_fill_rect(0, MAX_ROWS - 1, MAX_COLS, 1, ' ', g_attr_status);
 	// left: file name and modified flag
-	buf[0] = '\0';
-	if (E->filename[0]) { strncpy(buf, E->filename, sizeof(buf)-1); buf[sizeof(buf)-1]='\0'; }
-	else { strcpy(buf, "[No Name]"); }
-	if (E->modified) strcat(buf, " *");
-	vga_write_str_xy(1, MAX_ROWS - 1, buf, g_attr_status);
+	char left[(MAX_COLS > 1 ? (MAX_COLS - 1) : MAX_COLS) + 1];
+	const char *fname = (E && E->filename[0]) ? E->filename : "[No Name]";
+	snprintf(left, sizeof(left), "%s%s", fname, (E && E->modified) ? " *" : "");
+	left[sizeof(left) - 1] = '\0';
+	vga_write_str_xy(1, MAX_ROWS - 1, left, g_attr_status);
 	// right: Ln/Col and mode
 	char rbuf[64];
-	int ln = E->cursor_row + 1; int col = E->cursor_col + 1;
-	char num[16]; num[0]=0; // small itoa inline
-	{
-		int v=ln,n=0,s[10]; if(v==0){num[0]='0';num[1]='\0';} else {while(v){s[n++]=v%10; v/=10;} for(int i=0;i<n;i++) num[i]=(char)('0'+s[n-1-i]); num[n]='\0';}
-	}
-	strcpy(rbuf, "Ln "); strcat(rbuf, num); strcat(rbuf, ", Col ");
-	{
-		int v=col,n=0,s[10]; char nn[16]; if(v==0){nn[0]='0';nn[1]='\0';} else {while(v){s[n++]=v%10; v/=10;} for(int i=0;i<n;i++) nn[i]=(char)('0'+s[n-1-i]); nn[n]='\0';}
-		strcat(rbuf, nn);
-	}
-	strcat(rbuf, "  "); strcat(rbuf, E->insert_mode?"INS":"OVR");
+	int ln = (E ? E->cursor_row : 0) + 1;
+	int col = (E ? E->cursor_col : 0) + 1;
+	const char *mode = (E && E->insert_mode) ? "INS" : "OVR";
+	snprintf(rbuf, sizeof(rbuf), "Ln %d, Col %d  %s", ln, col, mode);
+	rbuf[sizeof(rbuf) - 1] = '\0';
 	int x = MAX_COLS - (int)strlen(rbuf) - 2; if (x < 0) x = 0;
 	vga_write_str_xy((uint32_t)x, MAX_ROWS - 1, rbuf, g_attr_status);
 	// center message if any
@@ -740,23 +772,34 @@ static int file_load(Editor *E, const char *path) {
     }
 	fs_file_free(f);
 	// parse into lines
-	buf_clear(E);
+	(void)buf_clear(E);
 	if (!buf || sz == 0) { if (buf) kfree(buf); return 0; }
 	// count lines
 	int lines = 1; for (size_t i=0;i<sz;i++) if (buf[i]=='\n') lines++;
-	buf_ensure_lines(E, lines);
+	if (buf_ensure_lines(E, lines) != 0) { kfree(buf); return -1; }
 	E->line_count = 0;
 	size_t i = 0; while (i < sz) {
 		// extract line up to \n (handle CRLF)
 		size_t start = i; while (i < sz && buf[i] != '\n') i++;
 		size_t end = i; // [start,end)
 		if (end > start && buf[end-1] == '\r') end--;
-		Line L = {0}; L.cap = (end - start) + 16; L.data = (char*)kcalloc(L.cap, 1); L.len = (end - start);
+		Line L = {0};
+		L.cap = (end - start) + 16;
+		L.data = (char*)kcalloc(L.cap, 1);
+		if (!L.data) break;
+		L.len = (end - start);
 		if (L.len) memcpy(L.data, buf + start, L.len);
 		E->lines[E->line_count++] = L;
 		if (i < sz && buf[i] == '\n') i++;
 	}
-	if (E->line_count == 0) { E->line_count = 1; E->lines[0].data = (char*)kcalloc(16,1); E->lines[0].len=0; E->lines[0].cap=16; }
+	if (E->line_count == 0) {
+		E->line_count = 1;
+		if (E->lines[0].data) kfree(E->lines[0].data);
+		E->lines[0].data = (char*)kcalloc(16,1);
+		if (!E->lines[0].data) { E->lines[0].data = NULL; E->lines[0].cap = 0; }
+		E->lines[0].len = 0;
+		E->lines[0].cap = E->lines[0].cap ? E->lines[0].cap : 16;
+	}
 	E->cursor_row = 0; E->cursor_col = 0; E->view_top = 0; E->view_left = 0; E->modified = 0;
 	kfree(buf);
 	return 0;
@@ -917,7 +960,11 @@ static void insert_tab(Editor *E) {
 
 // ---- Public entry ----
 void editor_run(const char *path) {
-	Editor E; buf_init(&E);
+	Editor E;
+	if (buf_init(&E) != 0) {
+		kprintf("AxonEdit: out of memory\n");
+		return;
+	}
 	apply_theme(0);
 	if (path && path[0]) {
 		char abs[512]; const char* use = path;
@@ -947,6 +994,7 @@ void editor_run(const char *path) {
 	while (running) {
 		char c = kgetc();
         int redraw = 0, restatus = 0;
+        const char *status_msg = NULL;
         int old_view_top = E.view_top;
         int old_view_left = E.view_left;
 		if (c == 27) { // ESC: игнорировать (меню отключено)
@@ -977,7 +1025,12 @@ void editor_run(const char *path) {
 			}
 			if (E.filename[0]) {
 				int rc = file_save(&E, E.filename);
-				ui_draw_status(&E, rc==0?"Saved.":"Save failed!");
+                status_msg = (rc==0) ? "Saved." : "Save failed!";
+                /* Saving can trigger background console output (drivers/logs) that overwrites the editor UI.
+                   Do a full redraw to keep theme stable. */
+                ui_draw_menu();
+                view_cache_invalidate();
+				redraw = 1;
 				restatus = 1;
 			}
 		}
@@ -1036,7 +1089,7 @@ void editor_run(const char *path) {
             redraw = 1;
         }
         if (redraw) { ui_draw_view(&E); }
-        if (redraw || restatus) { ui_draw_status(&E, 0); }
+        if (redraw || restatus) { ui_draw_status(&E, status_msg); }
 		ui_place_cursor(&E);
 	}
 

@@ -2,7 +2,7 @@
 #define INC_USER_H
 
 #include <stddef.h>
-#include "stdint.h"
+#include <stdint.h>
 
 typedef unsigned int uid_t;
 typedef unsigned int gid_t;
@@ -47,6 +47,11 @@ int user_export_passwd(char **out, size_t *out_len);
 
 /* Get next unused uid (simple: max existing + 1) */
 uid_t user_get_next_uid(void);
+
+/* Resolve uid/gid to names for UI tools (ls, ps, etc).
+   Returns 0 on success, -1 if unknown/failed. */
+int user_lookup_name_by_uid(uid_t uid, char *out, size_t outsz);
+int user_lookup_group_by_gid(gid_t gid, char *out, size_t outsz);
 
 #endif
 

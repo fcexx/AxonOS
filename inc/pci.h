@@ -37,6 +37,7 @@ typedef struct pci_device {
  */
 void pci_init(void);
 void pci_sysfs_init(void);
+void pci_dump_devices(void);
 
 /*
  * pci_config_read_dword/pci_config_write_dword - access PCI config space

@@ -34,7 +34,10 @@ global multiboot_info_saved
 multiboot_info_saved:
         resq 1
 ; page tables in BSS (aligned to 4096)
-align 4096
+; IMPORTANT: use alignb in .bss, because NASM may ignore normal `align` here
+; (it would require emitting padding bytes, which is "initialization" for BSS).
+; If alignment is ignored, page tables may become non-4KiB-aligned -> random #GP/#PF.
+alignb 4096
 global page_table_l4
 page_table_l4:
         resb 4096
@@ -62,35 +65,25 @@ global _start
 extern kernel_main
 bits 32
 _start:
-        mov esp, stack_top
+        ; Set up our own stack first. Relying on loader's stack is fragile.
+        mov esp, stack_top ; stack top: 16KB by default
 
-        push ebx
-        push eax
-
-        mov edi, boot_msg_start
-        call print_vga
-
-        call check_cpuid
-        call check_long_mode
-
-        pop eax
-        pop ebx
+        ; IMPORTANT: Save Multiboot2 registers BEFORE any calls.
+        ; print_vga/check_cpuid/etc may clobber AL/EBX -> magic becomes 0x36d76200 and info ptr breaks.
         mov dword [multiboot_magic_saved], eax
         mov dword [multiboot_magic_saved + 4], 0
         mov dword [multiboot_info_saved], ebx
         mov dword [multiboot_info_saved + 4], 0
 
-        mov edi, boot_msg_before_pt
+        mov edi, initmsg
         call print_vga
+
+        call check_cpuid
+        call check_long_mode
+
         cli
         call setup_page_tables
-        mov edi, boot_msg_after_pt
-        call print_vga
-        mov edi, boot_msg_before_enable
-        call print_vga
         call enable_paging
-        mov edi, boot_msg_after_enable
-        call print_vga
 
         lea         eax, [tmp_gdt_ptr]
         lgdt        [eax]
@@ -254,43 +247,23 @@ setup_page_tables:
         ret
 
 enable_paging:
-        ; debug: before setting CR4
-        mov edi, boot_msg_before_cr4
-        call print_vga
         mov eax, cr4
         ; enable PAE (bit5) and PGE (bit7) to be more compatible with host expectations
         or eax, (1 << 5) | (1 << 7)
         mov cr4, eax
-        mov edi, boot_msg_after_cr4
-        call print_vga
 
-        ; debug: before loading CR3
-        mov edi, boot_msg_before_cr3
-        call print_vga
         mov eax, page_table_l4
         and eax, 0xFFFFF000
         mov cr3, eax
-        mov edi, boot_msg_after_cr3
-        call print_vga
 
-        ; debug: before setting EFER.LME via MSR
-        mov edi, boot_msg_before_efer
-        call print_vga
         mov ecx, 0xC0000080
         rdmsr
         or eax, 1 << 8
         wrmsr
-        mov edi, boot_msg_after_efer
-        call print_vga
 
-        ; debug: before enabling PG in CR0
-        mov edi, boot_msg_before_cr0
-        call print_vga
         mov eax, cr0
         or eax, 1 << 31
         mov cr0, eax
-        mov edi, boot_msg_after_cr0
-        call print_vga
 
         ret
 
@@ -347,19 +320,7 @@ error1_msg: db "Error loading kernel: no cpuid support.", 0
 error2_msg: db "Error loading kernel: your cpu does not support 64 mode.", 0
 error3_msg: db "Error loading kernel: code 3. If you see this, please contact the Axon team.", 0
 error4_msg: db "Error loading kernel: code 4. If you see this, please contact the Axon team.", 0
-boot_msg_start: db "[BOOT] start\n", 0
-boot_msg_before_pt: db "[BOOT] before setup_page_tables\n", 0
-boot_msg_after_pt: db "[BOOT] after setup_page_tables\n", 0
-boot_msg_before_enable: db "[BOOT] before enable_paging\n", 0
-boot_msg_after_enable: db "[BOOT] after enable_paging\n", 0
-boot_msg_before_cr4: db "[BOOT] before CR4\n", 0
-boot_msg_after_cr4: db "[BOOT] after CR4\n", 0
-boot_msg_before_cr3: db "[BOOT] before CR3\n", 0
-boot_msg_after_cr3: db "[BOOT] after CR3\n", 0
-boot_msg_before_efer: db "[BOOT] before EFER\n", 0
-boot_msg_after_efer: db "[BOOT] after EFER\n", 0
-boot_msg_before_cr0: db "[BOOT] before CR0\n", 0
-boot_msg_after_cr0: db "[BOOT] after CR0\n", 0
+initmsg:    db "Loading AxonOS kernel...", 10
 ; ---------------- GDT ----------------
 align 8
 tmp_gdt:

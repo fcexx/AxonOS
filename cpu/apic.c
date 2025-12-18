@@ -1,5 +1,5 @@
 #include <apic.h>
-#include <stdio.h>
+#include <vga.h>
 
 static uint32_t* lapic_base = NULL;
 static bool apic_initialized = false;

@@ -2,6 +2,8 @@
 #include <debug.h> 
 #include <pic.h>
 #include <idt.h>
+#include <serial.h>
+#include <vga.h>
 // VGA text mode uses hardware cursor; no backbuffer swap needed
 #include <thread.h>
 //#include <vbe.h>

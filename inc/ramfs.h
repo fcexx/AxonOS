@@ -2,8 +2,8 @@
 #define INC_RAMFS_H
 
 #include <stddef.h>
-#include "fs.h"
-#include "stat.h"
+#include <fs.h>
+#include <stat.h>
 
 int ramfs_register(void);
 int ramfs_unregister(void);

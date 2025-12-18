@@ -10,6 +10,7 @@
 #include <gdt.h>
 #include <paging.h>
 #include <elf.h>
+#include <vga.h>
 
 extern uint8_t _end[]; /* kernel end symbol from linker */
 

@@ -26,9 +26,13 @@
 #include <initfs.h>
 #include <editor.h>
 #include <fat32.h>
-#include <intel_chipset.h>s
+#include <intel_chipset.h>
 #include <disk.h>
 #include <mmio.h>
+#include <pci.h>
+#include <devfs.h>
+#include <user.h>
+#include <serial.h>
 
 /* ATA DMA driver init (registered here) */
 void ata_dma_init(void);
@@ -36,6 +40,39 @@ void ata_dma_init(void);
 int exit = 0;
 
 static char g_cwd[256] = "/";
+
+extern uint8_t _end[]; /* kernel end symbol from linker */
+
+static inline uintptr_t align_up_uintptr(uintptr_t v, uintptr_t a) {
+    return (v + (a - 1)) & ~(a - 1);
+}
+
+/* Multiboot2: find the maximum module end address. This is critical to place
+   the kernel heap ABOVE modules; otherwise heap headers can overwrite initfs
+   (this is exactly what happens on VMware in your log). */
+static uintptr_t mb2_modules_max_end(uint32_t multiboot_magic, uint64_t multiboot_info) {
+    if (multiboot_magic != 0x36d76289u || multiboot_info == 0) return 0;
+    uint8_t *p = (uint8_t*)(uintptr_t)multiboot_info;
+    uint32_t total_size = *(uint32_t*)p;
+    if (total_size < 16 || total_size > (64u * 1024u * 1024u)) return 0;
+
+    uint32_t off = 8;
+    uintptr_t max_end = 0;
+    while (off + 8 <= total_size) {
+        uint32_t type = *(uint32_t*)(p + off);
+        uint32_t size = *(uint32_t*)(p + off + 4);
+        if (size < 8) break;
+        if ((uint64_t)off + (uint64_t)size > (uint64_t)total_size) break;
+        if (type == 0) break;
+        if (type == 3 && size >= 16) { /* module */
+            const uint8_t *fp = p + off + 8;
+            uint32_t mod_end = *(uint32_t*)(fp + 4);
+            if ((uintptr_t)mod_end > max_end) max_end = (uintptr_t)mod_end;
+        }
+        off += (size + 7) & ~7u;
+    }
+    return max_end;
+}
 
 static ssize_t sysfs_show_const(char *buf, size_t size, void *priv) {
     if (!buf || size == 0) return 0;
@@ -91,111 +128,6 @@ static ssize_t sysfs_show_ram_mb_attr(char *buf, size_t size, void *priv) {
     return (ssize_t)written;
 }
 
-static void resolve_path(const char *cwd, const char *arg, char *out, size_t outlen) {
-    if (!arg || arg[0] == '\0') {
-        /* return cwd */
-        strncpy(out, cwd, outlen-1);
-        out[outlen-1] = '\0';
-        return;
-    }
-    if (arg[0] == '/') {
-        strncpy(out, arg, outlen-1);
-        out[outlen-1] = '\0';
-        return;
-    }
-    /* remove leading ./ if present */
-    const char *p = arg;
-    if (p[0] == '.' && p[1] == '/') p += 2;
-    /* build absolute path into tmp then normalize */
-    char tmp[512];
-    if (arg[0] == '\0') {
-        strncpy(tmp, cwd, sizeof(tmp)-1);
-        tmp[sizeof(tmp)-1] = '\0';
-    } else if (arg[0] == '/') {
-        strncpy(tmp, arg, sizeof(tmp)-1);
-        tmp[sizeof(tmp)-1] = '\0';
-    } else {
-        if (strcmp(cwd, "/") == 0) {
-            tmp[0] = '/';
-            size_t n = strlen(p);
-            if (n > sizeof(tmp) - 2) n = sizeof(tmp) - 2;
-            if (n) memcpy(tmp + 1, p, n);
-            tmp[1 + n] = '\0';
-        } else {
-            size_t a = strlen(cwd);
-            if (a > sizeof(tmp) - 2) a = sizeof(tmp) - 2;
-            memcpy(tmp, cwd, a);
-            tmp[a] = '/';
-            size_t n = strlen(p);
-            if (n > sizeof(tmp) - a - 2) n = sizeof(tmp) - a - 2;
-            if (n) memcpy(tmp + a + 1, p, n);
-            tmp[a + 1 + n] = '\0';
-        }
-    }
-    /* normalize tmp into out (handle "." and "..") */
-    /* algorithm: split by '/', push segments, pop on '..' */
-    char **parts = (char**)kmalloc(128);
-    if (!parts) return;
-    int pc = 0;
-    char *s = tmp;
-    /* ensure leading slash */
-    if (*s != '/') {
-        /* make absolute by prepending cwd */
-        char t2[512]; strncpy(t2, tmp, sizeof(t2)-1); t2[sizeof(t2)-1] = '\0';
-        if (strcmp(cwd, "/") == 0) {
-            tmp[0] = '/';
-            size_t n = strlen(t2);
-            if (n > sizeof(tmp) - 2) n = sizeof(tmp) - 2;
-            if (n) memcpy(tmp + 1, t2, n);
-            tmp[1 + n] = '\0';
-        } else {
-            size_t a = strlen(cwd);
-            if (a > sizeof(tmp) - 2) a = sizeof(tmp) - 2;
-            memcpy(tmp, cwd, a);
-            tmp[a] = '/';
-            size_t n = strlen(t2);
-            if (n > sizeof(tmp) - a - 2) n = sizeof(tmp) - a - 2;
-            if (n) memcpy(tmp + a + 1, t2, n);
-            tmp[a + 1 + n] = '\0';
-        }
-        s = tmp;
-    }
-    /* tokenize */
-    s++; /* skip leading slash */
-    while (*s) {
-        char *seg = s;
-        while (*s && *s != '/') s++;
-        size_t len = (size_t)(s - seg);
-        if (len == 0) { if (*s) s++; continue; }
-        char save = seg[len];
-        seg[len] = '\0';
-        if (strcmp(seg, ".") == 0) {
-            /* ignore */
-        } else if (strcmp(seg, "..") == 0) {
-            if (pc > 0) pc--; /* pop */
-        } else {
-            parts[pc++] = seg;
-        }
-        seg[len] = save;
-        if (*s) s++;
-    }
-    /* build output */
-    if (pc == 0) {
-        strncpy(out, "/", outlen-1); out[outlen-1] = '\0';
-    } else {
-        size_t pos = 0;
-        for (int i = 0; i < pc; i++) {
-            size_t need = strlen(parts[i]) + 1; /* '/' + name */
-            if (pos + need >= outlen) break;
-            out[pos++] = '/';
-            size_t n = strlen(parts[i]);
-            memcpy(out + pos, parts[i], n);
-            pos += n;
-        }
-        out[pos] = '\0';
-    }
-    kfree(parts);
-}
 
 static int is_dir_path(const char *path) {
     struct fs_file *f = fs_open(path);
@@ -250,6 +182,20 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     kprint("Initializing kernel...\n");
     sysinfo_init(multiboot_magic, multiboot_info);
 
+    /* Initialize heap EARLY and place it above kernel + multiboot modules.
+       Otherwise heap metadata can overwrite initfs module (seen on VMware). */
+    {
+        uintptr_t heap_start = align_up_uintptr((uintptr_t)_end, 0x1000);
+        uintptr_t mods_end = mb2_modules_max_end(multiboot_magic, multiboot_info);
+        if (mods_end) {
+            uintptr_t mods_end_aligned = align_up_uintptr(mods_end, 0x1000);
+            if (mods_end_aligned > heap_start) heap_start = mods_end_aligned;
+        }
+        heap_init(heap_start, 0);
+        kprintf("kernel: heap_start=%p kernel_end=%p mods_end=%p\n",
+                (void*)heap_start, (void*)(uintptr_t)_end, (void*)mods_end);
+    }
+
     gdt_init();
     /* allocate IST1 stack for Double Fault handler to avoid triple-faults */
     {
@@ -275,7 +221,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     syscall_init();
     
     paging_init();
-    heap_init(0, 0);
 
     // Включаем прерывания
     asm volatile("sti");
@@ -376,8 +321,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     {
         int r = initfs_process_multiboot_module(multiboot_magic, multiboot_info, "initfs");
         if (r == 0) kprintf("initfs: unpacked successfully\n");
-        else if (r == 1) kprintf("initfs: initfs module not found or not multiboot2\n");
-        else if (r == -1) kprintf("initfs: success\n");
+        else kprintf("initfs: failed rc=%d\n", r);
     }
     /* register and mount devfs at /dev */
     if (devfs_register() == 0) {

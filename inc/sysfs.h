@@ -2,8 +2,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include "fs.h"
-#include "stat.h"
+#include <fs.h>
+#include <stat.h>
 
 typedef ssize_t (*sysfs_show_t)(char *buf, size_t size, void *priv);
 typedef ssize_t (*sysfs_store_t)(const char *buf, size_t size, void *priv);
