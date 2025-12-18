@@ -2,7 +2,7 @@
 #define PIT_H
 
 #include <stdint.h>
-#include "idt.h"
+#include <idt.h>
 
 // PIT ports
 #define PIT_CHANNEL0            0x40

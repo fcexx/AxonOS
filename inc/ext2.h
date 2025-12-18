@@ -75,4 +75,8 @@ int ext2_mount_from_memory(void *image, size_t size);
 void ext2_ls_root(void);
 int ext2_read_file_root(const char *name, void *out_buf, size_t buf_size);
 
+/* VFS integration (see fs/ext2.c) */
+int ext2_register(void);
+int ext2_unregister(void);
+
 #endif /* INC_EXT2_H */

@@ -1,31 +1,28 @@
 // AxonOS shell (osh): bash-like minimal interpreter with pipes and redirections
-#include "../inc/stdint.h"
+#include <stdint.h>
 #include <stddef.h>
 #include <string.h>
-#include "../inc/axosh.h"
-#include "../inc/vga.h"
-#include "../inc/keyboard.h"
-#include "../inc/heap.h"
-#include "../inc/fs.h"
-#include "../inc/ext2.h"
-#include "../inc/ramfs.h"
-#include "../inc/devfs.h"
-#include "../inc/fat32.h"
-#include "../inc/osh_line.h"
-#include "../inc/user.h"
-// local prototype for kprintf
-void kprintf(const char* fmt, ...);
-/* snprintf is implemented in drv/vga.c, declare it here */
-int snprintf(char* out, size_t outsz, const char* fmt, ...);
+#include <axosh.h>
+#include <vga.h>
+#include <keyboard.h>
+#include <heap.h>
+#include <fs.h>
+#include <ext2.h>
+#include <ramfs.h>
+#include <devfs.h>
+#include <fat32.h>
+#include <osh_line.h>
+#include <user.h>
+#include <exec.h>
 /* forward declare password reader and util */
 static int read_password(const char *prompt, char *buf, int bufsize);
 static unsigned int parse_uint(const char *s);
 // forward decls for optional chipset commands
 void intel_print_chipset_info(void);
 void intel_chipset_reset(void);
-#include "../inc/thread.h"
-#include "../inc/editor.h"
-#include "../inc/sysinfo.h"
+#include <thread.h>
+#include <editor.h>
+#include <sysinfo.h>
 
 typedef long ssize_t;
 
@@ -1378,25 +1375,66 @@ static int bi_kprint(cmd_ctx *c) {
 
 static int bi_ls(cmd_ctx *c) {
     char path[256]; if (c->argc<2) resolve_path(g_cwd, "", path, sizeof(path)); else resolve_path(g_cwd, c->argv[1], path, sizeof(path));
-    struct fs_file *f = fs_open(path); if (!f) { osh_write(c->out, c->out_len, c->out_cap, "ls: cannot access\n"); return 1; }
+    struct fs_file *f = fs_open(path);
+    if (!f) {
+        osh_write(c->out, c->out_len, c->out_cap, "ls: cannot access ");
+        osh_write(c->out, c->out_len, c->out_cap, path);
+        osh_write(c->out, c->out_len, c->out_cap, "\n");
+        return 1;
+    }
     if (f->type != FS_TYPE_DIR) { osh_write(c->out, c->out_len, c->out_cap, c->argv[1] ? c->argv[1] : path); osh_write(c->out, c->out_len, c->out_cap, "\n"); fs_file_free(f); return 0; }
-    size_t want = f->size ? f->size : 4096;
-    void *buf = kmalloc(want+1);
-    ssize_t r = buf ? fs_read(f, buf, want, 0) : 0;
-    if (r > 0) {
+    /* Read directory stream fully; single 4K read breaks nested dirs on some FS. */
+    size_t cap_bytes = 4096;
+    size_t len_bytes = 0;
+    uint8_t *buf = (uint8_t*)kmalloc(cap_bytes);
+    if (!buf) { fs_file_free(f); return 1; }
+    for (;;) {
+        if (len_bytes + 1024 > cap_bytes) {
+            size_t ncap = cap_bytes * 2;
+            if (ncap > 256 * 1024) break; /* hard cap */
+            uint8_t *nb = (uint8_t*)kmalloc(ncap);
+            if (!nb) break;
+            memcpy(nb, buf, len_bytes);
+            kfree(buf);
+            buf = nb;
+            cap_bytes = ncap;
+        }
+        ssize_t rr = fs_read(f, buf + len_bytes, cap_bytes - len_bytes, len_bytes);
+        if (rr < 0) break;
+        if (rr == 0) break;
+        len_bytes += (size_t)rr;
+    }
+    if (len_bytes > 0) {
         // Соберём все имена в список, сохраняя информацию о директориях
         int cap = 64, cnt = 0;
         char **names = (char**)kmalloc(sizeof(char*) * cap);
         int *is_dir = (int*)kmalloc(sizeof(int) * cap);
+        if (!names || !is_dir) {
+            if (names) kfree(names);
+            if (is_dir) kfree(is_dir);
+            kfree(buf);
+            fs_file_free(f);
+            return 1;
+        }
         uint32_t off = 0;
-        while ((size_t)off < (size_t)r) {
+        while ((size_t)off + sizeof(struct ext2_dir_entry) <= (size_t)len_bytes) {
             struct ext2_dir_entry *de = (struct ext2_dir_entry*)((uint8_t*)buf+off);
             if (de->inode==0 || de->rec_len==0) break;
-            int nlen = de->name_len; if (nlen>255) nlen = 255;
+            if (de->rec_len < sizeof(struct ext2_dir_entry)) break;
+            if ((size_t)off + (size_t)de->rec_len > (size_t)len_bytes) break;
+            if ((size_t)de->name_len > (size_t)de->rec_len - sizeof(struct ext2_dir_entry)) { off += de->rec_len; continue; }
+            int nlen = (int)de->name_len;
+            if (nlen <= 0) { off += de->rec_len; continue; }
+            if (nlen > 255) nlen = 255;
             if (cnt >= cap) {
                 int ncap = cap * 2;
                 char **nn = (char**)kmalloc(sizeof(char*) * ncap);
                 int *nd = (int*)kmalloc(sizeof(int) * ncap);
+                if (!nn || !nd) {
+                    if (nn) kfree(nn);
+                    if (nd) kfree(nd);
+                    break;
+                }
                 for (int i=0;i<cnt;i++) { nn[i] = names[i]; nd[i] = is_dir[i]; }
                 kfree(names); kfree(is_dir);
                 names = nn; is_dir = nd; cap = ncap;
@@ -1426,8 +1464,14 @@ static int bi_ls(cmd_ctx *c) {
             int cols = MAX_COLS / colw; if (cols < 1) cols = 1;
             int rows = (cnt + cols - 1) / cols;
 
-            // Формируем список с stat'ами и выводим в формате столбцов (права uid gid size name)
-            typedef struct { char *name; int is_dir; struct stat st; } ent_t;
+            // Формируем список с stat'ами и выводим в формате столбцов (права user group size name)
+            typedef struct {
+                char *name;
+                int is_dir;
+                struct stat st;
+                char uname[32];
+                char gname[32];
+            } ent_t;
             ent_t *ents = (ent_t*)kmalloc(sizeof(ent_t) * cnt);
             int nents = 0;
             for (int i=0;i<cnt;i++) {
@@ -1443,6 +1487,13 @@ static int bi_ls(cmd_ctx *c) {
                 if (vfs_stat(childpath, &ents[nents].st) != 0) {
                     memset(&ents[nents].st, 0, sizeof(ents[nents].st));
                 }
+                /* Resolve uid/gid to names (fallback: numeric). */
+                if (user_lookup_name_by_uid((uid_t)ents[nents].st.st_uid, ents[nents].uname, sizeof(ents[nents].uname)) != 0) {
+                    snprintf(ents[nents].uname, sizeof(ents[nents].uname), "%u", (unsigned)ents[nents].st.st_uid);
+                }
+                if (user_lookup_group_by_gid((gid_t)ents[nents].st.st_gid, ents[nents].gname, sizeof(ents[nents].gname)) != 0) {
+                    snprintf(ents[nents].gname, sizeof(ents[nents].gname), "%u", (unsigned)ents[nents].st.st_gid);
+                }
                 nents++;
             }
             // простой сортировщик (bubble) по имени
@@ -1453,24 +1504,22 @@ static int bi_ls(cmd_ctx *c) {
                     }
                 }
             }
-            /* compute column widths for uid/gid/size to align like linux ls */
-            int uid_w = 0, gid_w = 0, size_w = 0;
+            /* compute column widths for user/group/size to align like linux ls */
+            int uname_w = 0, gname_w = 0, size_w = 0;
             for (int i = 0; i < nents; i++) {
                 struct stat *s = &ents[i].st;
-                unsigned long u = (unsigned long)s->st_uid;
-                unsigned long g = (unsigned long)s->st_gid;
                 unsigned long z = (unsigned long)s->st_size;
-                int du = 1, dg = 1, dz = 1;
+                int dz = 1;
                 unsigned long tmp;
-                tmp = u; while (tmp >= 10) { du++; tmp /= 10; }
-                tmp = g; while (tmp >= 10) { dg++; tmp /= 10; }
                 tmp = z; while (tmp >= 10) { dz++; tmp /= 10; }
-                if (du > uid_w) uid_w = du;
-                if (dg > gid_w) gid_w = dg;
+                int lu = (int)strlen(ents[i].uname);
+                int lg = (int)strlen(ents[i].gname);
+                if (lu > uname_w) uname_w = lu;
+                if (lg > gname_w) gname_w = lg;
                 if (dz > size_w) size_w = dz;
             }
-            if (uid_w < 3) uid_w = 3;
-            if (gid_w < 3) gid_w = 3;
+            if (uname_w < 4) uname_w = 4;
+            if (gname_w < 4) gname_w = 4;
             if (size_w < 4) size_w = 4;
 
             char line[512];
@@ -1488,11 +1537,10 @@ static int bi_ls(cmd_ctx *c) {
                 perms[8] = (s->st_mode & 0002) ? 'w' : '-';
                 perms[9] = (s->st_mode & 0001) ? 'x' : '-';
                 perms[10] = '\0';
-                int uid = (int)s->st_uid;
-                int gid = (int)s->st_gid;
                 long sizev = (long)s->st_size;
-                int n = snprintf(line, sizeof(line), "%s %*d %*d %*ld %s%s\n",
-                    perms, uid_w, uid, gid_w, gid, size_w, sizev, ents[i].name, ents[i].is_dir ? "/" : "");
+                int n = snprintf(line, sizeof(line), "%s %-*s %-*s %*ld %s%s\n",
+                    perms, uname_w, ents[i].uname, gname_w, ents[i].gname, size_w, sizev,
+                    ents[i].name, ents[i].is_dir ? "/" : "");
                 if (n > 0) osh_write(c->out, c->out_len, c->out_cap, line);
             }
             // свободим вспомогательные массивы (names элементы уже используются в ents)
@@ -1503,7 +1551,9 @@ static int bi_ls(cmd_ctx *c) {
             kfree(names);
         }
     }
-    if (buf) kfree(buf); fs_file_free(f); return 0;
+    if (buf) kfree(buf);
+    fs_file_free(f);
+    return 0;
 }
 
 static int bi_cat(cmd_ctx *c) {
@@ -1574,7 +1624,7 @@ static int bi_rm(cmd_ctx *c) {
     int r = ramfs_remove(path); return r==0?0:1;
 }
 
-#include "../inc/axonos.h"
+#include <axonos.h>
 
 static int bi_about(cmd_ctx *c) { 
     (void)c;
@@ -1645,8 +1695,16 @@ static int bi_mem(cmd_ctx *c){
 static int bi_osh(cmd_ctx *c) {
     if (c->argc < 2) { osh_run(); return 0; }
     // Use the same path join logic as cat/ls to avoid intermittent resolution issues
-    char *path = kmalloc(256); if (path==0) return; join_cwd(g_cwd, c->argv[1], path, sizeof(path));
-    struct fs_file *f = fs_open(path); if (!f) { osh_write(c->out, c->out_len, c->out_cap, "osh: cannot open script\n"); return 1; }
+    char *path = kmalloc(256);
+    if (!path) return 1;
+    join_cwd(g_cwd, c->argv[1], path, 256);
+    struct fs_file *f = fs_open(path);
+    if (!f) {
+        kfree(path);
+        osh_write(c->out, c->out_len, c->out_cap, "osh: cannot open script\n");
+        return 1;
+    }
+    kfree(path);
     size_t want = f->size ? f->size : 0; char *buf = (char*)kmalloc(want + 1);
     if (!buf) { fs_file_free(f); return 1; }
     ssize_t r = fs_read(f, buf, want, 0); fs_file_free(f);

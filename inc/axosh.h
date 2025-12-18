@@ -21,6 +21,9 @@ void osh_resolve_path(const char* base, const char* arg, char* out, unsigned lon
 // Экспорт списка builtin-команд для подсказок
 int osh_get_builtin_names(const char*** out_names);
 
+/* Execute a single shell line (used by kernelcore at boot to run /start). */
+int exec_line(const char *line);
+
 #ifdef __cplusplus
 }
 #endif

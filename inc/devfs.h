@@ -1,7 +1,7 @@
 #pragma once
 
 #include <stddef.h>
-#include "fs.h"
+#include <fs.h>
 
 /* Number of virtual ttys provided by devfs (default) */
 #ifndef DEVFS_TTY_COUNT

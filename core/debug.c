@@ -78,12 +78,14 @@ void print_hex(unsigned int num)
     if (num == 0)
     {
         write_serial('0');
+        return;
     }
 
     while (num != 0)
     {
-        buffer[i++] = hex_chars[num & 16];
-        num /= 16;
+        /* take the low nibble (0..15) */
+        buffer[i++] = hex_chars[num & 0xF];
+        num >>= 4;
     }
 
     while (i > 0)

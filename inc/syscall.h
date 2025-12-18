@@ -1,7 +1,7 @@
 #pragma once
 
 #include <stdint.h>
-#include "idt.h"
+#include <idt.h>
 
 /* Minimal syscall numbers (Linux-compatible where convenient) */
 #define SYS_read    0

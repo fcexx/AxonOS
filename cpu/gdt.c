@@ -1,4 +1,5 @@
 #include <gdt.h>
+#include <vga.h>
 #include <stdint.h>
 #include <axonos.h>
 #include <debug.h>

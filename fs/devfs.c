@@ -1,14 +1,15 @@
-#include "../inc/devfs.h"
-#include "../inc/heap.h"
-#include "../inc/fs.h"
-#include "../inc/vga.h"
-#include "../inc/keyboard.h"
-#include "../inc/thread.h"
+#include <devfs.h>
+#include <heap.h>
+#include <fs.h>
+#include <vga.h>
+#include <keyboard.h>
+#include <thread.h>
 #include <string.h>
 #include <stddef.h>
-#include "../inc/spinlock.h"
-#include "../inc/ext2.h"
-#include "../inc/keyboard.h"
+#include <spinlock.h>
+#include <ext2.h>
+#include <keyboard.h>
+#include <disk.h>
 
 #define DEVFS_TTY_COUNT 6
 
@@ -45,7 +46,7 @@ static struct devfs_block dev_blocks[16];
 static int dev_block_count = 0;
 static uint32_t devfs_rand_state = 0x12345678;
 /* special device names exposed under /dev */
-static const char *devfs_special_names[] = { "null", "zero", "random", "stdin", "stdout", "stderr", "urandom" };
+static const char * const devfs_special_names[] = { "null", "zero", "random", "stdin", "stdout", "stderr", "urandom" };
 static const int devfs_special_count = sizeof(devfs_special_names) / sizeof(devfs_special_names[0]);
 
 /* entropy and RNG state */
@@ -80,8 +81,11 @@ static struct fs_file *devfs_alloc_file(const char *path, int tty) {
     struct fs_file *f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
     if (!f) return NULL;
     memset(f, 0, sizeof(*f));
-    f->path = (const char*)kmalloc(strlen(path) + 1);
-    strcpy((char*)f->path, path);
+    size_t plen = strlen(path) + 1;
+    char *pp = (char*)kmalloc(plen);
+    if (!pp) { kfree(f); return NULL; }
+    memcpy(pp, path, plen);
+    f->path = (const char*)pp;
     f->fs_private = &devfs_driver_data;
     f->driver_private = (void*)&dev_ttys[tty];
     f->type = FS_TYPE_REG;
@@ -103,8 +107,11 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
         struct fs_file *f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
         if (!f) return -1;
         memset(f, 0, sizeof(*f));
-        f->path = (const char*)kmalloc(strlen(path) + 1);
-        strcpy((char*)f->path, path);
+        size_t plen = strlen(path) + 1;
+        char *pp = (char*)kmalloc(plen);
+        if (!pp) { kfree(f); return -1; }
+        memcpy(pp, path, plen);
+        f->path = (const char*)pp;
         f->fs_private = NULL;
         /* allocate a simple handle to mark directory */
         struct { int is_dir; int dir_count; } *h = kmalloc(sizeof(*h));
@@ -126,8 +133,11 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
         struct fs_file *f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
         if (!f) return -1;
         memset(f, 0, sizeof(*f));
-        f->path = (const char*)kmalloc(strlen(path) + 1);
-        strcpy((char*)f->path, path);
+        size_t plen = strlen(path) + 1;
+        char *pp = (char*)kmalloc(plen);
+        if (!pp) { kfree(f); return -1; }
+        memcpy(pp, path, plen);
+        f->path = (const char*)pp;
         f->fs_private = &devfs_driver_data;
         f->driver_private = (void*)&dev_blocks[bi];
         f->type = FS_TYPE_REG;
@@ -144,8 +154,11 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
             struct fs_file *f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
             if (!f) return -1;
             memset(f, 0, sizeof(*f));
-            f->path = (const char*)kmalloc(strlen(path) + 1);
-            strcpy((char*)f->path, path);
+            size_t plen = strlen(path) + 1;
+            char *pp = (char*)kmalloc(plen);
+            if (!pp) { kfree(f); return -1; }
+            memcpy(pp, path, plen);
+            f->path = (const char*)pp;
             f->fs_private = &devfs_driver_data;
             int *ptype = (int*)kmalloc(sizeof(int));
             if (!ptype) { kfree((void*)f->path); kfree(f); return -1; }
@@ -166,7 +179,6 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
 }
 
 static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t offset) {
-    (void)offset;
     if (!file || !buf) return -1;
     /* block device file handling */
     for (int bi = 0; bi < dev_block_count; bi++) {
@@ -331,7 +343,12 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             size_t rec_len = 8 + namelen;
             if (pos + rec_len <= (size_t)offset) { pos += rec_len; continue; }
             if (written >= size) break;
-            uint8_t tmp[256];
+            uint8_t tmp[512];
+            if (rec_len > sizeof(tmp)) {
+                /* name too long for our entry buffer -> skip safely */
+                pos += rec_len;
+                continue;
+            }
             struct ext2_dir_entry de;
             de.inode = (uint32_t)(i + 1);
             de.rec_len = (uint16_t)rec_len;
@@ -340,7 +357,7 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             memcpy(tmp, &de, 8);
             memcpy(tmp + 8, nm, namelen);
             size_t entry_off = 0;
-            if (offset > (ssize_t)pos) entry_off = (size_t)offset - pos;
+            if ((size_t)offset > pos) entry_off = (size_t)offset - pos;
             size_t avail = size - written;
             size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
             if (tocopy > avail) tocopy = avail;

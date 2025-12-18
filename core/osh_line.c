@@ -1,15 +1,13 @@
-#include "../inc/osh_line.h"
-#include "../inc/vga.h"
-#include "../inc/keyboard.h"
-#include "../inc/fs.h"
-#include "../inc/ext2.h"
-#include "../inc/heap.h"
-#include "../inc/axosh.h"
+#include <osh_line.h>
+#include <vga.h>
+#include <keyboard.h>
+#include <fs.h>
+#include <ext2.h>
+#include <heap.h>
+#include <axosh.h>
 #include <stdint.h>
 #include <string.h>
-#include "../inc/devfs.h"
-/* kprintf used for debug in some flows */
-int kprintf(const char* fmt, ...);
+#include <devfs.h>
 
 #define OSH_MAX_HISTORY 32
 #define OSH_MAX_LINE 512
@@ -118,23 +116,50 @@ static int list_dir_entries(const char* path, const char*** out_names, int* out_
     struct fs_file* f = fs_open(path);
     if (!f) return -1;
     if (f->type != FS_TYPE_DIR) { fs_file_free(f); return -1; }
-    size_t want = f->size ? f->size : 4096;
-    uint8_t* buf = (uint8_t*)kmalloc(want+1);
+    /* Read directory stream fully (sysfs/devfs can exceed 4K and a single read
+       would miss entries, breaking tab completion). */
+    size_t cap_bytes = 4096;
+    size_t len_bytes = 0;
+    uint8_t* buf = (uint8_t*)kmalloc(cap_bytes);
     if (!buf) { fs_file_free(f); return -1; }
-    ssize_t r = fs_read(f, buf, want, 0);
+    for (;;) {
+        if (len_bytes + 1024 > cap_bytes) {
+            size_t ncap = cap_bytes * 2;
+            if (ncap > 256 * 1024) break; /* hard cap */
+            uint8_t* nb = (uint8_t*)kmalloc(ncap);
+            if (!nb) break;
+            memcpy(nb, buf, len_bytes);
+            kfree(buf);
+            buf = nb;
+            cap_bytes = ncap;
+        }
+        ssize_t r = fs_read(f, buf + len_bytes, cap_bytes - len_bytes, len_bytes);
+        if (r < 0) { kfree(buf); fs_file_free(f); return -1; }
+        if (r == 0) break;
+        len_bytes += (size_t)r;
+    }
     fs_file_free(f);
-    if (r <= 0) { kfree(buf); return -1; }
+    if (len_bytes == 0) { kfree(buf); return -1; }
     // грубо посчитаем кол-во записей
     int cap = 64, cnt = 0;
     const char** names = (const char**)kmalloc(sizeof(char*) * cap);
+    if (!names) { kfree(buf); return -1; }
     uint32_t off = 0;
-    while ((size_t)off + sizeof(struct ext2_dir_entry) < (size_t)r) {
+    while ((size_t)off + sizeof(struct ext2_dir_entry) <= (size_t)len_bytes) {
         struct ext2_dir_entry* de = (struct ext2_dir_entry*)(buf + off);
         if (de->inode == 0 || de->rec_len == 0) break;
+        if (de->rec_len < sizeof(struct ext2_dir_entry)) break;
+        if ((size_t)off + (size_t)de->rec_len > (size_t)len_bytes) break;
+        if ((size_t)de->name_len > (size_t)de->rec_len - sizeof(struct ext2_dir_entry)) { off += de->rec_len; continue; }
         int nlen = de->name_len; if (nlen <= 0 || nlen > 255) { off += de->rec_len; continue; }
         if (cnt >= cap) {
-            int ncap = cap * 2; const char** nn = (const char**)kmalloc(sizeof(char*)*ncap);
-            for (int i=0;i<cnt;i++) nn[i]=names[i]; kfree(names); names = nn; cap = ncap;
+            int ncap = cap * 2;
+            const char** nn = (const char**)kmalloc(sizeof(char*)*ncap);
+            if (!nn) break;
+            for (int i=0;i<cnt;i++) nn[i]=names[i];
+            kfree(names);
+            names = nn;
+            cap = ncap;
         }
         // создаём временные C-строки поверх нового буфера
         char* s = (char*)kmalloc(nlen+1); if (!s) { off += de->rec_len; continue; }
@@ -162,21 +187,36 @@ static void complete_token(const char* cwd, char* buf, int* io_len, int* io_cur,
     // текущий токен
     char token[256]; int tlen = cur - start; if (tlen<0) tlen=0; if (tlen > 255) tlen = 255;
     memcpy(token, buf+start, (size_t)tlen); token[tlen]='\0';
-    // определим каталог для поиска
-    char *dir = (char*)kmalloc(256); if (!dir) return; dir[0]='\0';
-    char *base = (char*)kmalloc(256); if (!base) { kfree(dir); return; } base[0]='\0';
+    /* определим каталог для поиска */
+    enum { DIR_CAP = 256, BASE_CAP = 256, ABS_CAP = 512 };
+    char *dir = (char*)kmalloc(DIR_CAP);
+    if (!dir) return;
+    dir[0] = '\0';
+    char *base = (char*)kmalloc(BASE_CAP);
+    if (!base) { kfree(dir); return; }
+    base[0] = '\0';
     const char* slash = NULL; for (int i=0;i<tlen;i++) if (token[i]=='/') slash = &token[i];
     if (slash) {
         int dlen = (int)(slash - token);
-        memcpy(dir, token, (size_t)dlen); dir[dlen]='\0';
-        strncpy(base, slash+1, sizeof(base)-1); base[sizeof(base)-1]='\0';
+        /* Special case: absolute path with slash at position 0 (e.g. "/de").
+           In that case directory for listing is "/" (not ""), otherwise
+           osh_resolve_path() would treat "" as cwd and completion would fail. */
+        if (dlen == 0 && token[0] == '/') {
+            strcpy(dir, "/");
+        } else {
+            if (dlen >= DIR_CAP) dlen = DIR_CAP - 1;
+            memcpy(dir, token, (size_t)dlen);
+            dir[dlen]='\0';
+        }
+        strncpy(base, slash+1, BASE_CAP-1);
+        base[BASE_CAP-1]='\0';
     } else {
-        strcpy(dir, "."); strncpy(base, token, sizeof(base)-1); base[sizeof(base)-1]='\0';
+        strcpy(dir, "."); strncpy(base, token, BASE_CAP-1); base[BASE_CAP-1]='\0';
     }
     // построим абсолютный нормализованный путь для dir с учётом '.', '..' и cwd
-    char *abs = (char*)kmalloc(512);
-    if (!abs) return;
-    osh_resolve_path(cwd, dir, abs, sizeof(abs));
+    char *abs = (char*)kmalloc(ABS_CAP);
+    if (!abs) { kfree(base); kfree(dir); return; }
+    osh_resolve_path(cwd, dir, abs, ABS_CAP);
     // получим список файлов
     const char** fs_names = NULL; int fs_count = 0;
     (void)list_dir_entries(abs, &fs_names, &fs_count); // игнорируем ошибку, просто 0 кандидатов
@@ -189,6 +229,7 @@ static void complete_token(const char* cwd, char* buf, int* io_len, int* io_cur,
     }
     // теперь фильтруем по base
     int matches = 0; char common[256]; common[0]='\0';
+    char **candidates = NULL;
     // 1) builtin
     for (int i=0;i<bcount;i++) {
         if (strncmp(bnames[i], base, strlen(base))==0) {
@@ -212,7 +253,7 @@ static void complete_token(const char* cwd, char* buf, int* io_len, int* io_cur,
         }
     }
     // отфильтруем по base и найдём общий префикс
-    if (matches == 0) { if (fs_names) free_name_list(fs_names, fs_count); return; }
+    if (matches == 0) goto cleanup;
     // вставим недостающую часть общего префикса
     int add = (int)strlen(common) - (int)strlen(base);
     if (add > 0) {
@@ -224,7 +265,9 @@ static void complete_token(const char* cwd, char* buf, int* io_len, int* io_cur,
     } else if (matches > 1 && sugg && sugg_cap>0) {
         /* build list of matches and print them in columns */
         int max_candidates = bcount + fs_count;
-        char **candidates = (char**)kmalloc(sizeof(char*) * (size_t)max_candidates);
+        if (max_candidates <= 0) goto after_sugg;
+        candidates = (char**)kmalloc(sizeof(char*) * (size_t)max_candidates);
+        if (!candidates) goto after_sugg;
         int cand = 0;
         int maxlen = 0;
         size_t baselen = strlen(base);
@@ -286,12 +329,12 @@ static void complete_token(const char* cwd, char* buf, int* io_len, int* io_cur,
         } else {
             *sugg_len = 0;
         }
-        kfree(candidates);
     }
+after_sugg:
     // Если единственное совпадение — файл и это директория, добавим '/' как в bash
     if (matches == 1) {
         // common содержит имя совпадения; abs — абсолютный путь к каталогу для поиска
-        char *candidate = (char*)kmalloc(1024); if (!candidate) return;
+        char candidate[1024];
         size_t alen = strlen(abs);
         size_t clen = strlen(common);
         if (alen + 1 + clen + 1 < 1024) {
@@ -336,7 +379,12 @@ static void complete_token(const char* cwd, char* buf, int* io_len, int* io_cur,
         }
     }
     *io_len = len; *io_cur = cur;
+cleanup:
+    if (candidates) kfree(candidates);
     if (fs_names) free_name_list(fs_names, fs_count);
+    if (abs) kfree(abs);
+    if (base) kfree(base);
+    if (dir) kfree(dir);
 }
 
 int osh_line_read(const char* prompt, const char* cwd, char* out, int out_size) {

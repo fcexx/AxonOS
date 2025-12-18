@@ -1,4 +1,6 @@
 #include <stdint.h>
+#include <stddef.h>
+#include <stdarg.h>
 
 #define VIDEO_ADDRESS 0xb8000
 #define MAX_ROWS 25
@@ -28,6 +30,17 @@ void vga_get_cursor(uint32_t* x, uint32_t* y);
 
 /* Set hardware cursor scanline start/end (0-31). */
 void set_cursor_shape(uint8_t start, uint8_t end);
+
+/* Enable hardware VGA cursor (also sets a sane default shape). */
+void enable_cursor(void);
+
+/* Kernel printf-like output to VGA text mode. */
+void kprintf(const char* fmt, ...);
+
+/* Minimal printf-to-buffer helpers implemented in drv/vga.c */
+int vsnprintf(char* out, size_t outsz, const char* fmt, va_list ap);
+int snprintf(char* out, size_t outsz, const char* fmt, ...);
+int sprintf(char* out, const char* fmt, ...);
 
 /* Fast direct VGA helpers (write directly to video memory) */
 void vga_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr);

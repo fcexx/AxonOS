@@ -1,6 +1,7 @@
 #include <disk.h>
 #include <axonos.h>
 #include <string.h>
+#include <vga.h>
 
 static disk_ops_t *g_disks[DISK_MAX_DEVICES];
 static int g_disk_count = 0;

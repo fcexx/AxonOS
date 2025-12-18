@@ -41,16 +41,19 @@ kernel: $(KERNEL_BIN)
 
 $(BUILD_DIR)/%.asm.o: %.asm
 	@mkdir -p $(dir $@)
+	@echo "NASM		$<"
 	@$(ASM) $(ASM_ELF_FLAGS) -o $@ $<
 
 $(BUILD_DIR)/%.c.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c -o $@ $<
+	@echo "CC		$<"
+	@$(CC) $(CFLAGS) -c -o $@ $<
 
 # Build rule for GAS .S files (with C preprocessor)
 $(BUILD_DIR)/%.S.o: %.S
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c -o $@ $<
+	@echo "CC		$<"
+	@$(CC) $(CFLAGS) -c -o $@ $<
 
 $(KERNEL_ELF): $(MULTIBOOT_OBJ) $(OTHER_ASM_OBJS) $(SOBJS) $(COBJS)
 	@mkdir -p $(BUILD_DIR)

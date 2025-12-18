@@ -532,7 +532,13 @@ static void __bw_putc(__bufw* w, char ch) {
 	w->len++;
 }
 
-static char tmp[64];
+static void __bw_putn(__bufw* w, char ch, int count) {
+	for (int i = 0; i < count; i++) __bw_putc(w, ch);
+}
+
+static void __bw_putstrn(__bufw* w, const char* s, int slen) {
+	for (int i = 0; i < slen; i++) __bw_putc(w, s[i]);
+}
 
 int __vsnprintf(char* out, size_t outsz, const char* fmt, va_list ap_in) {
 	if (!out || outsz==0) return 0;
@@ -541,38 +547,124 @@ int __vsnprintf(char* out, size_t outsz, const char* fmt, va_list ap_in) {
 	for (const char *p = fmt; *p; ) {
 		if (*p != '%') { __bw_putc(&W, *p++); continue; }
 		p++;
-		// flags (ignored mostly)
-		while (*p=='-'||*p=='+'||*p==' '||*p=='#'||*p=='0') p++;
-		// width
-		if (*p=='*') { (void)va_arg(ap,int); p++; } else { while (*p>='0'&&*p<='9') p++; }
-		// precision
-		if (*p=='.') { p++; if (*p=='*'){ (void)va_arg(ap,int); p++; } else { while (*p>='0'&&*p<='9') p++; } }
-		// length
-		if (*p=='h'||*p=='l'||*p=='z') { if ((p[0]=='h'&&p[1]=='h')||(p[0]=='l'&&p[1]=='l')) p+=2; else p++; }
-		char spec = *p ? *p++ : '\0'; int n=0;
+
+		/* flags */
+		int left = 0, plus = 0, space = 0, alt = 0, zero = 0;
+		for (;;) {
+			if (*p == '-') { left = 1; p++; }
+			else if (*p == '+') { plus = 1; p++; }
+			else if (*p == ' ') { space = 1; p++; }
+			else if (*p == '#') { alt = 1; p++; }
+			else if (*p == '0') { zero = 1; p++; }
+			else break;
+		}
+
+		/* width */
+		int width = 0;
+		if (*p == '*') { width = va_arg(ap, int); p++; }
+		else while (*p >= '0' && *p <= '9') { width = width * 10 + (*p++ - '0'); }
+		if (width < 0) { left = 1; width = -width; }
+
+		/* precision */
+		int prec = -1;
+		if (*p == '.') {
+			p++;
+			if (*p == '*') { prec = va_arg(ap, int); p++; }
+			else { prec = 0; while (*p >= '0' && *p <= '9') prec = prec * 10 + (*p++ - '0'); }
+		}
+
+		/* length */
+		enum { LEN_DEF, LEN_HH, LEN_H, LEN_L, LEN_LL, LEN_Z } len = LEN_DEF;
+		if (*p == 'h') { p++; if (*p == 'h') { len = LEN_HH; p++; } else len = LEN_H; }
+		else if (*p == 'l') { p++; if (*p == 'l') { len = LEN_LL; p++; } else len = LEN_L; }
+		else if (*p == 'z') { len = LEN_Z; p++; }
+
+		char spec = *p ? *p++ : '\0';
+
+		char num[64];
+		int n = 0;
+
 		switch (spec) {
-			case 'c': { int ch=va_arg(ap,int); __bw_putc(&W,(char)ch); break; }
-			case 's': { const char* s=va_arg(ap,const char*); if(!s)s="(null)"; while(*s) __bw_putc(&W,*s++); break; }
+		case 'c': {
+			int ch = va_arg(ap, int);
+			int pad = (width > 1) ? width - 1 : 0;
+			if (!left) __bw_putn(&W, ' ', pad);
+			__bw_putc(&W, (char)ch);
+			if (left) __bw_putn(&W, ' ', pad);
+			break; }
+
+		case 's': {
+			const char *s = va_arg(ap, const char*);
+			if (!s) s = "(null)";
+			int slen = 0; while (s[slen]) slen++;
+			if (prec >= 0 && prec < slen) slen = prec;
+			int pad = (width > slen) ? width - slen : 0;
+			if (!left) __bw_putn(&W, ' ', pad);
+			__bw_putstrn(&W, s, slen);
+			if (left) __bw_putn(&W, ' ', pad);
+			break; }
+
 			case 'd': case 'i': {
-				long long v = va_arg(ap,int);
-				unsigned long long u = (v<0)?(unsigned long long)(-v):(unsigned long long)v;
-				if (u==0) tmp[n++]='0';
-				while(u){ tmp[n++]=(char)('0'+(u%10)); u/=10; }
-				if (v<0) __bw_putc(&W,'-');
-				for (int i=n-1;i>=0;i--) __bw_putc(&W,tmp[i]);
-				break;
-			}
+			long long v;
+			if (len == LEN_LL) v = va_arg(ap, long long);
+			else if (len == LEN_L) v = va_arg(ap, long);
+			else if (len == LEN_Z) v = (long long)va_arg(ap, size_t);
+			else v = va_arg(ap, int);
+			unsigned long long u = (v < 0) ? (unsigned long long)(-v) : (unsigned long long)v;
+			n = utoa_rev(u, 10, 0, num);
+			char signch = 0;
+			if (v < 0) signch = '-';
+			else if (plus) signch = '+';
+			else if (space) signch = ' ';
+			int digits = n;
+			int tot = digits + (signch ? 1 : 0);
+			int pad = (width > tot) ? width - tot : 0;
+			char padch = (zero && !left && prec < 0) ? '0' : ' ';
+			if (!left) __bw_putn(&W, padch, pad);
+			if (signch) __bw_putc(&W, signch);
+			for (int i = n - 1; i >= 0; i--) __bw_putc(&W, num[i]);
+			if (left) __bw_putn(&W, ' ', pad);
+			break; }
+
 			case 'u': case 'x': case 'X': {
-				unsigned base = (spec=='u')?10:16; int upper = (spec=='X');
-				unsigned long long u = va_arg(ap,unsigned int);
-				const char* D = upper?"0123456789ABCDEF":"0123456789abcdef";
-				if (u==0) tmp[n++]='0';
-				while(u){ tmp[n++]=D[u%base]; u/=base; }
-				for (int i=n-1;i>=0;i--) __bw_putc(&W,tmp[i]);
+			unsigned base = (spec == 'u') ? 10u : 16u;
+			int upper = (spec == 'X');
+			unsigned long long u;
+			if (len == LEN_LL) u = va_arg(ap, unsigned long long);
+			else if (len == LEN_L) u = va_arg(ap, unsigned long);
+			else if (len == LEN_Z) u = (unsigned long long)va_arg(ap, size_t);
+			else u = va_arg(ap, unsigned int);
+			n = utoa_rev(u, base, upper, num);
+			int prefix = 0;
+			if (alt && base == 16 && u != 0) prefix = 2;
+			int tot = n + prefix;
+			int pad = (width > tot) ? width - tot : 0;
+			char padch = (zero && !left && prec < 0) ? '0' : ' ';
+			if (!left) __bw_putn(&W, padch, pad);
+			if (prefix) { __bw_putc(&W, '0'); __bw_putc(&W, upper ? 'X' : 'x'); }
+			for (int i = n - 1; i >= 0; i--) __bw_putc(&W, num[i]);
+			if (left) __bw_putn(&W, ' ', pad);
+			break; }
+
+		case 'p': {
+			void *pv = va_arg(ap, void*);
+			unsigned long long u = (unsigned long long)(uintptr_t)pv;
+			n = utoa_rev(u, 16, 0, num);
+			/* always 0x prefix */
+			int tot = n + 2;
+			int pad = (width > tot) ? width - tot : 0;
+			if (!left) __bw_putn(&W, ' ', pad);
+			__bw_putc(&W, '0'); __bw_putc(&W, 'x');
+			for (int i = n - 1; i >= 0; i--) __bw_putc(&W, num[i]);
+			if (left) __bw_putn(&W, ' ', pad);
+			break; }
+
+		case '%': __bw_putc(&W, '%'); break;
+		default:
+			/* unknown specifier: print it literally to avoid desync */
+			__bw_putc(&W, '%');
+			__bw_putc(&W, spec);
 				break;
-			}
-			case '%': __bw_putc(&W,'%'); break;
-			default: __bw_putc(&W,spec); break;
 		}
 	}
 	// NUL

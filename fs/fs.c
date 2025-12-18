@@ -1,13 +1,13 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
-#include "../inc/fs.h"
-#include "../inc/stat.h"
+#include <fs.h>
+#include <stat.h>
+#include <heap.h>
+#include <vga.h>
 /* driver-specific stat helpers */
-#include "../inc/sysfs.h"
-#include "../inc/ramfs.h"
-/* debug print */
-extern void kprintf(const char *fmt, ...);
+#include <sysfs.h>
+#include <ramfs.h>
 
 #define MAX_FS_DRIVERS 8
 #define MAX_FS_MOUNTS 8

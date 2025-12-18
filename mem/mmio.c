@@ -4,6 +4,7 @@
 #include <spinlock.h>
 #include <mmio.h>
 #include <paging.h>
+#include <vga.h>
 
 #define MMIO_IDENTITY_LIMIT ((uint64_t)0x100000000ULL) /* 4GiB */
 /* place MMIO pool at a high virtual address to avoid stomping low memory used

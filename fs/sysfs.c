@@ -1,15 +1,15 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
-#include "../inc/fs.h"
-#include "../inc/sysfs.h"
-#include "../inc/heap.h"
-#include "../inc/ext2.h"
-#include "../inc/stat.h"
-#include "../inc/spinlock.h"
-#include "../inc/rtc.h"
-#include "../inc/thread.h"
-#include "../inc/stdint.h"
+#include <fs.h>
+#include <sysfs.h>
+#include <heap.h>
+#include <ext2.h>
+#include <stat.h>
+#include <spinlock.h>
+#include <rtc.h>
+#include <thread.h>
+#include <stdint.h>
 
 struct sysfs_node {
     char *name;
@@ -213,7 +213,7 @@ int sysfs_create_file(const char *path, const struct sysfs_attr *attr) {
     }
     if (!node->attr) {
         node->attr = (struct sysfs_attr*)kmalloc(sizeof(struct sysfs_attr));
-        if (!node->attr) return -1;
+        if (!node->attr) { release(&sysfs_lock); return -1; }
     }
     memcpy(node->attr, attr, sizeof(struct sysfs_attr));
     /* compute size for sysfs file content if possible */
@@ -231,27 +231,42 @@ static int sysfs_open(const char *path, struct fs_file **out_file) {
     if (!path || !out_file) return -1;
     if (!sysfs_root) return -1;
     if (!(strcmp(path, "/sys") == 0 || strncmp(path, "/sys/", 5) == 0)) return -1;
+    int rc = -1;
+    struct fs_file *f = NULL;
+    char *pp = NULL;
+    struct sysfs_handle *h = NULL;
+
     acquire(&sysfs_lock);
     struct sysfs_node *node = sysfs_lookup(path);
     if (!node) { release(&sysfs_lock); return -1; }
-    struct fs_file *f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
-    if (!f) return -1;
+
+    /* Allocation failures must not leave sysfs_lock held, otherwise later VFS
+       operations may spin forever under memory pressure. */
+    f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
+    if (!f) goto out_unlock;
     memset(f, 0, sizeof(*f));
     size_t plen = strlen(path) + 1;
-    char *pp = (char*)kmalloc(plen);
-    if (!pp) { kfree(f); return -1; }
+    pp = (char*)kmalloc(plen);
+    if (!pp) goto out_unlock;
     memcpy(pp, path, plen);
     f->path = pp;
     f->fs_private = sysfs_driver.driver_data;
     f->type = node->is_dir ? FS_TYPE_DIR : FS_TYPE_REG;
     f->size = node->size;
-    struct sysfs_handle *h = (struct sysfs_handle*)kmalloc(sizeof(struct sysfs_handle));
-    if (!h) { kfree((void*)f->path); kfree(f); return -1; }
+    h = (struct sysfs_handle*)kmalloc(sizeof(struct sysfs_handle));
+    if (!h) goto out_unlock;
     h->node = node;
     f->driver_private = h;
     *out_file = f;
+    f = NULL; pp = NULL; h = NULL;
+    rc = 0;
+
+out_unlock:
     release(&sysfs_lock);
-    return 0;
+    if (h) kfree(h);
+    if (pp) kfree(pp);
+    if (f) kfree(f);
+    return rc;
 }
 
 static ssize_t sysfs_read(struct fs_file *file, void *buf, size_t size, size_t offset) {
@@ -280,11 +295,15 @@ static ssize_t sysfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             if (written >= size) break;
             /* compute where to start copying from this entry */
             size_t entry_off = 0;
-            if (offset > (ssize_t)pos) entry_off = (size_t)offset - pos;
+            if ((size_t)offset > pos) entry_off = (size_t)offset - pos;
             /* build full entry into a temporary buffer then copy partial */
-            size_t need = rec_len;
-            if (need > 4096) need = 4096;
             uint8_t tmp[512];
+            if (rec_len > sizeof(tmp)) {
+                /* name too long for our temp entry buffer -> skip entry safely */
+                pos += rec_len;
+                child = child->next;
+                continue;
+            }
             struct ext2_dir_entry de;
             de.inode = (uint32_t)(child->ino & 0xFFFFFFFFu);
             de.rec_len = (uint16_t)rec_len;
@@ -317,15 +336,38 @@ static ssize_t sysfs_read(struct fs_file *file, void *buf, size_t size, size_t o
     }
     release(&sysfs_lock);
     if (!show_fn) return 0;
-    (void)offset; /* sysfs values are regenerated each read */
-    ssize_t r = show_fn((char*)buf, size, show_priv);
-    /* update atime if node still valid and attr unchanged */
-    acquire(&sysfs_lock);
-    if (h->node == node && node->attr && node->attr->show == show_fn) {
-        node->atime = (time_t)rtc_ticks;
+    /* sysfs must respect offset and provide EOF semantics, otherwise tools like `cat`
+       will loop forever (because sysfs content is regenerated each read). */
+    {
+        /* Generate full value into a temporary buffer, then slice by offset. */
+        size_t cap = 4096;
+        if (cap < size + offset) cap = size + offset; /* best effort */
+        if (cap > 65536) cap = 65536; /* hard cap */
+        char *tmp = (char*)kmalloc(cap);
+        if (!tmp) return -1;
+        ssize_t full = show_fn(tmp, cap, show_priv);
+        if (full < 0) { kfree(tmp); return -1; }
+        size_t len = (size_t)full;
+        if ((size_t)offset >= len) {
+            kfree(tmp);
+            /* update atime */
+            acquire(&sysfs_lock);
+            if (h->node == node && node->attr && node->attr->show == show_fn) node->atime = (time_t)rtc_ticks;
+            release(&sysfs_lock);
+            return 0;
+        }
+        size_t to_copy = len - (size_t)offset;
+        if (to_copy > size) to_copy = size;
+        memcpy(buf, tmp + offset, to_copy);
+        kfree(tmp);
+        /* update atime if node still valid and attr unchanged */
+        acquire(&sysfs_lock);
+        if (h->node == node && node->attr && node->attr->show == show_fn) {
+            node->atime = (time_t)rtc_ticks;
+        }
+        release(&sysfs_lock);
+        return (ssize_t)to_copy;
     }
-    release(&sysfs_lock);
-    return r;
 }
 
 static ssize_t sysfs_write(struct fs_file *file, const void *buf, size_t size, size_t offset) {

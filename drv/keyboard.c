@@ -7,7 +7,8 @@
 #include <string.h>
 #include <thread.h>
 #include <sysfs.h>
-#include "../inc/devfs.h"
+#include <pic.h>
+#include <devfs.h>
 
 // Вспомогательные функции для ожидания статусов контроллера PS/2
 static int ps2_wait_input_empty(void) {

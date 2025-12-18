@@ -1,7 +1,9 @@
-#include "../inc/user.h"
-#include "../inc/heap.h"
+#include <user.h>
+#include <heap.h>
 #include <string.h>
-#include "../inc/thread.h"
+#include <thread.h>
+#include <vga.h>
+#include <fs.h>
 
 /* avoid including host stdlib headers in kernel code */
 
@@ -128,6 +130,95 @@ const char* user_get_current_name(void) {
 uid_t user_get_current_uid(void) {
     thread_t* t = thread_current();
     return (t) ? t->euid : g_current_uid;
+}
+
+static int copy_out(char *out, size_t outsz, const char *s) {
+    if (!out || outsz == 0) return -1;
+    if (!s) s = "";
+    size_t n = strlen(s);
+    if (n >= outsz) n = outsz - 1;
+    memcpy(out, s, n);
+    out[n] = '\0';
+    return 0;
+}
+
+int user_lookup_name_by_uid(uid_t uid, char *out, size_t outsz) {
+    if (!out || outsz == 0) return -1;
+    for (int i = 0; i < g_user_count; i++) {
+        if (g_users[i].uid == uid) return copy_out(out, outsz, g_users[i].name);
+    }
+    if (uid == ROOT_UID) return copy_out(out, outsz, ROOT_USER_NAME);
+    return -1;
+}
+
+static int parse_uint_field(const char *s, unsigned int *out) {
+    if (!s || !out) return -1;
+    unsigned int v = 0;
+    int any = 0;
+    while (*s == ' ' || *s == '\t') s++;
+    while (*s >= '0' && *s <= '9') {
+        any = 1;
+        unsigned int d = (unsigned int)(*s - '0');
+        v = v * 10u + d;
+        s++;
+    }
+    if (!any) return -1;
+    *out = v;
+    return 0;
+}
+
+int user_lookup_group_by_gid(gid_t gid, char *out, size_t outsz) {
+    if (!out || outsz == 0) return -1;
+    if (gid == ROOT_GID) return copy_out(out, outsz, "root");
+
+    /* First: try /etc/group (name:x:gid:members) */
+    struct fs_file *f = fs_open("/etc/group");
+    if (f) {
+        size_t sz = f->size;
+        if (sz > 0 && sz < (64u * 1024u)) {
+            char *buf = (char*)kmalloc(sz + 1);
+            if (buf) {
+                ssize_t r = fs_read(f, buf, sz, 0);
+                if (r > 0) {
+                    buf[(size_t)r] = '\0';
+                    char *p = buf;
+                    while (*p) {
+                        char *line = p;
+                        char *nl = strchr(p, '\n');
+                        if (nl) { *nl = '\0'; p = nl + 1; } else { p += strlen(p); }
+                        if (line[0] == '\0' || line[0] == '#') continue;
+                        /* name:x:gid:... */
+                        char *c1 = strchr(line, ':');
+                        if (!c1) continue;
+                        *c1 = '\0';
+                        char *rest = c1 + 1;
+                        char *c2 = strchr(rest, ':');
+                        if (!c2) continue;
+                        rest = c2 + 1;
+                        char *c3 = strchr(rest, ':');
+                        if (c3) *c3 = '\0';
+                        unsigned int gval = 0;
+                        if (parse_uint_field(rest, &gval) == 0) {
+                            if ((gid_t)gval == gid) {
+                                int rc = copy_out(out, outsz, line);
+                                kfree(buf);
+                                fs_file_free(f);
+                                return rc;
+                            }
+                        }
+                    }
+                }
+                kfree(buf);
+            }
+        }
+        fs_file_free(f);
+    }
+
+    /* Fallback: if some user has this primary gid, use username as group label. */
+    for (int i = 0; i < g_user_count; i++) {
+        if (g_users[i].gid == gid) return copy_out(out, outsz, g_users[i].name);
+    }
+    return -1;
 }
 
 

@@ -1,12 +1,12 @@
-#include "../inc/pci.h"
+#include <pci.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
 #include <apic.h>
 #include <apic_timer.h>
-#include "../inc/sysfs.h"
-#include "../inc/serial.h"
-extern void kprintf(const char *fmt, ...);
+#include <sysfs.h>
+#include <serial.h>
+#include <vga.h>
 
 #define PCI_CONFIG_ADDRESS 0xCF8
 #define PCI_CONFIG_DATA    0xCFC

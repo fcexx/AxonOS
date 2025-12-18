@@ -46,4 +46,7 @@ typedef struct {
 /* Fill status struct, returns 0 on success */
 int mmio_pool_get_status(mmio_pool_status_t *out);
 
+/* Initialize mmio subsystem (idempotent). */
+void mmio_init(void);
+
 
