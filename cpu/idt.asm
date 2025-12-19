@@ -66,20 +66,23 @@ isr%1:
 
 %macro ISR_ERR 1
 isr%1:
-        ; CPU уже положил error code на стек. Не снимать его сейчас, иначе испортим кадр для iretq.
-        ; Сначала сохраняем все регистры.
+        ; For exceptions with CPU-pushed error code (e.g., #PF):
+        ; entry stack layout: [error_code][RIP][CS][RFLAGS][RSP][SS]
+        ; Our cpu_registers_t expects:
+        ;   interrupt_number, error_code, r15..rax, RIP, CS, RFLAGS, RSP, SS
+        ;
+        ; To avoid shifting the layout by keeping TWO error codes on stack,
+        ; we remove the CPU error code first and re-push it in the expected place.
+        mov rax, [rsp]                  ; save CPU error code
+        add rsp, 8                      ; drop original error code (iretq frame now starts with RIP)
         PUSH_REGS
-        ; Скопируем CPU error code (лежит под сохранёнными регистрами)
-        ; PUSH_REGS положил 15 регистров по 8 байт => 120 байт.
-        mov rax, [rsp + 120]
-        push rax                        ; дублируем error code для C-обработчика
+        push rax                        ; error_code
         mov rax, %1
-        push rax                        ; interrupt number
-        mov rdi, rsp                ; rdi -> cpu_registers_t
+        push rax                        ; interrupt_number
+        mov rdi, rsp                    ; rdi -> cpu_registers_t
         call isr_dispatch
-        add rsp, 16                 ; убрать vector + дубликат error code
+        add rsp, 16                     ; pop interrupt_number + error_code
         POP_REGS
-        add rsp, 8                  ; убрать оригинальный CPU error code перед iretq
         iretq
 %endmacro
 

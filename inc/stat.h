@@ -28,5 +28,9 @@ struct stat {
 #ifndef S_IFREG
 #define S_IFREG 0100000
 #endif
+#ifndef S_IFLNK
+#define S_IFLNK 0120000
+#endif
+
 
 

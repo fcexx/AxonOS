@@ -159,6 +159,139 @@ int fs_unmount(const char *path) {
     return -1;
 }
 
+/* Внутренняя функция открытия файла без разрешения симлинков.
+   Используется для чтения содержимого симлинков. */
+static struct fs_file *fs_open_no_resolve(const char *path) {
+    if (!path) return NULL;
+    struct fs_driver *mount_drv = fs_match_mount(path);
+    if (mount_drv && mount_drv->ops && mount_drv->ops->open) {
+        struct fs_file *file = NULL;
+        int rr = mount_drv->ops->open(path, &file);
+        if (rr == 0 && file) {
+            if (!file->fs_private) file->fs_private = (void*)mount_drv;
+            return file;
+        }
+    }
+    for (int i = 0; i < g_drivers_count; i++) {
+        struct fs_driver *drv = g_drivers[i];
+        if (!drv || !drv->ops || !drv->ops->open) continue;
+        struct fs_file *file = NULL;
+        int r = drv->ops->open(path, &file);
+        if (r == 0 && file) {
+            if (!file->fs_private) file->fs_private = (void*)drv;
+            return file;
+        }
+        if (r < 0 && r != -1) return NULL; /* real error */
+    }
+    return NULL;
+}
+
+/* Разрешает симлинки в пути, возвращает новый путь или NULL при ошибке.
+   Вызывающий должен освободить возвращенный путь через kfree. */
+static char *fs_resolve_symlinks(const char *path) {
+    if (!path) return NULL;
+    char *curpath = (char*)kmalloc(strlen(path) + 1);
+    if (!curpath) return NULL;
+    strcpy(curpath, path);
+    
+    for (int depth = 0; depth < 16; depth++) {
+        struct stat st;
+        /* используем fs_open_no_resolve для проверки, чтобы избежать рекурсии */
+        struct fs_file *check_file = fs_open_no_resolve(curpath);
+        if (!check_file) {
+            /* файл не существует, возвращаем текущий путь */
+            return curpath;
+        }
+        int stat_result = vfs_fstat(check_file, &st);
+        fs_file_free(check_file);
+        if (stat_result != 0) {
+            /* не удалось получить stat, возвращаем текущий путь */
+            return curpath;
+        }
+        
+        /* если это не симлинк, возвращаем текущий путь */
+        if ((st.st_mode & S_IFLNK) != S_IFLNK) {
+            return curpath;
+        }
+        
+        /* читаем содержимое симлинка (без разрешения симлинков) */
+        struct fs_file *lf = fs_open_no_resolve(curpath);
+        if (!lf) {
+            /* не удалось открыть симлинк, возвращаем текущий путь */
+            return curpath;
+        }
+        
+        size_t tsize = (size_t)lf->size;
+        if (tsize == 0) {
+            fs_file_free(lf);
+            return curpath;
+        }
+        
+        size_t cap = tsize + 1;
+        char *tbuf = (char*)kmalloc(cap);
+        if (!tbuf) {
+            fs_file_free(lf);
+            kfree(curpath);
+            return NULL;
+        }
+        
+        ssize_t rr = fs_read(lf, tbuf, tsize, 0);
+        fs_file_free(lf);
+        if (rr <= 0) {
+            kfree(tbuf);
+            return curpath;
+        }
+        tbuf[rr] = '\0';
+        
+        /* строим новый абсолютный путь */
+        char *newpath = NULL;
+        if (tbuf[0] == '/') {
+            /* абсолютный путь */
+            newpath = (char*)kmalloc(strlen(tbuf) + 1);
+            if (newpath) {
+                strcpy(newpath, tbuf);
+            }
+        } else {
+            /* относительный путь: родительская директория curpath + '/' + tbuf */
+            const char *slash = strrchr(curpath, '/');
+            size_t plen = slash ? (size_t)(slash - curpath) : 0;
+            if (plen == 0) plen = 1; /* корень */
+            
+            size_t nlen = plen + 1 + strlen(tbuf) + 1;
+            newpath = (char*)kmalloc(nlen);
+            if (newpath) {
+                if (plen == 1) {
+                    /* родитель - корень */
+                    newpath[0] = '/';
+                    newpath[1] = '\0';
+                } else {
+                    strncpy(newpath, curpath, plen);
+                    newpath[plen] = '\0';
+                }
+                /* добавляем '/' если нужно */
+                size_t curl = strlen(newpath);
+                if (newpath[curl-1] != '/') {
+                    strncat(newpath, "/", nlen - curl - 1);
+                }
+                strncat(newpath, tbuf, nlen - strlen(newpath) - 1);
+            }
+        }
+        
+        kfree(tbuf);
+        kfree(curpath);
+        
+        if (!newpath) {
+            return NULL;
+        }
+        
+        curpath = newpath;
+        /* продолжаем цикл для разрешения следующего уровня */
+    }
+    
+    /* достигнут лимит глубины, возвращаем последний путь */
+    return curpath;
+}
+
 /* Try drivers in registration order. Drivers should return -1 if they do not handle the path. */
 struct fs_file *fs_create_file(const char *path) {
     if (!path) return NULL;
@@ -191,27 +324,44 @@ struct fs_file *fs_create_file(const char *path) {
 
 struct fs_file *fs_open(const char *path) {
     if (!path) return NULL;
-    struct fs_driver *mount_drv = fs_match_mount(path);
+    
+    /* разрешаем симлинки перед открытием */
+    char *resolved_path = fs_resolve_symlinks(path);
+    if (!resolved_path) return NULL;
+    
+    struct fs_file *result = NULL;
+    struct fs_driver *mount_drv = fs_match_mount(resolved_path);
     if (mount_drv && mount_drv->ops && mount_drv->ops->open) {
         struct fs_file *file = NULL;
-        int rr = mount_drv->ops->open(path, &file);
+        int rr = mount_drv->ops->open(resolved_path, &file);
         if (rr == 0 && file) {
             if (!file->fs_private) file->fs_private = (void*)mount_drv;
-            return file;
+            result = file;
         }
     }
-    for (int i = 0; i < g_drivers_count; i++) {
-        struct fs_driver *drv = g_drivers[i];
-        if (!drv || !drv->ops || !drv->ops->open) continue;
-        struct fs_file *file = NULL;
-        int r = drv->ops->open(path, &file);
-        if (r == 0 && file) {
-            if (!file->fs_private) file->fs_private = (void*)drv;
-            return file;
+    
+    if (!result) {
+        for (int i = 0; i < g_drivers_count; i++) {
+            struct fs_driver *drv = g_drivers[i];
+            if (!drv || !drv->ops || !drv->ops->open) continue;
+            struct fs_file *file = NULL;
+            int r = drv->ops->open(resolved_path, &file);
+            if (r == 0 && file) {
+                if (!file->fs_private) file->fs_private = (void*)drv;
+                result = file;
+                break;
+            }
+            if (r < 0 && r != -1) {
+                /* real error, stop */
+                break;
+            }
         }
-        if (r < 0 && r != -1) return NULL; /* real error */
     }
-    return NULL;
+    
+    /* освобождаем разрешенный путь (всегда выделяется новый буфер) */
+    kfree(resolved_path);
+    
+    return result;
 }
 
 ssize_t fs_read(struct fs_file *file, void *buf, size_t size, size_t offset) {

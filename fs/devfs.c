@@ -27,6 +27,8 @@ struct devfs_tty {
     /* waiting threads (tids) */
     int waiters[8];
     int waiters_count;
+    /* foreground process group for this tty (-1 = unset) */
+    int fg_pgrp;
 };
 
 static struct devfs_tty dev_ttys[DEVFS_TTY_COUNT];
@@ -46,7 +48,12 @@ static struct devfs_block dev_blocks[16];
 static int dev_block_count = 0;
 static uint32_t devfs_rand_state = 0x12345678;
 /* special device names exposed under /dev */
-static const char * const devfs_special_names[] = { "null", "zero", "random", "stdin", "stdout", "stderr", "urandom" };
+static const char * const devfs_special_names[] = {
+    "null", "zero", "random",
+    "stdin", "stdout", "stderr",
+    "tty",          /* controlling tty (alias to thread-attached tty) */
+    "urandom"
+};
 static const int devfs_special_count = sizeof(devfs_special_names) / sizeof(devfs_special_names[0]);
 
 /* entropy and RNG state */
@@ -259,7 +266,14 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                     file->driver_private = (void*)tstdin;
                     break;
                 }
-                case 6: { /* /dev/urandom - non-blocking random */
+                case 6: { /* /dev/tty -> map to controlling tty (same logic as stdin) */
+                    thread_t *cur = thread_current();
+                    int tty_idx = (cur && cur->attached_tty >= 0) ? cur->attached_tty : devfs_get_active();
+                    struct devfs_tty *tstdin = &dev_ttys[tty_idx];
+                    file->driver_private = (void*)tstdin;
+                    break;
+                }
+                case 7: { /* /dev/urandom - non-blocking random */
                     uint8_t *p = (uint8_t*)buf;
                     for (size_t i=0;i<size;i++) {
                         devfs_rand_state ^= devfs_rand_state << 13;
@@ -381,6 +395,10 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             t->in_head = (t->in_head + 1) % (int)sizeof(t->inbuf);
             t->in_count--;
             release_irqrestore(&t->in_lock, flags);
+            /* Canonical-ish line discipline: handle backspace locally so userland read()
+               behaves human-friendly even without full termios. */
+            if (c == '\r') c = '\n';
+            /* deliver character (including backspace) to userspace and do not echo here */
             out[got++] = c;
             if (c == '\n') break;
             continue;
@@ -392,6 +410,8 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             if (cur->tid == 0) {
                 release_irqrestore(&t->in_lock, flags);
                 char c = kgetc();
+                if (c == '\r') c = '\n';
+                /* deliver character (including backspace) to userspace and do not echo here */
                 out[got++] = c;
                 if (c == '\n') break;
                 continue;
@@ -496,9 +516,11 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                 t = &dev_ttys[tty];
                 /* update file handle to point directly to tty to avoid repeated marker derefs */
                 file->driver_private = (void*)t;
-            } else if (si == 3) {
+            } else if (si == 3 || si == 6) {
                 /* /dev/stdin used for writing — map to console tty */
-                t = &dev_ttys[0];
+                thread_t *cur = thread_current();
+                int tty = (cur && cur->attached_tty >= 0) ? cur->attached_tty : devfs_get_active();
+                t = &dev_ttys[tty];
                 file->driver_private = (void*)t;
             } else {
                 /* other special devices are not writable here */
@@ -594,6 +616,7 @@ int devfs_register(void) {
         dev_ttys[i].in_head = dev_ttys[i].in_tail = dev_ttys[i].in_count = 0;
         dev_ttys[i].in_lock.lock = 0;
         dev_ttys[i].waiters_count = 0;
+        dev_ttys[i].fg_pgrp = -1;
         dev_ttys[i].screen = (uint8_t*)kmalloc(MAX_ROWS * MAX_COLS * 2);
         if (dev_ttys[i].screen) {
             for (uint32_t j=0;j<MAX_ROWS*MAX_COLS*2;j+=2) { dev_ttys[i].screen[j] = ' '; dev_ttys[i].screen[j+1] = GRAY_ON_BLACK; }
@@ -728,8 +751,59 @@ int devfs_tty_available(int tty) {
     return v;
 }
 
+/* Helpers exposed to other kernel components */
+int devfs_tty_get_fg_pgrp(struct fs_file *file) {
+    if (!file || !file->driver_private) return -1;
+    uintptr_t p = (uintptr_t)file->driver_private;
+    uintptr_t base = (uintptr_t)&dev_ttys[0];
+    uintptr_t end = (uintptr_t)&dev_ttys[DEVFS_TTY_COUNT];
+    if (!(p >= base && p < end)) return -1;
+    struct devfs_tty *t = (struct devfs_tty*)p;
+    return t->fg_pgrp;
+}
+
+int devfs_tty_set_fg_pgrp(struct fs_file *file, int pgrp) {
+    if (!file || !file->driver_private) return -1;
+    uintptr_t p = (uintptr_t)file->driver_private;
+    uintptr_t base = (uintptr_t)&dev_ttys[0];
+    uintptr_t end = (uintptr_t)&dev_ttys[DEVFS_TTY_COUNT];
+    if (!(p >= base && p < end)) return -1;
+    struct devfs_tty *t = (struct devfs_tty*)p;
+    t->fg_pgrp = pgrp;
+    return 0;
+}
+
+int devfs_tty_get_index_from_file(struct fs_file *file) {
+    if (!file || !file->driver_private) return -1;
+    uintptr_t p = (uintptr_t)file->driver_private;
+    uintptr_t base = (uintptr_t)&dev_ttys[0];
+    uintptr_t end = (uintptr_t)&dev_ttys[DEVFS_TTY_COUNT];
+    if (!(p >= base && p < end)) return -1;
+    struct devfs_tty *t = (struct devfs_tty*)p;
+    return t->id;
+}
+
+int devfs_tty_attach_thread(struct fs_file *file, thread_t *th) {
+    if (!file || !file->driver_private || !th) return -1;
+    uintptr_t p = (uintptr_t)file->driver_private;
+    uintptr_t base = (uintptr_t)&dev_ttys[0];
+    uintptr_t end = (uintptr_t)&dev_ttys[DEVFS_TTY_COUNT];
+    if (!(p >= base && p < end)) return -1;
+    struct devfs_tty *t = (struct devfs_tty*)p;
+    th->attached_tty = t->id;
+    return 0;
+}
+
 int devfs_is_tty_file(struct fs_file *file) {
     if (!file) return 0;
+    /* Fast path by path name: treat console/stdin/stdout/stderr/tty as tty-like. */
+    if (file->path) {
+        if (strcmp(file->path, "/dev/console") == 0) return 1;
+        if (strcmp(file->path, "/dev/tty") == 0) return 1;
+        if (strcmp(file->path, "/dev/stdin") == 0) return 1;
+        if (strcmp(file->path, "/dev/stdout") == 0) return 1;
+        if (strcmp(file->path, "/dev/stderr") == 0) return 1;
+    }
     /* driver_private for devfs files points into dev_ttys array */
     for (int i = 0; i < DEVFS_TTY_COUNT; i++) {
         if (file->driver_private == &dev_ttys[i]) return 1;

@@ -128,7 +128,7 @@ static int buf_init(Editor *E) {
 	E->insert_mode = 1;
 	E->modified = 0;
 	E->filename[0] = '\0';
-	E->syntax_mode = 0;
+    E->syntax_mode = 0;
 	E->lines[0].data = (char*)kcalloc(64, 1);
 	if (!E->lines[0].data) {
 		kfree(E->lines);

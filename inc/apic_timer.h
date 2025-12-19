@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <idt.h>
 
 #define APIC_TIMER_VECTOR     0x30
 
@@ -30,7 +31,7 @@ void apic_timer_init(void);
 void apic_timer_start(uint32_t freq_hz);
 void apic_timer_start_oneshot(uint32_t microseconds);
 void apic_timer_stop(void);
-void apic_timer_handler(void);
+void apic_timer_handler(cpu_registers_t* regs);
 
 uint64_t apic_timer_get_ticks(void);
 uint64_t apic_timer_get_time_ms(void);

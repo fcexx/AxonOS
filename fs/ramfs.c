@@ -26,6 +26,11 @@ struct ramfs_node {
     struct ramfs_node *next; /* sibling */
 };
 
+/* forward declarations for functions used before definitions */
+static void ramfs_free_node_shallow(struct ramfs_node *n);
+static struct ramfs_node *ramfs_find_child(struct ramfs_node *parent, const char *name);
+static struct ramfs_node *ramfs_lookup(const char *path);
+
 struct ramfs_file_handle {
     struct ramfs_node *node;
 };
@@ -55,6 +60,60 @@ static struct ramfs_node *ramfs_alloc_node(const char *name, int is_dir) {
     return n;
 }
 
+/* create a symlink at path -> target */
+int ramfs_symlink(const char *path, const char *target) {
+    if (!path || path[0] != '/' || !target) return -1;
+    /* find parent */
+    size_t path_len = strlen(path);
+    char *tmp = (char*)kmalloc(path_len + 1);
+    if (!tmp) return -2;
+    memcpy(tmp, path, path_len + 1);
+    char *slash = strrchr(tmp, '/');
+    char *name = NULL;
+    const char *parent_path = NULL;
+    if (slash == tmp) {
+        parent_path = "/";
+        name = slash + 1;
+    } else {
+        *slash = '\0';
+        parent_path = tmp;
+        name = slash + 1;
+    }
+    if (!name || !name[0]) { kfree(tmp); return -3; }
+    struct ramfs_node *parent = ramfs_lookup(parent_path);
+    if (!parent) { kfree(tmp); return -2; }
+    if (!parent->is_dir) { kfree(tmp); return -3; }
+    if (ramfs_find_child(parent, name)) { kfree(tmp); return -4; }
+    struct ramfs_node *n = ramfs_alloc_node(name, 0);
+    if (!n) { kfree(tmp); return -5; }
+    n->parent = parent;
+    n->next = parent->children;
+    parent->children = n;
+    /* set symlink mode and store target in data */
+    n->mode = S_IFLNK | 0777;
+    size_t tlen = strlen(target);
+    n->data = (char*)kmalloc(tlen + 1);
+    if (!n->data) {
+        /* rollback */
+        if (parent->children == n) parent->children = n->next;
+        else {
+            struct ramfs_node *p = parent->children;
+            while (p && p->next != n) p = p->next;
+            if (p && p->next == n) p->next = n->next;
+        }
+        ramfs_free_node_shallow(n);
+        kfree(tmp);
+        return -6;
+    }
+    memcpy(n->data, target, tlen+1);
+    n->size = tlen;
+    /* owner */
+    thread_t* ct = thread_current();
+    if (ct) { n->uid = ct->euid; n->gid = ct->egid; }
+    kfree(tmp);
+    return 0;
+}
+
 static void ramfs_free_node_shallow(struct ramfs_node *n) {
     if (!n) return;
     if (n->name) kfree(n->name);
@@ -76,19 +135,83 @@ static struct ramfs_node *ramfs_lookup(const char *path) {
     if (!path) return NULL;
     if (strcmp(path, "/") == 0) return ramfs_root;
     if (path[0] != '/') return NULL;
-    size_t plen = strlen(path);
-    char *tmp = (char*)kmalloc(plen + 1);
-    if (!tmp) return NULL;
-    /* copy without leading slash, include trailing NUL */
-    memcpy(tmp, path + 1, plen);
-    struct ramfs_node *cur = ramfs_root;
-    char *tok = strtok(tmp, "/");
-    while (tok && cur) {
-        cur = ramfs_find_child(cur, tok);
-        tok = strtok(NULL, "/");
+    /* We'll implement basic symlink resolution with limited depth. */
+    int depth = 0;
+    char *curpath = (char*)kmalloc(strlen(path) + 1);
+    if (!curpath) return NULL;
+    strcpy(curpath, path);
+    while (depth < 16) {
+        depth++;
+        size_t plen = strlen(curpath);
+        char *tmp = (char*)kmalloc(plen + 1);
+        if (!tmp) { kfree(curpath); return NULL; }
+        /* copy without leading slash */
+        memcpy(tmp, curpath + 1, plen);
+        tmp[plen] = '\0';
+        struct ramfs_node *cur = ramfs_root;
+        char *tok = strtok(tmp, "/");
+        char *restptr = NULL;
+        while (tok && cur) {
+            struct ramfs_node *child = ramfs_find_child(cur, tok);
+            if (!child) {
+                kfree(tmp);
+                kfree(curpath);
+                return NULL;
+            }
+            /* if child is symlink, resolve */
+            if ((child->mode & S_IFLNK) == S_IFLNK) {
+                /* compute remaining path after this token */
+                char *rest = NULL;
+                if ((restptr = strtok(NULL, "")) && restptr[0] != '\0') rest = restptr;
+                size_t newlen = strlen(child->data) + 1 + (rest ? strlen(rest) : 0) + 2;
+                char *newpath = (char*)kmalloc(newlen);
+                if (!newpath) { kfree(tmp); kfree(curpath); return NULL; }
+                if (child->data[0] == '/') {
+                    /* absolute target */
+                    strcpy(newpath, child->data);
+                } else {
+                    /* relative to parent directory of symlink */
+                    /* build parent path */
+                    char parentbuf[512];
+                    /* compute parent path of current node */
+                    struct ramfs_node *p = child->parent;
+                    size_t plenp = 0;
+                    parentbuf[0] = '\0';
+                    if (p && p != ramfs_root) {
+                        /* reconstruct path by walking up - simple approach: ignore, treat as '/' */
+                        strcpy(parentbuf, "/");
+                    } else {
+                        strcpy(parentbuf, "/");
+                    }
+                    snprintf(newpath, newlen, "%s/%s", parentbuf, child->data);
+                }
+                if (rest) {
+                    size_t curlen = strlen(newpath);
+                    newpath[curlen] = '/';
+                    newpath[curlen+1] = '\0';
+                    strncat(newpath, rest, newlen - curlen - 2);
+                }
+                kfree(tmp);
+                kfree(curpath);
+                curpath = newpath;
+                /* restart outer loop to resolve new path */
+                break;
+            }
+            /* not a symlink: continue traversal */
+            cur = child;
+            tok = strtok(NULL, "/");
+        }
+        if (tok == NULL) {
+            /* finished without hitting symlink */
+            kfree(tmp);
+            kfree(curpath);
+            return cur;
+        }
+        /* else we restarted due to symlink; continue loop */
+        /* loop continues, curpath updated */
     }
-    kfree(tmp);
-    return cur;
+    kfree(curpath);
+    return NULL;
 }
 
 static int ramfs_create(const char *path, struct fs_file **out_file) {
@@ -260,15 +383,16 @@ int ramfs_fill_stat(struct fs_file *file, struct stat *st) {
     struct ramfs_file_handle *fh = (struct ramfs_file_handle*)file->driver_private;
     if (!fh || !fh->node) return -1;
     struct ramfs_node *n = fh->node;
-    st->st_ino = 0; /* ramfs does not expose persistent ino yet */
-    st->st_mode = n->is_dir ? (S_IFDIR | 0755) : (S_IFREG | 0644);
-    st->st_nlink = 1;
-    st->st_uid = 0;
-    st->st_gid = 0;
+    st->st_ino = (ino_t)n->ino;
+    /* Use stored node mode (supports S_IFLNK, S_IFREG, S_IFDIR) */
+    st->st_mode = (mode_t)n->mode;
+    st->st_nlink = (nlink_t)n->nlink;
+    st->st_uid = n->uid;
+    st->st_gid = n->gid;
     st->st_size = (off_t)n->size;
-    st->st_atime = 0;
-    st->st_mtime = 0;
-    st->st_ctime = 0;
+    st->st_atime = n->atime;
+    st->st_mtime = n->mtime;
+    st->st_ctime = n->ctime;
     return 0;
 }
 

@@ -9,6 +9,8 @@ int ramfs_register(void);
 int ramfs_unregister(void);
 int ramfs_mkdir(const char *path);
 int ramfs_remove(const char *path);
+/* create a symbolic link at 'path' pointing to 'target' */
+int ramfs_symlink(const char *path, const char *target);
 
 #ifdef __cplusplus
 extern "C" {

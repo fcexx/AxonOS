@@ -28,6 +28,9 @@ typedef struct thread {
         uint32_t sleep_until;          // sleep until (in timer ticks)
         uint64_t clear_child_tid;      // clear child tid
         struct fs_file* fds[THREAD_MAX_FD];
+        /* current working directory for userland syscalls (POSIX-like).
+           For kernel threads this is ignored; for user processes it's used to resolve relative paths. */
+        char cwd[256];
         /* POSIX credentials */
         uid_t euid;
         gid_t egid;

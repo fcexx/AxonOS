@@ -16,10 +16,13 @@ volatile uint32_t pit_frequency = 1000; // Default 100 Hz
 // PIT handler - called on IRQ 0
 void pit_handler(cpu_registers_t* regs) {
         pit_ticks++;
-        (void)regs;
+
+        if (!init) return;
+        /* То же правило, что и для APIC: не планируем из IRQ, пришедшего из ring3. */
+        if (regs && ((regs->cs & 3) == 3)) return;
         
         // Вызываем планировщик реже - каждые 10 тиков (10 мс при 1000 Гц)
-        if (init && (pit_ticks % 10 == 0)) {
+        if ((pit_ticks % 10) == 0) {
                 thread_schedule();
         }
 }
