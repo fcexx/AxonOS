@@ -284,8 +284,25 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
             if (create_file_with_data(target, file_data, filesize) != 0) {
                 kprintf("initfs: warn: failed to create %s (ingore)\n", target);
             }
+        } else if ((mode & 0170000u) == 0120000u) {
+            /* symbolic link: file data contains link target */
+            ensure_parent_dirs(target);
+            const void *file_data = base + file_data_offset;
+            /* make a NUL-terminated copy of link target */
+            size_t tlen = filesize;
+            char *linkt = (char*)kmalloc(tlen + 1);
+            if (linkt) {
+                memcpy(linkt, file_data, tlen);
+                linkt[tlen] = '\0';
+                if (ramfs_symlink(target, linkt) < 0) {
+                    kprintf("initfs: warn: failed to create symlink %s -> %s\n", target, linkt);
+                }
+                kfree(linkt);
+            } else {
+                kprintf("initfs: warn: failed to alloc for symlink %s\n", target);
+            }
         } else {
-            /* other types (symlink, device...) - skip for now */
+            /* other types (device, fifo...) - skip for now */
             //kprintf("initfs: skipping special file %s (mode %o)\n", target, mode);
         }
         /* advance offset to next header (file data aligned to 4).

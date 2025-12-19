@@ -360,12 +360,12 @@ static ssize_t sysfs_read(struct fs_file *file, void *buf, size_t size, size_t o
         if (to_copy > size) to_copy = size;
         memcpy(buf, tmp + offset, to_copy);
         kfree(tmp);
-        /* update atime if node still valid and attr unchanged */
-        acquire(&sysfs_lock);
-        if (h->node == node && node->attr && node->attr->show == show_fn) {
-            node->atime = (time_t)rtc_ticks;
-        }
-        release(&sysfs_lock);
+    /* update atime if node still valid and attr unchanged */
+    acquire(&sysfs_lock);
+    if (h->node == node && node->attr && node->attr->show == show_fn) {
+        node->atime = (time_t)rtc_ticks;
+    }
+    release(&sysfs_lock);
         return (ssize_t)to_copy;
     }
 }

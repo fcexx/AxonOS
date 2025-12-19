@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <fs.h>
+#include <thread.h>
 
 /* Number of virtual ttys provided by devfs (default) */
 #ifndef DEVFS_TTY_COUNT
@@ -33,6 +34,12 @@ int devfs_tty_pop_nb(int tty);
 int devfs_tty_available(int tty);
 /* Check whether an fs_file is a devfs tty device */
 int devfs_is_tty_file(struct fs_file *file);
+
+/* TTY helpers for ioctl and controlling terminal management */
+int devfs_tty_get_fg_pgrp(struct fs_file *file); /* returns fg pgrp or -1 on error */
+int devfs_tty_set_fg_pgrp(struct fs_file *file, int pgrp); /* returns 0 on success */
+int devfs_tty_get_index_from_file(struct fs_file *file); /* returns tty index or -1 */
+int devfs_tty_attach_thread(struct fs_file *file, thread_t *th); /* attach thread as controlling tty */
 
 /* Create a block device node at given path and associate with disk device_id.
    sectors - total number of 512-byte sectors on device (for size reporting). */

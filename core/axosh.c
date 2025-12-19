@@ -2031,13 +2031,11 @@ static int bi_help(cmd_ctx *c) {
     kprint((uint8_t*)"chipset info - print chipset information\n");
     kprint((uint8_t*)"chipset reset - reset chipset\n");
     kprint((uint8_t*)"osh - run a script file\n");
-    kprint((uint8_t*)"art - show ASCII art\n");
     kprint((uint8_t*)"exit - exit the shell\n");
     return 0;
 }
 
 extern void ascii_art(void);
-static int bi_art(cmd_ctx *c){ (void)c; ascii_art(); return 0; }
 typedef int (*builtin_fn)(cmd_ctx*);
 typedef struct { const char* name; builtin_fn fn; } builtin;
 /* forward declaration for chmod builtin */
@@ -2062,7 +2060,7 @@ static const builtin builtin_table[] = {
     {"ls", bi_ls}, {"cat", bi_cat}, {"mkdir", bi_mkdir}, {"touch", bi_touch}, {"rm", bi_rm},
     {"about", bi_about}, {"time", bi_time}, {"date", bi_date}, {"uptime", bi_uptime},
     {"edit", bi_edit}, {"reboot", bi_reboot}, {"shutdown", bi_shutdown}, {"mem", bi_mem},
-    {"osh", bi_osh}, {"art", bi_art}, {"pause", bi_pause}, {"chipset", bi_chipset}, {"help", bi_help},
+    {"osh", bi_osh}, {"pause", bi_pause}, {"chipset", bi_chipset}, {"help", bi_help},
     {"passwd", bi_passwd}, {"su", bi_su}, {"whoami", bi_whoami}, {"mkpasswd", bi_mkpasswd}, {"groups", bi_groups},
     {"useradd", bi_useradd}, {"groupadd", bi_groupadd}, {"chmod", bi_chmod}, {"chvt", bi_chvt},
     {"open", bi_open}, {"close", bi_close}, {"dup", bi_dup}, {"dup2", bi_dup2}, {"isatty", bi_isatty}, {"xxd", bi_xxd}, {"mount", bi_mount}, {"umount", bi_umount}, {"exec", bi_exec}
@@ -2411,6 +2409,58 @@ static builtin_fn find_builtin(const char* name) {
     return NULL;
 }
 
+/* Try to run an external userspace program (ELF64) when the command is not a builtin.
+   Supports:
+   - absolute/relative paths containing '/' (resolved against cwd)
+   - minimal PATH fallback: /bin/<cmd>
+   Safety:
+   - only from main interactive shell thread (tid==0) and only while we are in ring0 shell.
+     This avoids starting ring3 from background jobs (`cmd &` runs in a kernel thread). */
+static int osh_try_exec_external(char **argv, int argc) {
+    if (!argv || argc <= 0 || !argv[0] || !argv[0][0]) return 0;
+    if (thread_get_current_user() != NULL) return 0;
+    thread_t *cur = thread_current();
+    if (!cur || cur->tid != 0) return 0;
+
+    const char *cmd = argv[0];
+    char fullpath[512];
+
+    if (strchr(cmd, '/')) {
+        join_cwd(g_cwd, cmd, fullpath, sizeof(fullpath));
+    } else {
+        snprintf(fullpath, sizeof(fullpath), "/bin/%s", cmd);
+    }
+
+    const char **kargv = (const char **)kmalloc(sizeof(char*) * (size_t)(argc + 1));
+    if (!kargv) {
+        kprintf("osh: exec: allocation failed\n");
+        return 1;
+    }
+    for (int i = 0; i < argc; i++) kargv[i] = argv[i];
+    kargv[argc] = NULL;
+
+    int r = kernel_execve_from_path(fullpath, kargv, NULL);
+    kfree(kargv);
+
+    if (r != 0 && !strchr(cmd, '/')) {
+        /* fallback: try relative to cwd (./cmd or cmd in cwd) */
+        join_cwd(g_cwd, cmd, fullpath, sizeof(fullpath));
+        kargv = (const char **)kmalloc(sizeof(char*) * (size_t)(argc + 1));
+        if (!kargv) {
+            kprintf("osh: exec: allocation failed\n");
+            return 1;
+        }
+        for (int i = 0; i < argc; i++) kargv[i] = argv[i];
+        kargv[argc] = NULL;
+        r = kernel_execve_from_path(fullpath, kargv, NULL);
+        kfree(kargv);
+    }
+
+    /* r==0 doesn't return; if we got here, exec failed -> let caller handle "not found". */
+    (void)r;
+    return 0;
+}
+
 // export builtin names for completion
 int osh_get_builtin_names(const char*** out_names) {
     static const char* names[64];
@@ -2484,7 +2534,12 @@ static int exec_simple(char **argv, int argc, const char *in, char **out, size_t
         return 2; // exit interactive shell
     }
     builtin_fn fn = find_builtin(argv[0]);
-    if (!fn) { kprintf("<(0c)>osh: %s: command not found\n", argv[0]); return 1; }
+    if (!fn) {
+        int tr = osh_try_exec_external(argv, argc);
+        if (tr != 0) return tr;
+        kprintf("<(0c)>osh: %s: command not found\n", argv[0]);
+        return 1;
+    }
     cmd_ctx c = { .argv=argv, .argc=argc, .in=in, .out=out, .out_len=out_len, .out_cap=out_cap };
     return fn(&c);
 }
@@ -2987,8 +3042,7 @@ static void build_prompt(char* out, size_t outsz) {
 }
 
 void osh_run(void) {
-    kprintf("%s v%s (%s)\n", OSH_NAME, OSH_VERSION, OSH_FULL_NAME);
-    static char buf[512];
+    volatile static char buf[512];
     osh_history_init();
     for (;;) {
         /* приглашение osh + строковый редактор */

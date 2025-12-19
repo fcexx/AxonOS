@@ -10,6 +10,7 @@
 #include <stddef.h>
 #include <apic_timer.h>
 #include <debug.h>
+#include <mmio.h>
 // Avoid including <cstdint> because cross-toolchain headers may not provide it; use uint64_t instead
 
 // Forward declare C-linkage helpers from other compilation units
@@ -52,9 +53,76 @@ static void dump(const char* what, const char* who, cpu_registers_t* regs, uint6
         kprintf("RCX: 0x%llx\n", (unsigned long long)regs->rcx);
 }
 
+static inline uint64_t rdmsr_u64(uint32_t msr) {
+        uint32_t lo=0, hi=0;
+        asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+        return ((uint64_t)hi << 32) | lo;
+}
+static inline void wrmsr_u64(uint32_t msr, uint64_t v) {
+        uint32_t lo = (uint32_t)(v & 0xFFFFFFFFu);
+        uint32_t hi = (uint32_t)(v >> 32);
+        asm volatile("wrmsr" :: "c"(msr), "a"(lo), "d"(hi));
+}
+
 static void ud_fault_handler(cpu_registers_t* regs) {
-        // Invalid Opcode (#UD). В ring3 не эмулируем — завершаем поток.
+        /* Invalid Opcode (#UD).
+           В ring3 перехватываем FSGSBASE инструкции (RDFSBASE/RDGSBASE/WRFSBASE/WRGSBASE),
+           которые libc может использовать при наличии CPUID.FSGSBASE. Мы держим CR4.FSGSBASE
+           выключенным ради совместимости (см. cpu/gdt.c), поэтому эти опкоды попадают сюда. */
         if ((regs->cs & 3) == 3) {
+                const uint8_t *ip = (const uint8_t*)(uintptr_t)regs->rip;
+                /* Encoding: F3 0F AE /r with reg field:
+                   /0 RDFSBASE, /1 RDGSBASE, /2 WRFSBASE, /3 WRGSBASE */
+                if ((uintptr_t)ip + 4 < (uintptr_t)MMIO_IDENTITY_LIMIT &&
+                    ip[0] == 0xF3 && ip[1] == 0x0F && ip[2] == 0xAE) {
+                        uint8_t modrm = ip[3];
+                        uint8_t mod = (modrm >> 6) & 3;
+                        uint8_t reg = (modrm >> 3) & 7;
+                        uint8_t rm  = (modrm >> 0) & 7;
+                        if (mod == 3 && reg <= 3) {
+                                /* helpers to access GPR by index (rm) */
+                                uint64_t *gpr = NULL;
+                                switch (rm) {
+                                        case 0: gpr = &regs->rax; break;
+                                        case 1: gpr = &regs->rcx; break;
+                                        case 2: gpr = &regs->rdx; break;
+                                        case 3: gpr = &regs->rbx; break;
+                                        case 4: gpr = &regs->rsp; break;
+                                        case 5: gpr = &regs->rbp; break;
+                                        case 6: gpr = &regs->rsi; break;
+                                        case 7: gpr = &regs->rdi; break;
+                                }
+
+                                enum { MSR_FS_BASE = 0xC0000100u, MSR_GS_BASE = 0xC0000101u };
+
+                                if (reg == 0 /* RDFSBASE */) {
+                                        if (gpr) *gpr = rdmsr_u64(MSR_FS_BASE);
+                                        regs->rip += 4;
+                                        return;
+                                } else if (reg == 1 /* RDGSBASE */) {
+                                        if (gpr) *gpr = rdmsr_u64(MSR_GS_BASE);
+                                        regs->rip += 4;
+                                        return;
+                                } else if (reg == 2 /* WRFSBASE */) {
+                                        uint64_t new_fs = gpr ? *gpr : 0;
+                                        /* keep stack canary stable across FS changes: copy old fs:0x28 into new fs:0x28 */
+                                        uint64_t old_fs = rdmsr_u64(MSR_FS_BASE);
+                                        uint64_t old_guard = 0;
+                                        if (old_fs + 0x30 < (uint64_t)MMIO_IDENTITY_LIMIT) old_guard = *(volatile uint64_t*)(uintptr_t)(old_fs + 0x28);
+                                        else if (0x30 < (uint64_t)MMIO_IDENTITY_LIMIT) old_guard = *(volatile uint64_t*)(uintptr_t)0x28;
+                                        wrmsr_u64(MSR_FS_BASE, new_fs);
+                                        if (new_fs + 0x30 < (uint64_t)MMIO_IDENTITY_LIMIT) *(volatile uint64_t*)(uintptr_t)(new_fs + 0x28) = old_guard;
+                                        regs->rip += 4;
+                                        return;
+                                } else if (reg == 3 /* WRGSBASE */) {
+                                        uint64_t new_gs = gpr ? *gpr : 0;
+                                        wrmsr_u64(MSR_GS_BASE, new_gs);
+                                        regs->rip += 4;
+                                        return;
+                                }
+                        }
+                }
+
                 dump("invalid opcode", "user", regs, 0, 0, true);
                 for(;;){ asm volatile("sti; hlt" ::: "memory"); }
         }
@@ -130,9 +198,10 @@ static void gp_fault_handler(cpu_registers_t* regs){
             kprintf("stack @ RSP: (outside identity map)\n");
         }
 
-        kprintf("GPF: killing user thread to avoid returning to faulty user code\n");
-        /* terminate current user thread safely */
-        for(;;){ asm volatile("sti; hlt" ::: "memory"); }
+        kprintf("GPF: terminating user thread and returning to shell\n");
+        /* terminate current user thread safely and return to ring0 shell */
+        extern void syscall_return_to_shell(void);
+        syscall_return_to_shell();
     }
     // kernel GP — стоп, но оставляем PIT активным для мигания курсора
     (void)regs;

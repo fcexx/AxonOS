@@ -32,6 +32,8 @@ void thread_init() {
         main_thread.euid = 0;
         main_thread.egid = 0;
         main_thread.attached_tty = devfs_get_active();
+        strncpy(main_thread.cwd, "/", sizeof(main_thread.cwd));
+        main_thread.cwd[sizeof(main_thread.cwd) - 1] = '\0';
         kprintf("thread_init: idle thread created with pid %d\n", main_thread.tid);
         init = 1;
 }
@@ -85,6 +87,8 @@ thread_t* thread_create(void (*entry)(void), const char* name) {
         t->euid = 0;
         t->egid = 0;
         t->attached_tty = -1;
+        strncpy(t->cwd, "/", sizeof(t->cwd));
+        t->cwd[sizeof(t->cwd) - 1] = '\0';
         threads[thread_count++] = t;
         return t;
 }
@@ -93,7 +97,7 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         if (thread_count >= MAX_THREADS) return NULL;
         // Sanity checks: reject clearly invalid user contexts (entry==0 or tiny stack)
         if (user_rip == 0 || user_rsp < 0x1000) {
-                kprintf("<(0c)>fatal: refusing to register user thread with invalid rip=0x%llx rsp=0x%llx\n",
+                kprintf("fatal: refusing to register user thread with invalid rip=0x%llx rsp=0x%llx\n",
                                (unsigned long long)user_rip, (unsigned long long)user_rsp);
                 return NULL;
         }
@@ -115,7 +119,10 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
                 /* copy fd table */
                 for (int i = 0; i < THREAD_MAX_FD; i++) t->fds[i] = current->fds[i];
                 t->attached_tty = current->attached_tty >= 0 ? current->attached_tty : devfs_get_active();
+                strncpy(t->cwd, current->cwd[0] ? current->cwd : "/", sizeof(t->cwd));
+                t->cwd[sizeof(t->cwd) - 1] = '\0';
         } else { t->euid = 0; t->egid = 0; t->attached_tty = devfs_get_active(); }
+        if (!t->cwd[0]) { strncpy(t->cwd, "/", sizeof(t->cwd)); t->cwd[sizeof(t->cwd)-1] = '\0'; }
         threads[thread_count++] = t;
         current_user = t;
         return t;
@@ -199,11 +206,12 @@ void thread_yield() {
 void thread_stop(int pid) {
         for (int i = 0; i < thread_count; ++i) {
                 if (threads[i] && threads[i]->tid == pid && threads[i]->state != THREAD_TERMINATED) {
+                        kprintf("thread_stop: stopping tid=%d name=%s\n", pid, threads[i]->name);
                         threads[i]->state = THREAD_TERMINATED;
                         return;
                 }
         }
-        kprintf("<(0c)>thread_stop: thread %d not found or already terminated\n", pid);
+        kprintf("thread_stop: thread %d not found or already terminated\n", pid);
 }
 
 void thread_block(int pid) {

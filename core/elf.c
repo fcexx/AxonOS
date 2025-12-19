@@ -14,6 +14,17 @@
 
 extern uint8_t _end[]; /* kernel end symbol from linker */
 
+static inline uint64_t msr_read_u64_local(uint32_t msr) {
+    uint32_t lo = 0, hi = 0;
+    asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+static inline void msr_write_u64_local(uint32_t msr, uint64_t v) {
+    uint32_t lo = (uint32_t)(v & 0xFFFFFFFFu);
+    uint32_t hi = (uint32_t)(v >> 32);
+    asm volatile("wrmsr" :: "c"(msr), "a"(lo), "d"(hi));
+}
+
 /* Helpers for per-process page table creation.
    We allocate 4KiB-aligned tables via kmalloc and build a new PML4 for the process,
    copying kernel entries and installing per-segment leaf entries with PG_US.
@@ -166,9 +177,10 @@ static int elf_validate_header(const Elf64_Ehdr *eh, size_t len) {
     /* data encoding little endian */
     if (eh->e_ident[5] != 1) return 0;
     /* ELF type/executable */
-    if (eh->e_type != 2 && eh->e_type != 3) {
-        /* allow ET_EXEC and ET_DYN */
-        /* but continue — position-independent recommended */
+    if (eh->e_type != 2) {
+        /* For now we support only classic ET_EXEC binaries.
+           ET_DYN (PIE) requires relocations/loader which we don't implement yet. */
+        return 0;
     }
     return 1;
 }
@@ -193,6 +205,16 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
         uint64_t vstart = ph->p_vaddr;
         uint64_t vend = ph->p_vaddr + ph->p_memsz;
         if (vend < vstart) return -1;
+        /* Hard limit for user image virtual range.
+           We currently load user binaries into the low identity-mapped region by copying to p_vaddr.
+           Keep them below the heap floor (64MiB) to prevent corrupting kernel heap. */
+        const uint64_t USER_IMAGE_LIMIT = 64ULL * 1024ULL * 1024ULL;
+        if (vend > USER_IMAGE_LIMIT) {
+            kprintf("elf: user image too high (segment 0x%llx..0x%llx, limit 0x%llx)\n",
+                    (unsigned long long)vstart, (unsigned long long)vend,
+                    (unsigned long long)USER_IMAGE_LIMIT);
+            return -4;
+        }
         if (vstart < kernel_end && vend > kernel_start) {
             kprintf("elf: segment overlaps kernel (vaddr 0x%llx..0x%llx kernel 0x%llx..0x%llx)\n",
                 (unsigned long long)vstart, (unsigned long long)vend,
@@ -242,6 +264,9 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
                 kprintf("elf: no L3 entry for va=0x%llx\n", (unsigned long long)va);
                 return -1;
             }
+            /* PDPT entry must also allow user access, иначе будет #PF err=0x5 при fetch/чтении из ring3. */
+            l3[l3i] |= PG_US;
+            l3[l3i] &= ~PG_NX;
             uint64_t l3e = l3[l3i];
             if (l3e & PG_PS_2M) {
                 /* 1GiB mapping at L3: set US and clear NX on L3 entry */
@@ -276,6 +301,37 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
     return 0;
 }
 
+/* Mark an identity-mapped VA range as user-accessible by setting PG_US
+   on all relevant paging structure levels. This is required for both
+   instruction fetch and stack/data access in ring3. */
+static int mark_user_identity_range_2m(uint64_t va_begin, uint64_t va_end) {
+    extern uint64_t page_table_l4[];
+    if (va_end < va_begin) return -1;
+    uint64_t begin = va_begin & ~(PAGE_SIZE_2M - 1);
+    uint64_t end = (va_end + PAGE_SIZE_2M - 1) & ~(PAGE_SIZE_2M - 1);
+    for (uint64_t va = begin; va < end; va += PAGE_SIZE_2M) {
+        uint64_t l4i = (va >> 39) & 0x1FF;
+        uint64_t l3i = (va >> 30) & 0x1FF;
+        uint64_t l2i = (va >> 21) & 0x1FF;
+        uint64_t *l4 = (uint64_t*)page_table_l4;
+        if (!(l4[l4i] & PG_PRESENT)) return -1;
+        l4[l4i] |= PG_US;
+        uint64_t *l3 = (uint64_t*)(uintptr_t)(l4[l4i] & ~0xFFFULL);
+        if (!(l3[l3i] & PG_PRESENT)) return -1;
+        l3[l3i] |= PG_US;
+        uint64_t l3e = l3[l3i];
+        if (l3e & PG_PS_2M) {
+            /* 1GiB mapping */
+            continue;
+        }
+        uint64_t *l2 = (uint64_t*)(uintptr_t)(l3e & ~0xFFFULL);
+        if (!(l2[l2i] & PG_PRESENT)) return -1;
+        l2[l2i] |= PG_US;
+        invlpg((void*)(uintptr_t)va);
+    }
+    return 0;
+}
+
 int elf_load_from_path(const char *path, uint64_t *out_entry) {
     struct fs_file *f = fs_open(path);
     if (!f) return -1;
@@ -296,79 +352,118 @@ int elf_load_from_path(const char *path, uint64_t *out_entry) {
    under USER_STACK_TOP (<4GiB). Returns negative on error; on success does not return. */
 int kernel_execve_from_path(const char *path, const char *const argv[], const char *const envp[]) {
     if (!path) return -1;
+    /* Resolve symlinks (follow up to 16 levels) */
+    char *curpath = (char*)kmalloc(strlen(path) + 1);
+    if (!curpath) return -1;
+    strcpy(curpath, path);
+    for (int depth = 0; depth < 16; depth++) {
+        struct stat st;
+        if (vfs_stat(curpath, &st) != 0) break;
+        if ((st.st_mode & S_IFLNK) == S_IFLNK) {
+            /* read link target */
+            struct fs_file *lf = fs_open(curpath);
+            if (!lf) break;
+            size_t tsize = (size_t)lf->size;
+            if (tsize == 0) { fs_file_free(lf); break; }
+            size_t cap = tsize + 1;
+            char *tbuf = (char*)kmalloc(cap);
+            if (!tbuf) { fs_file_free(lf); break; }
+            ssize_t rr = fs_read(lf, tbuf, tsize, 0);
+            fs_file_free(lf);
+            if (rr <= 0) { kfree(tbuf); break; }
+            tbuf[rr] = '\\0';
+            /* build new absolute path */
+            char *newpath = NULL;
+            if (tbuf[0] == '/') {
+                newpath = (char*)kmalloc(strlen(tbuf) + 1);
+                if (newpath) strcpy(newpath, tbuf);
+            } else {
+                /* relative: parent dir of curpath + '/' + tbuf */
+                const char *slash = strrchr(curpath, '/');
+                size_t plen = slash ? (size_t)(slash - curpath) : 0;
+                if (plen == 0) plen = 1; /* root */
+                size_t nlen = plen + 1 + strlen(tbuf) + 1;
+                newpath = (char*)kmalloc(nlen);
+                if (newpath) {
+                    if (plen == 1) {
+                        /* parent is root */
+                        newpath[0] = '/'; newpath[1] = '\\0';
+                    } else {
+                        strncpy(newpath, curpath, plen);
+                        newpath[plen] = '\\0';
+                    }
+                    /* ensure trailing slash */
+                    size_t curl = strlen(newpath);
+                    if (newpath[curl-1] != '/') strncat(newpath, "/", nlen - curl - 1);
+                    strncat(newpath, tbuf, nlen - strlen(newpath) - 1);
+                }
+            }
+            kfree(tbuf);
+            if (!newpath) break;
+            kfree(curpath);
+            curpath = newpath;
+            /* continue resolving */
+            continue;
+        }
+        break;
+    }
     uint64_t entry = 0;
-    int r = elf_load_from_path(path, &entry);
+    int r = elf_load_from_path(curpath, &entry);
+    if (curpath) kfree(curpath);
     if (r != 0) {
         kprintf("execve: elf_load_from_path failed for %s (rc=%d)\n", path, r);
         return -1;
     }
-    /* Create a private PML4 for the new process and map PT_LOAD segments into it.
-       We re-open the ELF file and iterate program headers to map pages into the new PML4. */
-    void *new_pml4 = create_process_pml4();
-    if (!new_pml4) { kprintf("execve: failed to alloc new pml4\n"); return -1; }
-    struct fs_file *f = fs_open(path);
-    if (!f) { kfree(new_pml4); return -1; }
-    size_t fsz = f->size;
-    if (fsz == 0 || fsz > 16*1024*1024) { fs_file_free(f); kfree(new_pml4); return -1; }
-    void *buf = kmalloc(fsz);
-    if (!buf) { fs_file_free(f); kfree(new_pml4); return -1; }
-    ssize_t rr = fs_read(f, buf, fsz, 0);
-    fs_file_free(f);
-    if (rr <= 0 || (size_t)rr != fsz) { kfree(buf); kfree(new_pml4); return -1; }
-    const Elf64_Ehdr *eh = (const Elf64_Ehdr*)buf;
-    const Elf64_Phdr *ph = (const Elf64_Phdr*)((const char*)buf + eh->e_phoff);
-    for (int i = 0; i < eh->e_phnum; i++) {
-        if (ph->p_type != 1) { ph++; continue; }
-        /* map each 4KiB page of the segment into new_pml4 */
-        uint64_t seg_va = ph->p_vaddr;
-        uint64_t seg_pa = ph->p_paddr ? ph->p_paddr : ph->p_vaddr; /* prefer p_paddr if present */
-        uint64_t seg_memsz = ph->p_memsz;
-        for (uint64_t off = 0; off < seg_memsz; off += PAGE_SIZE_4K) {
-            uint64_t va = (seg_va + off) & ~((uint64_t)0xFFF);
-            uint64_t phys_frame = virt_to_phys(va);
-            if (phys_frame == 0) {
-                kprintf("execve: cannot translate va=0x%llx to phys\n", (unsigned long long)va);
-                kfree(buf);
-                kfree(new_pml4);
-                return -1;
-            }
-            uint64_t flags = PG_PRESENT | PG_RW | PG_US;
-            /* if segment is not executable, set NX */
-            if (!(ph->p_flags & 0x1)) flags |= PG_NX; /* PF_X == 1 */
-            if (pml4_map_one(new_pml4, va, phys_frame, flags) != 0) {
-                kprintf("execve: pml4_map_one failed va=0x%llx phys=0x%llx\n", (unsigned long long)va, (unsigned long long)phys_frame);
-                kfree(buf);
-                kfree(new_pml4);
-                return -1;
-            }
-        }
-        ph++;
-    }
-    kfree(buf);
+    /* NOTE:
+       We currently execute user programs in the *same* address space (same CR3),
+       relying on identity mapping and marking PT_LOAD pages as user-accessible in elf_load_from_memory().
+       The previous attempt to build a per-process PML4 was buggy and leaked page tables heavily.
+       Once we have a real physical-page allocator, we can reintroduce isolated address spaces. */
 
-    /* Switch CR3 to new PML4 (physical == virtual in identity region) */
-    /* Map user stack region in new_pml4 so RSP after switch is valid */
-    uintptr_t stack_base = ((uintptr_t)USER_STACK_TOP - USER_STACK_SIZE) & ~0xFFFULL;
-    for (uintptr_t a = stack_base; a < (uintptr_t)USER_STACK_TOP; a += PAGE_SIZE_4K) {
-        uint64_t phys = virt_to_phys(a);
-        if (phys == 0) {
-            kprintf("execve: cannot translate stack page va=0x%llx\n", (unsigned long long)a);
-            return -1;
-        }
-        if (pml4_map_one(new_pml4, a, phys, PG_PRESENT | PG_RW | PG_US) != 0) {
-            kprintf("execve: failed to map user stack va=0x%llx phys=0x%llx\n", (unsigned long long)a, (unsigned long long)phys);
-            return -1;
+    /* Parse ELF headers again to construct a minimal auxv.
+       glibc static startup relies on AT_PHDR/AT_PHENT/AT_PHNUM/AT_ENTRY/AT_RANDOM. */
+    uint64_t aux_entry = entry;
+    uint64_t aux_phdr = 0;
+    uint64_t aux_phent = 0;
+    uint64_t aux_phnum = 0;
+    {
+        struct fs_file *f = fs_open(path);
+        if (f) {
+            Elf64_Ehdr eh;
+            ssize_t rr = fs_read(f, &eh, sizeof(eh), 0);
+            if (rr == (ssize_t)sizeof(eh) && elf_validate_header(&eh, sizeof(eh)) && eh.e_phnum > 0 && eh.e_phentsize == sizeof(Elf64_Phdr)) {
+                size_t phsz = (size_t)eh.e_phnum * (size_t)eh.e_phentsize;
+                size_t need = (size_t)eh.e_phoff + phsz;
+                if (need > 0 && need <= 65536) {
+                    uint8_t *phbuf = (uint8_t*)kmalloc(need);
+                    if (phbuf) {
+                        ssize_t rr2 = fs_read(f, phbuf, need, 0);
+                        if (rr2 == (ssize_t)need) {
+                            const Elf64_Ehdr *eh2 = (const Elf64_Ehdr*)phbuf;
+                            const Elf64_Phdr *ph = (const Elf64_Phdr*)(phbuf + eh2->e_phoff);
+                            aux_phent = (uint64_t)eh2->e_phentsize;
+                            aux_phnum = (uint64_t)eh2->e_phnum;
+                            aux_entry = (uint64_t)eh2->e_entry;
+                            /* Compute in-memory PHDR virtual address: find PT_LOAD that contains e_phoff..e_phoff+phsz */
+                            for (int i = 0; i < eh2->e_phnum; i++) {
+                                if (ph[i].p_type != 1) continue; /* PT_LOAD */
+                                uint64_t poff = ph[i].p_offset;
+                                uint64_t pend = ph[i].p_offset + ph[i].p_filesz;
+                                uint64_t want0 = eh2->e_phoff;
+                                uint64_t want1 = eh2->e_phoff + phsz;
+                                if (want0 >= poff && want1 <= pend) {
+                                    aux_phdr = ph[i].p_vaddr + (want0 - poff);
+                                    break;
+                                }
+                            }
+                        }
+                        kfree(phbuf);
+                    }
+                }
+            }
+            fs_file_free(f);
         }
     }
-
-    /* CR3 must contain physical address of PML4. Translate virtual->physical */
-    uint64_t phys_pml4 = virt_to_phys((uint64_t)(uintptr_t)new_pml4);
-    if (phys_pml4 == 0) {
-        kprintf("execve: cannot translate new_pml4 virt->phys, abort\n");
-        return -1;
-    }
-    asm volatile("mov %0, %%cr3" :: "r"(phys_pml4) : "memory");
-    kprintf("execve: switched CR3 to phys=0x%llx (virt=0x%llx)\n", (unsigned long long)phys_pml4, (unsigned long long)(uintptr_t)new_pml4);
 
     /* Build argv strings and pointers in kernel, then copy into user stack area.
        We must ensure the final RSP passed to user mode is 16-byte aligned to avoid
@@ -381,12 +476,22 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     for (int i = 0; i < argc; i++) strings_size += strlen(argv[i]) + 1;
     size_t env_strings_size = 0; /* env not supported for now */
 
-    /* pointer area: argv pointers + NULL + env NULL */
-    size_t ptrs = (size_t)(argc + 1 + 1);
+    /* Stack layout (SysV x86_64):
+       RSP -> argc
+              argv[0..argc-1], NULL
+              envp[0..], NULL (we provide empty envp)
+              auxv pairs (a_type,a_val) ending with AT_NULL
+       Many libc start routines expect auxv to exist; without AT_NULL they may parse garbage. */
+    enum { AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_PAGESZ = 6, AT_ENTRY = 9, AT_RANDOM = 25 };
+    const size_t aux_pairs = 7; /* PHDR,PHENT,PHNUM,ENTRY,PAGESZ,RANDOM,NULL */
+    const size_t aux_qwords = aux_pairs * 2;
+    /* pointer area: argv pointers + NULL + env NULL + auxv */
+    size_t ptrs = (size_t)(argc + 1 + 1) + aux_qwords;
     size_t ptrs_bytes = ptrs * sizeof(uint64_t);
 
-    /* total needed on stack: pointers + strings + small padding */
-    size_t total = ptrs_bytes + strings_size + 16;
+    /* total needed on stack: pointers + strings + AT_RANDOM bytes + small padding */
+    const size_t random_bytes = 16;
+    size_t total = ptrs_bytes + strings_size + random_bytes + 32;
     if (total > USER_STACK_SIZE - 128) {
         kprintf("execve: required stack size too large %u\n", (unsigned)total);
         return -1;
@@ -402,9 +507,11 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     /* recompute base relative to aligned final_stack */
     base = final_stack + 8;
 
-    /* layout: pointers at [base .. base+ptrs_bytes), strings at [base+ptrs_bytes .. ) */
+    /* layout: pointers at [base .. base+ptrs_bytes), strings at [base+ptrs_bytes .. ),
+       then 16 bytes for AT_RANDOM. */
     uintptr_t ptrs_addr = base;
     uintptr_t strings_addr = base + ptrs_bytes;
+    uintptr_t random_addr = strings_addr + strings_size;
 
     /* Ensure addresses are within identity-mapped range */
     if (strings_addr + strings_size > (uintptr_t)MMIO_IDENTITY_LIMIT) {
@@ -414,95 +521,122 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
 
     /* copy strings into their place */
     char *str_dst = (char*)(uintptr_t)strings_addr;
-    char **argv_ptrs = (char**)(uintptr_t)ptrs_addr;
+    uint64_t *sp64 = (uint64_t*)(uintptr_t)ptrs_addr;
     for (int i = 0; i < argc; i++) {
         size_t l = strlen(argv[i]) + 1;
         memcpy(str_dst, argv[i], l);
-        argv_ptrs[i] = (char*)(uintptr_t)str_dst;
+        sp64[i] = (uint64_t)(uintptr_t)str_dst; /* argv[i] pointer */
         str_dst += l;
     }
-    argv_ptrs[argc] = NULL;
-    argv_ptrs[argc+1] = NULL; /* envp NULL */
+    sp64[argc] = 0;     /* argv NULL */
+    sp64[argc + 1] = 0; /* envp NULL */
+
+    /* AT_RANDOM: 16 bytes. Not cryptographically secure; enough for libc bootstrap. */
+    {
+        uint8_t *rp = (uint8_t*)(uintptr_t)random_addr;
+        for (size_t i = 0; i < 16; i++) rp[i] = (uint8_t)(0xA5u ^ (uint8_t)(i * 17u));
+    }
+
+    /* auxv pairs start right after envp NULL */
+    size_t ax = (size_t)argc + 2;
+    sp64[ax + 0] = (uint64_t)AT_PHDR;   sp64[ax + 1] = aux_phdr;
+    sp64[ax + 2] = (uint64_t)AT_PHENT;  sp64[ax + 3] = aux_phent ? aux_phent : (uint64_t)sizeof(Elf64_Phdr);
+    sp64[ax + 4] = (uint64_t)AT_PHNUM;  sp64[ax + 5] = aux_phnum;
+    sp64[ax + 6] = (uint64_t)AT_ENTRY;  sp64[ax + 7] = aux_entry;
+    sp64[ax + 8] = (uint64_t)AT_PAGESZ; sp64[ax + 9] = 4096ULL;
+    sp64[ax +10] = (uint64_t)AT_RANDOM; sp64[ax +11] = (uint64_t)random_addr;
+    sp64[ax +12] = (uint64_t)AT_NULL;   sp64[ax +13] = 0;
 
     /* write argc at final_stack (RSP will point here) */
     *((uint64_t*)(uintptr_t)final_stack) = (uint64_t)argc;
+
+    /* Ensure the entire user stack mapping is user-accessible (PG_US).
+       Without this, the first user push/read will trigger #PF err=0x5. */
+    {
+        uintptr_t stack_base = ((uintptr_t)USER_STACK_TOP - USER_STACK_SIZE) & ~0xFFFULL;
+        uintptr_t stack_end = (uintptr_t)USER_STACK_TOP;
+        if (mark_user_identity_range_2m((uint64_t)stack_base, (uint64_t)stack_end) != 0) {
+            kprintf("execve: failed to mark user stack range user-accessible\n");
+            return -1;
+        }
+    }
+
+    /* Seed an initial TLS base + stack canary guard before entering userspace.
+       Some libcs may execute stack-protected code before they set up TLS. If FS base is 0,
+       GCC's stack protector reads canary from fs:0x28, which is physical address 0x28 under
+       identity mapping and may change -> false "*** stack smashing detected ***".
+       We ensure FS points to a stable, user-accessible TLS page with a guard at +0x28. */
+    enum { MSR_FS_BASE_LOCAL = 0xC0000100u };
+    const uintptr_t user_tls_base = (uintptr_t)USER_TLS_BASE; /* reserved TLS region (see inc/exec.h) */
+    {
+        if (user_tls_base + 0x1000u >= (uintptr_t)MMIO_IDENTITY_LIMIT) {
+            kprintf("execve: tls base outside identity map\n");
+            return -1;
+        }
+        if (mark_user_identity_range_2m((uint64_t)user_tls_base, (uint64_t)(user_tls_base + 0x1000u)) != 0) {
+            kprintf("execve: failed to mark TLS range user-accessible\n");
+            return -1;
+        }
+        memset((void*)user_tls_base, 0, 0x1000u);
+        uint64_t guard = 0;
+        if (random_addr + 16 <= (uintptr_t)MMIO_IDENTITY_LIMIT) guard = *(uint64_t*)(uintptr_t)random_addr;
+        else guard = 0x8b13f00d2a11c0deULL;
+        /* glibc uses a "terminator canary": least-significant byte is 0 */
+        guard &= ~0xFFULL;
+        *(volatile uint64_t*)(uintptr_t)(user_tls_base + 0x28u) = guard;
+        msr_write_u64_local(MSR_FS_BASE_LOCAL, (uint64_t)user_tls_base);
+    }
 
 
     /* register user thread info for debugger/listing purposes and allocate kernel stack */
     thread_t *ut = thread_register_user(entry, final_stack, path);
     if (ut) {
+        ut->user_fs_base = (uint64_t)user_tls_base;
         /* allocate kernel stack for the user thread so hardware can switch to a valid RSP0 */
         void *kst = kmalloc(8192 + 16);
         if (kst) {
             ut->kernel_stack = (uint64_t)kst + 8192 + 16;
             tss_set_rsp0(ut->kernel_stack);
-            kprintf("execve: allocated kernel_stack=%p for user thread tid=%llu\n", (void*)(uintptr_t)ut->kernel_stack, (unsigned long long)ut->tid);
         } else {
-            kprintf("execve: WARNING: failed to allocate kernel stack for user thread\n");
+            /* keep going (less safe), but avoid noisy warnings */
         }
     } else {
-        kprintf("execve: WARNING: thread_register_user failed\n");
+        /* keep going without a registered user thread */
     }
 
-    /* Sanity checks & probes before entering user mode to avoid silent triple-faults.
-       - Verify entry and stack are within identity-mapped region.
-       - Touch stack memory and read first byte at entry (if readable). */
-    kprintf("execve: entry=0x%llx final_stack=0x%llx argc=%d\n",
-        (unsigned long long)entry, (unsigned long long)final_stack, argc);
-
-    /* Debug: print CR3, GDTR base and kernel rsp0 to help debug privilege switch */
-    {
-        uint64_t cr3 = 0;
-        asm volatile("mov %%cr3, %0" : "=r"(cr3));
-        struct { uint16_t limit; uint64_t base; } gdtr;
-        asm volatile("sgdt %0" : "=m"(gdtr));
-        extern uint64_t syscall_kernel_rsp0;
-        kprintf("execve: CR3=0x%llx GDTR.base=0x%llx GDTR.limit=%u rsp0=0x%llx\n",
-            (unsigned long long)cr3, (unsigned long long)gdtr.base, (unsigned)gdtr.limit,
-            (unsigned long long)syscall_kernel_rsp0);
-    }
-
-    /* Debug helper: dump page-table entries for a virtual address */
-    {
-        extern uint64_t page_table_l4[];
-        void dump_va(uint64_t va) {
-            uint64_t l4i = (va >> 39) & 0x1FF;
-            uint64_t l3i = (va >> 30) & 0x1FF;
-            uint64_t l2i = (va >> 21) & 0x1FF;
-            uint64_t l1i = (va >> 12) & 0x1FF;
-            uint64_t *l4 = (uint64_t*)page_table_l4;
-            kprintf("pte dump for va=0x%llx: L4[%llu]=0x%016llx\n", (unsigned long long)va, (unsigned long long)l4i, (unsigned long long)l4[l4i]);
-            if (!(l4[l4i] & PG_PRESENT)) return;
-            uint64_t *l3 = (uint64_t*)(uintptr_t)(l4[l4i] & ~0xFFFULL);
-            kprintf(" L3[%llu]=0x%016llx\n", (unsigned long long)l3i, (unsigned long long)l3[l3i]);
-            if (l3[l3i] & PG_PS_2M) return;
-            uint64_t *l2 = (uint64_t*)(uintptr_t)(l3[l3i] & ~0xFFFULL);
-            kprintf("  L2[%llu]=0x%016llx\n", (unsigned long long)l2i, (unsigned long long)l2[l2i]);
-            if (l2[l2i] & PG_PS_2M) return;
-            uint64_t *l1 = (uint64_t*)(uintptr_t)(l2[l2i] & ~0xFFFULL);
-            kprintf("   L1[%llu]=0x%016llx\n", (unsigned long long)l1i, (unsigned long long)l1[l1i]);
+    /* Debug: print argv/env passed to execve for user debugging (qemu debug) */
+    if (argv) {
+        int i = 0;
+        qemu_debug_printf("execve: launching %s argv:", path);
+        while (argv[i]) {
+            qemu_debug_printf(" \"%s\"", argv[i]);
+            i++;
+            if (i > 16) break;
         }
-        kprintf("PTEs for entry:\n"); dump_va((uint64_t)entry);
-        kprintf("PTEs for final_stack:\n"); dump_va((uint64_t)final_stack);
+        qemu_debug_printf("\n");
     }
+    if (envp) {
+        int i = 0;
+        qemu_debug_printf("execve: envp first entries:");
+        while (envp[i]) {
+            qemu_debug_printf(" %s", envp[i]);
+            i++;
+            if (i > 8) break;
+        }
+        qemu_debug_printf("\n");
+    }
+
 
     if ((uintptr_t)entry >= (uintptr_t)MMIO_IDENTITY_LIMIT || (uintptr_t)final_stack >= (uintptr_t)MMIO_IDENTITY_LIMIT) {
         kprintf("execve: entry or stack outside identity-mapped region, abort\n");
         return -1;
     }
 
-    /* touch stack pages (write to several words to ensure allocation/mapping) */
-    volatile uint64_t *stk = (volatile uint64_t*)(uintptr_t)final_stack;
-    for (int i = 0; i < 8; i++) {
-        stk[i] = 0xDEADBEEFu ^ (uint64_t)i;
-    }
-    
     /* try to read first byte of entry */
     volatile uint8_t *entry_b = (volatile uint8_t*)(uintptr_t)entry;
     uint8_t first = 0;
     /* wrap read in a benign check */
     first = entry_b[0];
-    kprintf("execve: entry[0]=0x%02x\n", (unsigned)first);
 
     /* Transfer to user mode (does not return) */
     enter_user_mode(entry, final_stack);

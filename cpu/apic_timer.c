@@ -165,10 +165,19 @@ uint64_t apic_timer_get_uptime_seconds(void) {
     return apic_timer_get_time_ms() / 1000;
 }
 
-void apic_timer_handler(void) {
+void apic_timer_handler(cpu_registers_t* regs) {
     apic_timer_ticks++;
     apic_timer_state.ticks = apic_timer_ticks;
-    if (init) thread_yield();
+    /* Важно: пока user-процессы не интегрированы в scheduler как полноценные потоки,
+       нельзя вызывать планировщик из прерывания, пришедшего из ring3 — это ломает
+       return-контекст (iret/sysret) и приводит к прыжкам в мусорный RIP. */
+    if (init) {
+        if (regs && ((regs->cs & 3) == 3)) {
+            apic_eoi();
+            return;
+        }
+        thread_yield();
+    }
     apic_eoi();
 }
 

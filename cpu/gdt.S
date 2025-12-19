@@ -32,14 +32,7 @@ enter_user_mode_asm:
         mov %rax, %rbx
         call enter_user_pre_iret
 
-        // IRET frame: SS, RSP, RFLAGS, CS, RIP
-        pushq %rdx                           // SS (user_ds|3)
-        pushq %rsi                           // RSP (user stack)
-        pushq %rax                           // RFLAGS (with IF)
-        pushq %rcx                           // CS (user_cs|3)
-        pushq %rdi                           // RIP (entry)
-
-        // use preserved callee-saved regs to push the iret frame values
+        // Build ONE IRET frame using preserved callee-saved regs.
         // Mask selectors to 16-bit and set RPL=3 to avoid upper-bit garbage.
         mov %r14, %rax
         and $0xffff, %rax
@@ -58,13 +51,21 @@ enter_user_mode_asm:
         pushq %r12                           // RIP (entry)
 
         // Now call post-iret diagnostic with the words we just pushed.
+        // Stack layout at %rsp: [RIP][CS][RFLAGS][RSP][SS]
         movq %rsp, %r9
-        movq (%r9), %rdi      // SS
-        movq 8(%r9), %rsi     // RSP
-        movq 16(%r9), %rdx    // RFLAGS
-        movq 24(%r9), %rcx    // CS
-        movq 32(%r9), %r8     // RIP
+        movq 32(%r9), %rdi     // SS
+        movq 24(%r9), %rsi     // RSP
+        movq 16(%r9), %rdx     // RFLAGS
+        movq 8(%r9), %rcx      // CS
+        movq 0(%r9), %r8       // RIP
         call enter_user_post_iret
+
+        /* Userspace entry registers:
+           On Linux x86_64, %rdx is used to pass rtld_fini from the dynamic loader.
+           For static executables (our current target), it must be 0. If we leave
+           kernel garbage (or our user_ds selector) in %rdx, libc may later call it
+           during exit and jump into low memory (e.g. RIP=0x3d5). */
+        xor %rdx, %rdx
 
         cld
         iretq
