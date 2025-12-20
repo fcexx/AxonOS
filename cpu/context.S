@@ -28,3 +28,37 @@ context_switch:
         popfq
         // my favorite 'ret'
         ret
+
+/* Restore volatile (caller-saved) registers from a context_t pointer.
+   Prototype: void restore_volatile_regs(context_t *ctx)
+   This will load rdx,rcx,rax,r8,r9,r10,r11 from the memory image pointed by ctx.
+   IMPORTANT: it does NOT touch rdi/rsi so callers can set up function arguments
+   after restore (enter_user_mode will be called with correct args). */
+.global restore_volatile_regs
+restore_volatile_regs:
+        // rdi == ctx pointer
+        // load values via rax temp and push in order so pops set registers correctly
+        movq    32(%rdi), %rax      // r11
+        pushq   %rax
+        movq    40(%rdi), %rax      // r10
+        pushq   %rax
+        movq    48(%rdi), %rax      // r9
+        pushq   %rax
+        movq    56(%rdi), %rax      // r8
+        pushq   %rax
+        movq    112(%rdi), %rax     // rax
+        pushq   %rax
+        movq    96(%rdi), %rax      // rcx
+        pushq   %rax
+        movq    88(%rdi), %rax      // rdx
+        pushq   %rax
+
+        // Now pop into registers in reverse order
+        popq    %rdx
+        popq    %rcx
+        popq    %rax
+        popq    %r8
+        popq    %r9
+        popq    %r10
+        popq    %r11
+        ret

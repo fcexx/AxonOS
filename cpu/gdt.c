@@ -156,6 +156,13 @@ void enter_user_mode(uint64_t user_entry, uint64_t user_stack_top) {
         enter_user_mode_asm(user_entry, user_stack_top, USER_DS, USER_CS);
 } 
 
+// Set the user FS base MSR for the CPU. Used when switching a thread into user mode.
+void set_user_fs_base(uint64_t base) {
+        uint32_t lo = (uint32_t)(base & 0xFFFFFFFFu);
+        uint32_t hi = (uint32_t)(base >> 32);
+        asm volatile("wrmsr" :: "c"(0xC0000100u), "a"(lo), "d"(hi));
+}
+
 /* Called from assembly trampoline right before iret frame is pushed.
    We are still in kernel context; print the exact iret-frame values and a small
    stack/code dump to diagnose mis-frames or bad mappings. */

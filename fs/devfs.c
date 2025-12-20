@@ -13,23 +13,6 @@
 
 #define DEVFS_TTY_COUNT 6
 
-struct devfs_tty {
-    int id;
-    uint8_t *screen; /* saved VGA buffer (raw bytes 2 per cell) */
-    uint32_t cursor_x;
-    uint32_t cursor_y;
-    /* input buffer (chars) */
-    char inbuf[256];
-    int in_head;
-    int in_tail;
-    int in_count;
-    spinlock_t in_lock;
-    /* waiting threads (tids) */
-    int waiters[8];
-    int waiters_count;
-    /* foreground process group for this tty (-1 = unset) */
-    int fg_pgrp;
-};
 
 static struct devfs_tty dev_ttys[DEVFS_TTY_COUNT];
 static int devfs_active = 0;
@@ -540,8 +523,6 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
             kputchar((uint8_t)ch, GRAY_ON_BLACK);
         } else {
             /* write into saved screen buffer */
-            /* compute offset and write char; simple approach: append at last line */
-            /* For simplicity, ignore attributes and just drop if buffer not present */
             if (t->screen) {
                 /* very naive: append at bottom-right with no wrapping */
                 uint32_t x = t->cursor_x;
@@ -693,6 +674,7 @@ void devfs_tty_push_input(int tty, char c) {
     struct devfs_tty *t = &dev_ttys[tty];
     unsigned long flags = 0;
     acquire_irqsave(&t->in_lock, &flags);
+    qemu_debug_printf("devfs: push_input tty=%d char=0x%02x ('%c') in_count=%d\n", tty, (unsigned char)c, (c >= 32 && c < 127) ? c : '.', t->in_count);
     if (t->in_count < (int)sizeof(t->inbuf)) {
         t->inbuf[t->in_tail] = c;
         t->in_tail = (t->in_tail + 1) % (int)sizeof(t->inbuf);
@@ -714,6 +696,7 @@ void devfs_tty_push_input_noblock(int tty, char c) {
     if (tty < 0 || tty >= DEVFS_TTY_COUNT) return;
     struct devfs_tty *t = &dev_ttys[tty];
     if (!try_acquire(&t->in_lock)) return;
+    qemu_debug_printf("devfs: push_input_noblock tty=%d char=0x%02x ('%c') in_count=%d\n", tty, (unsigned char)c, (c >= 32 && c < 127) ? c : '.', t->in_count);
     if (t->in_count < (int)sizeof(t->inbuf)) {
         t->inbuf[t->in_tail] = c;
         t->in_tail = (t->in_tail + 1) % (int)sizeof(t->inbuf);
@@ -811,6 +794,52 @@ int devfs_is_tty_file(struct fs_file *file) {
     return 0;
 }
 
+/* Map an open file handle to a tty index if possible, or -1 otherwise.
++   Encapsulates logic used to resolve /dev/stdin/out/err, /dev/tty and ttyN. */
+int devfs_get_tty_index_from_file(struct fs_file *file) {
+    if (!file) return -1;
+    if (file->driver_private) {
+        uintptr_t dp = (uintptr_t)file->driver_private;
+        uintptr_t base_tty = (uintptr_t)&dev_ttys[0];
+        uintptr_t end_tty = (uintptr_t)&dev_ttys[DEVFS_TTY_COUNT];
+        if (dp >= base_tty && dp < end_tty) {
+            struct devfs_tty *t = (struct devfs_tty*)dp;
+            return t->id;
+        }
+        /* marker pointer for special devices */
+        int marker = *(int*)file->driver_private;
+        if ((marker & 0x80000000) == 0x80000000) {
+            int si = marker & 0x7FFFFFFF;
+            if (si == 3 || si == 6 || si == 4 || si == 5) {
+                thread_t *cur = thread_current();
+                return (cur && cur->attached_tty >= 0) ? cur->attached_tty : devfs_get_active();
+            }
+        }
+    }
+    if (file->path) {
+        if (strcmp(file->path, "/dev/console") == 0) return 0;
+        if (strncmp(file->path, "/dev/tty", 8) == 0) {
+            int n = file->path[8] - '0';
+            if (n >= 0 && n < DEVFS_TTY_COUNT) return n;
+        }
+        if (strcmp(file->path, "/dev/stdin") == 0 || strcmp(file->path, "/dev/tty") == 0) {
+            thread_t *cur = thread_current();
+            return (cur && cur->attached_tty >= 0) ? cur->attached_tty : devfs_get_active();
+        }
+    }
+    return -1;
+}
+
+int devfs_get_tty_fg_pgrp(int tty) {
+    if (tty < 0 || tty >= DEVFS_TTY_COUNT) return -1;
+    return dev_ttys[tty].fg_pgrp;
+}
+
+void devfs_set_tty_fg_pgrp(int tty, int pgrp) {
+    if (tty < 0 || tty >= DEVFS_TTY_COUNT) return;
+    dev_ttys[tty].fg_pgrp = pgrp;
+}
+
 /* Create a block device node and register mapping */
 int devfs_create_block_node(const char *path, int device_id, uint32_t sectors) {
     if (!path) return -1;
@@ -851,4 +880,5 @@ int devfs_get_device_id(const char *path) {
     if (idx < 0) return -1;
     return dev_blocks[idx].device_id;
 }
+
 

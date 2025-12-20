@@ -124,10 +124,58 @@ static void ud_fault_handler(cpu_registers_t* regs) {
                 }
 
                 dump("invalid opcode", "user", regs, 0, 0, true);
+                /* Dump nearby code bytes to help diagnose user UD */
+                {
+                    uintptr_t rip = (uintptr_t)regs->rip;
+                    const int BYTES = 32;
+                    uintptr_t start = rip > BYTES ? rip - BYTES : rip;
+                    if (start + BYTES*2 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                        kprintf("user code dump around RIP=0x%llx:\n", (unsigned long long)rip);
+                        const unsigned char *p = (const unsigned char*)(uintptr_t)start;
+                        for (int i = 0; i < BYTES*2; i++) {
+                            kprintf("%02x ", (unsigned int)p[i]);
+                            if ((i & 0xF) == 0xF) kprintf("\n");
+                        }
+                        kprintf("\n");
+                    } else {
+                        kprintf("user code dump skipped (out of identity range)\n");
+                    }
+                }
                 for(;;){ asm volatile("sti; hlt" ::: "memory"); }
         }
         // Иначе — ядро: печатаем и стоп
         dump("invalid opcode", "kernel", regs, 0, 0, false);
+        /* Dump nearby kernel code bytes and kernel syscall stack top to diagnose why UD happened */
+        {
+            uintptr_t rip = (uintptr_t)regs->rip;
+            const int BYTES = 32;
+            uintptr_t start = rip > BYTES ? rip - BYTES : rip;
+            if (start + BYTES*2 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                qemu_debug_printf("kernel code dump around RIP=0x%llx:\n", (unsigned long long)rip);
+                const unsigned char *p = (const unsigned char*)(uintptr_t)start;
+                for (int i = 0; i < BYTES*2; i++) {
+                        qemu_debug_printf("%02x ", (unsigned int)p[i]);
+                    if ((i & 0xF) == 0xF) kprintf("\n");
+                }
+                qemu_debug_printf("\n");
+            } else {
+                qemu_debug_printf("kernel code dump skipped (out of identity range)\n");
+            }
+        }
+        {
+            extern uint64_t syscall_kernel_rsp0;
+            if ((uintptr_t)syscall_kernel_rsp0 != 0 && (uintptr_t)syscall_kernel_rsp0 + 8*16 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                qemu_debug_printf("syscall_kernel_rsp0=0x%llx\n", (unsigned long long)syscall_kernel_rsp0);
+                uint64_t *stk = (uint64_t*)(uintptr_t)syscall_kernel_rsp0;
+                qemu_debug_printf("kernel syscall stack top qwords:\n");
+                for (int i = 0; i < 16; i++) {
+                        qemu_debug_printf("[%2d] 0x%016llx\n", i, (unsigned long long)stk[i]);
+                }
+                qemu_debug_printf("saved RIP slot (offset +104) = 0x%016llx\n", (unsigned long long)stk[13]);
+            } else {
+                qemu_debug_printf("syscall_kernel_rsp0 not set or out of range\n");
+            }
+        }
         for(;;){ asm volatile("sti; hlt":::"memory"); }
 }
 
@@ -151,6 +199,11 @@ static void page_fault_handler(cpu_registers_t* regs) {
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
         int user = (regs->cs & 3) == 3;
         dump("page fault", user ? "user" : "kernel", regs, cr2, regs->error_code, user);
+        // Read MSR_FS_BASE to help diagnose faults caused by missing TLS base
+        uint64_t fsbase_lo = 0, fsbase_hi = 0;
+        asm volatile("rdmsr" : "=a"(fsbase_lo), "=d"(fsbase_hi) : "c"(0xC0000100u));
+        uint64_t fsbase = ((uint64_t)fsbase_hi << 32) | fsbase_lo;
+        kprintf("page fault MSR_FS_BASE=0x%016llx\n", (unsigned long long)fsbase);
         kprintf("page fault details: CR2=0x%llx err=0x%llx user=%d\n", (unsigned long long)cr2, (unsigned long long)regs->error_code, user);
         for (;;) { asm volatile("sti; hlt" ::: "memory"); }
 }

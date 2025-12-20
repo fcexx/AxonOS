@@ -5,6 +5,7 @@
 .extern syscall_user_rsp_saved
 .extern syscall_exit_to_shell_flag
 .extern syscall_return_to_shell
+.extern syscall_exec_trampoline_active
 
 // x86_64 SYSCALL entry point.
 // Assumptions/constraints (current AxonOS design):
@@ -23,6 +24,8 @@
 //       Good enough for current AxonOS; we can make it per-thread/per-cpu later.
 syscall_entry64:
     cld
+    // Save user RIP (return address) for SYSCALL path (rcx contains return RIP)
+    movq    %rcx, syscall_user_return_rip(%rip)
     // Save user RSP and switch to kernel syscall stack.
     movq    %rsp, syscall_user_rsp_saved(%rip)
     movq    syscall_kernel_rsp0(%rip), %rsp
@@ -71,6 +74,9 @@ syscall_entry64:
        Here: a4 is saved r10. a5 must be saved r8, a6 must be saved r9. */
     movq    56(%rsp),  %r9      // a5 = user r8
     pushq   48(%rsp)            // a6 = user r9 (7th arg on stack)
+    // save user return RIP (stored by syscall in stack at offset 104) to kernel-global for syscall handlers
+    movq    104(%rsp), %rax
+    movq    %rax, syscall_user_return_rip(%rip)
     call    syscall_do
     addq    $8, %rsp
 
@@ -87,7 +93,17 @@ syscall_entry64:
 .ret_to_user:
 
     // Store return value into saved rax slot so final pop restores it.
+    // If a trampoline was applied by kernel, assembly should not overwrite the patched
+    // saved-rax slot. Check global flag syscall_exec_trampoline_active.
+    movq    syscall_exec_trampoline_active(%rip), %rdx
+    testq   %rdx, %rdx
+    jz      .L_do_write_rax
+    // clear flag and skip writing rax (preserve patched slot)
+    movq    $0, syscall_exec_trampoline_active(%rip)
+    jmp     .L_skip_write_rax
+.L_do_write_rax:
     movq    %rax, 112(%rsp)
+.L_skip_write_rax:
 
     // Restore registers.
     popq    %r15

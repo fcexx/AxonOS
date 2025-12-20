@@ -7,6 +7,7 @@
 #include <context.h>
 #include <debug.h>
 #include <devfs.h>
+#include <gdt.h>
 
 #define MAX_THREADS 32
 thread_t* threads[MAX_THREADS];
@@ -34,6 +35,19 @@ void thread_init() {
         main_thread.attached_tty = devfs_get_active();
         strncpy(main_thread.cwd, "/", sizeof(main_thread.cwd));
         main_thread.cwd[sizeof(main_thread.cwd) - 1] = '\0';
+        main_thread.vfork_parent_tid = -1;
+        main_thread.rseq_ptr = NULL;
+        main_thread.parent_tid = -1;
+        main_thread.pgid = main_thread.tid;
+        main_thread.sid = main_thread.tid;
+        main_thread.saved_user_rip = 0;
+        main_thread.saved_user_rsp = 0;
+        main_thread.waiter_tid = -1;
+        main_thread.exit_status = 0;
+        main_thread.exec_trampoline_flag = 0;
+        main_thread.exec_trampoline_rip = 0;
+        main_thread.exec_trampoline_rsp = 0;
+        main_thread.exec_trampoline_rax = 0;
         kprintf("thread_init: idle thread created with pid %d\n", main_thread.tid);
         init = 1;
 }
@@ -87,6 +101,19 @@ thread_t* thread_create(void (*entry)(void), const char* name) {
         t->euid = 0;
         t->egid = 0;
         t->attached_tty = -1;
+        t->pgid = t->tid;
+        t->sid = t->tid;
+        t->vfork_parent_tid = -1;
+        t->rseq_ptr = NULL;
+        t->parent_tid = -1;
+        t->saved_user_rip = 0;
+        t->saved_user_rsp = 0;
+        t->waiter_tid = -1;
+        t->exit_status = 0;
+        t->exec_trampoline_flag = 0;
+        t->exec_trampoline_rip = 0;
+        t->exec_trampoline_rsp = 0;
+        t->exec_trampoline_rax = 0;
         strncpy(t->cwd, "/", sizeof(t->cwd));
         t->cwd[sizeof(t->cwd) - 1] = '\0';
         threads[thread_count++] = t;
@@ -121,11 +148,51 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
                 t->attached_tty = current->attached_tty >= 0 ? current->attached_tty : devfs_get_active();
                 strncpy(t->cwd, current->cwd[0] ? current->cwd : "/", sizeof(t->cwd));
                 t->cwd[sizeof(t->cwd) - 1] = '\0';
+                t->pgid = current->pgid;
+                t->sid = current->sid;
         } else { t->euid = 0; t->egid = 0; t->attached_tty = devfs_get_active(); }
         if (!t->cwd[0]) { strncpy(t->cwd, "/", sizeof(t->cwd)); t->cwd[sizeof(t->cwd)-1] = '\0'; }
+        t->vfork_parent_tid = -1;
+        t->rseq_ptr = NULL;
+        t->parent_tid = -1;
+        t->waiter_tid = -1;
+        t->exit_status = 0;
+        t->exec_trampoline_flag = 0;
+        t->exec_trampoline_rip = 0;
+        t->exec_trampoline_rsp = 0;
+        t->exec_trampoline_rax = 0;
         threads[thread_count++] = t;
         current_user = t;
         return t;
+}
+
+// Entry for kernel-created user threads: set up per-thread kernel stack as TSS, mark as current_user
+// then enter user mode at saved rip/rsp. This function is used as the entry point passed to thread_create().
+void user_thread_entry(void) {
+	thread_t *self = thread_current();
+	if (!self) {
+		for (;;) asm volatile("hlt");
+	}
+	// mark as user thread
+	self->ring = 3;
+	thread_set_current_user(self);
+	// set TSS RSP0 to this thread's kernel stack so syscalls use its stack
+	tss_set_rsp0(self->kernel_stack);
+	// set per-thread FS base so userspace TLS and stack-canary work
+	set_user_fs_base(self->user_fs_base);
+	// ensure return value from fork is 0 in child: clear RAX
+	/* Restore volatile (caller-saved) registers from the thread context so that
+	   a forked child resumes with the same register values as parent after syscall.
+	   context_switch already restored callee-saved registers (rbx, rbp, r12..r15).
+	   Here we restore the remaining registers that enter_user_mode won't set. */
+	/* Do not restore volatile registers here — rely on a clean user_rip/user_stack
+	   and ensure the child sees 0 from fork in RAX. Restoring volatile regs proved
+	   to be unsafe (clobbered kernel flow). */
+	asm volatile("xor %%rax, %%rax" ::: "rax");
+	// Jump to user mode
+	enter_user_mode(self->user_rip, self->user_stack);
+	// Should not return
+	for (;;) asm volatile("hlt");
 }
 
 int thread_fd_alloc(struct fs_file *file) {
@@ -206,7 +273,6 @@ void thread_yield() {
 void thread_stop(int pid) {
         for (int i = 0; i < thread_count; ++i) {
                 if (threads[i] && threads[i]->tid == pid && threads[i]->state != THREAD_TERMINATED) {
-                        kprintf("thread_stop: stopping tid=%d name=%s\n", pid, threads[i]->name);
                         threads[i]->state = THREAD_TERMINATED;
                         return;
                 }
@@ -277,6 +343,13 @@ thread_t* thread_get(int pid) {
                 if (threads[i] && threads[i]->tid == pid) {
                         return threads[i];
                 }
+        }
+        return NULL;
+}
+
+thread_t* thread_find_child_of(int parent_tid) {
+        for (int i = 0; i < thread_count; ++i) {
+                if (threads[i] && threads[i]->parent_tid == parent_tid) return threads[i];
         }
         return NULL;
 }

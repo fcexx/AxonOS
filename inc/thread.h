@@ -25,6 +25,9 @@ typedef struct thread {
         struct thread* next;
         uint64_t tid;
         char name[32];                 // thread name (urmomissofaturmomissofaturmomiss)
+        /* POSIX-ish job control identifiers */
+        int pgid;                      // process group id
+        int sid;                       // session id
         uint32_t sleep_until;          // sleep until (in timer ticks)
         uint64_t clear_child_tid;      // clear child tid
         struct fs_file* fds[THREAD_MAX_FD];
@@ -36,6 +39,27 @@ typedef struct thread {
         gid_t egid;
         /* attached tty index or -1 */
         int attached_tty;
+        /* vfork parent PID: if >=0 then this thread was created by vfork and parent is blocked;
+           on execve/exit child must unblock parent. */
+        int vfork_parent_tid;
+        /* exec trampoline support: when set, kernel will patch the saved syscall return
+           frame so that on syscall return the thread resumes at exec_trampoline_rip/rsp
+           with RAX=exec_trampoline_rax. Used to implement vfork-by-reusing-current-thread. */
+        int exec_trampoline_flag;
+        uint64_t exec_trampoline_rip;
+        uint64_t exec_trampoline_rsp;
+        uint64_t exec_trampoline_rax;
+        /* pointer to rseq area in userspace (for minimal rseq support) */
+        void *rseq_ptr;
+        /* parent thread id (for wait/waitpid) */
+        int parent_tid;
+        /* saved syscall return site for current syscall (per-thread) */
+        uint64_t saved_user_rip;
+        uint64_t saved_user_rsp;
+        /* if non-negative, tid of thread waiting for this child (wait/waitpid) */
+        int waiter_tid;
+        /* exit status encoded like wait(2) returns (status word) */
+        int exit_status;
 } thread_t;
 
 extern int init;
@@ -62,6 +86,8 @@ thread_t* thread_get_current_user();
 void thread_set_current_user(thread_t* t);
 // find a user thread attached to given tty (or NULL)
 thread_t* thread_find_by_tty(int tty);
+// find any child of given parent tid, or NULL
+thread_t* thread_find_child_of(int parent_tid);
 
 // per-thread fd helpers
 int thread_fd_alloc(struct fs_file *file); /* returns fd or -1 */

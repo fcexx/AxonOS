@@ -270,15 +270,59 @@ void ps2_keyboard_init() {
 
 // Получить символ (блокирующая функция, как в Unix)
 char kgetc() {
-        int tty = devfs_get_active();
-        if (tty < 0) tty = 0;
-        int c;
-        for (;;) {
-                c = devfs_tty_pop_nb(tty);
-                if (c >= 0) return (char)c;
-                /* no data — sleep until IRQ wakes us */
-                asm volatile("sti; hlt" ::: "memory");
+    int tty = devfs_get_active();
+    if (tty < 0) tty = 0;
+    int c;
+    for (;;) {
+        c = devfs_tty_pop_nb(tty);
+        if (c >= 0) {
+            /* If ESC, try to detect CSI sequences for arrows and translate to KEY_* */
+            if (c == 27) {
+                /* wait briefly for following bytes (non-blocking spin) */
+                int next1 = -1;
+                for (int spin = 0; spin < 100; spin++) {
+                    next1 = devfs_tty_pop_nb(tty);
+                    if (next1 >= 0) break;
+                    asm volatile("pause");
+                }
+                if (next1 < 0) return (char)27;
+                if (next1 == '[' || next1 == 'O') {
+                    int next2 = -1;
+                    for (int spin = 0; spin < 100; spin++) {
+                        next2 = devfs_tty_pop_nb(tty);
+                        if (next2 >= 0) break;
+                        asm volatile("pause");
+                    }
+                    if (next2 < 0) {
+                        /* only ESC [ — return ESC */
+                        /* push back next1? can't — just return ESC */
+                        return (char)27;
+                    }
+                    /* CSI/SS3 finals */
+                    if (next2 == 'A') return (char)KEY_UP;
+                    if (next2 == 'B') return (char)KEY_DOWN;
+                    if (next2 == 'C') return (char)KEY_RIGHT;
+                    if (next2 == 'D') return (char)KEY_LEFT;
+                    /* SS3 mapping (ESC O A etc) */
+                    if (next1 == 'O') {
+                        if (next2 == 'A') return (char)KEY_UP;
+                        if (next2 == 'B') return (char)KEY_DOWN;
+                        if (next2 == 'C') return (char)KEY_RIGHT;
+                        if (next2 == 'D') return (char)KEY_LEFT;
+                    }
+                    /* unknown sequence: ignore and continue */
+                    continue;
+                } else {
+                    /* not CSI: return ESC and make the next1 available by pushing into tty buffer */
+                    /* As fallback we can't push back into devfs easily — drop next1 */
+                    return (char)27;
+                }
+            }
+            return (char)c;
         }
+        /* no data — sleep until IRQ wakes us */
+        asm volatile("sti; hlt" ::: "memory");
+    }
 }
 
 // Проверить, есть ли доступные символы (неблокирующая)

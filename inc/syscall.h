@@ -44,6 +44,9 @@
 #define SYS_arch_prctl 158
 #define SYS_exit    60
 #define SYS_execve  59
+#define SYS_vfork   58
+#define SYS_fork    57
+#define SYS_wait4   61
 #define SYS_exit_group 231
 #define SYS_openat  257
 #define SYS_newfstatat 262
