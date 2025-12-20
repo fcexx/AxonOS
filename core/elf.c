@@ -638,6 +638,15 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     /* wrap read in a benign check */
     first = entry_b[0];
 
+    /* If this thread was created via vfork, wake parent now (child is about to exec). */
+    {
+        thread_t *tc = thread_current();
+        if (tc && tc->vfork_parent_tid >= 0) {
+            thread_unblock(tc->vfork_parent_tid);
+            tc->vfork_parent_tid = -1;
+        }
+    }
+
     /* Transfer to user mode (does not return) */
     enter_user_mode(entry, final_stack);
     return 0; /* not reached */

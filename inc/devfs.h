@@ -2,12 +2,31 @@
 
 #include <stddef.h>
 #include <fs.h>
-#include <thread.h>
+#include <stdint.h>
+#include <spinlock.h>
 
 /* Number of virtual ttys provided by devfs (default) */
 #ifndef DEVFS_TTY_COUNT
 #define DEVFS_TTY_COUNT 6
 #endif
+
+struct devfs_tty {
+    int id;
+    uint8_t *screen; /* saved VGA buffer (raw bytes 2 per cell) */
+    uint32_t cursor_x;
+    uint32_t cursor_y;
+    /* foreground process group for this tty (-1 if none) */
+    int fg_pgrp;
+    /* input buffer (chars) */
+    char inbuf[256];
+    int in_head;
+    int in_tail;
+    int in_count;
+    spinlock_t in_lock;
+    /* waiting threads (tids) */
+    int waiters[8];
+    int waiters_count;
+};
 
 int devfs_register(void);
 int devfs_unregister(void);
@@ -35,11 +54,10 @@ int devfs_tty_available(int tty);
 /* Check whether an fs_file is a devfs tty device */
 int devfs_is_tty_file(struct fs_file *file);
 
-/* TTY helpers for ioctl and controlling terminal management */
-int devfs_tty_get_fg_pgrp(struct fs_file *file); /* returns fg pgrp or -1 on error */
-int devfs_tty_set_fg_pgrp(struct fs_file *file, int pgrp); /* returns 0 on success */
-int devfs_tty_get_index_from_file(struct fs_file *file); /* returns tty index or -1 */
-int devfs_tty_attach_thread(struct fs_file *file, thread_t *th); /* attach thread as controlling tty */
+/* Helpers to map an open file handle to a tty index and manage per-tty foreground pgrp. */
+int devfs_get_tty_index_from_file(struct fs_file *file);
+int devfs_get_tty_fg_pgrp(int tty);
+void devfs_set_tty_fg_pgrp(int tty, int pgrp);
 
 /* Create a block device node at given path and associate with disk device_id.
    sectors - total number of 512-byte sectors on device (for size reporting). */

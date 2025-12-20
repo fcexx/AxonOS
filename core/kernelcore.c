@@ -356,17 +356,17 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     kprintf("kernel base: done\n");
     
     //autostart: run /start script once if present
-    {
-        struct fs_file *f = fs_open("/start");
-        if (f) { fs_file_free(f); (void)exec_line("osh /start"); }
-        else { kprintf("FATAL: /start file not found; fallback to osh\n"); exec_line("PS1=\"\\w # \""); exec_line("osh"); }
-    }
-
     // {
-    //     struct fs_file *f = fs_open("/bin/busybox");
-    //     if (f) { fs_file_free(f); (void)exec_line("exec /bin/busybox sh"); }
-    //     else kprintf("fatal: unable to run initial process; halt\n");
+    //     struct fs_file *f = fs_open("/start");
+    //     if (f) { fs_file_free(f); (void)exec_line("osh /start"); }
+    //     else { kprintf("FATAL: /start file not found; fallback to osh\n"); exec_line("PS1=\"\\w # \""); exec_line("osh"); }
     // }
+
+    {
+        struct fs_file *f = fs_open("/bin/busybox");
+        if (f) { fs_file_free(f); (void)exec_line("busybox init"); }
+        else kprintf("fatal: unable to run initial process; halt\n");
+    }
     
     for(;;) {
         asm volatile("hlt");

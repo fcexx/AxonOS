@@ -6,13 +6,13 @@
 #include <fs.h>
 #include <mmio.h>
 #include <heap.h>
+#include <devfs.h>
 #include <syscall.h>
 #include <gdt.h>
 #include <paging.h>
 #include <exec.h>
 #include <pit.h>
 #include <ext2.h>
-#include <devfs.h>
 
 extern void kprintf(const char *fmt, ...);
 
@@ -20,6 +20,9 @@ extern void kprintf(const char *fmt, ...);
 uint64_t syscall_user_rsp_saved = 0;
 /* Set to non-zero when user called exit/exit_group; handled in syscall_entry64. */
 uint64_t syscall_exit_to_shell_flag = 0;
+/* Flag set by kernel when it applies an exec-trampoline so syscall return
+   path should not overwrite the patched saved-rax slot. */
+uint64_t syscall_exec_trampoline_active = 0;
 
 
 extern void ring0_shell(void);
@@ -88,7 +91,7 @@ static inline uint64_t ret_err(int e) {
     thread_t *t = thread_get_current_user();
     if (!t) t = thread_current();
     if (e == ENOSYS && t && (t->tid == 3)) {
-        qemu_debug_printf("ret_err: ENOSYS returned for pid=%u syscall=%u\n",
+        kprintf("ret_err: ENOSYS returned for pid=%llu syscall=%llu\n",
                 (unsigned long long)(t->tid ? t->tid : 1),
                 (unsigned long long)last_syscall_debug);
     }
@@ -130,8 +133,7 @@ static int copy_from_user_raw(void *kdst, const void *usrc, size_t n) {
     return 0;
 }
 
-/* Minimal tty state for job control-ish ioctls (single session). */
-static uint64_t user_pgrp = 1;
+/* Note: per-thread pgid/sid are stored in thread_t (set in thread creation/registration). */
 
 /* Minimal signal emulation (we do not actually deliver signals yet).
    We only keep per-signal "handlers" so libc/busybox doesn't abort early. */
@@ -358,6 +360,36 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             size_t bytes = (size_t)iovcnt * sizeof(iov[0]);
             if (copy_from_user_raw(iov, iov_u, bytes) != 0) return ret_err(EFAULT);
 
+            /* Debug: capture early libc/ld.so/stderr messages to qemu log to help diagnose exits.
+               Limit to 256 bytes per writev to avoid flooding. */
+            if ((fd == 2 || fd == 1)) {
+                size_t probe_total = 0;
+                size_t probe_cap = 4096;
+                char *dbg = (char*)kmalloc(probe_cap + 1);
+                if (dbg) {
+                    for (int ii = 0; ii < iovcnt && probe_total < probe_cap; ii++) {
+                        size_t need = (size_t)iov[ii].len;
+                        size_t to_copy = (probe_cap - probe_total) < need ? (probe_cap - probe_total) : need;
+                        if (to_copy > 0) {
+                            if ((uintptr_t)iov[ii].base + to_copy <= (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                                memcpy(dbg + probe_total, (const void*)(uintptr_t)iov[ii].base, to_copy);
+                                probe_total += to_copy;
+                            }
+                        }
+                    }
+                    if (probe_total > 0) {
+                        size_t probe = probe_total < probe_cap ? probe_total : probe_cap;
+                        for (size_t i = 0; i < probe; i++) {
+                            char c = dbg[i];
+                            dbg[i] = (c >= 32 && c < 127) ? c : '.';
+                        }
+                        dbg[probe] = '\\0';
+                        qemu_debug_printf("USER OUT (fd=%d via writev): %s\n", fd, dbg);
+                    }
+                    kfree(dbg);
+                }
+            }
+
             uint64_t total = 0;
             for (int i = 0; i < iovcnt; i++) {
                 const void *base = (const void*)(uintptr_t)iov[i].base;
@@ -395,10 +427,12 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
         case SYS_getegid:
             return (uint64_t)cur->egid;
         case SYS_setsid:
-            user_pgrp = (uint64_t)(cur->tid ? cur->tid : 1);
-            return user_pgrp;
+            /* create new session: set session id and make current process group equal to pid */
+            cur->sid = (int)(cur->tid ? cur->tid : 1);
+            cur->pgid = (int)(cur->tid ? cur->tid : 1);
+            return (uint64_t)cur->sid;
         case SYS_getpgrp:
-            return user_pgrp;
+            return (uint64_t)cur->pgid;
         case SYS_setpgid:
             /* Minimal setpgid implementation:
                If pid==0 use current tid; if pgid==0 use pid.
@@ -414,8 +448,8 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     kprintf("sys_setpgid: pid=%d pgid=%d -> ESRCH (only current pid supported)\n", pid, pgid);
                     return ret_err(ESRCH);
                 }
-                if (pgid != 0) user_pgrp = (uint64_t)pgid;
-                kprintf("sys_setpgid: pid=%d pgid=%d -> OK (user_pgrp=%llu)\n", pid, pgid, (unsigned long long)user_pgrp);
+                if (pgid != 0) cur->pgid = pgid;
+                kprintf("sys_setpgid: pid=%d pgid=%d -> OK (pgid=%d)\n", pid, pgid, cur->pgid);
                 return 0;
             }
         case SYS_tgkill: {
@@ -586,10 +620,10 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             int pid = (int)a1;
             uint64_t self = (uint64_t)(cur->tid ? cur->tid : 1);
             if (pid == 0) {
-                return (uint64_t)user_pgrp;
+                return (uint64_t)cur->pgid;
             }
-            if ((uint64_t)pid == self) return (uint64_t)user_pgrp;
-            /* We only support querying current process for now */
+            if ((uint64_t)pid == self) return (uint64_t)cur->pgid;
+            /* Support querying current process only for now */
             return ret_err(ESRCH);
         }
         case SYS_rt_sigaction: {
@@ -658,11 +692,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             uint64_t req = a2;
             void *argp = (void*)(uintptr_t)a3;
             /* Map negative fds to fd 0 (controlling/stdin) to be tolerant of libc behavior. */
-            if (fd < 0) {
-                qemu_debug_printf("sys_ioctl: pid=%llu got negative fd=%d, mapping to fd 0\n",
-                        (unsigned long long)(cur->tid ? cur->tid : 1), fd);
-                fd = 0;
-            }
+            if (fd < 0) fd = 0;
             qemu_debug_printf("sys_ioctl: pid=%llu fd=%d req=0x%llx arg=%p\n",
                     (unsigned long long)(cur->tid ? cur->tid : 1), fd, (unsigned long long)req, argp);
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
@@ -720,37 +750,31 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 return 0;
             }
             if (req == TIOCSCTTY) {
-                /* Make ioctl(TIOCSCTTY) attach this thread to the tty as controlling tty.
-                   If attaching is not possible, accept silently. */
-                qemu_debug_printf("ioctl: TIOCSCTTY on fd=%d (arg=%p)\n", fd, argp);
-                {
-                    thread_t *curth = thread_current();
-                    if (curth) {
-                        /* try to attach current thread to this tty */
-                        (void)devfs_tty_attach_thread(f, curth);
-                    }
-                }
-                return 0;
-            }
-            if (req == TIOCGPGRP) {
-                if (!argp) return ret_err(EFAULT);
-                /* Try to return tty-specific foreground pgrp, fallback to global user_pgrp */
-                int pgrp = devfs_tty_get_fg_pgrp(f);
-                if (pgrp < 0) pgrp = (int)(user_pgrp);
-                qemu_debug_printf("ioctl: TIOCGPGRP on fd=%d -> returning pgrp=%d\n", fd, pgrp);
-                uint32_t pu = (uint32_t)pgrp;
-                if (copy_to_user_safe(argp, &pu, sizeof(pu)) != 0) return ret_err(EFAULT);
+                /* Assign controlling tty: map file to tty index and attach to current thread.
+                   Also initialize tty foreground pgrp from caller so job control behaves. */
+                   qemu_debug_printf("ioctl: TIOCSCTTY on fd=%d (arg=%p)\n", fd, argp);
+                   {
+                       int tty_idx = devfs_get_tty_index_from_file(f);
+                       thread_t *ct = thread_current();
+                       if (tty_idx >= 0 && ct) {
+                           ct->attached_tty = tty_idx;
+                           devfs_set_tty_fg_pgrp(tty_idx, ct->pgid);
+                           qemu_debug_printf("ioctl: TIOCSCTTY -> attached_tty=%d pgid=%d for tid=%llu\n",
+                                   tty_idx, ct->pgid, (unsigned long long)(ct->tid ? ct->tid : 1));
+                       }
+                   }
                 return 0;
             }
             if (req == TIOCSPGRP) {
-                if (!argp) return ret_err(EFAULT);
-                uint32_t p = 0;
-                if (copy_from_user_raw(&p, argp, sizeof(p)) != 0) return ret_err(EFAULT);
-                qemu_debug_printf("ioctl: TIOCSPGRP on fd=%d -> set pgrp=%u\n", fd, p);
-                /* Try to set tty-specific foreground pgrp; fall back to global user_pgrp */
-                if (devfs_tty_set_fg_pgrp(f, (int)p) != 0) {
-                    if (p != 0) user_pgrp = (uint64_t)p;
-                }
+                int pgrp;
+                if (copy_from_user_raw(&pgrp, argp, sizeof(pgrp))!=0) return ret_err(EFAULT);
+                ((struct devfs_tty*)f->driver_private)->fg_pgrp = pgrp;
+                return 0;
+            }
+            if (req == TIOCGPGRP) {
+                int pgrp = ((struct devfs_tty*)f->driver_private)->fg_pgrp;
+                if (pgrp < 0) pgrp = (int)thread_current()->tid;   /* по умолчанию */
+                if (copy_to_user_safe(argp, &pgrp, sizeof(pgrp))!=0) return ret_err(EFAULT);
                 return 0;
             }
             if (req == TCGETS) {
@@ -793,7 +817,22 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             size_t copied = 0;
             void *tmp = copy_from_user_safe(bufp, cnt, 4096, &copied);
             if (!tmp) return ret_err(EFAULT);
-
+            /* Debug: capture early libc/ld.so/stderr messages to qemu log to help diagnose exits.
+               Limit to 256 bytes per write to avoid flooding. */
+            if ((fd == 2 || fd == 1) && copied > 0) {
+                size_t probe = copied < 256 ? copied : 256;
+                /* Ensure printable: replace non-printable with '.' */
+                char *dbg = (char*)kmalloc(probe + 1);
+                if (dbg) {
+                    for (size_t i = 0; i < probe; i++) {
+                        char c = ((char*)tmp)[i];
+                        dbg[i] = (c >= 32 && c < 127) ? c : '.';
+                    }
+                    dbg[probe] = '\\0';
+                    qemu_debug_printf("USER OUT (fd=%d): %s\n", fd, dbg);
+                    kfree(dbg);
+                }
+            }
             ssize_t wr = fs_write(f, tmp, copied, f->pos);
             if (wr > 0) f->pos += (size_t)wr;
             kfree(tmp);
@@ -1072,9 +1111,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
         }
         case SYS_exit_group: {
             (void)a1;
-            kprintf("sys_exit_group: pid=%llu called exit_group(code=%llu)\n",
-                    (unsigned long long)(cur->tid ? cur->tid : 1),
-                    (unsigned long long)a1);
             thread_stop((int)cur->tid);
             syscall_exit_to_shell_flag = 1;
             return 0;
@@ -1118,5 +1154,7 @@ void syscall_init(void) {
 
     kprintf("syscall: int0x80 handler registered; SYSCALL enabled\n");
 }
+
+
 
 
