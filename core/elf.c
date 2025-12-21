@@ -14,6 +14,10 @@
 
 extern uint8_t _end[]; /* kernel end symbol from linker */
 
+/* Fixed base to load ET_DYN (PIE) style executables when full relocation/loader
+   support isn't available. */
+static const uint64_t ELF_ET_DYN_BASE = 0x00400000ULL; /* 4MiB */
+
 static inline uint64_t msr_read_u64_local(uint32_t msr) {
     uint32_t lo = 0, hi = 0;
     asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
@@ -47,7 +51,7 @@ static void *dup_page_table(void *old) {
 /* Translate virtual address to physical by walking current page_table_l4.
    Returns physical base (frame) or 0 on failure. Works only while current
    page tables are active and mapping exists. */
-static uint64_t virt_to_phys(uint64_t va) {
+uint64_t virt_to_phys(uint64_t va) {
     extern uint64_t page_table_l4[];
     uint64_t *l4 = (uint64_t*)page_table_l4;
     uint64_t l4i = (va >> 39) & 0x1FF;
@@ -177,9 +181,10 @@ static int elf_validate_header(const Elf64_Ehdr *eh, size_t len) {
     /* data encoding little endian */
     if (eh->e_ident[5] != 1) return 0;
     /* ELF type/executable */
-    if (eh->e_type != 2) {
-        /* For now we support only classic ET_EXEC binaries.
-           ET_DYN (PIE) requires relocations/loader which we don't implement yet. */
+    /* Accept both ET_EXEC and ET_DYN (PIE). ET_DYN will be loaded at a fixed
+       base address to support position-independent executables; full dynamic
+       loader/relocations are still not implemented. */
+    if (eh->e_type != 2 && eh->e_type != 3) {
         return 0;
     }
     return 1;
@@ -190,6 +195,10 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
     const Elf64_Ehdr *eh = (const Elf64_Ehdr*)buf;
     if (!elf_validate_header(eh, len)) return -1;
     if (eh->e_phoff == 0 || eh->e_phnum == 0) return -1;
+
+    /* For ET_DYN (PIE) load at a fixed base within identity-mapped region. */
+    uint64_t load_base = 0;
+    if (eh->e_type == 3) load_base = ELF_ET_DYN_BASE;
 
     /* Basic safety: do not allow loading segments that overlap kernel image */
     uintptr_t kernel_start = (uintptr_t)0x100000; /* from linker.ld */
@@ -202,8 +211,8 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
         if (ph->p_type != 1) { ph++; continue; } /* PT_LOAD */
 
         /* Check bounds */
-        uint64_t vstart = ph->p_vaddr;
-        uint64_t vend = ph->p_vaddr + ph->p_memsz;
+        uint64_t vstart = ph->p_vaddr + load_base;
+        uint64_t vend = ph->p_vaddr + load_base + ph->p_memsz;
         if (vend < vstart) return -1;
         /* Hard limit for user image virtual range.
            We currently load user binaries into the low identity-mapped region by copying to p_vaddr.
@@ -229,7 +238,7 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
 
         /* Copy file data into target vaddr (assumes identity mapping) */
         if (ph->p_offset + ph->p_filesz > len) return -1;
-        void *dst = (void*)(uintptr_t)ph->p_vaddr;
+        void *dst = (void*)(uintptr_t)(ph->p_vaddr + load_base);
         const void *src = (const char*)buf + ph->p_offset;
         /* copy filesz bytes */
         if (ph->p_filesz > 0) memcpy(dst, src, (size_t)ph->p_filesz);
@@ -297,7 +306,7 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
         ph++;
     }
 
-    if (out_entry) *out_entry = eh->e_entry;
+    if (out_entry) *out_entry = eh->e_entry + load_base;
     return 0;
 }
 
@@ -462,6 +471,21 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
                 }
             }
             fs_file_free(f);
+        }
+    }
+
+    /* If this ELF is ET_DYN (PIE) we loaded it at a fixed base; reflect that
+       in aux_phdr/aux_entry so libc startup code sees correct addresses. */
+    {
+        struct fs_file *f3 = fs_open(path);
+        if (f3) {
+            Elf64_Ehdr eh3;
+            ssize_t r3 = fs_read(f3, &eh3, sizeof(eh3), 0);
+            if (r3 == (ssize_t)sizeof(eh3) && eh3.e_type == 3) {
+                aux_phdr += ELF_ET_DYN_BASE;
+                aux_entry += ELF_ET_DYN_BASE;
+            }
+            fs_file_free(f3);
         }
     }
 
@@ -645,6 +669,22 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
             thread_unblock(tc->vfork_parent_tid);
             tc->vfork_parent_tid = -1;
         }
+    }
+
+    /* Diagnostic: dump a few bytes at the entry and physical mapping to help debug PFs */
+    if ((uintptr_t)entry < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+        uint64_t phys = virt_to_phys(entry);
+        qemu_debug_printf("execve: DEBUG entry=0x%llx virt_phys=0x%llx final_stack=0x%llx\n",
+                          (unsigned long long)entry, (unsigned long long)phys, (unsigned long long)final_stack);
+        unsigned char dbuf[32];
+        for (int i = 0; i < (int)sizeof(dbuf); i++) {
+            dbuf[i] = *((unsigned char*)(uintptr_t)(entry + i));
+        }
+        qemu_debug_printf("execve: entry_bytes:");
+        for (int i = 0; i < (int)sizeof(dbuf); i++) qemu_debug_printf("%02x", (unsigned int)dbuf[i]);
+        qemu_debug_printf("\n");
+    } else {
+        qemu_debug_printf("execve: DEBUG entry outside identity map: 0x%llx\n", (unsigned long long)entry);
     }
 
     /* Transfer to user mode (does not return) */

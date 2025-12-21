@@ -519,9 +519,140 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
     for (size_t i = 0; i < size; i++) {
         char ch = s[i];
         if (idx == devfs_active) {
-            /* write to VGA directly */
-            kputchar((uint8_t)ch, GRAY_ON_BLACK);
+            /* write to VGA directly, but respect ANSI escape sequences on the active tty */
+            struct devfs_tty *tty = t;
+            /* simple streaming ANSI CSI parser for a subset of sequences */
+            if (tty->ansi_escape_state == 0) {
+                if ((unsigned char)ch == 0x1B) {
+                    tty->ansi_escape_state = 1; /* ESC seen */
+                } else {
+                    /* normal character output using current attribute */
+                    kputchar((uint8_t)ch, tty->current_attr);
+                }
+            } else if (tty->ansi_escape_state == 1) {
+                if ((unsigned char)ch == '[') {
+                    tty->ansi_escape_state = 2; /* CSI start */
+                    tty->ansi_param_count = 0;
+                    tty->ansi_current_param = 0;
+                } else {
+                    /* unknown sequence, reset and output the ESC as literal */
+                    tty->ansi_escape_state = 0;
+                    kputchar(0x1B, tty->current_attr);
+                    kputchar((uint8_t)ch, tty->current_attr);
+                }
+            } else if (tty->ansi_escape_state == 2) {
+                /* CSI parsing: accumulate parameters until final byte */
+                if (ch >= '0' && ch <= '9') {
+                    tty->ansi_current_param = tty->ansi_current_param * 10 + (ch - '0');
+                } else if (ch == ';') {
+                    if (tty->ansi_param_count < (int)(sizeof(tty->ansi_param)/sizeof(tty->ansi_param[0]))) {
+                        tty->ansi_param[tty->ansi_param_count++] = tty->ansi_current_param;
+                    }
+                    tty->ansi_current_param = 0;
+                } else {
+                    /* final byte of CSI */
+                    if (tty->ansi_param_count < (int)(sizeof(tty->ansi_param)/sizeof(tty->ansi_param[0]))) {
+                        tty->ansi_param[tty->ansi_param_count++] = tty->ansi_current_param;
+                    }
+                    unsigned char final_byte = (unsigned char)ch;
+                    if (final_byte == 'm') {
+                        /* SGR - simple color management */
+                        if (tty->ansi_param_count == 0) {
+                            tty->current_attr = GRAY_ON_BLACK;
+                        } else {
+                            for (int pi = 0; pi < tty->ansi_param_count; pi++) {
+                                int code = tty->ansi_param[pi];
+                                if (code == 0) {
+                                    tty->current_attr = GRAY_ON_BLACK;
+                                } else if (code == 39) {
+                                    /* default foreground: keep current BG, set FG to white (7) */
+                                    int bg = (tty->current_attr & 0xF0) >> 4;
+                                    tty->current_attr = (bg << 4) | 7;
+                                } else if (code >= 30 && code <= 37) {
+                                    int fg = code - 30;
+                                    int bg = (tty->current_attr & 0xF0) >> 4;
+                                    tty->current_attr = (bg << 4) | (fg & 0x0F);
+                                } else if (code >= 40 && code <= 47) {
+                                    int bg = code - 40;
+                                    int fg = tty->current_attr & 0x0F;
+                                    tty->current_attr = (bg << 4) | (fg & 0x0F);
+                                } else {
+                                    /* ignore other codes (bold, reset etc.) for simplicity */
+                                }
+                            }
+                        }
+                    } else if (final_byte == 'H' || final_byte == 'f') {
+                        /* Cursor position: ESC [ <row> ; <col> H (1-based) */
+                        int row = 1, col = 1;
+                        if (tty->ansi_param_count >= 1) row = tty->ansi_param[0];
+                        if (tty->ansi_param_count >= 2) col = tty->ansi_param[1];
+                        if (row < 1) row = 1;
+                        if (col < 1) col = 1;
+                        if (row > MAX_ROWS) row = MAX_ROWS;
+                        if (col > MAX_COLS) col = MAX_COLS;
+                        tty->cursor_y = row - 1;
+                        tty->cursor_x = col - 1;
+                        set_cursor((tty->cursor_y * MAX_COLS + tty->cursor_x) * 2);
+                    } else if (final_byte == 'J') {
+                        int param = (tty->ansi_param_count > 0) ? tty->ansi_param[0] : 0;
+                        if (param == 2) {
+                            /* Clear entire screen */
+                            for (uint32_t ry = 0; ry < MAX_ROWS; ry++) {
+                                for (uint32_t rx = 0; rx < MAX_COLS; rx++) {
+                                    uint16_t off = (uint16_t)((ry * MAX_COLS + rx) * 2);
+                                    if (tty->screen) {
+                                        tty->screen[off] = ' ';
+                                        tty->screen[off + 1] = tty->current_attr;
+                                    }
+                                }
+                            }
+                            tty->cursor_x = 0;
+                            tty->cursor_y = 0;
+                            set_cursor(0);
+                        } else {
+                            /* default: clear from cursor to end of screen - simple no-op for now */
+                        }
+                    } else if (final_byte == 'K') {
+                        int param = (tty->ansi_param_count > 0) ? tty->ansi_param[0] : 0;
+                        if (param == 2) {
+                            /* Clear current line */
+                            for (int rx = 0; rx < MAX_COLS; rx++) {
+                                uint16_t off = (uint16_t)((tty->cursor_y * MAX_COLS + rx) * 2);
+                                if (tty->screen) {
+                                    tty->screen[off] = ' ';
+                                    tty->screen[off + 1] = tty->current_attr;
+                                }
+                            }
+                        }
+                    }
+                    /* reset CSI parser state after handling final byte */
+                    tty->ansi_escape_state = 0;
+                    tty->ansi_param_count = 0;
+                    tty->ansi_current_param = 0;
+                }
+            }
         } else {
+            /* non-active tty: write directly to its saved screen with its current attributes */
+            struct devfs_tty *tty = t;
+            /* similar handling but on the non-active tty's buffer */
+            if (tty->ansi_escape_state != 0) {
+                /* For simplicity, ignore escape sequences on non-active ttys to avoid desync. */
+                tty->ansi_escape_state = 0;
+                tty->ansi_param_count = 0;
+                tty->ansi_current_param = 0;
+            }
+            if (tty->screen) {
+                uint32_t x = tty->cursor_x;
+                uint32_t y = tty->cursor_y;
+                uint16_t off = (uint16_t)((y * MAX_COLS + x) * 2);
+                if (off + 1 < (MAX_ROWS * MAX_COLS * 2)) {
+                    tty->screen[off] = (uint8_t)ch;
+                    tty->screen[off + 1] = tty->current_attr;
+                    tty->cursor_x++;
+                    if (tty->cursor_x >= MAX_COLS) { tty->cursor_x = 0; tty->cursor_y++; if (tty->cursor_y >= MAX_ROWS) tty->cursor_y = MAX_ROWS - 1; }
+                }
+            }
+        }
             /* write into saved screen buffer */
             if (t->screen) {
                 /* very naive: append at bottom-right with no wrapping */
@@ -567,9 +698,8 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                 release_irqrestore(&rb->lock, flags);
             }
         }
+        return (ssize_t)size;
     }
-    return (ssize_t)size;
-}
 
 static void devfs_release(struct fs_file *file) {
     if (!file) return;
@@ -602,6 +732,12 @@ int devfs_register(void) {
         if (dev_ttys[i].screen) {
             for (uint32_t j=0;j<MAX_ROWS*MAX_COLS*2;j+=2) { dev_ttys[i].screen[j] = ' '; dev_ttys[i].screen[j+1] = GRAY_ON_BLACK; }
         }
+        /* initialize ANSI/escape parsing state and current attribute */
+        dev_ttys[i].current_attr = GRAY_ON_BLACK;
+        dev_ttys[i].ansi_escape_state = 0;
+        dev_ttys[i].ansi_param_count = 0;
+        dev_ttys[i].ansi_current_param = 0;
+        dev_ttys[i].controlling_sid = -1;
     }
     /* init stdio ring buffers */
     for (int si = 0; si < 2; si++) {
@@ -756,6 +892,28 @@ int devfs_tty_set_fg_pgrp(struct fs_file *file, int pgrp) {
     return 0;
 }
 
+/* Get/set controlling session id via file handle helpers */
+int devfs_get_tty_controlling_sid(struct fs_file *file) {
+    if (!file || !file->driver_private) return -1;
+    uintptr_t p = (uintptr_t)file->driver_private;
+    uintptr_t base = (uintptr_t)&dev_ttys[0];
+    uintptr_t end = (uintptr_t)&dev_ttys[DEVFS_TTY_COUNT];
+    if (!(p >= base && p < end)) return -1;
+    struct devfs_tty *t = (struct devfs_tty*)p;
+    return t->controlling_sid;
+}
+
+int devfs_set_tty_controlling_sid(struct fs_file *file, int sid) {
+    if (!file || !file->driver_private) return -1;
+    uintptr_t p = (uintptr_t)file->driver_private;
+    uintptr_t base = (uintptr_t)&dev_ttys[0];
+    uintptr_t end = (uintptr_t)&dev_ttys[DEVFS_TTY_COUNT];
+    if (!(p >= base && p < end)) return -1;
+    struct devfs_tty *t = (struct devfs_tty*)p;
+    t->controlling_sid = sid;
+    return 0;
+}
+
 int devfs_tty_get_index_from_file(struct fs_file *file) {
     if (!file || !file->driver_private) return -1;
     uintptr_t p = (uintptr_t)file->driver_private;
@@ -838,6 +996,13 @@ int devfs_get_tty_fg_pgrp(int tty) {
 void devfs_set_tty_fg_pgrp(int tty, int pgrp) {
     if (tty < 0 || tty >= DEVFS_TTY_COUNT) return;
     dev_ttys[tty].fg_pgrp = pgrp;
+}
+
+/* Clear controlling_sid for any ttys owned by given session id */
+void devfs_clear_controlling_by_sid(int sid) {
+    for (int i = 0; i < DEVFS_TTY_COUNT; i++) {
+        if (dev_ttys[i].controlling_sid == sid) dev_ttys[i].controlling_sid = -1;
+    }
 }
 
 /* Create a block device node and register mapping */

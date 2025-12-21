@@ -78,6 +78,9 @@ int thread_get_state(int pid);
 int thread_get_count();
 void thread_sleep(uint32_t ms);
 
+// access thread by index (0..thread_get_count()-1)
+thread_t* thread_get_by_index(int idx);
+
 // register user thread (process) for display in list
 thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char* name);
 

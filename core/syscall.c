@@ -6,23 +6,29 @@
 #include <fs.h>
 #include <mmio.h>
 #include <heap.h>
-#include <devfs.h>
 #include <syscall.h>
 #include <gdt.h>
 #include <paging.h>
 #include <exec.h>
 #include <pit.h>
 #include <ext2.h>
+#include <devfs.h>
+#include <rtc.h>
 
 extern void kprintf(const char *fmt, ...);
+
+/* Helper exported from core/elf.c */
+extern uint64_t virt_to_phys(uint64_t va);
 
 /* Saved user RSP for syscall_entry64 (single-core, single-syscall-in-flight). */
 uint64_t syscall_user_rsp_saved = 0;
 /* Set to non-zero when user called exit/exit_group; handled in syscall_entry64. */
 uint64_t syscall_exit_to_shell_flag = 0;
-/* Flag set by kernel when it applies an exec-trampoline so syscall return
-   path should not overwrite the patched saved-rax slot. */
+/* When non-zero, assembly entry will skip overwriting saved rax slot so trampoline-patched
+   values remain in the syscall stack. apply_exec_trampoline sets this before returning. */
 uint64_t syscall_exec_trampoline_active = 0;
+/* per-thread saved values copied from syscall_entry64 globals at syscall start */
+
 
 
 extern void ring0_shell(void);
@@ -35,6 +41,8 @@ __attribute__((noreturn)) void syscall_return_to_shell(void) {
 }
 
 extern void syscall_entry64(void);
+/* helper entry for kernel-created user threads (defined in cpu/thread.c) */
+extern void user_thread_entry(void);
 
 static inline uint64_t msr_read_u64(uint32_t msr) {
     uint32_t lo = 0, hi = 0;
@@ -45,6 +53,64 @@ static inline void msr_write_u64(uint32_t msr, uint64_t v) {
     uint32_t lo = (uint32_t)(v & 0xFFFFFFFFu);
     uint32_t hi = (uint32_t)(v >> 32);
     asm volatile("wrmsr" :: "c"(msr), "a"(lo), "d"(hi));
+}
+
+/* Debug helper: dump kernel syscall stack region around syscall_kernel_rsp0 */
+static void debug_dump_kernel_syscall_stack(void) {
+    extern uint64_t syscall_kernel_rsp0;
+    uint64_t base = (uint64_t)syscall_kernel_rsp0;
+    if (base == 0) {
+        qemu_debug_printf("DBG: no syscall_kernel_rsp0\n");
+        return;
+    }
+    if (base >= (uint64_t)MMIO_IDENTITY_LIMIT) {
+        qemu_debug_printf("DBG: syscall_kernel_rsp0 out of identity map: %p\n", (void*)(uintptr_t)base);
+        return;
+    }
+    qemu_debug_printf("DBG: dump kernel syscall stack at %p:\n", (void*)(uintptr_t)base);
+    /* print 16 qwords starting at base (be conservative) */
+    for (int i = 0; i < 16; i++) {
+        uint64_t *p = (uint64_t*)(uintptr_t)(base + (i * 8));
+        if ((uintptr_t)p + 8 <= (uintptr_t)MMIO_IDENTITY_LIMIT) {
+            uint64_t v = *p;
+            qemu_debug_printf("  [%02d] %p: 0x%016llx\n", i, (void*)p, (unsigned long long)v);
+        } else {
+            qemu_debug_printf("  [%02d] %p: (out of range)\n", i, (void*)p);
+        }
+    }
+}
+
+/* Apply per-thread exec trampoline by patching kernel syscall stack saved return RIP
+   and adjusting saved user RSP. Returns 0 on success, -1 on failure. */
+static int apply_exec_trampoline(thread_t *t) {
+    if (!t || !t->exec_trampoline_flag) return -1;
+    extern uint64_t syscall_kernel_rsp0;
+    if ((uintptr_t)syscall_kernel_rsp0 == 0) return -1;
+    uintptr_t base = (uintptr_t)syscall_kernel_rsp0;
+    uintptr_t rcx_slot = base + 104; /* saved rcx (user RIP) */
+    uintptr_t rax_slot = base + 112; /* saved rax slot */
+    /* safety: ensure writing within identity map */
+    if (rcx_slot + 8 > (uintptr_t)MMIO_IDENTITY_LIMIT) return -1;
+    if (rax_slot + 8 > (uintptr_t)MMIO_IDENTITY_LIMIT) return -1;
+    /* Write the desired return RIP into saved rcx slot so iret will use it */
+    *(uint64_t*)(uintptr_t)rcx_slot = (uint64_t)t->exec_trampoline_rip;
+    /* Set global saved user rsp so assembly builds IRET frame with this RSP */
+    syscall_user_rsp_saved = t->exec_trampoline_rsp;
+    /* Also set saved rax so final popped rax becomes our chosen value */
+    *(uint64_t*)(uintptr_t)rax_slot = (uint64_t)t->exec_trampoline_rax;
+    /* Debug: verify write */
+    qemu_debug_printf("apply_exec_trampoline: base=%p rcx_slot=%p wrote_rip=0x%llx rax_slot=%p wrote_rax=0x%llx saved_rsp=%p\n",
+                      (void*)(uintptr_t)base, (void*)(uintptr_t)rcx_slot,
+                      (unsigned long long)(uint64_t)t->exec_trampoline_rip,
+                      (void*)(uintptr_t)rax_slot, (unsigned long long)(uint64_t)t->exec_trampoline_rax,
+                      (void*)(uintptr_t)syscall_user_rsp_saved);
+    /* memory barrier */
+    asm volatile("mfence" ::: "memory");
+    /* clear flag (we consumed it) */
+    t->exec_trampoline_flag = 0;
+    /* notify assembly entry to preserve patched slots */
+    syscall_exec_trampoline_active = 1;
+    return 0;
 }
 
 enum {
@@ -83,6 +149,8 @@ static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, siz
 #define ENOMEM  12
 #define ERANGE  34
 #define EMFILE  24
+/* no child processes */
+#define ECHILD  10
 /* filename too long */
 #define ENAMETOOLONG 36
 static uint64_t last_syscall_debug = 0;
@@ -91,7 +159,7 @@ static inline uint64_t ret_err(int e) {
     thread_t *t = thread_get_current_user();
     if (!t) t = thread_current();
     if (e == ENOSYS && t && (t->tid == 3)) {
-        kprintf("ret_err: ENOSYS returned for pid=%llu syscall=%llu\n",
+        qemu_debug_printf("ret_err: ENOSYS returned for pid=%u syscall=%u\n",
                 (unsigned long long)(t->tid ? t->tid : 1),
                 (unsigned long long)last_syscall_debug);
     }
@@ -133,7 +201,8 @@ static int copy_from_user_raw(void *kdst, const void *usrc, size_t n) {
     return 0;
 }
 
-/* Note: per-thread pgid/sid are stored in thread_t (set in thread creation/registration). */
+/* Minimal tty state for job control-ish ioctls (single session). */
+static uint64_t user_pgrp = 1;
 
 /* Minimal signal emulation (we do not actually deliver signals yet).
    We only keep per-signal "handlers" so libc/busybox doesn't abort early. */
@@ -164,18 +233,191 @@ static int mark_user_identity_range_2m_sys(uint64_t va_begin, uint64_t va_end) {
         uint64_t *l4 = (uint64_t*)page_table_l4;
         if (!(l4[l4i] & PG_PRESENT)) return -1;
         l4[l4i] |= PG_US;
+        l4[l4i] &= ~PG_NX;
         uint64_t *l3 = (uint64_t*)(uintptr_t)(l4[l4i] & ~0xFFFULL);
         if (!(l3[l3i] & PG_PRESENT)) return -1;
         l3[l3i] |= PG_US;
+        l3[l3i] &= ~PG_NX;
         uint64_t l3e = l3[l3i];
         if (l3e & PG_PS_2M) { invlpg((void*)(uintptr_t)va); continue; }
         uint64_t *l2 = (uint64_t*)(uintptr_t)(l3e & ~0xFFFULL);
         if (!(l2[l2i] & PG_PRESENT)) return -1;
         l2[l2i] |= PG_US;
+        l2[l2i] &= ~PG_NX;
+        uint64_t l2e = l2[l2i];
+        if (l2e & PG_PS_2M) {
+            invlpg((void*)(uintptr_t)va);
+            continue;
+        }
+        uint64_t *l1 = (uint64_t*)(uintptr_t)(l2e & ~0xFFFULL);
+        /* set US and clear NX on L1 entry covering this 4KiB range */
+        l1[(va >> 12) & 0x1FF] |= PG_US;
+        l1[(va >> 12) & 0x1FF] &= ~PG_NX;
         invlpg((void*)(uintptr_t)va);
     }
     return 0;
 }
+
+/* Attempt to find a valid user return RIP from the kernel syscall stack.
+   Scans up to `max_qwords` qwords starting at kernel_rsp (virtual pointer)
+   and returns first candidate `v` such that:
+     - v is within plausible user range
+     - virt_to_phys(v) != 0
+     - mark_user_identity_range_2m_sys() succeeds for the 2MiB region covering v
+   On success writes candidate into *out and returns 0. Otherwise returns -1.
+*/
+static int find_valid_saved_ret(uint64_t kernel_rsp, uint64_t *out, int max_qwords) {
+    if (!out) return -1;
+    if (kernel_rsp == 0) return -1;
+    for (int i = 0; i < max_qwords; i++) {
+        uintptr_t addr = (uintptr_t)(kernel_rsp + (i * 8));
+        if (addr + 8 > (uintptr_t)MMIO_IDENTITY_LIMIT) break;
+        uint64_t v = *(uint64_t*)(uintptr_t)addr;
+        if (v < 0x100000 || v >= (uint64_t)MMIO_IDENTITY_LIMIT) continue;
+        if (v == 0xdeadbeefcafebabeULL || v == 0xcafebabedeadbeefULL) continue;
+        /* must be backed by a physical frame */
+        if (virt_to_phys(v) == 0) continue;
+        /* try to mark the containing 2MiB range user-accessible */
+        uintptr_t begin = (uintptr_t)v & ~((uintptr_t)PAGE_SIZE_2M - 1);
+        uintptr_t end = begin + (uintptr_t)PAGE_SIZE_2M;
+        if (mark_user_identity_range_2m_sys((uint64_t)begin, (uint64_t)end) == 0) {
+            *out = v;
+            qemu_debug_printf("find_valid_saved_ret: picked 0x%llx from stack[%d]=%p\n", (unsigned long long)v, i, (void*)addr);
+            /* dump virt->phys and first bytes for debugging */
+            uint64_t p = virt_to_phys(v);
+            qemu_debug_printf("find_valid_saved_ret: virt_phys=0x%llx\n", (unsigned long long)p);
+            if ((uintptr_t)v + 32 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                unsigned char b[32];
+                for (int j = 0; j < 32; j++) b[j] = *((unsigned char*)(uintptr_t)(v + j));
+                qemu_debug_printf("find_valid_saved_ret: bytes:");
+                for (int j = 0; j < 32; j++) qemu_debug_printf("%02x", (unsigned int)b[j]);
+                qemu_debug_printf("\n");
+            }
+            /* Dump page table entries for VA to inspect flags */
+            {
+                extern uint64_t page_table_l4[];
+                uint64_t *l4 = (uint64_t*)page_table_l4;
+                int l4i = (v >> 39) & 0x1FF;
+                int l3i = (v >> 30) & 0x1FF;
+                int l2i = (v >> 21) & 0x1FF;
+                int l1i = (v >> 12) & 0x1FF;
+                qemu_debug_printf("ptes: l4[%d]=0x%016llx\n", l4i, (unsigned long long)l4[l4i]);
+                if (l4[l4i] & PG_PRESENT) {
+                    uint64_t *l3 = (uint64_t*)(uintptr_t)(l4[l4i] & ~0xFFFULL);
+                    qemu_debug_printf("ptes: l3[%d]=0x%016llx\n", l3i, (unsigned long long)l3[l3i]);
+                    if (l3[l3i] & PG_PRESENT) {
+                        uint64_t l3e = l3[l3i];
+                        if (l3e & PG_PS_2M) {
+                            qemu_debug_printf("ptes: 1GiB/2MiB large at L3\n");
+                        } else {
+                            uint64_t *l2 = (uint64_t*)(uintptr_t)(l3e & ~0xFFFULL);
+                            qemu_debug_printf("ptes: l2[%d]=0x%016llx\n", l2i, (unsigned long long)l2[l2i]);
+                            if (l2[l2i] & PG_PRESENT) {
+                                uint64_t l2e = l2[l2i];
+                                if (l2e & PG_PS_2M) {
+                                    qemu_debug_printf("ptes: 2MiB large at L2\n");
+                                } else {
+                                    uint64_t *l1 = (uint64_t*)(uintptr_t)(l2e & ~0xFFFULL);
+                                    qemu_debug_printf("ptes: l1[%d]=0x%016llx\n", l1i, (unsigned long long)l1[l1i]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static inline int is_leap_year(int y) {
+    return (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+}
+
+/* Convert rtc_datetime_t (year full e.g. 2025) to unix epoch seconds (UTC assumed). */
+static uint64_t rtc_datetime_to_epoch(const rtc_datetime_t *dt) {
+    if (!dt) return 0;
+    int year = (int)dt->year;
+    int month = (int)dt->month;
+    int day = (int)dt->day;
+    int hour = (int)dt->hour;
+    int minute = (int)dt->minute;
+    int second = (int)dt->second;
+    /* Normalize month/year for algorithm: treat March as month 1 */
+    if (month <= 2) {
+        year -= 1;
+        month += 12;
+    }
+    /* Days since epoch (1970-01-01) using proleptic Gregorian calendar */
+    int64_t y = year;
+    int64_t m = month;
+    int64_t days = 365 * (y - 1970) + (y - 1969) / 4 - (y - 1901) / 100 + (y - 1601) / 400;
+    /* month days cumulative for months starting at March=3 .. Feb=14 in this scheme */
+    static const int mdays[] = {
+        0,31,61,92,122,153,184,214,245,275,306,337, /* not used fully */
+    };
+    /* Simpler add days from months */
+    static const int month_days_norm[] = { 0,31,28,31,30,31,30,31,31,30,31,30,31 };
+    for (int mo = 1; mo < month; mo++) {
+        days += month_days_norm[mo];
+        if (mo == 2 && is_leap_year(year + (month <= 2 ? 1 : 0))) days += 1;
+    }
+    days += (day - 1);
+    uint64_t secs = (uint64_t)days * 86400ULL + (uint64_t)hour * 3600ULL + (uint64_t)minute * 60ULL + (uint64_t)second;
+    return secs;
+}
+
+/* Minimal signal numbers we use here */
+#ifndef SIGHUP
+#define SIGHUP 1
+#endif
+#ifndef SIGCONT
+#define SIGCONT 18
+#endif
+
+/* Send simple signals to all threads in given pgrp.
+   SIGHUP -> mark terminated (default action).
+   SIGCONT -> move sleeping/blocked to ready.
+*/
+static void send_signal_to_pgrp(int pgrp, int signum) {
+    int cnt = thread_get_count();
+    for (int i = 0; i < cnt; i++) {
+        thread_t *t = thread_get_by_index(i);
+        if (!t) continue;
+        if (t->pgid != pgrp) continue;
+        if (signum == SIGHUP) {
+            if (t->state != THREAD_TERMINATED) {
+                t->exit_status = (0 & 0xFF) << 8;
+                t->state = THREAD_TERMINATED;
+                if (t->waiter_tid >= 0) thread_unblock(t->waiter_tid);
+            }
+        } else if (signum == SIGCONT) {
+            if (t->state == THREAD_SLEEPING || t->state == THREAD_BLOCKED) {
+                t->state = THREAD_READY;
+            }
+        }
+    }
+}
+
+/* Send SIGHUP to all members of a session (except leader) */
+static void send_hup_to_session(int sid) {
+    int cnt = thread_get_count();
+    for (int i = 0; i < cnt; i++) {
+        thread_t *t = thread_get_by_index(i);
+        if (!t) continue;
+        if (t->sid != sid) continue;
+        if ((int)t->tid == sid) continue; /* skip leader */
+        if (t->state != THREAD_TERMINATED) {
+            t->exit_status = (0 & 0xFF) << 8;
+            t->state = THREAD_TERMINATED;
+            if (t->waiter_tid >= 0) thread_unblock(t->waiter_tid);
+        }
+    }
+    /* Also clear controlling_sid on dev ttys owned by this session */
+    devfs_clear_controlling_by_sid(sid);
+}
+
 
 /* Common syscall dispatcher used by both int0x80 and SYSCALL.
    Calling convention follows Linux x86_64: num + up to 6 args. */  
@@ -183,6 +425,15 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
     thread_t *cur = thread_get_current_user();
     if (!cur) cur = thread_current();
     if (!cur) return ret_err(EPERM);
+    /* copy syscall entry saved RIP/RSP into per-thread slots to avoid races */
+    cur->saved_user_rip = syscall_user_return_rip;
+    cur->saved_user_rsp = syscall_user_rsp_saved;
+
+    /* If return RIP wasn't recorded by entry path, dump kernel syscall stack for diagnosis */
+    if (syscall_user_return_rip == 0) {
+        qemu_debug_printf("DBG: syscall_do: syscall_user_return_rip == 0; dumping kernel syscall stack\n");
+        debug_dump_kernel_syscall_stack();
+    }
 
     /* record last syscall for debug logging of ENOSYS */
     last_syscall_debug = num;
@@ -198,14 +449,185 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             return (uint64_t)(cur->tid ? cur->tid : 1);
         }
+        case SYS_vfork: {
+            /* Minimal vfork semantics:
+               - create child thread that shares parent's address space and fds
+               - parent is blocked until child calls execve or exit
+               - parent returns child's pid, child returns 0
+             */
+            thread_t *p = cur;
+            if (!p) return ret_err(EINVAL);
+            /* Read saved return RIP and user RSP saved by syscall_entry64.
+               The assembly syscall entry writes the saved return RIP into
+               global `syscall_saved_ret_rip` for reliable access from C. */
+            /* prefer recorded user return RIP (works for both int0x80 and SYSCALL paths) */
+            uint64_t saved_rcx = p->saved_user_rip;
+            /* If saved return RIP wasn't recorded, attempt to find a valid candidate
+               on the kernel syscall stack using stricter validation. */
+            if (saved_rcx == 0) {
+                extern uint64_t syscall_kernel_rsp0;
+                if ((uintptr_t)syscall_kernel_rsp0 != 0) {
+                    uint64_t candidate = 0;
+                    if (find_valid_saved_ret(syscall_kernel_rsp0, &candidate, 64) == 0) {
+                        saved_rcx = candidate;
+                    } else {
+                        qemu_debug_printf("DBG: vfork: no valid saved_ret found on kernel stack\n");
+                    }
+                }
+            }
+            uint64_t saved_rsp = p->saved_user_rsp;
+
+            qemu_debug_printf("vfork: pid=%llu saved_ret=0x%llx saved_rsp=0x%llx\n",
+                    (unsigned long long)(p->tid ? p->tid : 1),
+                    (unsigned long long)saved_rcx, (unsigned long long)saved_rsp);
+            /* If we still don't have a valid saved_rcx at this point, fail early. */
+            if (saved_rcx == 0) {
+                qemu_debug_printf("vfork: refused - no valid saved return RIP\n");
+                return ret_err(EINVAL);
+            }
+            /* Try to ensure the user pages around saved_rcx are user-accessible to avoid PF
+               when the child enters user mode. This sets PG_US on the containing 2MiB region. */
+            if (saved_rcx != 0) {
+                uintptr_t begin = (uintptr_t)saved_rcx & ~((uintptr_t)PAGE_SIZE_2M - 1);
+                uintptr_t end = begin + (uintptr_t)PAGE_SIZE_2M;
+                if (mark_user_identity_range_2m_sys((uint64_t)begin, (uint64_t)end) == 0) {
+                    qemu_debug_printf("vfork: marked user range [%p - %p] as user-accessible\n", (void*)begin, (void*)end);
+                } else {
+                    qemu_debug_printf("vfork: failed to mark user range [%p - %p]\n", (void*)begin, (void*)end);
+                    /* If we cannot make the candidate return site user-accessible, refuse vfork
+                       rather than heuristically using an unmapped/privileged address which
+                       leads to immediate #PF err=0x5 when the child enters user mode. */
+                    kprintf("vfork: aborting due to unmapped/privileged saved return site\n");
+                    return ret_err(EINVAL);
+                }
+                /* Also try to broadly ensure common user ranges are user-accessible (helps when writes hit elsewhere). */
+                if (mark_user_identity_range_2m_sys(0x200000, (uint64_t)USER_STACK_TOP) == 0) {
+                    qemu_debug_printf("vfork: ensured broad user range [0x200000 - %p]\n", (void*)(uintptr_t)USER_STACK_TOP);
+                } else {
+                    qemu_debug_printf("vfork: could not ensure broad user range [0x200000 - %p]\n", (void*)(uintptr_t)USER_STACK_TOP);
+                }
+            }
+            kprintf("DBG: vfork: syscall_user_return_rip=0x%llx syscall_user_rsp_saved=0x%llx (saved_rcx=0x%llx saved_rsp=0x%llx)\n",
+                    (unsigned long long)syscall_user_return_rip, (unsigned long long)syscall_user_rsp_saved,
+                    (unsigned long long)saved_rcx, (unsigned long long)saved_rsp);
+            /* Implement vfork by creating a child thread that will run at saved_rcx/saved_rsp,
+               block the parent until the child either calls execve or _exit. */
+            if (saved_rcx == 0) {
+                /* cannot create child if we don't have return site */
+                return ret_err(EINVAL);
+            }
+            /* create child kernel thread that will enter user mode at user_thread_entry */
+            thread_t *child = thread_create(user_thread_entry, "vfork-child");
+            if (!child) return ret_err(ENOMEM);
+            /* initialize child's user context and inherit parent's FDs/credentials */
+            /* Create a small user-mode trampoline that zeroes RAX and jumps to saved_rcx.
+               This avoids executing user code directly in an unknown register/stack snapshot. */
+            {
+                uintptr_t tramp = (uintptr_t)USER_VFORK_TRAMP;
+                /* ensure tramp region is user-accessible */
+                mark_user_identity_range_2m_sys((uint64_t)(tramp & ~((uintptr_t)(PAGE_SIZE_2M - 1))),
+                                               (uint64_t)((tramp & ~((uintptr_t)(PAGE_SIZE_2M - 1))) + PAGE_SIZE_2M));
+                if ((uintptr_t)tramp + 64 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                    /* Build a minimal safe trampoline:
+                       - Set RAX=0 (child return value)
+                       - Set RSP to saved stack (so user code has correct stack)
+                       - Jump to saved_rcx (parent's return address)
+                       This is simpler and safer than trying to restore all registers. */
+                    unsigned char stub[64];
+                    int off = 0;
+                    /* xor rax, rax -> return value 0 in child */
+                    stub[off++] = 0x48; stub[off++] = 0x31; stub[off++] = 0xC0;
+                    /* movabs rsp, saved_rsp -> 48 BC imm64 */
+                    uint64_t imm_rsp = (uint64_t)saved_rsp;
+                    stub[off++] = 0x48; stub[off++] = 0xBC; memcpy(&stub[off], &imm_rsp, 8); off += 8;
+                    /* movabs r11, saved_rcx -> 49 BB imm64 */
+                    uint64_t imm_r11 = (uint64_t)saved_rcx;
+                    stub[off++] = 0x49; stub[off++] = 0xBB; memcpy(&stub[off], &imm_r11, 8); off += 8;
+                    /* jmp r11 -> 41 FF E3 */
+                    stub[off++] = 0x41; stub[off++] = 0xFF; stub[off++] = 0xE3;
+                    /* pad with NOPs */
+                    for (int z = off; z < (int)sizeof(stub); z++) stub[z] = 0x90;
+                    memcpy((void*)(uintptr_t)tramp, stub, off);
+                    /* Read back bytes to verify write succeeded */
+                    unsigned char verify[16];
+                    memcpy(verify, (void*)(uintptr_t)tramp, sizeof(verify));
+                    qemu_debug_printf("vfork: wrote trampoline at %p bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                                      (void*)(uintptr_t)tramp,
+                                      verify[0], verify[1], verify[2], verify[3],
+                                      verify[4], verify[5], verify[6], verify[7],
+                                      verify[8], verify[9], verify[10], verify[11],
+                                      verify[12], verify[13], verify[14], verify[15]);
+                    child->user_rip = (uint64_t)tramp;
+                } else {
+                    /* fallback: use saved_rcx if tramp can't be used */
+                    child->user_rip = saved_rcx;
+                }
+                child->user_stack = saved_rsp;
+                qemu_debug_printf("vfork: child->user_rip=0x%llx child->user_stack=0x%llx (saved_rcx=0x%llx)\n",
+                                  (unsigned long long)child->user_rip,
+                                  (unsigned long long)child->user_stack,
+                                  (unsigned long long)saved_rcx);
+                child->ring = 3;
+            }
+            /* inherit FS base (TLS) so child can access TLS before exec */
+            child->user_fs_base = p->user_fs_base;
+            child->parent_tid = (int)(p->tid ? p->tid : 1);
+            child->sid = p->sid;
+            child->pgid = p->pgid;
+            child->euid = p->euid; child->egid = p->egid;
+            child->attached_tty = p->attached_tty;
+            /* duplicate file descriptors (increase refcounts) */
+            for (int i = 0; i < THREAD_MAX_FD; i++) {
+                child->fds[i] = p->fds[i];
+                if (child->fds[i]) {
+                    if (child->fds[i]->refcount <= 0) child->fds[i]->refcount = 1;
+                    else child->fds[i]->refcount++;
+                }
+            }
+            /* mark child as vfork child: set vfork_parent_tid so child will wake parent on exec/exit */
+            child->vfork_parent_tid = (int)(p->tid ? p->tid : 1);
+            /* prepare exec trampoline so syscall return will send child into trampoline */
+            child->exec_trampoline_flag = 1;
+            child->exec_trampoline_rip = (uint64_t)USER_VFORK_TRAMP;
+            child->exec_trampoline_rsp = saved_rsp;
+            child->exec_trampoline_rax = 0;
+            if (apply_exec_trampoline(child) != 0) {
+                qemu_debug_printf("vfork: apply_exec_trampoline failed\n");
+            }
+            /* block parent until child unblocks it */
+            p->state = THREAD_BLOCKED;
+            /* schedule to let child run immediately */
+            thread_schedule();
+            /* when parent is unblocked and resumes here, return child's pid to parent */
+            return (uint64_t)(child->tid ? child->tid : 1);
+        }
         case SYS_set_robust_list:
             /* set_robust_list(head, len): accept (no robust futex handling yet) */
             (void)a1; (void)a2;
             return 0;
         case SYS_rseq:
-            /* rseq is optional optimization. Tell libc it's not available. */
-            (void)a1; (void)a2; (void)a3; (void)a4;
-            return ret_err(ENOSYS);
+            /* Minimal rseq registration:
+               int rseq(struct rseq *rseq, uint32_t rseq_len, int flags, uint32_t sig)
+               We accept a non-NULL pointer and length (basic validation) and store it
+               per-thread so userspace can use rseq registration checks. This is not a
+               full rseq implementation but enough for libc compatibility. */
+            {
+                const void *rseq_ptr = (const void*)(uintptr_t)a1;
+                uint32_t rseq_len = (uint32_t)a2;
+                int flags = (int)a3;
+                (void)flags;
+                thread_t *tcur = thread_get_current_user();
+                if (!tcur) tcur = thread_current();
+                if (rseq_ptr == NULL) {
+                    /* unregister */
+                    if (tcur) tcur->rseq_ptr = NULL;
+                    return 0;
+                }
+                if ((uintptr_t)rseq_ptr + (uintptr_t)rseq_len > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+                if (rseq_len < 16 || rseq_len > 4096) return ret_err(EINVAL);
+                if (tcur) tcur->rseq_ptr = (void*)rseq_ptr;
+                return 0;
+            }
         case SYS_prlimit64: {
             /* prlimit64(pid, resource, new_limit, old_limit)
                Minimal: return conservative limits for current process only (pid==0 or self).
@@ -295,6 +717,19 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             ((int64_t*)tp)[1] = nsec;
             return 0;
         }
+        case 201: { /* time(time_t *tloc) */
+            void *tloc = (void*)(uintptr_t)a1;
+            /* If pointer is provided, store seconds since epoch there (time_t is 64-bit) */
+            rtc_datetime_t dt;
+            rtc_read_datetime(&dt);
+            uint64_t secs = rtc_datetime_to_epoch(&dt);
+            if (tloc) {
+                if ((uintptr_t)tloc + sizeof(int64_t) > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+                int64_t sval = (int64_t)secs;
+                if (copy_to_user_safe(tloc, &sval, sizeof(sval)) != 0) return ret_err(EFAULT);
+            }
+            return (uint64_t)secs;
+        }
         case SYS_uname: {
             void *up = (void*)(uintptr_t)a1;
             if (!up) return ret_err(EFAULT);
@@ -360,36 +795,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             size_t bytes = (size_t)iovcnt * sizeof(iov[0]);
             if (copy_from_user_raw(iov, iov_u, bytes) != 0) return ret_err(EFAULT);
 
-            /* Debug: capture early libc/ld.so/stderr messages to qemu log to help diagnose exits.
-               Limit to 256 bytes per writev to avoid flooding. */
-            if ((fd == 2 || fd == 1)) {
-                size_t probe_total = 0;
-                size_t probe_cap = 4096;
-                char *dbg = (char*)kmalloc(probe_cap + 1);
-                if (dbg) {
-                    for (int ii = 0; ii < iovcnt && probe_total < probe_cap; ii++) {
-                        size_t need = (size_t)iov[ii].len;
-                        size_t to_copy = (probe_cap - probe_total) < need ? (probe_cap - probe_total) : need;
-                        if (to_copy > 0) {
-                            if ((uintptr_t)iov[ii].base + to_copy <= (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                                memcpy(dbg + probe_total, (const void*)(uintptr_t)iov[ii].base, to_copy);
-                                probe_total += to_copy;
-                            }
-                        }
-                    }
-                    if (probe_total > 0) {
-                        size_t probe = probe_total < probe_cap ? probe_total : probe_cap;
-                        for (size_t i = 0; i < probe; i++) {
-                            char c = dbg[i];
-                            dbg[i] = (c >= 32 && c < 127) ? c : '.';
-                        }
-                        dbg[probe] = '\\0';
-                        qemu_debug_printf("USER OUT (fd=%d via writev): %s\n", fd, dbg);
-                    }
-                    kfree(dbg);
-                }
-            }
-
             uint64_t total = 0;
             for (int i = 0; i < iovcnt; i++) {
                 const void *base = (const void*)(uintptr_t)iov[i].base;
@@ -427,12 +832,17 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
         case SYS_getegid:
             return (uint64_t)cur->egid;
         case SYS_setsid:
-            /* create new session: set session id and make current process group equal to pid */
-            cur->sid = (int)(cur->tid ? cur->tid : 1);
-            cur->pgid = (int)(cur->tid ? cur->tid : 1);
-            return (uint64_t)cur->sid;
+            if (cur) {
+                cur->sid = (int)(cur->tid ? cur->tid : 1);
+                cur->pgid = (int)(cur->tid ? cur->tid : 1);
+                user_pgrp = (uint64_t)cur->pgid;
+            }
+            return user_pgrp;
         case SYS_getpgrp:
-            return (uint64_t)cur->pgid;
+            if (cur) {
+                if (cur->pgid != 0) return (uint64_t)cur->pgid;
+            }
+            return user_pgrp;
         case SYS_setpgid:
             /* Minimal setpgid implementation:
                If pid==0 use current tid; if pgid==0 use pid.
@@ -443,13 +853,40 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 uint64_t self = (uint64_t)(cur->tid ? cur->tid : 1);
                 if (pid == 0) pid = (int)self;
                 if (pgid == 0) pgid = pid;
+                /* Allow setting pgid for current process or a child process.
+                   If pid refers to another thread, verify it's a child of current (simple permission). */
                 if ((uint64_t)pid != self) {
-                    /* we only support changing current process group's pgid for now */
-                    kprintf("sys_setpgid: pid=%d pgid=%d -> ESRCH (only current pid supported)\n", pid, pgid);
-                    return ret_err(ESRCH);
+                    thread_t *t = thread_get(pid);
+                    if (!t) {
+                        kprintf("sys_setpgid: pid=%d pgid=%d -> ESRCH (not found)\n", pid, pgid);
+                        return ret_err(ESRCH);
+                    }
+                    /* simple permission: only parent can change child's pgid */
+                    if (t->parent_tid != (int)self) {
+                        kprintf("sys_setpgid: pid=%d pgid=%d -> EPERM (not parent)\n", pid, pgid);
+                        return ret_err(EPERM);
+                    }
+                    /* Additional guard: do not allow setting arbitrary pgid==1 (init) unless
+                       caller is pid 1. This avoids user processes mistakenly moving into
+                       init's pgrp which later confuses job control and can cause shells to exit. */
+                    if (pgid == 1 && (int)self != 1) {
+                        kprintf("sys_setpgid: pid=%d attempted to set pgid=1 -> EPERM (denied)\n", pid);
+                        return ret_err(EPERM);
+                    }
+                    /* Additional guard: do not allow setting arbitrary pgid different from current
+                       unless caller is session leader. */
+                    int caller_tid = (int)self;
+                    int caller_sid = cur ? cur->sid : -1;
+                    if ((int)pgid != t->pgid && caller_sid != caller_tid) {
+                        kprintf("sys_setpgid: pid=%d pgid=%d -> EPERM (not session leader)\n", pid, pgid);
+                        return ret_err(EPERM);
+                    }
+                    t->pgid = pgid;
+                } else {
+                    if (cur) cur->pgid = pgid;
                 }
-                if (pgid != 0) cur->pgid = pgid;
-                kprintf("sys_setpgid: pid=%d pgid=%d -> OK (pgid=%d)\n", pid, pgid, cur->pgid);
+                if (pgid != 0) user_pgrp = (uint64_t)pgid;
+                kprintf("sys_setpgid: pid=%d pgid=%d -> OK (user_pgrp=%llu)\n", pid, pgid, (unsigned long long)user_pgrp);
                 return 0;
             }
         case SYS_tgkill: {
@@ -526,6 +963,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             return 0;
         }
         case 269: /* faccessat(dirfd, pathname, mode, flags) */
+        case 271: /* safe trial: map to faccessat-like check (AT_FDCWD) */
         case 439: /* faccessat2(dirfd, pathname, mode, flags, ...) */
         {
             int dirfd = (int)a1;
@@ -535,40 +973,55 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             (void)mode; (void)flags;
             if (!path_u) return ret_err(EFAULT);
             if ((uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-            char path[512];
-            if (path_u[0] == '/') {
-                /* absolute */
-                strncpy(path, path_u, sizeof(path));
-                path[sizeof(path)-1] = '\0';
-            } else {
-                /* relative: if dirfd == AT_FDCWD (-100) use cwd, else try to use fd's path */
-                const int AT_FDCWD = -100;
-                if (dirfd == AT_FDCWD) {
-                    resolve_user_path(cur, path_u, path, sizeof(path));
-                } else if (dirfd >= 0 && dirfd < THREAD_MAX_FD && cur->fds[dirfd]) {
-                    const char *base = cur->fds[dirfd]->path ? cur->fds[dirfd]->path : "/";
-                    size_t bl = strlen(base);
-                    if (bl + 1 + strlen(path_u) + 1 > sizeof(path)) return ret_err(ENAMETOOLONG);
-                    /* if base is not a directory path, strip filename to parent */
-                    char basecopy[512];
-                    strncpy(basecopy, base, sizeof(basecopy));
-                    basecopy[sizeof(basecopy)-1] = '\0';
-                    /* ensure ends with slash */
-                    if (basecopy[bl-1] != '/') {
-                        /* try to find last slash */
-                        char *s = strrchr(basecopy, '/');
-                        if (s) *(s+1) = '\0';
-                        else { basecopy[0] = '/'; basecopy[1] = '\0'; }
-                    }
-                    snprintf(path, sizeof(path), "%s%s", basecopy, path_u);
+            /* build path relative to CWD/dirfd similarly to 269, but only check existence */
+            {
+                char path[512];
+                if (path_u[0] == '/') {
+                    strncpy(path, path_u, sizeof(path));
+                    path[sizeof(path) - 1] = '\0';
                 } else {
-                    /* fallback to cwd */
-                    resolve_user_path(cur, path_u, path, sizeof(path));
+                    const int AT_FDCWD = -100;
+                    if (dirfd == AT_FDCWD) {
+                        resolve_user_path(cur, path_u, path, sizeof(path));
+                    } else if (dirfd >= 0 && dirfd < THREAD_MAX_FD && cur->fds[dirfd]) {
+                        const char *base = cur->fds[dirfd]->path ? cur->fds[dirfd]->path : "/";
+                        size_t bl = strlen(base);
+                        if (bl + 1 + strlen(path_u) + 1 > sizeof(path)) return ret_err(ENAMETOOLONG);
+                        char basecopy[512]; strncpy(basecopy, base, sizeof(basecopy)); basecopy[sizeof(basecopy)-1] = '\0';
+                        if (basecopy[bl-1] != '/') {
+                            char *s = strrchr(basecopy, '/');
+                            if (s) *(s+1) = '\0';
+                            else { basecopy[0] = '/'; basecopy[1] = '\0'; }
+                        }
+                        snprintf(path, sizeof(path), "%s%s", basecopy, path_u);
+                    } else {
+                        resolve_user_path(cur, path_u, path, sizeof(path));
+                    }
+                }
+                struct stat st;
+                if (vfs_stat(path, &st) != 0) return ret_err(ENOENT);
+                return 0;
+            }
+            /* Additional diagnostics for syscall 271: dump raw args and nearby memory for easier debugging */
+            qemu_debug_printf("271 args: a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx a6=0x%llx\n",
+                              (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3,
+                              (unsigned long long)a4, (unsigned long long)a5, (unsigned long long)a6);
+            unsigned long long addrs[6] = { a1, a2, a3, a4, a5, a6 };
+            for (int i = 0; i < 6; i++) {
+                void *ptr = (void*)(uintptr_t)addrs[i];
+                if (ptr && (uintptr_t)ptr < (uintptr_t)MMIO_IDENTITY_LIMIT && (uintptr_t)ptr > 0x1000) {
+                    unsigned char mem[32];
+                    size_t copied = 0;
+                    if (copy_from_user_raw(mem, ptr, sizeof(mem)) == 0) {
+                        qemu_debug_printf("271 mem[%d] @%p:", i+1, ptr);
+                        for (size_t j = 0; j < sizeof(mem); j++) {
+                            if ((j % 16) == 0) qemu_debug_printf(" ");
+                            qemu_debug_printf("%02x", mem[j]);
+                        }
+                        qemu_debug_printf("\n");
+                    }
                 }
             }
-            struct stat st;
-            if (vfs_stat(path, &st) != 0) return ret_err(ENOENT);
-            return 0;
         }
         case 72: { /* fcntl(fd, cmd, arg) - minimal support */
             int fd = (int)a1;
@@ -620,10 +1073,10 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             int pid = (int)a1;
             uint64_t self = (uint64_t)(cur->tid ? cur->tid : 1);
             if (pid == 0) {
-                return (uint64_t)cur->pgid;
+                return (uint64_t)user_pgrp;
             }
-            if ((uint64_t)pid == self) return (uint64_t)cur->pgid;
-            /* Support querying current process only for now */
+            if ((uint64_t)pid == self) return (uint64_t)user_pgrp;
+            /* We only support querying current process for now */
             return ret_err(ESRCH);
         }
         case SYS_rt_sigaction: {
@@ -665,6 +1118,68 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             return 0;
         }
+        case SYS_execve: {
+            /* copy path, argv, envp from user and call kernel_execve_from_path */
+            const char *path_u = (const char*)(uintptr_t)a1;
+            const char *const *argv_u = (const char *const*)(uintptr_t)a2;
+            const char *const *envp_u = (const char *const*)(uintptr_t)a3;
+            if (!path_u) return ret_err(EFAULT);
+            if ((uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+            /* Copy path */
+            size_t plen = strnlen(path_u, 1024);
+            if (plen == 0 || plen >= 1024) return ret_err(ENOENT);
+            char *path = (char*)kmalloc(plen + 1);
+            if (!path) return ret_err(ENOMEM);
+            if (copy_from_user_raw(path, path_u, plen + 1) != 0) { kfree(path); return ret_err(EFAULT); }
+
+            /* Copy argv array (NULL-terminated) */
+            int argc = 0;
+            if (argv_u) {
+                /* count args */
+                while (argc < 256 && argv_u[argc]) argc++;
+            }
+            const char **kargv = (const char**)kmalloc((size_t)(argc + 1) * sizeof(char*));
+            if (!kargv) { kfree(path); return ret_err(ENOMEM); }
+            for (int i = 0; i < argc; i++) {
+                const char *a_u = argv_u[i];
+                if (!a_u || (uintptr_t)a_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) { kfree((void*)kargv); kfree(path); return ret_err(EFAULT); }
+                size_t L = strnlen(a_u, 4096);
+                char *ks = (char*)kmalloc(L + 1);
+                if (!ks) { for (int j=0;j<i;j++) kfree((void*)kargv[j]); kfree((void*)kargv); kfree(path); return ret_err(ENOMEM); }
+                if (copy_from_user_raw(ks, a_u, L + 1) != 0) { kfree(ks); for (int j=0;j<i;j++) kfree((void*)kargv[j]); kfree((void*)kargv); kfree(path); return ret_err(EFAULT); }
+                kargv[i] = ks;
+            }
+            kargv[argc] = NULL;
+
+            /* Copy envp similarly (but allow NULL) */
+            int envc = 0;
+            const char **kenvp = NULL;
+            if (envp_u) {
+                while (envc < 256 && envp_u[envc]) envc++;
+                kenvp = (const char**)kmalloc((size_t)(envc + 1) * sizeof(char*));
+                if (!kenvp) { for (int j=0;j<argc;j++) kfree((void*)kargv[j]); kfree((void*)kargv); kfree(path); return ret_err(ENOMEM); }
+                for (int i = 0; i < envc; i++) {
+                    const char *e_u = envp_u[i];
+                    if (!e_u || (uintptr_t)e_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) { for (int j=0;j<i;j++) kfree((void*)kenvp[j]); kfree(kenvp); for (int j=0;j<argc;j++) kfree((void*)kargv[j]); kfree((void*)kargv); kfree(path); return ret_err(EFAULT); }
+                    size_t L = strnlen(e_u, 4096);
+                    char *ks = (char*)kmalloc(L + 1);
+                    if (!ks) { for (int j=0;j<i;j++) kfree((void*)kenvp[j]); kfree(kenvp); for (int j=0;j<argc;j++) kfree((void*)kargv[j]); kfree((void*)kargv); kfree(path); return ret_err(ENOMEM); }
+                    if (copy_from_user_raw(ks, e_u, L + 1) != 0) { kfree(ks); for (int j=0;j<i;j++) kfree((void*)kenvp[j]); kfree(kenvp); for (int j=0;j<argc;j++) kfree((void*)kargv[j]); kfree((void*)kargv); kfree(path); return ret_err(EFAULT); }
+                    kenvp[i] = ks;
+                }
+                kenvp[envc] = NULL;
+            }
+
+            /* call kernel execve (does not return on success) */
+            int rc = kernel_execve_from_path(path, (const char *const *)kargv, (const char *const *)kenvp);
+
+            /* cleanup on failure */
+            if (kenvp) { for (int i=0;i<envc;i++) if (kenvp[i]) kfree((void*)kenvp[i]); kfree(kenvp); }
+            for (int i=0;i<argc;i++) if (kargv[i]) kfree((void*)kargv[i]);
+            if (kargv) kfree((void*)kargv);
+            kfree(path);
+            return (rc == 0) ? 0 : ret_err(ENOENT);
+        }
         case SYS_rt_sigprocmask: {
             /* rt_sigprocmask(int how, const sigset_t *set, sigset_t *oldset, size_t sigsetsize)
                Keep a single 64-bit mask; accept common calls from libc. */
@@ -687,12 +1202,138 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             return 0;
         }
+        case SYS_fork: {
+            /* Minimal fork emulation:
+               - create a new kernel thread that will enter user mode at the saved
+                 return RIP and user RSP (copied from syscall stack / saved RSP).
+               - duplicate file descriptor table (increment refcounts).
+               - return child's pid to parent, child will see 0 as fork return (user_thread_entry clears RAX). */
+            /* Read saved return RIP from syscall entry recorded in `syscall_user_return_rip`.
+               If it's zero (not recorded), attempt to read it from the kernel syscall stack
+               top (`syscall_kernel_rsp0`) at the same offset used by the SYSCALL entry. */
+            uint64_t saved_rcx = cur->saved_user_rip;
+            if (saved_rcx == 0) {
+                extern uint64_t syscall_kernel_rsp0;
+                if ((uintptr_t)syscall_kernel_rsp0 != 0) {
+                    uint64_t candidate = 0;
+                    if (find_valid_saved_ret(syscall_kernel_rsp0, &candidate, 64) == 0) {
+                        saved_rcx = candidate;
+                    } else {
+                        qemu_debug_printf("fork: no valid saved_ret found on kernel stack\n");
+                    }
+                }
+            }
+            uint64_t saved_rsp = cur->saved_user_rsp;
+
+            /* create kernel thread that will enter user mode at saved_rcx/saved_rsp */
+            qemu_debug_printf("fork: pid=%llu saved_ret=0x%llx saved_rsp=0x%llx\n",
+                    (unsigned long long)(cur->tid ? cur->tid : 1),
+                    (unsigned long long)saved_rcx, (unsigned long long)saved_rsp);
+            if (saved_rcx == 0) {
+                qemu_debug_printf("fork: refused - no valid saved return RIP\n");
+                return ret_err(EINVAL);
+            }
+            /* Try to ensure the user pages around saved_rcx are user-accessible to avoid PF
+               when the child enters user mode. This sets PG_US on the containing 2MiB region. */
+            if (saved_rcx != 0) {
+                uintptr_t begin = (uintptr_t)saved_rcx & ~((uintptr_t)PAGE_SIZE_2M - 1);
+                uintptr_t end = begin + (uintptr_t)PAGE_SIZE_2M;
+                if (mark_user_identity_range_2m_sys((uint64_t)begin, (uint64_t)end) == 0) {
+                    qemu_debug_printf("fork: marked user range [%p - %p] as user-accessible\n", (void*)begin, (void*)end);
+                } else {
+                    qemu_debug_printf("fork: failed to mark user range [%p - %p]\n", (void*)begin, (void*)end);
+                }
+                /* Also try to broadly ensure common user ranges are user-accessible (helps when writes hit elsewhere). */
+                if (mark_user_identity_range_2m_sys(0x200000, (uint64_t)USER_STACK_TOP) == 0) {
+                    qemu_debug_printf("fork: ensured broad user range [0x200000 - %p]\n", (void*)(uintptr_t)USER_STACK_TOP);
+                } else {
+                    qemu_debug_printf("fork: could not ensure broad user range [0x200000 - %p]\n", (void*)(uintptr_t)USER_STACK_TOP);
+                }
+            }
+            char child_name[32];
+            snprintf(child_name, sizeof(child_name), "%s.child", cur->name);
+            kprintf("DBG: fork: syscall_user_return_rip=0x%llx syscall_user_rsp_saved=0x%llx (saved_rcx=0x%llx saved_rsp=0x%llx)\n",
+                    (unsigned long long)syscall_user_return_rip, (unsigned long long)syscall_user_rsp_saved,
+                    (unsigned long long)saved_rcx, (unsigned long long)saved_rsp);
+            thread_t *child = thread_create(user_thread_entry, child_name);
+            if (!child) return ret_err(ENOMEM);
+            /* set up user entry and stack for the child */
+            child->user_rip = saved_rcx;
+            child->user_stack = saved_rsp;
+            child->ring = 3;
+            /* inherit credentials */
+            child->euid = cur->euid;
+            child->egid = cur->egid;
+            child->attached_tty = cur->attached_tty;
+            /* copy cwd */
+            strncpy(child->cwd, cur->cwd, sizeof(child->cwd)-1);
+            child->cwd[sizeof(child->cwd)-1] = '\0';
+            /* duplicate file descriptors (increase refcounts) */
+            for (int i = 0; i < THREAD_MAX_FD; i++) {
+                child->fds[i] = cur->fds[i];
+                if (child->fds[i]) {
+                    if (child->fds[i]->refcount <= 0) child->fds[i]->refcount = 1;
+                    else child->fds[i]->refcount++;
+                }
+            }
+            /* child is ready (thread_create already set state), return child's pid to parent */
+            return (uint64_t)(child->tid ? child->tid : 1);
+        }
+        case SYS_wait4: {
+            /* waitpid(pid, status*, options, rusage*) minimal implementation
+               - pid > 0: wait for specific child pid
+               - pid == -1: wait for any child
+               We only support blocking wait (options == 0) and ignore rusage. */
+            int pid = (int)a1;
+            int *status_u = (int*)(uintptr_t)a2;
+            int options = (int)a3;
+            (void)a4;
+            if (options != 0) return ret_err(ENOSYS);
+            thread_t *tcur = thread_get_current_user();
+            if (!tcur) tcur = thread_current();
+            if (!tcur) return ret_err(EINVAL);
+
+            for (;;) {
+                thread_t *found = NULL;
+                if (pid > 0) {
+                    thread_t *c = thread_get(pid);
+                    if (c && c->parent_tid == (int)tcur->tid) found = c;
+                } else if (pid == -1) {
+                    /* find any child of current */
+                    found = thread_find_child_of((int)tcur->tid);
+                } else {
+                    return ret_err(EINVAL);
+                }
+                if (!found) return ret_err(ECHILD);
+                /* If already terminated -> return immediately */
+                if (found->state == THREAD_TERMINATED && found->exit_status != 0x80000000) {
+                    int st = found->exit_status;
+                    if (status_u) {
+                        if (copy_to_user_safe(status_u, &st, sizeof(st)) != 0) return ret_err(EFAULT);
+                    }
+                    /* mark reaped */
+                    found->exit_status = 0x80000000;
+                    return (uint64_t)(found->tid ? found->tid : 1);
+                }
+                /* not terminated -> block current thread and set waiter on child */
+                found->waiter_tid = (int)tcur->tid;
+                /* block current and yield */
+                thread_block((int)tcur->tid);
+                thread_yield();
+                /* when unblocked, loop to check again */
+            }
+            return ret_err(EINVAL);
+        }
         case SYS_ioctl: {
             int fd = (int)a1;
             uint64_t req = a2;
             void *argp = (void*)(uintptr_t)a3;
             /* Map negative fds to fd 0 (controlling/stdin) to be tolerant of libc behavior. */
-            if (fd < 0) fd = 0;
+            if (fd < 0) {
+                qemu_debug_printf("sys_ioctl: pid=%llu got negative fd=%d, mapping to fd 0\n",
+                        (unsigned long long)(cur->tid ? cur->tid : 1), fd);
+                fd = 0;
+            }
             qemu_debug_printf("sys_ioctl: pid=%llu fd=%d req=0x%llx arg=%p\n",
                     (unsigned long long)(cur->tid ? cur->tid : 1), fd, (unsigned long long)req, argp);
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
@@ -738,43 +1379,82 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
 
             if (req == TIOCGWINSZ) {
                 if (!argp) return ret_err(EFAULT);
-                struct winsize ws = { .ws_row = 25, .ws_col = 80, .ws_xpixel = 0, .ws_ypixel = 0 };
+                struct winsize ws = { .ws_row = 25, 
+                                      .ws_col = 80, 
+                                      .ws_xpixel = 0, 
+                                      .ws_ypixel = 0 };
                 if (copy_to_user_safe(argp, &ws, sizeof(ws)) != 0) return ret_err(EFAULT);
                 return 0;
             }
             if (req == TIOCSWINSZ) {
-                /* accept setting window size silently */
-                if (!argp) return ret_err(EFAULT);
+                if (!argp)  return ret_err(EFAULT); /* accept setting window size silently */
                 /* optionally we could copy_from_user and store winsize, but accept for now */
                 qemu_debug_printf("ioctl: TIOCSWINSZ on fd=%d\n", fd);
                 return 0;
             }
             if (req == TIOCSCTTY) {
-                /* Assign controlling tty: map file to tty index and attach to current thread.
-                   Also initialize tty foreground pgrp from caller so job control behaves. */
-                   qemu_debug_printf("ioctl: TIOCSCTTY on fd=%d (arg=%p)\n", fd, argp);
-                   {
-                       int tty_idx = devfs_get_tty_index_from_file(f);
-                       thread_t *ct = thread_current();
-                       if (tty_idx >= 0 && ct) {
-                           ct->attached_tty = tty_idx;
-                           devfs_set_tty_fg_pgrp(tty_idx, ct->pgid);
-                           qemu_debug_printf("ioctl: TIOCSCTTY -> attached_tty=%d pgid=%d for tid=%llu\n",
-                                   tty_idx, ct->pgid, (unsigned long long)(ct->tid ? ct->tid : 1));
-                       }
-                   }
-                return 0;
-            }
-            if (req == TIOCSPGRP) {
-                int pgrp;
-                if (copy_from_user_raw(&pgrp, argp, sizeof(pgrp))!=0) return ret_err(EFAULT);
-                ((struct devfs_tty*)f->driver_private)->fg_pgrp = pgrp;
+                /* Make ioctl(TIOCSCTTY) attach this thread to the tty as controlling tty.
+                   POSIX: only a session leader may acquire a controlling tty, and a tty may
+                   be a controlling tty for at most one session. */
+                qemu_debug_printf("ioctl: TIOCSCTTY on fd=%d (arg=%p) caller=%llu\n", fd, argp, (unsigned long long)(cur?cur->tid:0));
+                thread_t *curth = thread_current();
+                if (!curth) return 0;
+                /* must be session leader */
+                if (curth->sid != (int)curth->tid) {
+                    qemu_debug_printf("ioctl: TIOCSCTTY denied - caller is not session leader (pid=%llu sid=%d)\n",
+                            (unsigned long long)curth->tid, curth->sid);
+                    return ret_err(EPERM);
+                }
+                /* check whether tty already has controlling session */
+                int cur_sid = devfs_get_tty_controlling_sid(f);
+                if (cur_sid >= 0 && cur_sid != curth->sid) {
+                    qemu_debug_printf("ioctl: TIOCSCTTY denied - tty already has controlling_sid=%d\n", cur_sid);
+                    return ret_err(EPERM);
+                }
+                /* attach and set controlling_sid */
+                devfs_tty_attach_thread(f, curth);
+                devfs_set_tty_controlling_sid(f, curth->sid);
                 return 0;
             }
             if (req == TIOCGPGRP) {
-                int pgrp = ((struct devfs_tty*)f->driver_private)->fg_pgrp;
-                if (pgrp < 0) pgrp = (int)thread_current()->tid;   /* по умолчанию */
-                if (copy_to_user_safe(argp, &pgrp, sizeof(pgrp))!=0) return ret_err(EFAULT);
+                if (!argp) return ret_err(EFAULT);
+                /* Try to return tty-specific foreground pgrp, fallback to global user_pgrp */
+                int pgrp = devfs_tty_get_fg_pgrp(f);
+                if (pgrp < 0) pgrp = (int)(user_pgrp);
+                qemu_debug_printf("ioctl: TIOCGPGRP on fd=%d -> returning pgrp=%d (caller pid=%llu name=%s)\n",
+                        fd, pgrp, (unsigned long long)(cur->tid ? cur->tid : 1),
+                        cur && cur->name ? cur->name : "(null)");
+                uint32_t pu = (uint32_t)pgrp;
+                if (copy_to_user_safe(argp, &pu, sizeof(pu)) != 0) return ret_err(EFAULT);
+                return 0;
+            }
+            if (req == TIOCSPGRP) {
+                if (!argp) return ret_err(EFAULT);
+                uint32_t p = 0;
+                if (copy_from_user_raw(&p, argp, sizeof(p)) != 0) return ret_err(EFAULT);
+                qemu_debug_printf("ioctl: TIOCSPGRP on fd=%d -> set pgrp=%u (caller pid=%llu name=%s)\n",
+                        fd, p, (unsigned long long)(cur->tid ? cur->tid : 1),
+                        cur && cur->name ? cur->name : "(null)");
+                /* Restrict who may set terminal foreground pgrp:
+                   allow if caller's pgid == p (self-assign), or caller is session leader (sid == tid).
+                   Otherwise deny to avoid arbitrary pgrp resets that confuse job-control. */
+                int allow = 0;
+                if (cur) {
+                    int caller_pgid = cur->pgid;
+                    int caller_sid = cur->sid;
+                    int caller_tid = (int)(cur->tid ? cur->tid : 1);
+                    if (p == (uint32_t)caller_pgid) allow = 1;
+                    if (caller_sid == caller_tid) allow = 1; /* session leader may set */
+                }
+                if (!allow) {
+                    qemu_debug_printf("ioctl: TIOCSPGRP denied for pid=%llu trying to set pgrp=%u\\n",
+                            (unsigned long long)(cur->tid ? cur->tid : 1), p);
+                    return ret_err(EPERM);
+                }
+                /* Try to set tty-specific foreground pgrp; fall back to global user_pgrp */
+                if (devfs_tty_set_fg_pgrp(f, (int)p) != 0) {
+                    if (p != 0) user_pgrp = (uint64_t)p;
+                }
                 return 0;
             }
             if (req == TCGETS) {
@@ -817,22 +1497,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             size_t copied = 0;
             void *tmp = copy_from_user_safe(bufp, cnt, 4096, &copied);
             if (!tmp) return ret_err(EFAULT);
-            /* Debug: capture early libc/ld.so/stderr messages to qemu log to help diagnose exits.
-               Limit to 256 bytes per write to avoid flooding. */
-            if ((fd == 2 || fd == 1) && copied > 0) {
-                size_t probe = copied < 256 ? copied : 256;
-                /* Ensure printable: replace non-printable with '.' */
-                char *dbg = (char*)kmalloc(probe + 1);
-                if (dbg) {
-                    for (size_t i = 0; i < probe; i++) {
-                        char c = ((char*)tmp)[i];
-                        dbg[i] = (c >= 32 && c < 127) ? c : '.';
-                    }
-                    dbg[probe] = '\\0';
-                    qemu_debug_printf("USER OUT (fd=%d): %s\n", fd, dbg);
-                    kfree(dbg);
-                }
-            }
+
             ssize_t wr = fs_write(f, tmp, copied, f->pos);
             if (wr > 0) f->pos += (size_t)wr;
             kfree(tmp);
@@ -849,24 +1514,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             void *tmp = kmalloc(to_read);
             if (!tmp) return ret_err(ENOMEM);
             ssize_t rr = fs_read(f, tmp, to_read, f->pos);
-            /* Debug: log stdin reads to detect immediate EOF causing shell to exit */
-            if (fd == 0) {
-                if (rr <= 0) {
-                    qemu_debug_printf("USER READ stdin: rr=%lld\n", (long long)rr);
-                } else {
-                    size_t probe = rr < 64 ? (size_t)rr : 64;
-                    char *dbg = (char*)kmalloc(probe + 1);
-                    if (dbg) {
-                        for (size_t i = 0; i < probe; i++) {
-                            char c = ((char*)tmp)[i];
-                            dbg[i] = (c >= 32 && c < 127) ? c : '.';
-                        }
-                        dbg[probe] = '\\0';
-                        qemu_debug_printf("USER READ stdin: got %lld bytes: %s\n", (long long)rr, dbg);
-                        kfree(dbg);
-                    }
-                }
-            }
+
             if (rr > 0) {
                 if ((uintptr_t)bufp + (size_t)rr <= (uintptr_t)MMIO_IDENTITY_LIMIT) {
                     memcpy(bufp, tmp, (size_t)rr);
@@ -1102,26 +1750,80 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             return 0;
         case SYS_exit: {
             (void)a1;
-            kprintf("sys_exit: pid=%llu called exit(code=%llu)\n",
+            kprintf("sys_exit: pid=%llu name=%s called exit(code=%llu)\n",
                     (unsigned long long)(cur->tid ? cur->tid : 1),
+                    cur && cur->name ? cur->name : "(null)",
                     (unsigned long long)a1);
-            thread_stop((int)cur->tid);
+            /* store exit status in wait format (status << 8) */
+            if (cur) {
+                int code = (int)a1;
+                cur->exit_status = (code & 0xFF) << 8;
+                /* wake vfork parent if any */
+                if (cur->vfork_parent_tid >= 0) {
+                    thread_unblock(cur->vfork_parent_tid);
+                    cur->vfork_parent_tid = -1;
+                }
+                /* wake arbitrary waiter if present */
+                if (cur->waiter_tid >= 0) {
+                    thread_unblock(cur->waiter_tid);
+                }
+            }
+            /* mark terminated */
+            if (cur) cur->state = THREAD_TERMINATED;
             syscall_exit_to_shell_flag = 1;
             return 0;
         }
         case SYS_exit_group: {
             (void)a1;
-            thread_stop((int)cur->tid);
+            kprintf("sys_exit_group: pid=%llu name=%s called exit_group(code=%llu)\n",
+                    (unsigned long long)(cur->tid ? cur->tid : 1),
+                    cur && cur->name ? cur->name : "(null)",
+                    (unsigned long long)a1);
+            if (cur) {
+                int code = (int)a1;
+                cur->exit_status = (code & 0xFF) << 8;
+                if (cur->vfork_parent_tid >= 0) {
+                    thread_unblock(cur->vfork_parent_tid);
+                    cur->vfork_parent_tid = -1;
+                }
+                if (cur->waiter_tid >= 0) thread_unblock(cur->waiter_tid);
+                /* Before terminating, if this thread is a session leader, send SIGHUP
+                   to all session members and clear controlling ttys. */
+                if (cur->sid == (int)(cur->tid ? cur->tid : 1)) {
+                    send_hup_to_session(cur->sid);
+                /* clear controlling ttys via devfs helper */
+                devfs_clear_controlling_by_sid(cur->sid);
+                }
+                cur->state = THREAD_TERMINATED;
+            }
             syscall_exit_to_shell_flag = 1;
             return 0;
         }
         default:
-            /* Log unknown syscall with full args for easier diagnosis */
-            qemu_debug_printf("UNKNOWN SYSCALL: %u num=%u args=%u,%u,%u,%u,%u,%u\n",
+            /* Log unknown syscall with full args for easier diagnosis.
+               If it's syscall 271, try to print a possible pathname from a1 to help identify it. */
+            qemu_debug_printf("UNKNOWN SYSCALL: %u num=%u args=%llu,%llu,%llu,%llu,%llu,%llu\n",
                     (unsigned long long)(cur->tid ? cur->tid : 1),
                     (unsigned long long)num,
                     (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3,
                     (unsigned long long)a4, (unsigned long long)a5, (unsigned long long)a6);
+            if (num == 271) {
+                /* attempt to copy a NUL-terminated string from userspace pointer a1 */
+                const char *up = (const char*)(uintptr_t)a1;
+                if (up && (uintptr_t)up < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                    size_t copied = 0;
+                    void *tmp = copy_from_user_safe(up, 256, 256, &copied);
+                    if (tmp && copied > 0) {
+                        ((char*)tmp)[copied - 1] = '\\0';
+                        qemu_debug_printf("UNKNOWN SYSCALL 271: path='%s' (copied %u bytes)\n", (char*)tmp, (unsigned)copied);
+                        kfree(tmp);
+                    } else {
+                        qemu_debug_printf("UNKNOWN SYSCALL 271: failed to copy path at %p\n", (void*)up);
+                    }
+                } else {
+                    qemu_debug_printf("UNKNOWN SYSCALL 271: invalid user pointer %p\n", (void*)(uintptr_t)a1);
+                }
+            }
             (void)a4; (void)a5; (void)a6;
             return ret_err(ENOSYS);
     }
@@ -1129,6 +1831,15 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
 
 void isr_syscall(cpu_registers_t* regs) {
     if (!regs) return;
+    /* Record user rip/rsp for int0x80 path so fork/vfork can find return site. */
+    syscall_user_return_rip = regs->rip;
+    syscall_user_rsp_saved = regs->rsp;
+    /* Debug: record that we saw a syscall from user with these values */
+    qemu_debug_printf("DBG: isr_syscall: recorded user RIP=0x%llx RSP=0x%llx\n", (unsigned long long)syscall_user_return_rip, (unsigned long long)syscall_user_rsp_saved);
+    if (syscall_user_return_rip == 0) {
+        qemu_debug_printf("DBG: isr_syscall: return RIP==0, dumping kernel syscall stack for diagnosis\n");
+        debug_dump_kernel_syscall_stack();
+    }
     regs->rax = syscall_do(regs->rax, regs->rdi, regs->rsi, regs->rdx, regs->r10, regs->r9, regs->r8);
     /* If userspace called exit/exit_group via int0x80 path, do not iret back to ring3. */
     if (syscall_exit_to_shell_flag) {
@@ -1154,7 +1865,5 @@ void syscall_init(void) {
 
     kprintf("syscall: int0x80 handler registered; SYSCALL enabled\n");
 }
-
-
 
 

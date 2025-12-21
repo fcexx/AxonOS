@@ -17,6 +17,14 @@ struct devfs_tty {
     uint32_t cursor_y;
     /* foreground process group for this tty (-1 if none) */
     int fg_pgrp;
+    /* current attribute/color for this tty (VGA attribute byte) */
+    uint8_t cur_attr;
+    /* ANSI escape parsing state */
+    int esc_state; /* 0=normal,1=ESC,2=CSI */
+    char esc_buf[64];
+    int esc_len;
+    /* saved cursor position for save/restore */
+    uint16_t saved_cursor;
     /* input buffer (chars) */
     char inbuf[256];
     int in_head;
@@ -26,6 +34,16 @@ struct devfs_tty {
     /* waiting threads (tids) */
     int waiters[8];
     int waiters_count;
+    /* current VGA attribute for output on this tty (low nibble FG, high nibble BG) */
+    uint8_t current_attr;
+    /* simple ANSI escape state for CSI parsing (0=normal,1=ESC seen,2=CSI) */
+    uint8_t ansi_escape_state;
+    /* simple CSI parameter storage (up to 8 parameters) */
+    int ansi_param[8];
+    int ansi_param_count;
+    int ansi_current_param;
+    /* controlling session id for this tty (-1 if none) */
+    int controlling_sid;
 };
 
 int devfs_register(void);
@@ -58,6 +76,9 @@ int devfs_is_tty_file(struct fs_file *file);
 int devfs_get_tty_index_from_file(struct fs_file *file);
 int devfs_get_tty_fg_pgrp(int tty);
 void devfs_set_tty_fg_pgrp(int tty, int pgrp);
+int devfs_get_tty_controlling_sid(struct fs_file *file);
+int devfs_set_tty_controlling_sid(struct fs_file *file, int sid);
+void devfs_clear_controlling_by_sid(int sid);
 
 /* Create a block device node at given path and associate with disk device_id.
    sectors - total number of 512-byte sectors on device (for size reporting). */

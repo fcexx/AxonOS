@@ -1,7 +1,10 @@
-/* ATA PIO driver with basic IDENTIFY and PIO read/write (LBA28).
+/* 
+   ATA PIO driver with basic IDENTIFY and PIO read/write (LBA28).
    This is written to be readable and follow POSIX-like semantics where
    possible: functions return 0 on success and -1 on error, and public
    initialization is provided via ata_dma_init().
+
+   TODO: ATA DMA
 
    Notes:
    - Only legacy IDE I/O ports are probed (primary/secondary channels).
