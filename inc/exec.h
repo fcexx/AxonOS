@@ -17,4 +17,7 @@
    Returns 0 on success (does not return), negative on error. */
 int kernel_execve_from_path(const char *path, const char *const argv[], const char *const envp[]);
 
+/* Fixed user-space trampoline for safe vfork child entry (must be in low identity map). */
+#define USER_VFORK_TRAMP ((uintptr_t)0x00201000ULL) /* 2MiB + 4KiB */
+
 

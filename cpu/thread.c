@@ -38,8 +38,6 @@ void thread_init() {
         main_thread.vfork_parent_tid = -1;
         main_thread.rseq_ptr = NULL;
         main_thread.parent_tid = -1;
-        main_thread.pgid = main_thread.tid;
-        main_thread.sid = main_thread.tid;
         main_thread.saved_user_rip = 0;
         main_thread.saved_user_rsp = 0;
         main_thread.waiter_tid = -1;
@@ -101,8 +99,6 @@ thread_t* thread_create(void (*entry)(void), const char* name) {
         t->euid = 0;
         t->egid = 0;
         t->attached_tty = -1;
-        t->pgid = t->tid;
-        t->sid = t->tid;
         t->vfork_parent_tid = -1;
         t->rseq_ptr = NULL;
         t->parent_tid = -1;
@@ -139,6 +135,9 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         t->sleep_until = 0;
         t->tid = thread_count;
         strncpy(t->name, name ? name : "user", sizeof(t->name));
+        /* initialize POSIX-ish job control ids */
+        t->pgid = (int)t->tid;
+        t->sid = (int)t->tid;
         /* inherit credentials, file descriptors and attached tty from current thread if available */
         if (current) {
                 t->euid = current->euid;
@@ -148,8 +147,6 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
                 t->attached_tty = current->attached_tty >= 0 ? current->attached_tty : devfs_get_active();
                 strncpy(t->cwd, current->cwd[0] ? current->cwd : "/", sizeof(t->cwd));
                 t->cwd[sizeof(t->cwd) - 1] = '\0';
-                t->pgid = current->pgid;
-                t->sid = current->sid;
         } else { t->euid = 0; t->egid = 0; t->attached_tty = devfs_get_active(); }
         if (!t->cwd[0]) { strncpy(t->cwd, "/", sizeof(t->cwd)); t->cwd[sizeof(t->cwd)-1] = '\0'; }
         t->vfork_parent_tid = -1;
@@ -178,17 +175,37 @@ void user_thread_entry(void) {
 	thread_set_current_user(self);
 	// set TSS RSP0 to this thread's kernel stack so syscalls use its stack
 	tss_set_rsp0(self->kernel_stack);
-	// set per-thread FS base so userspace TLS and stack-canary work
-	set_user_fs_base(self->user_fs_base);
+	// restore user FS base (TLS) so user code can access fs-relative data like stack-protector
+	{
+		uint64_t fsbase = self->user_fs_base;
+		uint32_t msr = 0xC0000100u; /* MSR_FS_BASE */
+		/* Read current MSR_FS_BASE for debug */
+		{
+			uint32_t _lo = 0, _hi = 0;
+			asm volatile("rdmsr" : "=a"(_lo), "=d"(_hi) : "c"(msr));
+			uint64_t cur = ((uint64_t)_hi << 32) | _lo;
+			qemu_debug_printf("user_thread_entry: rdmsr before set MSR_FS_BASE=0x%llx target=0x%llx tid=%d\n",
+			                  (unsigned long long)cur, (unsigned long long)fsbase, (int)self->tid);
+		}
+		/* Write desired FS base then verify by reading back */
+		{
+			uint32_t lo = (uint32_t)(fsbase & 0xFFFFFFFFu);
+			uint32_t hi = (uint32_t)(fsbase >> 32);
+			asm volatile("wrmsr" :: "c"(msr), "a"(lo), "d"(hi));
+			uint32_t _lo = 0, _hi = 0;
+			asm volatile("rdmsr" : "=a"(_lo), "=d"(_hi) : "c"(msr));
+			uint64_t after = ((uint64_t)_hi << 32) | _lo;
+			qemu_debug_printf("user_thread_entry: rdmsr after set MSR_FS_BASE=0x%llx tid=%d\n",
+			                  (unsigned long long)after, (int)self->tid);
+		}
+	}
 	// ensure return value from fork is 0 in child: clear RAX
-	/* Restore volatile (caller-saved) registers from the thread context so that
-	   a forked child resumes with the same register values as parent after syscall.
-	   context_switch already restored callee-saved registers (rbx, rbp, r12..r15).
-	   Here we restore the remaining registers that enter_user_mode won't set. */
-	/* Do not restore volatile registers here — rely on a clean user_rip/user_stack
-	   and ensure the child sees 0 from fork in RAX. Restoring volatile regs proved
-	   to be unsafe (clobbered kernel flow). */
 	asm volatile("xor %%rax, %%rax" ::: "rax");
+	// Debug: report the user entry we're about to jump to
+	qemu_debug_printf("user_thread_entry: entering user mode rip=0x%llx rsp=0x%llx tid=%d\n",
+			  (unsigned long long)self->user_rip,
+			  (unsigned long long)self->user_stack,
+			  (int)self->tid);
 	// Jump to user mode
 	enter_user_mode(self->user_rip, self->user_stack);
 	// Should not return
@@ -273,6 +290,7 @@ void thread_yield() {
 void thread_stop(int pid) {
         for (int i = 0; i < thread_count; ++i) {
                 if (threads[i] && threads[i]->tid == pid && threads[i]->state != THREAD_TERMINATED) {
+                        kprintf("thread_stop: stopping tid=%d name=%s\n", pid, threads[i]->name);
                         threads[i]->state = THREAD_TERMINATED;
                         return;
                 }
@@ -352,6 +370,11 @@ thread_t* thread_find_child_of(int parent_tid) {
                 if (threads[i] && threads[i]->parent_tid == parent_tid) return threads[i];
         }
         return NULL;
+}
+
+thread_t* thread_get_by_index(int idx) {
+    if (idx < 0 || idx >= thread_count) return NULL;
+    return threads[idx];
 }
 
 int thread_get_pid(const char* name) {

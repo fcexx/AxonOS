@@ -1,0 +1,2 @@
+CC		core/syscall.c
+CC		cpu/thread.c

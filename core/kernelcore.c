@@ -33,6 +33,7 @@
 #include <devfs.h>
 #include <user.h>
 #include <serial.h>
+#include <exec.h>
 
 /* ATA DMA driver init (registered here) */
 void ata_dma_init(void);
@@ -363,9 +364,30 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     // }
 
     {
-        struct fs_file *f = fs_open("/bin/busybox");
-        if (f) { fs_file_free(f); (void)exec_line("busybox init"); }
-        else kprintf("fatal: unable to run initial process; halt\n");
+        /* Try standard init paths in order. Use kernel_execve_from_path to directly
+           transfer to user init; if it returns, the exec failed and we try next. */
+        const char *inits[] = { "/sbin/init",  NULL };
+        for (int i = 0; inits[i]; i++) {
+            const char *path = inits[i];
+            struct fs_file *f = fs_open(path);
+            if (!f) continue;
+            fs_file_free(f);
+            if (strcmp(path, "/bin/busybox") == 0) {
+                /* busybox invoked with 'init' arg */
+                const char *kargv[] = { "/bin/busybox", "init", NULL };
+                kprintf("execve: launching %s %s\n", kargv[0], kargv[1]);
+                (void)kernel_execve_from_path(kargv[0], kargv, NULL);
+            } else {
+                const char *kargv[] = { path, NULL };
+                kprintf("execve: launching %s\n", path);
+                (void)kernel_execve_from_path(path, kargv, NULL);
+            }
+            /* If we get here, exec failed; try next candidate */
+            kprintf("execve: %s failed, trying next\n", path);
+        }
+        kprintf("fatal: unable to run initial process; falling back to osh\n");
+        exec_line("PS1=\"osh-2.0# \"");
+        exec_line("osh");
     }
     
     for(;;) {

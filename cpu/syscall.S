@@ -7,21 +7,21 @@
 .extern syscall_return_to_shell
 .extern syscall_exec_trampoline_active
 
-// x86_64 SYSCALL entry point.
+// x86_64 SYSCALL entry point
 // Assumptions/constraints (current AxonOS design):
-// - Kernel and user share one address space (identity-mapped below 4GiB).
-// - We return to ring3 via IRETQ (not SYSRET), so we can use existing USER_CS/USER_DS.
-// - syscall_kernel_rsp0 is maintained by tss_set_rsp0() before entering user mode.
+// - Kernel and user share one address space (identity-mapped below 4GiB)
+// - We return to ring3 via IRETQ (not SYSRET), so we can use existing USER_CS/USER_DS
+// - syscall_kernel_rsp0 is maintained by tss_set_rsp0() before entering user mode
 //
 // Syscall ABI:
 //   rax = nr
 //   rdi,rsi,rdx,r10,r8,r9 = args 1..6
 //   rcx,r11 are clobbered by the SYSCALL instruction (rcx=return RIP, r11=return RFLAGS)
 //
-// We preserve all GPRs and only change rax (return value), rcx/r11 are restored and used for iret frame.
+// We preserve all GPRs and only change rax (return value), rcx/r11 are restored and used for iret frame
 //
-// NOTE: This is single-core / non-reentrant with respect to syscall_user_rsp_saved.
-//       Good enough for current AxonOS; we can make it per-thread/per-cpu later.
+// NOTE: This is single-core / non-reentrant with respect to syscall_user_rsp_saved
+//       Good enough for current AxonOS; we can make it per-thread/per-cpu later
 syscall_entry64:
     cld
     // Save user RIP (return address) for SYSCALL path (rcx contains return RIP)
