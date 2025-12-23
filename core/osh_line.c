@@ -214,9 +214,17 @@ static void complete_token(const char* cwd, char* buf, int* io_len, int* io_cur,
         strcpy(dir, "."); strncpy(base, token, BASE_CAP-1); base[BASE_CAP-1]='\0';
     }
     // построим абсолютный нормализованный путь для dir с учётом '.', '..' и cwd
-    char *abs = (char*)kmalloc(ABS_CAP);
+    /* allocate absolute path buffer sized to cwd+dir when needed to avoid overflow */
+    size_t abs_cap = ABS_CAP;
+    size_t need_len = 0;
+    if (cwd) need_len += strlen(cwd);
+    if (dir) need_len += strlen(dir);
+    /* +2 for optional '/' and NUL */
+    if (need_len + 2 > abs_cap) abs_cap = need_len + 2;
+    if (abs_cap > 4096) abs_cap = 4096; /* hard cap */
+    char *abs = (char*)kmalloc(abs_cap);
     if (!abs) { kfree(base); kfree(dir); return; }
-    osh_resolve_path(cwd, dir, abs, ABS_CAP);
+    osh_resolve_path(cwd, dir, abs, abs_cap);
     // получим список файлов
     const char** fs_names = NULL; int fs_count = 0;
     (void)list_dir_entries(abs, &fs_names, &fs_count); // игнорируем ошибку, просто 0 кандидатов
@@ -257,7 +265,8 @@ static void complete_token(const char* cwd, char* buf, int* io_len, int* io_cur,
     // вставим недостающую часть общего префикса
     int add = (int)strlen(common) - (int)strlen(base);
     if (add > 0) {
-        if (len + add < OSH_MAX_LINE-1) {
+        /* allow filling up to OSH_MAX_LINE-1 (space for trailing NUL) */
+        if (len + add < OSH_MAX_LINE) {
             memmove(buf + cur + add, buf + cur, (size_t)(len - cur + 1));
             memcpy(buf + cur, common + strlen(base), (size_t)add);
             cur += add; len += add;
@@ -351,14 +360,14 @@ after_sugg:
                 fs_file_free(cf);
                 if (is_dir) {
                     // вставим '/' если его ещё нет после текущего курсора
-                    if (len + 1 < OSH_MAX_LINE-1) {
+                    if (len + 1 < OSH_MAX_LINE) {
                         memmove(buf + cur + 1, buf + cur, (size_t)(len - cur + 1));
                         buf[cur] = '/';
                         cur++; len++;
                     }
                 } else {
                     /* single match and not a directory -> append space (like bash) */
-                    if (len + 1 < OSH_MAX_LINE-1) {
+                    if (len + 1 < OSH_MAX_LINE) {
                         if (cur >= len || !is_sep(buf[cur])) {
                             memmove(buf + cur + 1, buf + cur, (size_t)(len - cur + 1));
                             buf[cur] = ' ';
@@ -368,7 +377,7 @@ after_sugg:
                 }
             } else {
                 /* candidate not found in filesystem -> likely a builtin; append space */
-                if (len + 1 < OSH_MAX_LINE-1) {
+                if (len + 1 < OSH_MAX_LINE) {
                     if (cur >= len || !is_sep(buf[cur])) {
                         memmove(buf + cur + 1, buf + cur, (size_t)(len - cur + 1));
                         buf[cur] = ' ';

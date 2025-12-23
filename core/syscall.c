@@ -126,12 +126,15 @@ enum {
 static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, size_t *out_copied) {
     if (!uptr || count == 0) { if (out_copied) *out_copied = 0; return NULL; }
     size_t to_copy = count < max ? count : max;
+    /* Basic bounds check: ensure entirely within identity mapped user region. */
+    if ((uintptr_t)uptr + to_copy > (uintptr_t)MMIO_IDENTITY_LIMIT) {
+        if (out_copied) *out_copied = 0;
+        return NULL;
+    }
     void *buf = kmalloc(to_copy);
     if (!buf) { if (out_copied) *out_copied = 0; return NULL; }
-    /* Simple safety: only copy user addresses below 4GiB (identity mapped) */
-    if ((uintptr_t)uptr + to_copy > (uintptr_t)MMIO_IDENTITY_LIMIT) {
-        kfree(buf); if (out_copied) *out_copied = 0; return NULL;
-    }
+    /* Simple memcpy: assume identity-mapped user memory is accessible from kernel.
+       This mirrors previous behavior; more advanced checks caused double-faults. */
     memcpy(buf, uptr, to_copy);
     if (out_copied) *out_copied = to_copy;
     return buf;
@@ -232,17 +235,17 @@ static int mark_user_identity_range_2m_sys(uint64_t va_begin, uint64_t va_end) {
         uint64_t l2i = (va >> 21) & 0x1FF;
         uint64_t *l4 = (uint64_t*)page_table_l4;
         if (!(l4[l4i] & PG_PRESENT)) return -1;
-        l4[l4i] |= PG_US;
+        l4[l4i] |= PG_US | PG_RW;
         l4[l4i] &= ~PG_NX;
         uint64_t *l3 = (uint64_t*)(uintptr_t)(l4[l4i] & ~0xFFFULL);
         if (!(l3[l3i] & PG_PRESENT)) return -1;
-        l3[l3i] |= PG_US;
+        l3[l3i] |= PG_US | PG_RW;
         l3[l3i] &= ~PG_NX;
         uint64_t l3e = l3[l3i];
         if (l3e & PG_PS_2M) { invlpg((void*)(uintptr_t)va); continue; }
         uint64_t *l2 = (uint64_t*)(uintptr_t)(l3e & ~0xFFFULL);
         if (!(l2[l2i] & PG_PRESENT)) return -1;
-        l2[l2i] |= PG_US;
+        l2[l2i] |= PG_US | PG_RW;
         l2[l2i] &= ~PG_NX;
         uint64_t l2e = l2[l2i];
         if (l2e & PG_PS_2M) {
@@ -251,7 +254,7 @@ static int mark_user_identity_range_2m_sys(uint64_t va_begin, uint64_t va_end) {
         }
         uint64_t *l1 = (uint64_t*)(uintptr_t)(l2e & ~0xFFFULL);
         /* set US and clear NX on L1 entry covering this 4KiB range */
-        l1[(va >> 12) & 0x1FF] |= PG_US;
+        l1[(va >> 12) & 0x1FF] |= PG_US | PG_RW;
         l1[(va >> 12) & 0x1FF] &= ~PG_NX;
         invlpg((void*)(uintptr_t)va);
     }
@@ -1481,7 +1484,31 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 return 0;
             }
             if (req == TCSETS || req == TCSETSW || req == TCSETSF) {
-                /* accept silently */
+                /* Apply minimal termios flags to the underlying tty: read c_lflag and store it */
+                if (!argp) return ret_err(EFAULT);
+                struct termios_k {
+                    uint32_t c_iflag;
+                    uint32_t c_oflag;
+                    uint32_t c_cflag;
+                    uint32_t c_lflag;
+                    uint32_t c_line;
+                    uint8_t  c_cc[8];
+                    uint32_t c_ispeed;
+                    uint32_t c_ospeed;
+                } tio;
+                size_t need = sizeof(uint32_t) * 4; /* at least up to c_lflag */
+                if (copy_from_user_raw(&tio, argp, need) != 0) return ret_err(EFAULT);
+                /* map fd to tty and set flags */
+                if (!f) return ret_err(ENOTTY);
+                /* ensure this file is a tty */
+                if (!devfs_is_tty_file(f)) return ret_err(ENOTTY);
+                /* Resolve file -> tty index safely (driver_private may be a marker) */
+                int tty_idx = devfs_get_tty_index_from_file(f);
+                if (tty_idx < 0) return ret_err(ENOTTY);
+                struct devfs_tty *tty = devfs_get_tty_by_index(tty_idx);
+                if (!tty) return ret_err(ENOTTY);
+                tty->term_lflag = tio.c_lflag;
+                qemu_debug_printf("ioctl: TCSETS on fd=%d set c_lflag=0x%08x (tty=%d)\n", fd, (unsigned)tty->term_lflag, tty_idx);
                 return 0;
             }
                 qemu_debug_printf("ioctl: unknown req=0x%llx on fd=%d\n", (unsigned long long)req, fd);
@@ -1528,6 +1555,179 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             kfree(tmp);
             return (rr >= 0) ? (uint64_t)rr : ret_err(EINVAL);
         }
+        case SYS_sendfile: {
+            /* ssize_t sendfile(out_fd, in_fd, off_t *offset, size_t count) */
+            int out_fd = (int)a1;
+            int in_fd = (int)a2;
+            off_t *offp = (off_t*)(uintptr_t)a3;
+            size_t count = (size_t)a4;
+            qemu_debug_printf("sendfile: called out=%d in=%d offp=%p count=%llu (caller pid=%llu)\n",
+                              out_fd, in_fd, (void*)(uintptr_t)offp, (unsigned long long)count,
+                              (unsigned long long)(cur->tid ? cur->tid : 1));
+            if (out_fd < 0 || out_fd >= THREAD_MAX_FD) {
+                qemu_debug_printf("sendfile: invalid out_fd=%d -> EBADF\n", out_fd);
+                return ret_err(EBADF);
+            }
+            if (in_fd < 0 || in_fd >= THREAD_MAX_FD) {
+                qemu_debug_printf("sendfile: invalid in_fd=%d -> EBADF\n", in_fd);
+                return ret_err(EBADF);
+            }
+            struct fs_file *fout = cur->fds[out_fd];
+            struct fs_file *fin = cur->fds[in_fd];
+            if (!fout || !fin) {
+                qemu_debug_printf("sendfile: missing fd table entry fout=%p fin=%p -> EBADF\n", fout, fin);
+                /* Dump current thread and fd table for diagnosis */
+                thread_t *tc = thread_current();
+                thread_t *tu = thread_get_current_user();
+                qemu_debug_printf("sendfile: thread_current=%p tid=%d thread_get_current_user=%p tid=%d\n",
+                                  tc, tc ? tc->tid : -1, tu, tu ? tu->tid : -1);
+                if (tc) {
+                    for (int i = 0; i < THREAD_MAX_FD; i++) {
+                        qemu_debug_printf("sendfile: fd[%02d]=%p\n", i, tc->fds[i]);
+                    }
+                }
+                if (tu && tu != tc) {
+                    for (int i = 0; i < THREAD_MAX_FD; i++) {
+                        qemu_debug_printf("sendfile: user_fd[%02d]=%p\n", i, tu->fds[i]);
+                    }
+                }
+                return ret_err(EBADF);
+            }
+            /* Only support regular file -> write and read via fs_read/fs_write */
+            size_t total = 0;
+            size_t tocopy = count;
+            size_t bufcap = tocopy < 4096 ? tocopy : 4096;
+            if (bufcap == 0) return 0;
+            uint8_t *tmp = (uint8_t*)kmalloc(bufcap);
+            if (!tmp) {
+                qemu_debug_printf("sendfile: kmalloc(%u) failed -> ENOMEM\n", (unsigned)bufcap);
+                return ret_err(ENOMEM);
+            }
+            off_t use_pos = -1;
+            if (offp) use_pos = *offp;
+            while (tocopy > 0) {
+                size_t chunk = tocopy < bufcap ? tocopy : bufcap;
+                ssize_t rr;
+                if (use_pos >= 0) {
+                    rr = fs_read(fin, tmp, chunk, (size_t)use_pos);
+                } else {
+                    rr = fs_read(fin, tmp, chunk, fin->pos);
+                }
+                if (rr < 0) {
+                    qemu_debug_printf("sendfile: read error rr=%d -> EINVAL\n", (int)rr);
+                    kfree(tmp);
+                    return ret_err(EINVAL);
+                }
+                if (rr == 0) break;
+                /* write to fout at its current position */
+                ssize_t wr = fs_write(fout, tmp, (size_t)rr, fout->pos);
+                if (wr <= 0) {
+                    qemu_debug_printf("sendfile: write error wr=%d (requested=%u) -> returning\n", (int)wr, (unsigned)rr);
+                    kfree(tmp);
+                    return (total > 0) ? (uint64_t)total : ret_err(EINVAL);
+                }
+                if (use_pos >= 0) use_pos += (off_t)rr; else fin->pos += (size_t)rr;
+                fout->pos += (size_t)wr;
+                total += (size_t)wr;
+                tocopy -= (size_t)rr;
+                if ((size_t)rr < chunk) break;
+            }
+            kfree(tmp);
+            if (offp) *offp = use_pos;
+            qemu_debug_printf("sendfile: completed total=%u (updated off=%lld)\n", (unsigned)total, (long long)use_pos);
+            return (uint64_t)total;
+        }
+        case SYS_poll: {
+            /* int poll(struct pollfd *fds, nfds_t nfds, int timeout_ms) */
+            const void *ufds = (const void*)(uintptr_t)a1;
+            int nfds = (int)a2;
+            int timeout = (int)a3; /* milliseconds, -1 means infinite */
+            if (nfds < 0 || nfds > 1024) return ret_err(EINVAL);
+            if (nfds == 0) {
+                /* just wait for timeout */
+                if (timeout <= 0) return 0;
+                if (timeout < 0) {
+                    /* block indefinitely but yield */
+                    for (;;) { thread_sleep(10); }
+                } else {
+                    int waited = 0;
+                    while (waited < timeout) { thread_sleep(10); waited += 10; }
+                    return 0;
+                }
+            }
+            size_t entry_size = 8; /* struct { int fd; short events; short revents; } */
+            size_t bytes = (size_t)nfds * entry_size;
+            void *kbuf = kmalloc(bytes);
+            if (!kbuf) return ret_err(ENOMEM);
+            if (copy_from_user_raw(kbuf, ufds, bytes) != 0) { kfree(kbuf); return ret_err(EFAULT); }
+
+            enum { POLLIN = 0x001, POLLERR = 0x008, POLLHUP = 0x010, POLLNVAL = 0x020 };
+
+            auto_check:
+            {
+                int ready = 0;
+                thread_t *curth = thread_get_current_user();
+                if (!curth) curth = thread_current();
+                for (int i = 0; i < nfds; i++) {
+                    int fd = *(int*)((uint8_t*)kbuf + i * entry_size + 0);
+                    short events = *(short*)((uint8_t*)kbuf + i * entry_size + 4);
+                    short revents = 0;
+                    if (fd < 0 || fd >= THREAD_MAX_FD) {
+                        revents = POLLNVAL;
+                    } else {
+                        struct fs_file *f = curth ? curth->fds[fd] : NULL;
+                        if (!f) {
+                            revents = POLLNVAL;
+                        } else {
+                            /* tty */
+                            if (devfs_is_tty_file(f)) {
+                                int tidx = devfs_get_tty_index_from_file(f);
+                                if (tidx < 0) tidx = devfs_get_active();
+                                if ((events & POLLIN) && devfs_tty_available(tidx) > 0) revents |= POLLIN;
+                            } else {
+                                /* regular file: readable if pos < size */
+                                if ((events & POLLIN)) {
+                                    if (f->type != FS_TYPE_DIR) {
+                                        if ((size_t)f->pos < (size_t)f->size) revents |= POLLIN;
+                                    } else {
+                                        /* directories: indicate readable */
+                                        revents |= POLLIN;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    *(short*)((uint8_t*)kbuf + i * entry_size + 6) = revents; /* revents slot at offset 6? Actually struct layout fd(0), events(4), revents(6) */
+                    if (revents) ready++;
+                }
+                if (ready > 0) {
+                    if (copy_to_user_safe((void*)ufds, kbuf, bytes) != 0) { kfree(kbuf); return ret_err(EFAULT); }
+                    kfree(kbuf);
+                    return (uint64_t)ready;
+                }
+            }
+
+            if (timeout == 0) { kfree(kbuf); return 0; }
+            int elapsed = 0;
+            int step = 10; /* ms */
+            if (timeout < 0) {
+                /* block indefinitely, poll */
+                for (;;) {
+                    thread_sleep(step);
+                    goto auto_check;
+                }
+            } else {
+                while (elapsed < timeout) {
+                    thread_sleep(step);
+                    elapsed += step;
+                    goto auto_check;
+                }
+            }
+            /* timeout expired */
+            if (copy_to_user_safe((void*)ufds, kbuf, bytes) != 0) { kfree(kbuf); return ret_err(EFAULT); }
+            kfree(kbuf);
+            return 0;
+        }
         case SYS_open: {
             const char *path_u = (const char*)(uintptr_t)a1;
             (void)a2;
@@ -1535,23 +1735,36 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (!path_u || (uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
             char path[256];
             resolve_user_path(cur, path_u, path, sizeof(path));
+            qemu_debug_printf("open: pid=%llu path='%s' resolved='%s'\n", (unsigned long long)(cur->tid ? cur->tid : 1), path_u, path);
             struct fs_file *f = fs_open(path);
-            if (!f) return ret_err(ENOENT);
+            if (!f) {
+                qemu_debug_printf("open: failed to open '%s' -> ENOENT\n", path);
+                return ret_err(ENOENT);
+            }
             int fd = thread_fd_alloc(f);
-            if (fd < 0) { fs_file_free(f); return ret_err(EBADF); }
+            if (fd < 0) { fs_file_free(f); qemu_debug_printf("open: thread_fd_alloc failed for '%s' -> EBADF\n", path); return ret_err(EBADF); }
+            qemu_debug_printf("open: pid=%llu opened '%s' -> fd=%d\n", (unsigned long long)(cur->tid ? cur->tid : 1), path, fd);
             return (uint64_t)(unsigned)fd;
         }
         case SYS_openat: {
             /* openat(dirfd, pathname, flags, mode) */
             const char *path_u = (const char*)(uintptr_t)a2;
             (void)a1; (void)a3; (void)a4;
+            qemu_debug_printf("openat: pid=%llu dirfd=%d path_u=%p path='%s'\n",
+                              (unsigned long long)(cur->tid ? cur->tid : 1), (int)a1, path_u,
+                              path_u ? path_u : "(null)");
             if (!path_u || (uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
             char path[256];
             resolve_user_path(cur, path_u, path, sizeof(path));
+            qemu_debug_printf("openat: resolved path='%s'\n", path);
             struct fs_file *f = fs_open(path);
-            if (!f) return ret_err(ENOENT);
+            if (!f) {
+                qemu_debug_printf("openat: failed to open '%s' -> ENOENT\n", path);
+                return ret_err(ENOENT);
+            }
             int fd = thread_fd_alloc(f);
-            if (fd < 0) { fs_file_free(f); return ret_err(EBADF); }
+            if (fd < 0) { fs_file_free(f); qemu_debug_printf("openat: thread_fd_alloc failed for '%s' -> EBADF\n", path); return ret_err(EBADF); }
+            qemu_debug_printf("openat: pid=%llu opened '%s' -> fd=%d\n", (unsigned long long)(cur->tid ? cur->tid : 1), path, fd);
             return (uint64_t)(unsigned)fd;
         }
         case SYS_close: {
@@ -1618,6 +1831,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             f->pos = newpos;
             return (uint64_t)(uint64_t)f->pos;
         }
+        case SYS_getdents: /* historic getdents syscall (78) */
         case SYS_getdents64: {
             int fd = (int)a1;
             void *dirp_u = (void*)(uintptr_t)a2;
@@ -1629,40 +1843,118 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             struct fs_file *f = cur->fds[fd];
             if (!f) return ret_err(EBADF);
             if (f->type != FS_TYPE_DIR) return ret_err(EINVAL);
+            qemu_debug_printf("getdents64: pid=%llu fd=%d f=%p f->type=%d path=%s driver_priv=%p pos=%u size=%u\n",
+                              (unsigned long long)(cur->tid ? cur->tid : 1), fd, f, f->type,
+                              f->path ? f->path : "(null)", f->driver_private, (unsigned)f->pos, (unsigned)f->size);
 
+            /* Synthesize linux_dirent64 records into a kernel buffer, then copy to userspace.
+               This avoids exposing malformed driver records directly to libc. */
             uint8_t kbuf[1024];
             ssize_t rr = fs_readdir_next(f, kbuf, sizeof(kbuf));
             if (rr <= 0) return 0;
 
             size_t in_off = 0;
             size_t out_off = 0;
+            size_t out_cap = count < 4096 ? count : 4096;
+            uint8_t *outbuf = (uint8_t*)kmalloc(out_cap);
+            if (!outbuf) return ret_err(ENOMEM);
+
             while (in_off + 8 <= (size_t)rr) {
                 struct ext2_dir_entry *de = (struct ext2_dir_entry*)(kbuf + in_off);
                 if (de->rec_len < 8) break;
-                if (in_off + de->rec_len > (size_t)rr) break;
-                if (de->name_len > de->rec_len - 8) break;
+                size_t rem = (size_t)rr - in_off;
+                size_t entry_rec = (size_t)de->rec_len;
+                if (entry_rec == 0) break;
+                if (entry_rec > rem) entry_rec = rem;
+                size_t max_name = (entry_rec > 8) ? entry_rec - 8 : 0;
+                size_t name_len_use = (size_t)de->name_len;
+                if (name_len_use > max_name) name_len_use = max_name;
 
-                const char *nm = (const char*)(kbuf + in_off + 8);
-                size_t nlen = (size_t)de->name_len;
+                const char *nm_raw = (const char*)(kbuf + in_off + 8);
+                char namebuf_local[256];
+                size_t copy_n = (name_len_use < sizeof(namebuf_local)-1) ? name_len_use : (sizeof(namebuf_local)-1);
+                if (copy_n > 0) memcpy(namebuf_local, nm_raw, copy_n);
+                namebuf_local[copy_n] = '\0';
+                for (size_t _i = 0; _i < copy_n; _i++) {
+                    unsigned char ch = (unsigned char)namebuf_local[_i];
+                    if (ch < 32 || ch > 126) namebuf_local[_i] = '?';
+                }
+                const char *nm = namebuf_local;
+                size_t nlen = copy_n;
 
-                /* linux_dirent64 header (19 bytes) + name + NUL, aligned to 8 */
+                /* Determine inode/type by stat'ing the full path if possible */
+                uint64_t out_ino = (uint64_t)de->inode;
+                uint8_t out_type = (uint8_t)de->file_type;
+                if (f->path && nlen > 0) {
+                    char fullpath[512];
+                    size_t plen = strlen(f->path);
+                    if (plen + 1 + nlen + 1 < sizeof(fullpath)) {
+                        memcpy(fullpath, f->path, plen);
+                        if (plen == 0 || fullpath[plen-1] != '/') fullpath[plen++] = '/';
+                        memcpy(fullpath + plen, nm, nlen);
+                        fullpath[plen + nlen] = '\0';
+                        struct fs_file *ef = fs_open(fullpath);
+                        if (ef) {
+                            struct stat st;
+                            if (vfs_fstat(ef, &st) == 0) {
+                                out_ino = (uint64_t)st.st_ino;
+                                if ((st.st_mode & S_IFDIR) == S_IFDIR) out_type = EXT2_FT_DIR;
+                                else out_type = EXT2_FT_REG_FILE;
+                            }
+                            fs_file_free(ef);
+                        }
+                    }
+                }
+
                 size_t reclen = 19 + nlen + 1;
                 reclen = (reclen + 7) & ~7u;
-                if (out_off + reclen > count) break;
+                if (out_off + reclen > out_cap) break;
 
-                uint8_t *out = (uint8_t*)dirp_u + out_off;
-                *(uint64_t*)(out + 0) = (uint64_t)de->inode;
-                *(int64_t*)(out + 8) = (int64_t)f->pos; /* best-effort */
-                *(uint16_t*)(out + 16) = (uint16_t)reclen;
-                out[18] = (uint8_t)de->file_type;
-                memcpy(out + 19, nm, nlen);
-                out[19 + nlen] = '\0';
-                for (size_t z = 19 + nlen + 1; z < reclen; z++) out[z] = 0;
+                uint8_t *outp = outbuf + out_off;
+                *(uint64_t*)(outp + 0) = (uint64_t)out_ino;
+                *(int64_t*)(outp + 8) = (int64_t)f->pos;
+                *(uint16_t*)(outp + 16) = (uint16_t)reclen;
+                outp[18] = (uint8_t)out_type;
+                memcpy(outp + 19, nm, nlen);
+                outp[19 + nlen] = '\0';
+                for (size_t z = 19 + nlen + 1; z < reclen; z++) outp[z] = 0;
 
                 out_off += reclen;
-                in_off += de->rec_len;
+                in_off += entry_rec;
             }
-            return (uint64_t)out_off;
+
+            /* debug: dump synthesized buffer hex to kernel log to inspect what userspace will receive */
+            qemu_debug_printf("getdents_synth: out_off=%u bytes:\n", (unsigned)out_off);
+            for (size_t zi = 0; zi < out_off; zi++) {
+                qemu_debug_printf("%02x ", (unsigned)outbuf[zi]);
+                if ((zi & 0x0F) == 0x0F) qemu_debug_printf("\n");
+            }
+            qemu_debug_printf("\n");
+
+            /* copy synthesized data to user buffer per-record (safer) */
+            size_t wrote = 0;
+            size_t scan = 0;
+            while (scan + 18 < out_off) {
+                uint16_t recl = *(uint16_t*)(outbuf + scan + 16);
+                if (recl == 0) break;
+                if (scan + recl > out_off) break;
+                /* bounds check user destination */
+                if ((uintptr_t)dirp_u + wrote + recl > (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                    qemu_debug_printf("getdents_synth: user buffer overflow prevented wrote=%u recl=%u count=%u\n",
+                                      (unsigned)wrote, (unsigned)recl, (unsigned)count);
+                    break;
+                }
+                qemu_debug_printf("getdents_synth: copying record wrote=%u recl=%u\n", (unsigned)wrote, (unsigned)recl);
+                int rc = copy_to_user_safe((uint8_t*)dirp_u + wrote, outbuf + scan, recl);
+                if (rc != 0) {
+                    kfree(outbuf);
+                    return ret_err(EFAULT);
+                }
+                wrote += recl;
+                scan += recl;
+            }
+            kfree(outbuf);
+            return (uint64_t)wrote;
         }
         case SYS_arch_prctl: {
             /* Linux x86_64 arch_prctl */

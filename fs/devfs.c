@@ -374,17 +374,34 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
         acquire_irqsave(&t->in_lock, &flags);
         if (t->in_count > 0) {
             /* pop one */
-            char c = t->inbuf[t->in_head];
-            t->in_head = (t->in_head + 1) % (int)sizeof(t->inbuf);
-            t->in_count--;
-            release_irqrestore(&t->in_lock, flags);
-            /* Canonical-ish line discipline: handle backspace locally so userland read()
-               behaves human-friendly even without full termios. */
-            if (c == '\r') c = '\n';
-            /* deliver character (including backspace) to userspace and do not echo here */
-            out[got++] = c;
-            if (c == '\n') break;
-            continue;
+            /* Decide mode: canonical vs non-canonical */
+            int is_canonical = (t->term_lflag & 0x00000002u) ? 1 : 0; /* ICANON bit (kernel mapping) */
+            if (is_canonical) {
+                /* canonical: deliver one char, stop on newline */
+                char c = t->inbuf[t->in_head];
+                t->in_head = (t->in_head + 1) % (int)sizeof(t->inbuf);
+                t->in_count--;
+                release_irqrestore(&t->in_lock, flags);
+                if (c == '\r') c = '\n';
+                out[got++] = c;
+                if (c == '\n') break;
+                continue;
+            } else {
+                /* non-canonical: deliver as many available as fits */
+                int avail = t->in_count;
+                int tocopy_nc = (int)(size - got);
+                if (tocopy_nc > avail) tocopy_nc = avail;
+                for (int j = 0; j < tocopy_nc; j++) {
+                    char c = t->inbuf[t->in_head];
+                    t->in_head = (t->in_head + 1) % (int)sizeof(t->inbuf);
+                    t->in_count--;
+                    out[got++] = c;
+                }
+                release_irqrestore(&t->in_lock, flags);
+                /* return immediately with whatever we delivered (POSIX: may block per VMIN/VTIME) */
+                if (got > 0) break;
+                continue;
+            }
         }
         /* no data: block current thread until pushed */
         thread_t* cur = thread_current();
@@ -844,6 +861,17 @@ void devfs_tty_push_input_noblock(int tty, char c) {
         if (tid >= 0) thread_unblock(tid);
     }
     t->waiters_count = 0;
+    /* echo to active tty display if enabled and this is active tty */
+    if ((t->term_lflag & 0x00000008u) /* ECHO */ && tty == devfs_get_active()) {
+        if ((unsigned char)c >= 32 && (unsigned char)c < 127) {
+            kputchar((uint8_t)c, t->current_attr);
+        } else if (c == '\n' || c == '\r') {
+            kputchar((uint8_t)c, t->current_attr);
+        } else {
+            /* for control chars, optionally show caret notation (e.g., ^C) */
+            // simple: ignore non-printable for now
+        }
+    }
     release(&t->in_lock);
 }
 
@@ -986,6 +1014,12 @@ int devfs_get_tty_index_from_file(struct fs_file *file) {
         }
     }
     return -1;
+}
+
+/* Return pointer to internal tty struct by index, or NULL if invalid. */
+struct devfs_tty *devfs_get_tty_by_index(int idx) {
+    if (idx < 0 || idx >= DEVFS_TTY_COUNT) return NULL;
+    return &dev_ttys[idx];
 }
 
 int devfs_get_tty_fg_pgrp(int tty) {

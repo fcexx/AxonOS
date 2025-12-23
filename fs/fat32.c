@@ -403,40 +403,45 @@ static ssize_t fat32_read(struct fs_file *file, void *buf, size_t size, size_t o
                 continue;
             }
             /* short entry: assemble name from LFN if present, otherwise fall back to 8.3 */
-            char namebuf[512];
+            /* dynamically allocate name buffers to avoid fixed-stack overflows.
+               Cap to a reasonable upper bound to avoid unbounded allocations. */
+            size_t namebuf_cap = 512;
+            if (bytes_per_cluster > namebuf_cap) namebuf_cap = bytes_per_cluster;
+            if (namebuf_cap > 4096) namebuf_cap = 4096;
+            char *namebuf = (char*)kmalloc(namebuf_cap);
+            if (!namebuf) { kfree(buf); return -1; }
             if (lfn_present && lfn_count > 0 && lfn_ck_valid) {
                 uint8_t short_ck = fat32_lfn_checksum(tmp + off);
                 if (short_ck != lfn_ck) {
                     lfn_present = 0; lfn_count = 0; lfn_ck_valid = 0;
                 }
             }
+            int pos = 0;
             if (lfn_present && lfn_count > 0) {
                 /* assemble from lfn_u16 parts [0 .. lfn_count-1] converting UTF-16LE -> UTF-8 */
-                int pos = 0;
                 for (int si = 0; si < lfn_count; si++) {
                     if (lfn_u16_len[si] <= 0) continue;
-                    char tmputf[64];
+                    char tmputf[128];
                     int conv = utf16le_to_utf8(lfn_u16[si], lfn_u16_len[si], tmputf, (int)sizeof(tmputf));
                     if (conv > 0) {
-                        for (int k = 0; k < conv && pos < (int)sizeof(namebuf)-1; k++) namebuf[pos++] = tmputf[k];
+                        for (int k = 0; k < conv && pos < (int)namebuf_cap - 1; k++) namebuf[pos++] = tmputf[k];
                     }
                 }
                 namebuf[pos] = '\0';
             } else {
                 /* No LFN — fallback to legacy 8.3 (better than hiding files). */
-                int p2 = 0;
                 for (int i = 0; i < 8; i++) {
-                    char ch = (char)tmp[off + (uint32_t)i];
-                    if (ch != ' ' && p2 < (int)sizeof(namebuf) - 1) namebuf[p2++] = ch;
+                    char ch = (char)tmp[off + i];
+                    if (ch != ' ' && pos < (int)namebuf_cap - 1) namebuf[pos++] = ch;
                 }
                 if (tmp[off + 8] != ' ') {
-                    if (p2 < (int)sizeof(namebuf) - 1) namebuf[p2++] = '.';
+                    if (pos < (int)namebuf_cap - 1) namebuf[pos++] = '.';
                     for (int i = 0; i < 3; i++) {
-                        char ch = (char)tmp[off + 8 + (uint32_t)i];
-                        if (ch != ' ' && p2 < (int)sizeof(namebuf) - 1) namebuf[p2++] = ch;
+                        char ch = (char)tmp[off + 8 + i];
+                        if (ch != ' ' && pos < (int)namebuf_cap - 1) namebuf[pos++] = ch;
                     }
                 }
-                namebuf[p2] = '\0';
+                namebuf[pos] = '\0';
             }
             size_t namelen = strlen(namebuf);
             size_t rec_len = 8 + namelen;
@@ -450,11 +455,15 @@ static ssize_t fat32_read(struct fs_file *file, void *buf, size_t size, size_t o
             if (written >= size) goto dir_done;
             size_t entry_off = 0;
             if (offset > pos) entry_off = offset - pos;
-            uint8_t tmpent[8 + 512];
-            if (rec_len > sizeof(tmpent)) {
+            size_t tmpent_cap = 8 + namebuf_cap;
+            uint8_t *tmpent = (uint8_t*)kmalloc(tmpent_cap);
+            if (!tmpent) { kfree(namebuf); kfree(buf); return -1; }
+            if (rec_len > tmpent_cap) {
                 /* name too long for our entry buffer; skip */
+                kfree(tmpent);
                 pos += rec_len;
                 lfn_present = 0; lfn_count = 0; lfn_ck_valid = 0;
+                kfree(namebuf);
                 continue;
             }
             struct ext2_dir_entry de;
@@ -465,7 +474,7 @@ static ssize_t fat32_read(struct fs_file *file, void *buf, size_t size, size_t o
             /* debug: report directory entry discovered */
             kprintf("fat32: readdir found name='%s' type=%d lba=%u off=%u\n", namebuf, de.file_type, lba, off);
             memcpy(tmpent, &de, 8);
-            memcpy(tmpent + 8, namebuf, namelen);
+            if (namelen > 0) memcpy(tmpent + 8, namebuf, namelen);
             size_t avail = size - written;
             size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
             if (tocopy > avail) tocopy = avail;
@@ -474,6 +483,8 @@ static ssize_t fat32_read(struct fs_file *file, void *buf, size_t size, size_t o
             pos += rec_len;
             /* reset LFN state */
             lfn_present = 0; lfn_count = 0; lfn_ck_valid = 0;
+            kfree(tmpent);
+            kfree(namebuf);
         }
         uint32_t nxt = fat32_read_fat_entry(m, c);
         if (nxt >= 0x0FFFFFF8 || nxt == 0) break;
@@ -784,37 +795,51 @@ static int fat32_find_entry_in_dir(struct fat32_mount *m, uint32_t dir_cluster, 
                 if (buf[off] & 0x40) lfn_count = (int)(buf[off] & 0x1F);
                 continue;
             }
-            /* assemble name */
-            char namebuf[512];
+            /* assemble name into dynamically allocated buffer to avoid stack overflow */
+            size_t namebuf_cap = 512;
+            if (bytes_per_cluster > namebuf_cap) namebuf_cap = bytes_per_cluster;
+            if (namebuf_cap > 4096) namebuf_cap = 4096;
+            char *namebuf = (char*)kmalloc(namebuf_cap);
+            if (!namebuf) { kfree(buf); return -1; }
             if (lfn_present && lfn_count > 0 && lfn_ck_valid) {
                 uint8_t short_ck = fat32_lfn_checksum(buf + off);
                 if (short_ck != lfn_ck) {
                     lfn_present = 0; lfn_count = 0; lfn_ck_valid = 0;
                 }
             }
+            int pos = 0;
             if (lfn_present && lfn_count > 0) {
-                int pos = 0;
                 /* IMPORTANT: seq=1 is the last part of name; build from highest seq down to 1. */
                 for (int si = 0; si < lfn_count; si++) {
                     if (lfn_u16_len[si] <= 0) continue;
                     char tmputf[128];
                     int conv = utf16le_to_utf8(lfn_u16[si], lfn_u16_len[si], tmputf, sizeof(tmputf));
                     if (conv > 0) {
-                        for (int k = 0; k < conv && pos < (int)sizeof(namebuf)-1; k++) namebuf[pos++] = tmputf[k];
+                        for (int k = 0; k < conv && pos < (int)namebuf_cap - 1; k++) namebuf[pos++] = tmputf[k];
                     }
                 }
                 namebuf[pos] = '\0';
             } else {
-                int p2 = 0;
-                for (int i = 0; i < 8; i++) { char ch = buf[off + i]; if (ch != ' ') namebuf[p2++] = (char)((ch >= 'a' && ch <= 'z') ? ch - 32 : ch); }
-                if (buf[off+8] != ' ') { namebuf[p2++] = '.'; for (int i = 0; i < 3; i++) { char ch = buf[off + 8 + i]; if (ch != ' ') namebuf[p2++] = (char)((ch >= 'a' && ch <= 'z') ? ch - 32 : ch); } }
-                namebuf[p2] = 0;
+                for (int i = 0; i < 8 && pos < (int)namebuf_cap - 1; i++) {
+                    char ch = buf[off + i];
+                    if (ch != ' ') namebuf[pos++] = (char)((ch >= 'a' && ch <= 'z') ? ch - 32 : ch);
+                }
+                if (buf[off + 8] != ' ' && pos < (int)namebuf_cap - 1) {
+                    namebuf[pos++] = '.';
+                    for (int i = 0; i < 3 && pos < (int)namebuf_cap - 1; i++) {
+                        char ch = buf[off + 8 + i];
+                        if (ch != ' ') namebuf[pos++] = (char)((ch >= 'a' && ch <= 'z') ? ch - 32 : ch);
+                    }
+                }
+                namebuf[pos] = '\0';
             }
             /* lowercase for compare */
-            char lower_namebuf[512];
+            size_t lower_cap = namebuf_cap;
+            char *lower_namebuf = (char*)kmalloc(lower_cap);
+            if (!lower_namebuf) { kfree(namebuf); kfree(buf); return -1; }
             size_t nb_len = strlen(namebuf);
-            if (nb_len >= sizeof(lower_namebuf)) nb_len = sizeof(lower_namebuf)-1;
-            for (size_t i=0;i<nb_len;i++) {
+            if (nb_len >= lower_cap) nb_len = lower_cap - 1;
+            for (size_t i = 0; i < nb_len; i++) {
                 char c = namebuf[i];
                 lower_namebuf[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
             }
@@ -826,13 +851,17 @@ static int fat32_find_entry_in_dir(struct fat32_mount *m, uint32_t dir_cluster, 
                 uint32_t size = *(uint32_t*)(buf + off + 28);
                 int is_dir = (buf[off + 11] & 0x10) ? 1 : 0;
                 /* Basic sanity: regular files/dirs should not have start_cluster < 2 unless empty. */
-                if (start_cluster < 2 && size != 0) { kfree(buf); return -1; }
+                if (start_cluster < 2 && size != 0) { kfree(lower_namebuf); kfree(namebuf); kfree(buf); return -1; }
                 if (out_start_cluster) *out_start_cluster = start_cluster;
                 if (out_size) *out_size = size;
                 if (out_is_dir) *out_is_dir = is_dir;
+                kfree(lower_namebuf);
+                kfree(namebuf);
                 kfree(buf);
                 return 0;
             }
+            kfree(lower_namebuf);
+            kfree(namebuf);
             lfn_present = 0; lfn_count = 0; lfn_ck_valid = 0;
         }
         uint32_t nxt = fat32_read_fat_entry(m, cluster);

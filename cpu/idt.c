@@ -11,6 +11,7 @@
 #include <apic_timer.h>
 #include <debug.h>
 #include <mmio.h>
+#include <paging.h>
 // Avoid including <cstdint> because cross-toolchain headers may not provide it; use uint64_t instead
 
 // Forward declare C-linkage helpers from other compilation units
@@ -205,6 +206,78 @@ static void page_fault_handler(cpu_registers_t* regs) {
         uint64_t fsbase = ((uint64_t)fsbase_hi << 32) | fsbase_lo;
         kprintf("page fault MSR_FS_BASE=0x%016llx\n", (unsigned long long)fsbase);
         kprintf("page fault details: CR2=0x%llx err=0x%llx user=%d\n", (unsigned long long)cr2, (unsigned long long)regs->error_code, user);
+        /* Additional diagnostics to help pinpoint cause in user mode */
+        if (user) {
+            /* dump instruction bytes at RIP */
+            if ((uintptr_t)regs->rip < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                const unsigned char *code = (const unsigned char*)(uintptr_t)regs->rip;
+                kprintf("code @ RIP: ");
+                for (int i = 0; i < 32; i++) kprintf("%02x ", (unsigned)code[i]);
+                kprintf("\n");
+            } else {
+                kprintf("code @ RIP: (outside identity map)\n");
+            }
+            /* dump stack words */
+            if ((uintptr_t)regs->rsp < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                const uint64_t *stk = (const uint64_t*)(uintptr_t)regs->rsp;
+                kprintf("stack @ RSP: ");
+                for (int i = 0; i < 8; i++) kprintf("0x%016llx ", (unsigned long long)stk[i]);
+                kprintf("\n");
+            } else {
+                kprintf("stack @ RSP: (outside identity map)\n");
+            }
+            /* dump memory near CR2 if available */
+            if ((uintptr_t)cr2 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                kprintf("bytes @ CR2: ");
+                const unsigned char *p = (const unsigned char*)(uintptr_t)cr2;
+                for (int i = 0; i < 32; i++) kprintf("%02x ", (unsigned)p[i]);
+                kprintf("\n");
+            } else {
+                kprintf("bytes @ CR2: (outside identity map)\n");
+            }
+            /* dump page table entries for CR2 */
+            {
+                extern uint64_t page_table_l4[];
+                uint64_t v = (uint64_t)cr2;
+                uint64_t *l4 = (uint64_t*)page_table_l4;
+                int l4i = (v >> 39) & 0x1FF;
+                int l3i = (v >> 30) & 0x1FF;
+                int l2i = (v >> 21) & 0x1FF;
+                int l1i = (v >> 12) & 0x1FF;
+                kprintf("ptes for CR2 (v=0x%llx): l4[%d]=0x%016llx\n", (unsigned long long)v, l4i, (unsigned long long)l4[l4i]);
+                if (l4[l4i] & PG_PRESENT) {
+                    uint64_t *l3 = (uint64_t*)(uintptr_t)(l4[l4i] & ~0xFFFULL);
+                    kprintf("ptes: l3[%d]=0x%016llx\n", l3i, (unsigned long long)l3[l3i]);
+                    if (l3[l3i] & PG_PRESENT) {
+                        uint64_t l3e = l3[l3i];
+                        if (l3e & PG_PS_2M) {
+                            kprintf("ptes: 1GiB/2MiB large at L3\n");
+                        } else {
+                            uint64_t *l2 = (uint64_t*)(uintptr_t)(l3e & ~0xFFFULL);
+                            kprintf("ptes: l2[%d]=0x%016llx\n", l2i, (unsigned long long)l2[l2i]);
+                            if (l2[l2i] & PG_PRESENT) {
+                                uint64_t l2e = l2[l2i];
+                                if (l2e & PG_PS_2M) {
+                                    kprintf("ptes: 2MiB large at L2\n");
+                                } else {
+                                    uint64_t *l1 = (uint64_t*)(uintptr_t)(l2e & ~0xFFFULL);
+                                    kprintf("ptes: l1[%d]=0x%016llx\n", l1i, (unsigned long long)l1[l1i]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            /* show syscall_kernel_rsp0 if set */
+            {
+                extern uint64_t syscall_kernel_rsp0;
+                if ((uintptr_t)syscall_kernel_rsp0 != 0 && (uintptr_t)syscall_kernel_rsp0 + 8*16 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                    kprintf("syscall_kernel_rsp0=0x%llx\n", (unsigned long long)syscall_kernel_rsp0);
+                } else {
+                    kprintf("syscall_kernel_rsp0 not set or out of range\n");
+                }
+            }
+        }
         for (;;) { asm volatile("sti; hlt" ::: "memory"); }
 }
 

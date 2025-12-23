@@ -8,6 +8,7 @@
 /* driver-specific stat helpers */
 #include <sysfs.h>
 #include <ramfs.h>
+#include <procfs.h>
 
 #define MAX_FS_DRIVERS 8
 #define MAX_FS_MOUNTS 8
@@ -429,6 +430,8 @@ ssize_t fs_readdir_next(struct fs_file *file, void *buf, size_t size) {
     if (!file) return -1;
     ssize_t r = fs_read(file, buf, size, file->pos);
     if (r > 0) file->pos += r;
+    qemu_debug_printf("fs_readdir_next: path=%s pos=%llu returned=%d\n",
+                      file->path ? file->path : "(null)", (unsigned long long)file->pos, (int)r);
     return r;
 }
 
@@ -445,6 +448,8 @@ int vfs_fstat(struct fs_file *file, struct stat *st) {
             if (sysfs_fill_stat(file, st) == 0) return 0;
         } else if (name && strcmp(name, "ramfs") == 0) {
             if (ramfs_fill_stat(file, st) == 0) return 0;
+        } else if (name && strcmp(name, "procfs") == 0) {
+            if (procfs_fill_stat(file, st) == 0) return 0;
         }
         break;
     }

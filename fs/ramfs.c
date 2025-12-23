@@ -338,10 +338,15 @@ static ssize_t ramfs_read(struct fs_file *file, void *buf, size_t size, size_t o
         uint8_t *out = (uint8_t*)buf;
         for (struct ramfs_node *c = n->children; c; c = c->next) {
             size_t namelen = strlen(c->name);
+            /* record length: header (8) + name, padded to 4 bytes for compatibility */
             size_t rec_len = (size_t)(8 + namelen);
+            rec_len = (rec_len + 3) & ~3u;
+            if (rec_len < sizeof(struct ext2_dir_entry)) rec_len = sizeof(struct ext2_dir_entry);
             if (pos + rec_len <= (size_t)offset) { pos += rec_len; continue; }
             if (written >= size) break;
             uint8_t tmp[512];
+            /* initialize buffer to zero to avoid leaking memory beyond name */
+            for (size_t zi = 0; zi < sizeof(tmp); zi++) tmp[zi] = 0;
             de.inode = (uint32_t)(c->ino & 0xFFFFFFFFu);
             de.rec_len = (uint16_t)rec_len;
             de.name_len = (uint8_t)namelen;

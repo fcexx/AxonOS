@@ -264,7 +264,7 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
                 return -1;
             }
             /* Make sure the PML4 entry itself permits user access (parent entries must not block) */
-            l4[l4i] |= PG_US;
+            l4[l4i] |= PG_US | PG_RW;
             l4[l4i] &= ~PG_NX;
             invlpg((void*)(uintptr_t)va);
 
@@ -274,7 +274,7 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
                 return -1;
             }
             /* PDPT entry must also allow user access, иначе будет #PF err=0x5 при fetch/чтении из ring3. */
-            l3[l3i] |= PG_US;
+            l3[l3i] |= PG_US | PG_RW;
             l3[l3i] &= ~PG_NX;
             uint64_t l3e = l3[l3i];
             if (l3e & PG_PS_2M) {
@@ -292,14 +292,14 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
             uint64_t l2e = l2[l2i];
             if (l2e & PG_PS_2M) {
                 /* 2MiB mapping at L2: set US and clear NX on L2 entry */
-                l2[l2i] |= PG_US;
+                l2[l2i] |= PG_US | PG_RW;
                 l2[l2i] &= ~PG_NX;
                 invlpg((void*)(uintptr_t)va);
                 continue;
             }
             uint64_t *l1 = (uint64_t*)(uintptr_t)(l2e & ~0xFFFULL);
             /* set US and clear NX on L1 entry covering this 4KiB range */
-            l1[l1i] |= PG_US;
+            l1[l1i] |= PG_US | PG_RW;
             l1[l1i] &= ~PG_NX;
             invlpg((void*)(uintptr_t)va);
         }
@@ -339,6 +339,15 @@ static int mark_user_identity_range_2m(uint64_t va_begin, uint64_t va_end) {
         invlpg((void*)(uintptr_t)va);
     }
     return 0;
+}
+
+/* Temporary broad user-mark helper used during execve to avoid missing mappings.
+   This is a defensive measure: mark a large low address range user-accessible/writable
+   to avoid spurious PFs during early userspace bootstrap. */
+static void mark_broad_user_ranges_for_exec(void) {
+    uintptr_t begin = 0x200000; /* 2MiB */
+    uintptr_t end = USER_STACK_TOP;
+    (void)mark_user_identity_range_2m((uint64_t)begin, (uint64_t)end);
 }
 
 int elf_load_from_path(const char *path, uint64_t *out_entry) {
@@ -686,6 +695,12 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     } else {
         qemu_debug_printf("execve: DEBUG entry outside identity map: 0x%llx\n", (unsigned long long)entry);
     }
+
+    /* Temporary diagnostic: ensure low memory and broad user ranges are marked
+       user-accessible to test whether PFs are caused by missing PG_US. */
+    mark_broad_user_ranges_for_exec();
+    /* Mark 0..ELF_ET_DYN_BASE (0..4MiB) as user-accessible for diagnostic */
+    (void)mark_user_identity_range_2m(0, ELF_ET_DYN_BASE);
 
     /* Transfer to user mode (does not return) */
     enter_user_mode(entry, final_stack);

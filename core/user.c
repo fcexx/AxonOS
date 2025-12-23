@@ -98,8 +98,26 @@ int user_export_passwd(char **out, size_t *out_len) {
     size_t pos = 0;
     for (int i=0;i<g_user_count;i++) {
         struct user *u = &g_users[i];
-        /* format: name:x:uid:gid::\n */
-        int n = snprintf(buf + pos, (pos < cap) ? cap - pos : 0, "%s:x:%u:%u::\n", u->name, u->uid, u->gid);
+        /* format: name:x:uid:gid:gecos:home:shell\n
+           Provide reasonable defaults: root -> /root, others -> /home/name */
+        const char *gecos = u->name;
+        char *htmp = NULL;
+        const char *home = NULL;
+        if (u->uid == 0) {
+            home = "/root";
+        } else {
+            /* allocate temporary buffer for /home/<name> */
+            size_t hlen = strlen(u->name) + 7;
+            htmp = (char*)kmalloc(hlen);
+            if (htmp) {
+                snprintf(htmp, hlen, "/home/%s", u->name);
+                home = htmp;
+            } else {
+                home = "/home";
+            }
+        }
+        int n = snprintf(buf + pos, (pos < cap) ? cap - pos : 0, "%s:x:%u:%u:%s:%s:/bin/sh\n", u->name, u->uid, u->gid, gecos, home);
+        if (htmp) kfree(htmp);
         if (n <= 0) break;
         pos += (size_t)n;
         if (pos + 128 > cap) {

@@ -23,6 +23,7 @@
 #include <ext2.h>
 #include <ramfs.h>
 #include <sysfs.h>
+#include <procfs.h>
 #include <initfs.h>
 #include <editor.h>
 #include <fat32.h>
@@ -349,6 +350,15 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         }
     } else {
         kprintf("devfs: failed to register\n");
+    }
+
+    /* register and mount procfs at /proc */
+    if (procfs_register() == 0) {
+        kprintf("procfs: mounting procfs in /proc\n");
+        ramfs_mkdir("/proc");
+        procfs_mount("/proc");
+    } else {
+        kprintf("procfs: failed to register\n");
     }
 
     ps2_keyboard_init();

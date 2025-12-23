@@ -214,7 +214,9 @@ void user_thread_entry(void) {
 
 int thread_fd_alloc(struct fs_file *file) {
     if (!file) return -1;
-    thread_t *cur = thread_current();
+    /* Prefer the registered user thread for syscall context; fall back to current kernel thread. */
+    thread_t *cur = thread_get_current_user();
+    if (!cur) cur = thread_current();
     if (!cur) return -1;
     for (int i = 0; i < THREAD_MAX_FD; i++) {
         if (cur->fds[i] == NULL) {
@@ -229,7 +231,8 @@ int thread_fd_alloc(struct fs_file *file) {
 }
 
 int thread_fd_close(int fd) {
-    thread_t *cur = thread_current();
+    thread_t *cur = thread_get_current_user();
+    if (!cur) cur = thread_current();
     if (!cur || fd < 0 || fd >= THREAD_MAX_FD) return -1;
     struct fs_file *f = cur->fds[fd];
     if (!f) return -1;
@@ -239,7 +242,8 @@ int thread_fd_close(int fd) {
 }
 
 int thread_fd_dup(int oldfd) {
-    thread_t *cur = thread_current();
+    thread_t *cur = thread_get_current_user();
+    if (!cur) cur = thread_current();
     if (!cur || oldfd < 0 || oldfd >= THREAD_MAX_FD) return -1;
     struct fs_file *f = cur->fds[oldfd];
     if (!f) return -1;
@@ -255,7 +259,8 @@ int thread_fd_dup(int oldfd) {
 }
 
 int thread_fd_dup2(int oldfd, int newfd) {
-    thread_t *cur = thread_current();
+    thread_t *cur = thread_get_current_user();
+    if (!cur) cur = thread_current();
     if (!cur || oldfd < 0 || oldfd >= THREAD_MAX_FD || newfd < 0 || newfd >= THREAD_MAX_FD) return -1;
     if (oldfd == newfd) return newfd;
     struct fs_file *f = cur->fds[oldfd];
@@ -272,7 +277,8 @@ int thread_fd_dup2(int oldfd, int newfd) {
 }
 
 int thread_fd_isatty(int fd) {
-    thread_t *cur = thread_current();
+    thread_t *cur = thread_get_current_user();
+    if (!cur) cur = thread_current();
     if (!cur || fd < 0 || fd >= THREAD_MAX_FD) return 0;
     struct fs_file *f = cur->fds[fd];
     if (!f) return 0;
