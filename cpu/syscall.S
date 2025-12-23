@@ -26,9 +26,13 @@ syscall_entry64:
     cld
     // Save user RIP (return address) for SYSCALL path (rcx contains return RIP)
     movq    %rcx, syscall_user_return_rip(%rip)
-    // Save user RSP and switch to kernel syscall stack.
+    // Save user RSP and switch to kernel syscall stack (only if set).
     movq    %rsp, syscall_user_rsp_saved(%rip)
+    // Check syscall_kernel_rsp0 without clobbering registers and switch if non-zero.
+    cmpq    $0, syscall_kernel_rsp0(%rip)
+    je      .no_switch_syscall_stack
     movq    syscall_kernel_rsp0(%rip), %rsp
+.no_switch_syscall_stack:
 
     // Save registers (order matches our offset math below).
     pushq   %rax

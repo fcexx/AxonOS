@@ -44,6 +44,8 @@ struct devfs_tty {
     int ansi_current_param;
     /* controlling session id for this tty (-1 if none) */
     int controlling_sid;
+    /* POSIX termios local flags (c_lflag) for this tty */
+    uint32_t term_lflag;
 };
 
 int devfs_register(void);
@@ -79,6 +81,9 @@ void devfs_set_tty_fg_pgrp(int tty, int pgrp);
 int devfs_get_tty_controlling_sid(struct fs_file *file);
 int devfs_set_tty_controlling_sid(struct fs_file *file, int sid);
 void devfs_clear_controlling_by_sid(int sid);
+/* Return pointer to internal tty struct (for callers that need to read/write flags).
+   Caller must not free or modify beyond term_lflag; pointer is valid while devfs registered. */
+struct devfs_tty *devfs_get_tty_by_index(int idx);
 
 /* Create a block device node at given path and associate with disk device_id.
    sectors - total number of 512-byte sectors on device (for size reporting). */

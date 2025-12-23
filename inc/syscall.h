@@ -27,6 +27,7 @@
 #define SYS_rt_sigprocmask 14
 #define SYS_ioctl   16
 #define SYS_getdents64 217
+#define SYS_getdents 78
 #define SYS_getpid  39
 #define SYS_getppid 110
 #define SYS_getuid  102
@@ -40,6 +41,7 @@
 #define SYS_mmap    9
 #define SYS_munmap  11
 #define SYS_brk     12
+#define SYS_poll    7
 #define SYS_mprotect 10
 #define SYS_arch_prctl 158
 #define SYS_exit    60
@@ -51,6 +53,7 @@
 #define SYS_openat  257
 #define SYS_newfstatat 262
 #define SYS_tgkill  234
+#define SYS_sendfile 40
 
 /* initialize syscall subsystem (register handler) */
 void syscall_init(void);

@@ -148,6 +148,11 @@ void keyboard_process_scancode(uint8_t scancode) {
         }
 
         // Клавиша нажата
+        // determine target tty for user processes (prefer user's attached tty)
+        thread_t *tu_for_tty = thread_get_current_user();
+        int target_tty_for_user = devfs_get_active();
+        if (tu_for_tty && tu_for_tty->attached_tty >= 0) target_tty_for_user = tu_for_tty->attached_tty;
+
         switch (scancode) {
                 case 0x2A: // Left Shift
                 case 0x36: // Right Shift
@@ -161,34 +166,99 @@ void keyboard_process_scancode(uint8_t scancode) {
                         alt_pressed = true;
                         break;
                 case 0x48: // Up arrow
-                        add_to_buffer(KEY_UP);
+                        if (thread_get_current_user()) {
+                                /* send ESC [ A */
+                                devfs_tty_push_input_noblock(target_tty_for_user, 0x1B);
+                                devfs_tty_push_input_noblock(target_tty_for_user, '[');
+                                devfs_tty_push_input_noblock(target_tty_for_user, 'A');
+                        } else {
+                                add_to_buffer(KEY_UP);
+                        }
                         break;
                 case 0x50: // Down arrow
-                        add_to_buffer(KEY_DOWN);
+                        if (thread_get_current_user()) {
+                                devfs_tty_push_input_noblock(target_tty_for_user, 0x1B);
+                                devfs_tty_push_input_noblock(target_tty_for_user, '[');
+                                devfs_tty_push_input_noblock(target_tty_for_user, 'B');
+                        } else {
+                                add_to_buffer(KEY_DOWN);
+                        }
                         break;
                 case 0x4B: // Left arrow
-                        add_to_buffer(KEY_LEFT);
+                        if (thread_get_current_user()) {
+                                devfs_tty_push_input_noblock(target_tty_for_user, 0x1B);
+                                devfs_tty_push_input_noblock(target_tty_for_user, '[');
+                                devfs_tty_push_input_noblock(target_tty_for_user, 'D');
+                        } else {
+                                add_to_buffer(KEY_LEFT);
+                        }
                         break;
                 case 0x4D: // Right arrow
-                        add_to_buffer(KEY_RIGHT);
+                        if (thread_get_current_user()) {
+                                devfs_tty_push_input_noblock(target_tty_for_user, 0x1B);
+                                devfs_tty_push_input_noblock(target_tty_for_user, '[');
+                                devfs_tty_push_input_noblock(target_tty_for_user, 'C');
+                        } else {
+                                add_to_buffer(KEY_RIGHT);
+                        }
                         break;
                 case 0x47: // Home
-                        add_to_buffer(KEY_HOME);
+                        if (thread_get_current_user()) {
+                                devfs_tty_push_input_noblock(target_tty_for_user, 0x1B);
+                                devfs_tty_push_input_noblock(target_tty_for_user, '[');
+                                devfs_tty_push_input_noblock(target_tty_for_user, 'H');
+                        } else {
+                                add_to_buffer(KEY_HOME);
+                        }
                         break;
                 case 0x4F: // End
-                        add_to_buffer(KEY_END);
+                        if (thread_get_current_user()) {
+                                devfs_tty_push_input_noblock(target_tty_for_user, 0x1B);
+                                devfs_tty_push_input_noblock(target_tty_for_user, '[');
+                                devfs_tty_push_input_noblock(target_tty_for_user, 'F');
+                        } else {
+                                add_to_buffer(KEY_END);
+                        }
                         break;
                 case 0x49: // Page Up
-                        add_to_buffer(KEY_PGUP);
+                        if (thread_get_current_user()) {
+                                devfs_tty_push_input_noblock(target_tty_for_user, 0x1B);
+                                devfs_tty_push_input_noblock(target_tty_for_user, '[');
+                                devfs_tty_push_input_noblock(target_tty_for_user, '5');
+                                devfs_tty_push_input_noblock(target_tty_for_user, '~');
+                        } else {
+                                add_to_buffer(KEY_PGUP);
+                        }
                         break;
                 case 0x51: // Page Down
-                        add_to_buffer(KEY_PGDN);
+                        if (thread_get_current_user()) {
+                                devfs_tty_push_input_noblock(target_tty_for_user, 0x1B);
+                                devfs_tty_push_input_noblock(target_tty_for_user, '[');
+                                devfs_tty_push_input_noblock(target_tty_for_user, '6');
+                                devfs_tty_push_input_noblock(target_tty_for_user, '~');
+                        } else {
+                                add_to_buffer(KEY_PGDN);
+                        }
                         break;
                 case 0x52: // Insert
-                        add_to_buffer(KEY_INSERT);
+                        if (thread_get_current_user()) {
+                                devfs_tty_push_input_noblock(target_tty_for_user, 0x1B);
+                                devfs_tty_push_input_noblock(target_tty_for_user, '[');
+                                devfs_tty_push_input_noblock(target_tty_for_user, '2');
+                                devfs_tty_push_input_noblock(target_tty_for_user, '~');
+                        } else {
+                                add_to_buffer(KEY_INSERT);
+                        }
                         break;
                 case 0x53: // Delete
-                        add_to_buffer(KEY_DELETE);
+                        if (thread_get_current_user()) {
+                                devfs_tty_push_input_noblock(target_tty_for_user, 0x1B);
+                                devfs_tty_push_input_noblock(target_tty_for_user, '[');
+                                devfs_tty_push_input_noblock(target_tty_for_user, '3');
+                                devfs_tty_push_input_noblock(target_tty_for_user, '~');
+                        } else {
+                                add_to_buffer(KEY_DELETE);
+                        }
                         break;
                 case 0x0F: // Tab
                         add_to_buffer(KEY_TAB);

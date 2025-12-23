@@ -158,6 +158,13 @@ void kfree(void* ptr) {
     if (blk->magic != HEAP_MAGIC_ALLOC || blk->free) {
         kprintf("heap: double free / corrupt header ptr=%p magic=0x%x free=%u\n",
                 ptr, (unsigned)blk->magic, (unsigned)blk->free);
+        /* print caller address to help locate the double-free site */
+        void *caller = __builtin_return_address(0);
+        kprintf("    caller: %p\n", caller);
+        /* print header diagnostics */
+        kprintf("    hdr: addr=%p size=%u req=%u prev=%p next=%p\n",
+                (void*)blk, (unsigned)blk->size, (unsigned)blk->req_size,
+                (void*)blk->prev, (void*)blk->next);
         return;
     }
 #if HEAP_GUARD
@@ -170,6 +177,8 @@ void kfree(void* ptr) {
         if (got != (uint64_t)HEAP_CANARY_QWORD) {
             kprintf("heap: overflow detected ptr=%p req=%u can=%p\n",
                     ptr, (unsigned)blk->req_size, (void*)canp);
+            void *caller = __builtin_return_address(0);
+            kprintf("    caller: %p\n", caller);
         }
     }
 #endif
