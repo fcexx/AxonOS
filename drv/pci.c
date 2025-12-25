@@ -116,13 +116,13 @@ void pci_dump_devices(void)
     for (int i = 0; i < pci_get_device_count(); i++) {
         pci_device_t *d = &devs[i];
         if (d->irq == 0)
-            kprintf("PCI %u.%u.%u: vendor=%04x device=%04x class=%02x/%02x prog_if=%02x hdr=%02x irq=N/A\n",
+            klogprintf("PCI %u.%u.%u: vendor=%04x device=%04x class=%02x/%02x prog_if=%02x hdr=%02x irq=N/A\n",
                     d->bus, d->device, d->function,
                     d->vendor_id, d->device_id,
                     d->class_code, d->subclass, d->prog_if,
                     d->header_type);
         else
-            kprintf("PCI %u.%u.%u: vendor=%04x device=%04x class=%02x/%02x prog_if=%02x hdr=%02x irq=%u\n",
+            klogprintf("PCI %u.%u.%u: vendor=%04x device=%04x class=%02x/%02x prog_if=%02x hdr=%02x irq=%u\n",
                     d->bus, d->device, d->function,
                     d->vendor_id, d->device_id,
                     d->class_code, d->subclass, d->prog_if,
@@ -248,7 +248,7 @@ static void create_attr_file(const char *base, const char *name, const struct sy
 void pci_sysfs_init(void) {
     if (pci_sysfs_initialized) return;
     
-    kprintf("pci: initializing sysfs for %d devices\n", pci_get_device_count());
+    klogprintf("pci: initializing sysfs for %d devices\n", pci_get_device_count());
     sysfs_mkdir("/sys/bus");
     sysfs_mkdir("/sys/bus/pci");
     sysfs_mkdir("/sys/bus/pci/devices");

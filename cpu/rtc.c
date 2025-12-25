@@ -111,5 +111,5 @@ void rtc_init() {
     // Разрешаем прерывания
     asm volatile("sti");
     
-    qemu_debug_printf("RTC initialized with 2 Hz periodic interrupt.\n");
+    klogprintf("RTC: initialized with 2 Hz periodic interrupt.\n");
 }

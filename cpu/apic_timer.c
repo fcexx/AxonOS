@@ -1,7 +1,6 @@
 #include <apic_timer.h>
 #include <vga.h>
 #include <apic.h>
-#include <pit.h>
 #include <thread.h>
 #include <stdio.h>
 #include <string.h>
@@ -32,26 +31,35 @@ static uint8_t find_best_divider(uint32_t target_freq, uint32_t base_freq, uint3
 
 // Quick calibration using busy loop
 static uint32_t quick_calibrate(void) {
-    // Setup timer for one-shot
+    /* Attempt to read CPU base frequency from CPUID (leaf 0x16).
+       If available, use it as APIC base frequency (good heuristic on modern CPUs).
+       Otherwise fall back to the previous busy-loop measurement. */
+    uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0;
+    asm volatile("cpuid"
+                 : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                 : "a"(0x16), "c"(0));
+
+    if (eax != 0) {
+        uint32_t base_mhz = eax;
+        kprintf("APIC: CPUID reports base CPU frequency %u MHz; using for APIC calibration\n", base_mhz);
+        return base_mhz * 1000000u;
+    }
+
+    /* Fallback: measure APIC ticks using a short busy loop (previous behavior). */
     apic_set_lvt_timer(APIC_TIMER_VECTOR, APIC_TIMER_ONESHOT, false);
     apic_write(LAPIC_TIMER_DIV_REG, 0x3); // Divider 16
-    
-    // Set maximum count
     apic_write(LAPIC_TIMER_INIT_REG, 0xFFFFFFFF);
-    
-    // Busy wait for ~10ms
-    for (volatile int i = 0; i < 100000; i++) {
+
+    /* Busy wait for ~10ms — keep loop slightly longer to improve measurability. */
+    for (volatile int i = 0; i < 200000; i++) {
         asm volatile("pause");
     }
-    
-    // Calculate elapsed ticks
+
     uint32_t remaining = apic_read(LAPIC_TIMER_CURRENT_REG);
     uint32_t elapsed = 0xFFFFFFFF - remaining;
-    
-    // Stop timer
     apic_write(LAPIC_TIMER_INIT_REG, 0);
 
-    return elapsed * 100; // Convert to Hz
+    return elapsed * 100; /* Convert ~10ms sample to Hz */
 }
 
 // Simple integer to string conversion
@@ -198,12 +206,12 @@ void apic_timer_init(void) {
     // Stop timer initially
     apic_timer_stop();
     
-    kprintf("APIC: Ready (base freq: %u Hz)\n", apic_timer_state.base_frequency);
+    klogprintf("APIC: Ready (base freq: %u Hz)\n", apic_timer_state.base_frequency);
 }
 
 void apic_timer_start(uint32_t freq_hz) {
     if (!apic_timer_state.calibrated) {
-        kprintf("APIC: Not calibrated, cannot start\n");
+        klogprintf("APIC: Not calibrated, cannot start\n");
         return;
     }
     

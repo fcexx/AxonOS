@@ -13,14 +13,14 @@ int disk_register(disk_ops_t *ops) {
 	if (ops->init) {
 		int r = ops->init();
 		if (r != 0) {
-			kprintf("disk: driver %s init failed\n", ops->name ? ops->name : "unknown");
+			klogprintf("disk: fatal: Driver %s init failed\n", ops->name ? ops->name : "unknown");
 			/* unregister */
 			g_disks[id] = NULL;
 			g_disk_count--;
 			return -1;
 		}
 	}
-	kprintf("disk: registered device %d -> %s\n", id, ops->name ? ops->name : "unnamed");
+	klogprintf("disk: Registered device %d -> %s\n", id, ops->name ? ops->name : "unnamed");
 	return id;
 }
 

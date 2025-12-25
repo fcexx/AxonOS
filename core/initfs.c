@@ -184,7 +184,7 @@ static int create_file_with_data(const char *path, const void *data, size_t size
     ssize_t written = fs_write(f, data, size, 0);
     fs_file_free(f);
     if (written < 0 || (size_t)written != size) {
-        kprintf("initfs: write failed %s\n", path);
+        klogprintf("initfs: write failed %s\n", path);
         return -2;
     }
     return 0;
@@ -197,10 +197,10 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
     /* Find reliable start of a CPIO stream. */
     size_t found = find_cpio_start(base, archive_size);
     if (found == (size_t)-1) {
-        kprintf("initfs: cpio magic not found in module (size %u)\n", (unsigned)archive_size);
+        klogprintf("initfs: cpio magic not found in module (size %u)\n", (unsigned)archive_size);
         return -1;
     }
-    if (found != 0) kprintf("initfs: cpio magic found\n");
+    if (found != 0) klogprintf("initfs: cpio magic found\n");
     offset = found;
 
     while (offset + sizeof(struct cpio_newc_header) <= archive_size) {
@@ -241,7 +241,7 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
         size_t header_size = sizeof(struct cpio_newc_header);
         size_t name_offset = offset + header_size;
         if (name_offset + namesize > archive_size) {
-            kprintf("initfs: name extends past archive\n");
+            klogprintf("initfs: error: name extends past archive\n");
             return -1;
         }
         const char *name = (const char*)(base + name_offset);
@@ -251,7 +251,7 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
         size_t after_name = name_offset + namesize;
         size_t file_data_offset = (after_name + 3) & ~3u;
         if (file_data_offset + filesize > archive_size) {
-            kprintf("initfs: file data extends past archive for %s\n", name);
+            klogprintf("initfs: error: file data extends past archive for %s\n", name);
             return -1;
         }
         /* build target path: ensure leading slash */
@@ -282,7 +282,7 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
             ensure_parent_dirs(target);
             const void *file_data = base + file_data_offset;
             if (create_file_with_data(target, file_data, filesize) != 0) {
-                kprintf("initfs: warn: failed to create %s (ingore)\n", target);
+                klogprintf("initfs: warning: failed to create %s (ingore)\n", target);
             }
         } else if ((mode & 0170000u) == 0120000u) {
             /* symbolic link: file data contains link target */
@@ -295,11 +295,11 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
                 memcpy(linkt, file_data, tlen);
                 linkt[tlen] = '\0';
                 if (ramfs_symlink(target, linkt) < 0) {
-                    kprintf("initfs: warn: failed to create symlink %s -> %s\n", target, linkt);
+                    klogprintf("initfs: warning: failed to create symlink %s -> %s\n", target, linkt);
                 }
                 kfree(linkt);
             } else {
-                kprintf("initfs: warn: failed to alloc for symlink %s\n", target);
+                klogprintf("initfs: warning: failed to alloc for symlink %s\n", target);
             }
         } else {
             /* other types (device, fifo...) - skip for now */
@@ -325,11 +325,11 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
 /* Scan multiboot2 tags for module named `module_name` and unpack it. */
 int initfs_process_multiboot_module(uint32_t multiboot_magic, uint64_t multiboot_info, const char *module_name) {
     if (multiboot_magic != 0x36d76289u) {
-        kprintf("initfs: not multiboot2 magic=0x%x\n", (unsigned)multiboot_magic);
+        klogprintf("initfs: fatal: not multiboot2 magic=0x%x\n", (unsigned)multiboot_magic);
         return 2;
     }
     if (multiboot_info == 0) {
-        kprintf("initfs: multiboot_info is NULL\n");
+        klogprintf("initfs: fatal: multiboot_info is NULL\n");
         return 3;
     }
     uint8_t *p = (uint8_t*)(uintptr_t)multiboot_info;
@@ -337,7 +337,7 @@ int initfs_process_multiboot_module(uint32_t multiboot_magic, uint64_t multiboot
     /* Deep diagnostic: print header + first tags; this helps when some VMs
        pass different structures / pointers. */
     if (total_size < 16 || total_size > (64u * 1024u * 1024u)) {
-        kprintf("initfs: suspicious total_size=%u, aborting mb2 scan\n", (unsigned)total_size);
+        klogprintf("initfs: suspicious total_size=%u, aborting mb2 scan\n", (unsigned)total_size);
         return 4;
     }
     uint32_t offset = 8; /* tags start after total_size + reserved */
@@ -367,7 +367,7 @@ int initfs_process_multiboot_module(uint32_t multiboot_magic, uint64_t multiboot
             if (strcmp(name, module_name) == 0) {
                 size_t mod_size = mod_end > mod_start ? (size_t)(mod_end - mod_start) : 0;
                 const void *mod_ptr = (const void*)(uintptr_t)mod_start;
-                kprintf("initfs: found module '%s' at %p size %u\n", module_name, mod_ptr, (unsigned)mod_size);
+                klogprintf("initfs: found module '%s' at %p size %u\n", module_name, mod_ptr, (unsigned)mod_size);
                 if (mod_size == 0) return -2;
                 /* Diagnostic / robustness: attempt to copy module into heap and unpack from there.
                    This can bypass issues with remapped/readonly regions in some VMs. */
