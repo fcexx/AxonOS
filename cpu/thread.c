@@ -46,7 +46,6 @@ void thread_init() {
         main_thread.exec_trampoline_rip = 0;
         main_thread.exec_trampoline_rsp = 0;
         main_thread.exec_trampoline_rax = 0;
-        kprintf("thread_init: idle thread created with pid %d\n", main_thread.tid);
         init = 1;
 }
 
@@ -120,7 +119,7 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         if (thread_count >= MAX_THREADS) return NULL;
         // Sanity checks: reject clearly invalid user contexts (entry==0 or tiny stack)
         if (user_rip == 0 || user_rsp < 0x1000) {
-                kprintf("fatal: refusing to register user thread with invalid rip=0x%llx rsp=0x%llx\n",
+                klogprintf("fatal: refusing to register user thread with invalid rip=0x%llx rsp=0x%llx\n",
                                (unsigned long long)user_rip, (unsigned long long)user_rsp);
                 return NULL;
         }
@@ -301,7 +300,7 @@ void thread_stop(int pid) {
                         return;
                 }
         }
-        kprintf("thread_stop: thread %d not found or already terminated\n", pid);
+        klogprintf("thread_stop: thread %d not found or already terminated\n", pid);
 }
 
 void thread_block(int pid) {
@@ -311,7 +310,7 @@ void thread_block(int pid) {
                         return;
                 }
         }
-        kprintf("<(0c)>thread_block: thread %d not found or already blocked\n", pid);
+        klogprintf("<(0c)>thread_block: thread %d not found or already blocked\n", pid);
 }
 
 void thread_sleep(uint32_t ms) {

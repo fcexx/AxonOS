@@ -1,3 +1,7 @@
+/*
+    FAT32 (LFN) filesystem
+    Author: fcexx
+*/
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
@@ -12,10 +16,10 @@
 #include <vga.h>
 
 /* Disable local debug prints in this file */
-#ifdef kprintf
-#undef kprintf
+#ifdef klogprintf
+#undef klogprintf
 #endif
-#define kprintf(...) do {} while(0)
+#define klogprintf(...) do {} while(0)
 
 /* fat32.c uses utf16le_to_utf8() before its definition; keep an explicit prototype
    to avoid implicit declaration UB on x86_64. */
@@ -153,21 +157,21 @@ int fat32_mount_from_device(int device_id) {
     memset(m, 0, sizeof(*m));
     m->device_id = device_id;
     m->partition_lba = 0;
-    kprintf("fat32: probing device %d at LBA 0\n", device_id);
+    klogprintf("fat32: probing device %d at LBA 0\n", device_id);
     if (fat32_parse_boot(m, 0) == 0) {
-        kprintf("fat32: found BPB at LBA 0 on device %d\n", device_id);
+        klogprintf("fat32: found BPB at LBA 0 on device %d\n", device_id);
         g_fat = m;
         fat32_driver.driver_data = (void*)g_fat;
-        kprintf("FAT32: mounted from device %d (LBA 0) - ready for manual mount\n", device_id);
+        klogprintf("FAT32: mounted from device %d (LBA 0) - ready for manual mount\n", device_id);
         return 0;
     } else {
-        kprintf("fat32: no valid BPB at LBA 0 on device %d\n", device_id);
+        klogprintf("fat32: no valid BPB at LBA 0 on device %d\n", device_id);
     }
     /* maybe MBR with partition table: read sector 0 and check partition entries */
     uint8_t buf[512];
     if (read_sector(device_id, 0, buf) != 0) { kfree(m); return -1; }
     if (buf[510] != 0x55 || buf[511] != 0xAA) { kfree(m); return -1; }
-    kprintf("fat32: read MBR on device %d, scanning partitions\n", device_id);
+    klogprintf("fat32: read MBR on device %d, scanning partitions\n", device_id);
     /* partition table at offset 446, 4 entries of 16 bytes */
     for (int i = 0; i < 4; i++) {
         uint8_t *pe = buf + 446 + i * 16;
@@ -175,17 +179,17 @@ int fat32_mount_from_device(int device_id) {
         uint32_t start_lba = *(uint32_t*)(pe + 8);
         uint32_t part_sectors = *(uint32_t*)(pe + 12);
         if (start_lba == 0 || part_sectors == 0) continue;
-        kprintf("fat32: checking partition %d type=0x%02x start=%u sectors=%u\n", i, part_type, start_lba, part_sectors);
+        klogprintf("fat32: checking partition %d type=0x%02x start=%u sectors=%u\n", i, part_type, start_lba, part_sectors);
         /* Try to parse boot sector at partition start regardless of reported type */
         m->partition_lba = start_lba;
         if (fat32_parse_boot(m, m->partition_lba) == 0) {
-            kprintf("fat32: found BPB at partition %d start %u on device %d\n", i, start_lba, device_id);
+            klogprintf("fat32: found BPB at partition %d start %u on device %d\n", i, start_lba, device_id);
             g_fat = m;
             fat32_driver.driver_data = (void*)g_fat;
-            kprintf("FAT32: mounted from device %d (partition %d) - ready for manual mount\n", device_id, i);
+            klogprintf("fat32: mounted from device %d (partition %d) - ready for manual mount\n", device_id, i);
             return 0;
         } else {
-            kprintf("fat32: no valid BPB at partition %d start %u\n", i, start_lba);
+            klogprintf("fat32: no valid BPB at partition %d start %u\n", i, start_lba);
         }
     }
     kfree(m);
@@ -204,7 +208,7 @@ static int fat32_find_entry_in_dir(struct fat32_mount *m, uint32_t dir_cluster, 
 static int fat32_resolve_parent_cluster(struct fat32_mount *m, const char *path, uint32_t *out_parent_cluster, char *out_basename, size_t blen);
 
 static int fat32_open(const char *path, struct fs_file **out_file) {
-    kprintf("fat32: open called for path='%s'\n", path ? path : "(null)");
+    klogprintf("fat32: open called for path='%s'\n", path ? path : "(null)");
     if (!g_fat) return -1;
     if (!path || path[0] != '/') return -1;
     /* Determine mount prefix so driver can be mounted at arbitrary path (e.g., /mnt/c) */
@@ -214,13 +218,13 @@ static int fat32_open(const char *path, struct fs_file **out_file) {
         mount_prefix[0] = '\0';
     }
     size_t mp_len = strlen(mount_prefix);
-    kprintf("fat32: mount_prefix='%s' mp_len=%u\n", mount_prefix, (unsigned)mp_len);
+    klogprintf("fat32: mount_prefix='%s' mp_len=%u\n", mount_prefix, (unsigned)mp_len);
     const char *name = path;
     if (mp_len > 0) {
         if (strncmp(path, mount_prefix, mp_len) == 0) {
             name = path + mp_len;
         } else {
-            kprintf("fat32: path '%s' does not start with mount_prefix '%s'\n", path, mount_prefix);
+            klogprintf("fat32: path '%s' does not start with mount_prefix '%s'\n", path, mount_prefix);
             return -1;
         }
     }
@@ -290,7 +294,7 @@ static int fat32_open(const char *path, struct fs_file **out_file) {
 }
 
 static ssize_t fat32_read(struct fs_file *file, void *buf, size_t size, size_t offset) {
-    kprintf("fat32: read called path='%s' size=%u off=%u\n", file && file->path ? file->path : "(null)", (unsigned)size, (unsigned)offset);
+    klogprintf("fat32: read called path='%s' size=%u off=%u\n", file && file->path ? file->path : "(null)", (unsigned)size, (unsigned)offset);
     if (!file) return -1;
     struct fat32_file_handle *fh = NULL;
     if (file->driver_private) fh = (struct fat32_file_handle*)file->driver_private;
@@ -472,7 +476,7 @@ static ssize_t fat32_read(struct fs_file *file, void *buf, size_t size, size_t o
             de.name_len = (uint8_t)namelen;
             de.file_type = (tmp[off + 11] & 0x10) ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
             /* debug: report directory entry discovered */
-            kprintf("fat32: readdir found name='%s' type=%d lba=%u off=%u\n", namebuf, de.file_type, lba, off);
+            klogprintf("fat32: readdir found name='%s' type=%d lba=%u off=%u\n", namebuf, de.file_type, lba, off);
             memcpy(tmpent, &de, 8);
             if (namelen > 0) memcpy(tmpent + 8, namebuf, namelen);
             size_t avail = size - written;
@@ -584,7 +588,7 @@ static void fat32_hexdump_sector(int device_id, uint32_t lba, size_t len) {
         }
         line[lp++] = '\n';
         line[lp] = '\0';
-        kprintf("%s", line);
+        klogprintf("%s", line);
         printed += 16;
     }
     kfree(buf);
@@ -1027,7 +1031,7 @@ static int fat32_create(const char *path, struct fs_file **out_file) {
     /* Prevent duplicate filename in parent directory */
     uint32_t tmp_start = 0, tmp_size = 0; int tmp_is_dir = 0;
     if (fat32_find_entry_in_dir(g_fat, parent_cluster, cleanname, &tmp_start, &tmp_size, &tmp_is_dir) == 0) {
-        kprintf("fat32: create failed: name exists %s\n", cleanname);
+        klogprintf("fat32: create failed: name exists %s\n", cleanname);
         return -1;
     }
     uint32_t cluster = parent_cluster;
@@ -1036,7 +1040,7 @@ static int fat32_create(const char *path, struct fs_file **out_file) {
     if (!buf) return -1;
     uint8_t shortname[11];
     fat32_make_shortname(cleanname, shortname);
-    kprintf("fat32: creating %s in dir cluster %u\n", cleanname, cluster);
+    klogprintf("fat32: creating %s in dir cluster %u\n", cleanname, cluster);
     /* Always use LFN (no 8.3 support). Compute LFN entries needed (13 u16 per entry). */
     size_t bl = strlen(cleanname);
     int need_lfn = 1;
@@ -1081,7 +1085,7 @@ static int fat32_create(const char *path, struct fs_file **out_file) {
             memset(buf + short_off + 20, 0, 2);
             memset(buf + short_off + 26, 0, 2);
             memset(buf + short_off + 28, 0, 4);
-            if (disk_write_sectors(g_fat->device_id, lba, buf, g_fat->sectors_per_cluster) != 0) { kfree(buf); kprintf("fat32: write failed when creating\n"); return -1; }
+            if (disk_write_sectors(g_fat->device_id, lba, buf, g_fat->sectors_per_cluster) != 0) { kfree(buf); klogprintf("fat32: write failed when creating\n"); return -1; }
             /* build fs_file as before */
             struct fs_file *f = (struct fs_file*)kmalloc(sizeof(*f));
             if (!f) { kfree(buf); return -1; }
@@ -1101,7 +1105,7 @@ static int fat32_create(const char *path, struct fs_file **out_file) {
             f->driver_private = fh;
             *out_file = f;
             kfree(buf);
-            kprintf("fat32: created file %s (dir lba %u)\n", cleanname, lba);
+            klogprintf("fat32: created file %s (dir lba %u)\n", cleanname, lba);
             /* debug dump of directory sector */
             fat32_hexdump_sector(g_fat->device_id, lba, 256);
             return 0;
@@ -1338,7 +1342,7 @@ int fat32_register(void) {
     fat32_ops.chmod = NULL;
     fat32_driver.ops = &fat32_ops;
     fat32_driver.driver_data = NULL;
-    kprintf("fat32: registering filesystem driver\n");
+    klogprintf("fat32: registering filesystem driver\n");
     int r = fs_register_driver(&fat32_driver);
     return r;
 }
@@ -1354,7 +1358,7 @@ struct fs_driver *fat32_get_driver(void) {
 /* Cleanup mounted FAT state (called on umount) */
 void fat32_unmount_cleanup(void) {
     if (!g_fat) return;
-    kprintf("fat32: unmount cleanup for device %d\n", g_fat->device_id);
+    klogprintf("fat32: unmount cleanup for device %d\n", g_fat->device_id);
     kfree(g_fat);
     g_fat = NULL;
     fat32_driver.driver_data = NULL;

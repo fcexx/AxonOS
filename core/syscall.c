@@ -2155,7 +2155,7 @@ void syscall_init(void) {
        IF bit = 9, DF bit = 10 in RFLAGS. */
     msr_write_u64(MSR_FMASK, (1ULL << 9) | (1ULL << 10));
 
-    kprintf("syscall: int0x80 handler registered; SYSCALL enabled\n");
+    klogprintf("syscall: int0x80 handler registered; SYSCALL enabled\n");
 }
 
 

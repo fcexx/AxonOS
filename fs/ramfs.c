@@ -406,9 +406,13 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
     struct ramfs_file_handle *fh = (struct ramfs_file_handle*)file->driver_private;
     struct ramfs_node *n = fh->node;
     if (n->is_dir) return -1;
-    /* only root can write to ramfs by default */
+    /* allow kernel context writes (ct == NULL), otherwise require root */
     thread_t* ct = thread_current();
-    if (!ct || ct->euid != 0) return -1;
+    if (ct) {
+        if (ct->euid != 0) return -1;
+    } else {
+        /* kernel context: allow writes */
+    }
     size_t new_size = offset + size;
     if (new_size > n->size) {
         char *d = (char*)krealloc(n->data, new_size);

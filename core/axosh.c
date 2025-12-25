@@ -2054,6 +2054,10 @@ static int bi_mount(cmd_ctx *c);
 static int bi_umount(cmd_ctx *c);
 static int bi_exec(cmd_ctx *c);
 
+static int bi_check(cmd_ctx *c) {
+    klogprintf("Checking klogprintf()\n");
+}
+
 static const builtin builtin_table[] = {
     {"echo", bi_echo}, {"kprint", bi_kprint}, {"readline", bi_readline}, {"readkey", bi_readkey},
     {"pwd", bi_pwd}, {"cd", bi_cd}, {"clear", bi_cls}, {"cls", bi_cls},
@@ -2063,6 +2067,7 @@ static const builtin builtin_table[] = {
     {"osh", bi_osh}, {"pause", bi_pause}, {"chipset", bi_chipset}, {"help", bi_help},
     {"passwd", bi_passwd}, {"su", bi_su}, {"whoami", bi_whoami}, {"mkpasswd", bi_mkpasswd}, {"groups", bi_groups},
     {"useradd", bi_useradd}, {"groupadd", bi_groupadd}, {"chmod", bi_chmod}, {"chvt", bi_chvt},
+    {"check", bi_check},
     {"open", bi_open}, {"close", bi_close}, {"dup", bi_dup}, {"dup2", bi_dup2}, {"isatty", bi_isatty}, {"xxd", bi_xxd}, {"mount", bi_mount}, {"umount", bi_umount}, {"exec", bi_exec}
 };
 static int bi_chmod(cmd_ctx *c) {

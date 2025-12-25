@@ -144,7 +144,7 @@ static int ata_identify(uint16_t io_base, uint16_t ctrl_base, int is_slave, uint
 			if (keyboard_ctrlc_pending()) { keyboard_consume_ctrlc(); return -1; }
 			status = inb(ATA_REG_STATUS(io_base));
 			if (status & ATA_SR_ERR) {
-				kprintf("ata: identify failed (ERR) io=0x%x slave=%d\n", io_base, is_slave);
+				klogprintf("ata: identify failed (ERR) io=0x%x slave=%d\n", io_base, is_slave);
 				return -1;
 			}
 			if (status & ATA_SR_DRQ) break;
@@ -152,7 +152,7 @@ static int ata_identify(uint16_t io_base, uint16_t ctrl_base, int is_slave, uint
 				/* still waiting */
 			}
 			if (++poll > POLL_MAX) {
-				kprintf("ata: identify timeout io=0x%x slave=%d status=0x%x\n", io_base, is_slave, status);
+				klogprintf("ata: identify timeout io=0x%x slave=%d status=0x%x\n", io_base, is_slave, status);
 				return -1;
 			}
 		}
@@ -215,12 +215,12 @@ static int ata_pio_read(int device_id, uint32_t lba, void *buf, uint32_t sectors
 					if (keyboard_ctrlc_pending()) { keyboard_consume_ctrlc(); return -1; }
 					uint8_t st = inb(ATA_REG_STATUS(dev->io_base));
 					if (st & ATA_SR_ERR) {
-						kprintf("ata: read error dev=%d io=0x%x lba=%u\n", device_id, dev->io_base, lba);
+						klogprintf("ata: read error dev=%d io=0x%x lba=%u\n", device_id, dev->io_base, lba);
 						return -1;
 					}
 					if (st & ATA_SR_DRQ) break;
 					if (++poll > POLL_MAX) {
-						kprintf("ata: read timeout dev=%d io=0x%x lba=%u status=0x%x\n", device_id, dev->io_base, lba, st);
+						klogprintf("ata: read timeout dev=%d io=0x%x lba=%u status=0x%x\n", device_id, dev->io_base, lba, st);
 						return -1;
 					}
 				}
@@ -263,12 +263,12 @@ static int ata_pio_write(int device_id, uint32_t lba, const void *buf, uint32_t 
 					if (keyboard_ctrlc_pending()) { keyboard_consume_ctrlc(); return -1; }
 					uint8_t st = inb(ATA_REG_STATUS(dev->io_base));
 					if (st & ATA_SR_ERR) {
-						kprintf("ata: write error dev=%d io=0x%x lba=%u\n", device_id, dev->io_base, lba);
+						klogprintf("ata: write error dev=%d io=0x%x lba=%u\n", device_id, dev->io_base, lba);
 						return -1;
 					}
 					if (st & ATA_SR_DRQ) break;
 					if (++poll > POLL_MAX) {
-						kprintf("ata: write timeout dev=%d io=0x%x lba=%u status=0x%x\n", device_id, dev->io_base, lba, st);
+						klogprintf("ata: write timeout dev=%d io=0x%x lba=%u status=0x%x\n", device_id, dev->io_base, lba, st);
 						return -1;
 					}
 				}
@@ -298,7 +298,7 @@ static void ata_register_device(uint16_t io_base, uint16_t ctrl_base, int is_sla
 
 	int id = disk_register(ops);
 	if (id < 0) {
-		kprintf("ata: failed to register device %s\n", namebuf);
+		klogprintf("ata: error: failed to register device %s\n", namebuf);
 		kfree((void *)ops->name);
 		kfree(ops);
 		return;
@@ -335,17 +335,16 @@ static void ata_register_device(uint16_t io_base, uint16_t ctrl_base, int is_sla
 		struct fs_driver *drv = fat32_get_driver();
 		if (drv) {
 			if (fs_mount(mntpath, drv) == 0) {
-				kprintf("fat32: auto-mounted device %d at %s\n", id, mntpath);
+				klogprintf("fat32: Auto-mounted device %d at %s\n", id, mntpath);
 			} else {
-				kprintf("fat32: auto-mount failed for device %d at %s\n", id, mntpath);
+				klogprintf("fat32: Auto-mount failed for device %d at %s\n", id, mntpath);
 			}
 		}
 	}
-	kprintf("ATA: found pio disk: \"%s\" model: \"%s\" size: %u MB\n", ata_devices[id].model, ata_devices[id].model, size_mb);
+	klogprintf("ATA: Found pio disk: \"%s\" model: \"%s\" size: %u mb\n", ata_devices[id].model, ata_devices[id].model, size_mb);
 }
 
 void ata_dma_init(void) {
-	kprintf("ata: init start\n");
 	/* perform software reset on legacy channels to mimic cold-boot behavior
 	   which helps virtual machines (VMware) that do not reset ATA on soft reboot */
 	{
@@ -403,9 +402,10 @@ void ata_dma_init(void) {
 		}
 	}
 	if (ata_device_count == 0) {
-		kprintf("ata: no devices detected\n");
+		klogprintf("ata: No devices detected.\n");
+		return;
 	}
-	kprintf("ata: init done, devices=%d\n", ata_device_count);
+	klogprintf("ata: devices: %d\n", ata_device_count);
 }
 
 /* IRQ handler: clear status on devices to acknowledge IRQ.

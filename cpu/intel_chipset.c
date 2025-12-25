@@ -107,7 +107,7 @@ int intel_detect_chipset(void) {
     pci_device_t* devices = pci_get_devices();
 
 
-    kprintf("Intel: Scanning for Intel chipsets...\n");
+    klogprintf("Intel: Scanning for Intel chipsets...\n");
 
 
     int intel_devices = 0;
@@ -182,9 +182,9 @@ int intel_detect_chipset(void) {
 
 
     if (intel_detected) {
-        kprintf("Intel: Chipset initialized (%d Intel devices found)\n", intel_devices);
+        klogprintf("Intel: Chipset initialized (%d Intel devices found)\n", intel_devices);
     } else {
-        kprintf("Intel: No Intel chipset found\n");
+        klogprintf("Intel: No Intel chipset found\n");
     }
 
 
@@ -303,45 +303,45 @@ void intel_chipset_reset(void) {
 
 void intel_print_chipset_info(void) {
     if (!intel_detected) {
-        kprintf("Intel chipset not detected\n");
+        klogprintf("Intel: chipset not detected\n");
         return;
     }
 
 
     if (intel_chipset.chipset_name) {
-        kprintf("Chipset: %s\n", intel_chipset.chipset_name);
+        klogprintf("Intel: Chipset: %s\n", intel_chipset.chipset_name);
     }
 
 
     if (intel_chipset.lpc_controller) {
-        kprintf("LPC: %04X:%04X\n", 
+        klogprintf("Intel: LPC: %04X:%04X\n", 
                intel_chipset.lpc_controller->vendor_id,
                intel_chipset.lpc_controller->device_id);
     }
 
 
     if (intel_chipset.usb_controller) {
-        kprintf("USB: %d ports\n", intel_chipset.usb_ports);
+        klogprintf("Intel: USB: %d ports\n", intel_chipset.usb_ports);
     }
 
 
     if (intel_chipset.sata_controller) {
-        kprintf("SATA: %d ports\n", intel_chipset.sata_ports);
+        klogprintf("Intel: SATA: %d ports\n", intel_chipset.sata_ports);
     }
 
 
     if (intel_chipset.ethernet_controller) {
-        kprintf("Ethernet: Present\n");
+        kprintf("Intel: Ethernet: Present\n");
     }
 
 
     if (intel_chipset.graphics_controller) {
-        kprintf("Graphics: Present\n");
+        kprintf("Intel: Graphics: Present\n");
     }
 
 
     if (intel_chipset.audio_controller) {
-        kprintf("Audio: Present\n");
+        kprintf("Intel: Audio: Present\n");
     }
 
 

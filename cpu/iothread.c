@@ -24,7 +24,7 @@ static void process_io_request(io_request_t* request);
 // Инициализация I/O планировщика
 void iothread_init() {
         if (iothread_initialized) {
-            kprintf("iothread_init: already initialized\n");
+            klogprintf("iothread_init: already initialized\n");
                 return;
         }
         

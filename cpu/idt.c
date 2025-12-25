@@ -44,14 +44,14 @@ static inline void read_crs(uint64_t* cr0, uint64_t* cr2, uint64_t* cr3, uint64_
 }
 
 static void dump(const char* what, const char* who, cpu_registers_t* regs, uint64_t cr2, uint64_t err, bool user_mode){
-        kprintf("Oops! %s in %s at RIP=0x%llx err=0x%llx\n", what, who, (unsigned long long)regs->rip, (unsigned long long)regs->error_code);
-        kprintf("RIP: 0x%llx\n", (unsigned long long)regs->rip);
-        kprintf("RSP: 0x%llx\n", (unsigned long long)regs->rsp);
-        kprintf("RBP: 0x%llx\n", (unsigned long long)regs->rbp);
-        kprintf("RDI: 0x%llx\n", (unsigned long long)regs->rdi);
-        kprintf("RSI: 0x%llx\n", (unsigned long long)regs->rsi);
-        kprintf("RDX: 0x%llx\n", (unsigned long long)regs->rdx);
-        kprintf("RCX: 0x%llx\n", (unsigned long long)regs->rcx);
+        klogprintf("Oops! %s in %s at RIP=0x%llx err=0x%llx\n", what, who, (unsigned long long)regs->rip, (unsigned long long)regs->error_code);
+        klogprintf("RIP: 0x%llx\n", (unsigned long long)regs->rip);
+        klogprintf("RSP: 0x%llx\n", (unsigned long long)regs->rsp);
+        klogprintf("RBP: 0x%llx\n", (unsigned long long)regs->rbp);
+        klogprintf("RDI: 0x%llx\n", (unsigned long long)regs->rdi);
+        klogprintf("RSI: 0x%llx\n", (unsigned long long)regs->rsi);
+        klogprintf("RDX: 0x%llx\n", (unsigned long long)regs->rdx);
+        klogprintf("RCX: 0x%llx\n", (unsigned long long)regs->rcx);
 }
 
 static inline uint64_t rdmsr_u64(uint32_t msr) {
@@ -131,15 +131,15 @@ static void ud_fault_handler(cpu_registers_t* regs) {
                     const int BYTES = 32;
                     uintptr_t start = rip > BYTES ? rip - BYTES : rip;
                     if (start + BYTES*2 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                        kprintf("user code dump around RIP=0x%llx:\n", (unsigned long long)rip);
+                        klogprintf("user code dump around RIP=0x%llx:\n", (unsigned long long)rip);
                         const unsigned char *p = (const unsigned char*)(uintptr_t)start;
                         for (int i = 0; i < BYTES*2; i++) {
-                            kprintf("%02x ", (unsigned int)p[i]);
-                            if ((i & 0xF) == 0xF) kprintf("\n");
+                            klogprintf("%02x ", (unsigned int)p[i]);
+                            if ((i & 0xF) == 0xF) klogprintf("\n");
                         }
-                        kprintf("\n");
+                        klogprintf("\n");
                     } else {
-                        kprintf("user code dump skipped (out of identity range)\n");
+                        klogprintf("user code dump skipped (out of identity range)\n");
                     }
                 }
                 for(;;){ asm volatile("sti; hlt" ::: "memory"); }
@@ -156,7 +156,7 @@ static void ud_fault_handler(cpu_registers_t* regs) {
                 const unsigned char *p = (const unsigned char*)(uintptr_t)start;
                 for (int i = 0; i < BYTES*2; i++) {
                         qemu_debug_printf("%02x ", (unsigned int)p[i]);
-                    if ((i & 0xF) == 0xF) kprintf("\n");
+                    if ((i & 0xF) == 0xF) klogprintf("\n");
                 }
                 qemu_debug_printf("\n");
             } else {
@@ -204,36 +204,36 @@ static void page_fault_handler(cpu_registers_t* regs) {
         uint64_t fsbase_lo = 0, fsbase_hi = 0;
         asm volatile("rdmsr" : "=a"(fsbase_lo), "=d"(fsbase_hi) : "c"(0xC0000100u));
         uint64_t fsbase = ((uint64_t)fsbase_hi << 32) | fsbase_lo;
-        kprintf("page fault MSR_FS_BASE=0x%016llx\n", (unsigned long long)fsbase);
-        kprintf("page fault details: CR2=0x%llx err=0x%llx user=%d\n", (unsigned long long)cr2, (unsigned long long)regs->error_code, user);
+        klogprintf("page fault MSR_FS_BASE=0x%016llx\n", (unsigned long long)fsbase);
+        klogprintf("page fault details: CR2=0x%llx err=0x%llx user=%d\n", (unsigned long long)cr2, (unsigned long long)regs->error_code, user);
         /* Additional diagnostics to help pinpoint cause in user mode */
         if (user) {
             /* dump instruction bytes at RIP */
             if ((uintptr_t)regs->rip < (uintptr_t)MMIO_IDENTITY_LIMIT) {
                 const unsigned char *code = (const unsigned char*)(uintptr_t)regs->rip;
-                kprintf("code @ RIP: ");
-                for (int i = 0; i < 32; i++) kprintf("%02x ", (unsigned)code[i]);
-                kprintf("\n");
+                klogprintf("code @ RIP: ");
+                for (int i = 0; i < 32; i++) klogprintf("%02x ", (unsigned)code[i]);
+                klogprintf("\n");
             } else {
-                kprintf("code @ RIP: (outside identity map)\n");
+                klogprintf("code @ RIP: (outside identity map)\n");
             }
             /* dump stack words */
             if ((uintptr_t)regs->rsp < (uintptr_t)MMIO_IDENTITY_LIMIT) {
                 const uint64_t *stk = (const uint64_t*)(uintptr_t)regs->rsp;
-                kprintf("stack @ RSP: ");
-                for (int i = 0; i < 8; i++) kprintf("0x%016llx ", (unsigned long long)stk[i]);
-                kprintf("\n");
+                klogprintf("stack @ RSP: ");
+                for (int i = 0; i < 8; i++) klogprintf("0x%016llx ", (unsigned long long)stk[i]);
+                klogprintf("\n");
             } else {
-                kprintf("stack @ RSP: (outside identity map)\n");
+                klogprintf("stack @ RSP: (outside identity map)\n");
             }
             /* dump memory near CR2 if available */
             if ((uintptr_t)cr2 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                kprintf("bytes @ CR2: ");
+                klogprintf("bytes @ CR2: ");
                 const unsigned char *p = (const unsigned char*)(uintptr_t)cr2;
-                for (int i = 0; i < 32; i++) kprintf("%02x ", (unsigned)p[i]);
-                kprintf("\n");
+                for (int i = 0; i < 32; i++) klogprintf("%02x ", (unsigned)p[i]);
+                klogprintf("\n");
             } else {
-                kprintf("bytes @ CR2: (outside identity map)\n");
+                klogprintf("bytes @ CR2: (outside identity map)\n");
             }
             /* dump page table entries for CR2 */
             {
@@ -244,24 +244,24 @@ static void page_fault_handler(cpu_registers_t* regs) {
                 int l3i = (v >> 30) & 0x1FF;
                 int l2i = (v >> 21) & 0x1FF;
                 int l1i = (v >> 12) & 0x1FF;
-                kprintf("ptes for CR2 (v=0x%llx): l4[%d]=0x%016llx\n", (unsigned long long)v, l4i, (unsigned long long)l4[l4i]);
+                klogprintf("ptes for CR2 (v=0x%llx): l4[%d]=0x%016llx\n", (unsigned long long)v, l4i, (unsigned long long)l4[l4i]);
                 if (l4[l4i] & PG_PRESENT) {
                     uint64_t *l3 = (uint64_t*)(uintptr_t)(l4[l4i] & ~0xFFFULL);
-                    kprintf("ptes: l3[%d]=0x%016llx\n", l3i, (unsigned long long)l3[l3i]);
+                    klogprintf("ptes: l3[%d]=0x%016llx\n", l3i, (unsigned long long)l3[l3i]);
                     if (l3[l3i] & PG_PRESENT) {
                         uint64_t l3e = l3[l3i];
                         if (l3e & PG_PS_2M) {
-                            kprintf("ptes: 1GiB/2MiB large at L3\n");
+                            klogprintf("ptes: 1GiB/2MiB large at L3\n");
                         } else {
                             uint64_t *l2 = (uint64_t*)(uintptr_t)(l3e & ~0xFFFULL);
-                            kprintf("ptes: l2[%d]=0x%016llx\n", l2i, (unsigned long long)l2[l2i]);
+                            klogprintf("ptes: l2[%d]=0x%016llx\n", l2i, (unsigned long long)l2[l2i]);
                             if (l2[l2i] & PG_PRESENT) {
                                 uint64_t l2e = l2[l2i];
                                 if (l2e & PG_PS_2M) {
-                                    kprintf("ptes: 2MiB large at L2\n");
+                                    klogprintf("ptes: 2MiB large at L2\n");
                                 } else {
                                     uint64_t *l1 = (uint64_t*)(uintptr_t)(l2e & ~0xFFFULL);
-                                    kprintf("ptes: l1[%d]=0x%016llx\n", l1i, (unsigned long long)l1[l1i]);
+                                    klogprintf("ptes: l1[%d]=0x%016llx\n", l1i, (unsigned long long)l1[l1i]);
                                 }
                             }
                         }
@@ -272,9 +272,9 @@ static void page_fault_handler(cpu_registers_t* regs) {
             {
                 extern uint64_t syscall_kernel_rsp0;
                 if ((uintptr_t)syscall_kernel_rsp0 != 0 && (uintptr_t)syscall_kernel_rsp0 + 8*16 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                    kprintf("syscall_kernel_rsp0=0x%llx\n", (unsigned long long)syscall_kernel_rsp0);
+                    klogprintf("syscall_kernel_rsp0=0x%llx\n", (unsigned long long)syscall_kernel_rsp0);
                 } else {
-                    kprintf("syscall_kernel_rsp0 not set or out of range\n");
+                    klogprintf("syscall_kernel_rsp0 not set or out of range\n");
                 }
             }
         }
@@ -286,45 +286,45 @@ static void gp_fault_handler(cpu_registers_t* regs){
     // Строгая семантика для POSIX-подобного поведения: никаких эмуляций в ring3.
     // General Protection Fault в пользовательском процессе рассматривается как фатальная ошибка процесса.
     if ((regs->cs & 3) == 3) {
-        kprintf("<(0c)>\nGPF (user-mode) trap.\n");
-        kprintf("RIP: 0x%016llx\n", (unsigned long long)regs->rip);
-        kprintf("RSP: 0x%016llx\n", (unsigned long long)regs->rsp);
-        kprintf("RBP: 0x%016llx\n", (unsigned long long)regs->rbp);
-        kprintf("RDI: 0x%016llx\n", (unsigned long long)regs->rdi);
-        kprintf("RSI: 0x%016llx\n", (unsigned long long)regs->rsi);
-        kprintf("RDX: 0x%016llx\n", (unsigned long long)regs->rdx);
-        kprintf("RCX: 0x%016llx\n", (unsigned long long)regs->rcx);
-        kprintf("RBX: 0x%016llx\n", (unsigned long long)regs->rbx);
-        kprintf("RAX: 0x%016llx\n", (unsigned long long)regs->rax);
-        kprintf("ERR: 0x%016llx  RFLAGS: 0x%016llx  CS: 0x%04x  SS: 0x%04x\n",
+        klogprintf("<(0c)>\nGPF (user-mode) trap.\n");
+        klogprintf("RIP: 0x%016llx\n", (unsigned long long)regs->rip);
+        klogprintf("RSP: 0x%016llx\n", (unsigned long long)regs->rsp);
+        klogprintf("RBP: 0x%016llx\n", (unsigned long long)regs->rbp);
+        klogprintf("RDI: 0x%016llx\n", (unsigned long long)regs->rdi);
+        klogprintf("RSI: 0x%016llx\n", (unsigned long long)regs->rsi);
+        klogprintf("RDX: 0x%016llx\n", (unsigned long long)regs->rdx);
+        klogprintf("RCX: 0x%016llx\n", (unsigned long long)regs->rcx);
+        klogprintf("RBX: 0x%016llx\n", (unsigned long long)regs->rbx);
+        klogprintf("RAX: 0x%016llx\n", (unsigned long long)regs->rax);
+        klogprintf("ERR: 0x%016llx  RFLAGS: 0x%016llx  CS: 0x%04x  SS: 0x%04x\n",
                 (unsigned long long)regs->error_code, (unsigned long long)regs->rflags,
                 (uint16_t)(regs->cs & 0xFFFF), (uint16_t)(regs->ss & 0xFFFF));
         uint64_t cr2 = 0, cr3 = 0;
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
         asm volatile("mov %%cr3, %0" : "=r"(cr3));
-        kprintf("CR2=0x%016llx CR3=0x%016llx\n", (unsigned long long)cr2, (unsigned long long)cr3);
+        klogprintf("CR2=0x%016llx CR3=0x%016llx\n", (unsigned long long)cr2, (unsigned long long)cr3);
 
         /* Attempt to dump a few instruction bytes at RIP (if in identity region) */
         if ((uintptr_t)regs->rip < (uintptr_t)0x100000000ULL) {
             const uint8_t *code = (const uint8_t*)(uintptr_t)regs->rip;
-            kprintf("code @ RIP: ");
-            for (int i = 0; i < 16; i++) kprintf("%02x ", (unsigned)code[i]);
-            kprintf("\n");
+            klogprintf("code @ RIP: ");
+            for (int i = 0; i < 16; i++) klogprintf("%02x ", (unsigned)code[i]);
+            klogprintf("\n");
         } else {
-            kprintf("code @ RIP: (outside identity map)\n");
+            klogprintf("code @ RIP: (outside identity map)\n");
         }
 
         /* Dump few stack words */
         if ((uintptr_t)regs->rsp < (uintptr_t)0x100000000ULL) {
             const uint64_t *stk = (const uint64_t*)(uintptr_t)regs->rsp;
-            kprintf("stack @ RSP: ");
-            for (int i = 0; i < 8; i++) kprintf("0x%016llx ", (unsigned long long)stk[i]);
-            kprintf("\n");
+            klogprintf("stack @ RSP: ");
+            for (int i = 0; i < 8; i++) klogprintf("0x%016llx ", (unsigned long long)stk[i]);
+            klogprintf("\n");
         } else {
-            kprintf("stack @ RSP: (outside identity map)\n");
+            klogprintf("stack @ RSP: (outside identity map)\n");
         }
 
-        kprintf("GPF: terminating user thread and returning to shell\n");
+        klogprintf("GPF: terminating user thread and returning to shell\n");
         /* terminate current user thread safely and return to ring0 shell */
         extern void syscall_return_to_shell(void);
         syscall_return_to_shell();
@@ -336,7 +336,7 @@ static void gp_fault_handler(cpu_registers_t* regs){
 
 static void df_fault_handler(cpu_registers_t* regs){
         // Double Fault (#DF) — используем отдельный IST стек, чтобы избежать triple fault
-        kprint("DOUBLE FAULT\n");
+        klogprintf("DOUBLE FAULT\n");
         dump("double fault", "kernel", regs, 0, regs->error_code, false);
         // Застываем в безопасной петле с включёнными прерываниями
         for(;;){ asm volatile("sti; hlt" ::: "memory"); }

@@ -17,7 +17,6 @@
 #include <apic_timer.h>
 #include <stat.h>
 #include <syscall.h>
-
 #include <iothread.h>
 #include <fs.h>
 #include <ext2.h>
@@ -35,6 +34,7 @@
 #include <user.h>
 #include <serial.h>
 #include <exec.h>
+#include <klog.h>
 
 /* ATA DMA driver init (registered here) */
 void ata_dma_init(void);
@@ -130,41 +130,6 @@ static ssize_t sysfs_show_ram_mb_attr(char *buf, size_t size, void *priv) {
     return (ssize_t)written;
 }
 
-
-static int is_dir_path(const char *path) {
-    struct fs_file *f = fs_open(path);
-    if (!f) return 0;
-    /* If driver explicitly set type, use it */
-    if (f->type == FS_TYPE_DIR) {
-        fs_file_free(f);
-        return 1;
-    }
-    if (f->type == FS_TYPE_REG) {
-        fs_file_free(f);
-        return 0;
-    }
-    /* Fallback: attempt to read directory entries */
-    size_t want = f->size ? f->size : 512;
-    if (want > 8192) want = 8192;
-    void *buf = kmalloc(want + 1);
-    int found = 0;
-    if (buf) {
-        ssize_t r = fs_read(f, buf, want, 0);
-        if (r > 0) {
-            uint32_t off = 0;
-            while ((size_t)off + sizeof(struct ext2_dir_entry) < (size_t)r) {
-                struct ext2_dir_entry *de = (struct ext2_dir_entry *)((uint8_t*)buf + off);
-                if (de->inode != 0 && de->rec_len > 0 && de->name_len > 0 && de->name_len < 255) { found = 1; break; }
-                if (de->rec_len == 0) break;
-                off += de->rec_len;
-            }
-        }
-        kfree(buf);
-    }
-    fs_file_free(f);
-    return found;
-}
-
 void ring0_shell()  { osh_run(); }
 
 void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
@@ -182,12 +147,14 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             uintptr_t mods_end_aligned = align_up_uintptr(mods_end, 0x1000);
             if (mods_end_aligned > heap_start) heap_start = mods_end_aligned;
         }
-        /* IMPORTANT:
+        /* 
+           IMPORTANT:
            User ELF binaries are currently loaded by copying PT_LOAD segments into their p_vaddr
            in the identity-mapped region. Typical ELF64 ET_EXEC uses 0x00400000.. (4MiB+).
            If the kernel heap also lives in low memory, exec will literally overwrite heap blocks
            (we already observed this as a heap canary overflow during `exec /bin/busybox`).
-           Keep heap above a safe floor to avoid collisions with user image mappings. */
+           Keep heap above a safe floor to avoid collisions with user image mappings. 
+        */
         const uintptr_t HEAP_MIN_START = (uintptr_t)(64u * 1024u * 1024u); /* 64 MiB */
         if (heap_start < HEAP_MIN_START) heap_start = HEAP_MIN_START;
         heap_init(heap_start, 0);
@@ -211,56 +178,11 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     pic_init();
     pit_init();
     
-
-    
-    apic_init();
-    apic_timer_init();
-    idt_set_handler(APIC_TIMER_VECTOR, apic_timer_handler);
-    /* syscall (int 0x80) initialization */
-    syscall_init();
-    
-    paging_init();
-
-    // Включаем прерывания
-    asm volatile("sti");
-
-    apic_timer_start(100);
-
-    for (int i = 0; i < 50; i++) {
-        pit_sleep_ms(10);
-        if (apic_timer_ticks > 0) break;
-    }
-    if (apic_timer_ticks > 0) {
-        apic_timer_stop();
-        pit_disable();
-        pic_mask_irq(0);
-        apic_timer_start(1000);
-        kprintf("Switched to APIC Timer\n");
-    } else {
-        kprintf("APIC: using PIT\n");
-        apic_timer_stop();
-    }
-
-    pci_init();
-    pci_dump_devices();
-    intel_chipset_init();
-    /* start threading and I/O subsystem, then initialize disk drivers from a kernel thread
-       to avoid probing hardware too early during boot. */
-    thread_init();
-    iothread_init();
-    /* create kernel thread to initialize ATA/SATA drivers after scheduler is ready */
-    if (!thread_create(ata_dma_init, "ata_init")) {
-        kprintf("ata: failed to create init thread\n");
-    }
-    
-    /* user subsystem */
-    user_init();
-    ramfs_register();
-    ext2_register();
-    fat32_register();
-
     mmio_init();
     
+    ramfs_register();
+    ext2_register();
+
     if (sysfs_register() == 0) {
         kprintf("sysfs: mounting sysfs in /sys\n");
         ramfs_mkdir("/sys");
@@ -290,7 +212,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         sysfs_create_file("/sys/kernel/ram", &attr_ram_mb);
         sysfs_mount("/sys");
 
-        pci_sysfs_init();
         
         /* create /etc and write initial passwd/group files into ramfs */
         ramfs_mkdir("/etc");
@@ -315,16 +236,65 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     } else {
         kprintf("sysfs: failed to register\n");
     }
+    klog_init();
+    
+    apic_init();
+    apic_timer_init();
+    idt_set_handler(APIC_TIMER_VECTOR, apic_timer_handler);
+    /* syscall (int 0x80) initialization */
+    syscall_init();
+    
+    paging_init();
+
+    // Включаем прерывания
+    asm volatile("sti");
+
+    apic_timer_start(100);
+
+    for (int i = 0; i < 50; i++) {
+        pit_sleep_ms(10);
+        if (apic_timer_ticks > 0) break;
+    }
+    if (apic_timer_ticks > 0) {
+        apic_timer_stop();
+        pit_disable();
+        pic_mask_irq(0);
+        apic_timer_start(1000);
+    } else {
+        kprintf("APIC: using PIT\n");
+        apic_timer_stop();
+    }
+
+    /* Calibrate TSC for high-resolution timestamps now that APIC timer is running */
+    klog_calibrate_tsc();
+
+    pci_init();
+    pci_dump_devices();
+    pci_sysfs_init();
+    intel_chipset_init();
+    /* start threading and I/O subsystem, then initialize disk drivers from a kernel thread
+       to avoid probing hardware too early during boot. */
+    thread_init();
+    iothread_init();
+    /* create kernel thread to initialize ATA/SATA drivers after scheduler is ready */
+    if (!thread_create(ata_dma_init, "ata_init")) {
+        kprintf("ata: failed to create init thread\n");
+    }
+    
+    /* user subsystem */
+    user_init();
+    fat32_register();
+
     
     /* If an initfs module was provided by the bootloader, unpack it into ramfs */
     {
         int r = initfs_process_multiboot_module(multiboot_magic, multiboot_info, "initfs");
-        if (r == 0) kprintf("initfs: unpacked successfully\n");
-        else kprintf("initfs: failed rc=%d\n", r);
+        if (r == 0) klogprintf("initfs: unpacked successfully\n");
+        else klogprintf("initfs: error: failed, code: %d\n", r);
     }
     /* register and mount devfs at /dev */
     if (devfs_register() == 0) {
-        kprintf("devfs: registering devfs\n");
+        klogprintf("devfs: registering devfs\n");
         ramfs_mkdir("/dev");
         devfs_mount("/dev");
         /* initialize stdio fds for current thread (main) */
@@ -349,22 +319,20 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             }
         }
     } else {
-        kprintf("devfs: failed to register\n");
+        klogprintf("devfs: failed to register\n");
     }
 
     /* register and mount procfs at /proc */
     if (procfs_register() == 0) {
-        kprintf("procfs: mounting procfs in /proc\n");
+        klogprintf("procfs: mounting procfs in /proc\n");
         ramfs_mkdir("/proc");
         procfs_mount("/proc");
     } else {
-        kprintf("procfs: failed to register\n");
+        klogprintf("procfs: error: failed to register\n");
     }
 
     ps2_keyboard_init();
     rtc_init();
-    
-    kprintf("kernel base: done\n");
     
     //autostart: run /start script once if present
     // {

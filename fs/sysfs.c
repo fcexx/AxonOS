@@ -278,13 +278,16 @@ static ssize_t sysfs_read(struct fs_file *file, void *buf, size_t size, size_t o
     if (node->is_dir) {
         /* respect offset: skip bytes until offset then write up to size */
         acquire(&sysfs_lock);
+
         size_t pos = 0;
         size_t written = 0;
         uint8_t *out = (uint8_t*)buf;
         struct sysfs_node *child = node->children;
+
         while (child) {
             size_t namelen = strlen(child->name);
             size_t rec_len = 8 + namelen;
+            
             /* if entry lies entirely before offset, skip */
             if (pos + rec_len <= (size_t)offset) {
                 pos += rec_len;
@@ -293,9 +296,11 @@ static ssize_t sysfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             }
             /* if we've filled the output buffer, stop */
             if (written >= size) break;
+
             /* compute where to start copying from this entry */
             size_t entry_off = 0;
             if ((size_t)offset > pos) entry_off = (size_t)offset - pos;
+
             /* build full entry into a temporary buffer then copy partial */
             uint8_t tmp[512];
             if (rec_len > sizeof(tmp)) {
@@ -309,13 +314,17 @@ static ssize_t sysfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             de.rec_len = (uint16_t)rec_len;
             de.name_len = (uint8_t)namelen;
             de.file_type = child->is_dir ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
+
             memcpy(tmp, &de, 8);
             memcpy(tmp + 8, child->name, namelen);
+
             /* copy from tmp + entry_off up to remaining buffer */
             size_t avail = size - written;
             size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
             if (tocopy > avail) tocopy = avail;
+
             memcpy(out + written, tmp + entry_off, tocopy);
+
             written += tocopy;
             pos += rec_len;
             child = child->next;

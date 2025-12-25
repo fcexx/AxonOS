@@ -827,7 +827,6 @@ void devfs_tty_push_input(int tty, char c) {
     struct devfs_tty *t = &dev_ttys[tty];
     unsigned long flags = 0;
     acquire_irqsave(&t->in_lock, &flags);
-    qemu_debug_printf("devfs: push_input tty=%d char=0x%02x ('%c') in_count=%d\n", tty, (unsigned char)c, (c >= 32 && c < 127) ? c : '.', t->in_count);
     if (t->in_count < (int)sizeof(t->inbuf)) {
         t->inbuf[t->in_tail] = c;
         t->in_tail = (t->in_tail + 1) % (int)sizeof(t->inbuf);
@@ -849,7 +848,6 @@ void devfs_tty_push_input_noblock(int tty, char c) {
     if (tty < 0 || tty >= DEVFS_TTY_COUNT) return;
     struct devfs_tty *t = &dev_ttys[tty];
     if (!try_acquire(&t->in_lock)) return;
-    qemu_debug_printf("devfs: push_input_noblock tty=%d char=0x%02x ('%c') in_count=%d\n", tty, (unsigned char)c, (c >= 32 && c < 127) ? c : '.', t->in_count);
     if (t->in_count < (int)sizeof(t->inbuf)) {
         t->inbuf[t->in_tail] = c;
         t->in_tail = (t->in_tail + 1) % (int)sizeof(t->inbuf);
