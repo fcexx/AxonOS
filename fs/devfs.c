@@ -10,9 +10,9 @@
 #include <ext2.h>
 #include <keyboard.h>
 #include <disk.h>
+#include <kprint.h>
 
 #define DEVFS_TTY_COUNT 6
-
 
 static struct devfs_tty dev_ttys[DEVFS_TTY_COUNT];
 static int devfs_active = 0;
@@ -20,6 +20,10 @@ static int devfs_active = 0;
 static struct fs_driver devfs_driver;
 static struct fs_driver_ops devfs_ops;
 static void *devfs_driver_data = NULL;
+
+/* Framebuffer devices */
+static struct devfs_framebuffer dev_framebuffers[4];
+static int dev_fb_count = 0;
 
 /* simple block device node registry for /dev/hdN */
 struct devfs_block {
@@ -30,6 +34,7 @@ struct devfs_block {
 static struct devfs_block dev_blocks[16];
 static int dev_block_count = 0;
 static uint32_t devfs_rand_state = 0x12345678;
+
 /* special device names exposed under /dev */
 static const char * const devfs_special_names[] = {
     "null", "zero", "random",
@@ -67,6 +72,15 @@ static int devfs_path_to_tty(const char *path) {
     return -1;
 }
 
+/* helper: get framebuffer index from path like /dev/fbN */
+static int devfs_path_to_fb(const char *path) {
+    if (!path || strncmp(path, "/dev/fb", 7) != 0) return -1;
+    if (strlen(path) != 8) return -1; /* /dev/fbX - 8 символов */
+    int n = path[7] - '0';
+    if (n >= 0 && n < dev_fb_count) return n;
+    return -1;
+}
+
 static struct fs_file *devfs_alloc_file(const char *path, int tty) {
     struct fs_file *f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
     if (!f) return NULL;
@@ -92,6 +106,7 @@ static int devfs_create(const char *path, struct fs_file **out_file) {
 
 static int devfs_open(const char *path, struct fs_file **out_file) {
     if (!path) return -1;
+    
     /* directory /dev */
     if (strcmp(path, "/dev") == 0 || strcmp(path, "/dev/") == 0) {
         struct fs_file *f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
@@ -104,10 +119,13 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
         f->path = (const char*)pp;
         f->fs_private = NULL;
         /* allocate a simple handle to mark directory */
-        struct { int is_dir; int dir_count; } *h = kmalloc(sizeof(*h));
+        struct { 
+            int is_dir; 
+            int dir_count; 
+        } *h = kmalloc(sizeof(*h));
         if (!h) { kfree((void*)f->path); kfree(f); return -1; }
         h->is_dir = 1;
-        h->dir_count = DEVFS_TTY_COUNT + 1; /* console + ttyN */
+        h->dir_count = DEVFS_TTY_COUNT + 1 + devfs_special_count + dev_block_count + dev_fb_count;
         f->driver_private = (void*)h;
         f->type = FS_TYPE_DIR;
         f->size = 0;
@@ -117,6 +135,7 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
         *out_file = f;
         return 0;
     }
+    
     /* block device? */
     int bi = devfs_find_block_by_path(path);
     if (bi >= 0) {
@@ -136,6 +155,27 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
         *out_file = f;
         return 0;
     }
+    
+    /* framebuffer device? */
+    int fbi = devfs_path_to_fb(path);
+    if (fbi >= 0) {
+        struct fs_file *f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
+        if (!f) return -1;
+        memset(f, 0, sizeof(*f));
+        size_t plen = strlen(path) + 1;
+        char *pp = (char*)kmalloc(plen);
+        if (!pp) { kfree(f); return -1; }
+        memcpy(pp, path, plen);
+        f->path = (const char*)pp;
+        f->fs_private = &devfs_driver_data;
+        f->driver_private = (void*)&dev_framebuffers[fbi];
+        f->type = FS_TYPE_REG;
+        f->size = dev_framebuffers[fbi].fb_size;
+        f->pos = 0;
+        *out_file = f;
+        return 0;
+    }
+    
     /* special device nodes like /dev/null, /dev/zero, /dev/random, /dev/stdin/out/err */
     for (int si = 0; si < devfs_special_count; si++) {
         char spath[32];
@@ -160,6 +200,7 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
             return 0;
         }
     }
+    
     int tty = devfs_path_to_tty(path);
     if (tty < 0) return -1;
     struct fs_file *f = devfs_alloc_file(path, tty);
@@ -168,8 +209,42 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
     return 0;
 }
 
+/* Framebuffer read function */
+static ssize_t devfs_fb_read(struct fs_file *file, void *buf, size_t size, off_t offset) {
+    struct devfs_framebuffer *fb = (struct devfs_framebuffer *)file->driver_private;
+    if (!fb || !fb->fb_base) return -1;
+    
+    if (offset >= fb->fb_size) return 0;
+    if (offset + size > fb->fb_size) size = fb->fb_size - offset;
+    
+    /* Копируем напрямую из видеопамяти */
+    memcpy(buf, (void*)(uintptr_t)(fb->fb_base + offset), size);
+    return size;
+}
+
+/* Framebuffer write function */
+static ssize_t devfs_fb_write(struct fs_file *file, const void *buf, size_t size, off_t offset) {
+    struct devfs_framebuffer *fb = (struct devfs_framebuffer *)file->driver_private;
+    if (!fb || !fb->fb_base) return -1;
+    
+    if (offset >= fb->fb_size) return -1;
+    if (offset + size > fb->fb_size) size = fb->fb_size - offset;
+    
+    /* Копируем напрямую в видеопамять */
+    memcpy((void*)(uintptr_t)(fb->fb_base + offset), buf, size);
+    return size;
+}
+
 static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t offset) {
     if (!file || !buf) return -1;
+    
+    /* Framebuffer устройства */
+    if (file->driver_private && 
+        ((uintptr_t)file->driver_private >= (uintptr_t)&dev_framebuffers[0] &&
+         (uintptr_t)file->driver_private <= (uintptr_t)&dev_framebuffers[dev_fb_count])) {
+        return devfs_fb_read(file, buf, size, offset);
+    }
+    
     /* block device file handling */
     for (int bi = 0; bi < dev_block_count; bi++) {
         if (file->driver_private == &dev_blocks[bi]) {
@@ -222,6 +297,7 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             return (ssize_t)copied;
         }
     }
+    
     /* special devices via driver_private marker */
     if (file->driver_private) {
         int marker = *(int*)file->driver_private;
@@ -241,8 +317,6 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                     return (ssize_t)size;
                 }
                 case 3: { /* /dev/stdin -> map to console tty */
-                    /* Map /dev/stdin to the tty attached to current thread if present,
-                       otherwise to the active console. */
                     thread_t *cur = thread_current();
                     int tty_idx = (cur && cur->attached_tty >= 0) ? cur->attached_tty : devfs_get_active();
                     struct devfs_tty *tstdin = &dev_ttys[tty_idx];
@@ -270,6 +344,7 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             }
         }
     }
+    
     /* Support reading from /dev/stdout and /dev/stderr ring buffers */
     if (file->path) {
         if (strcmp(file->path, "/dev/stdout") == 0 || strcmp(file->path, "/dev/stderr") == 0) {
@@ -306,17 +381,19 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             return (ssize_t)got;
         }
     }
+    
     /* directory read */
     if (file->type == FS_TYPE_DIR && file->driver_private) {
         uint8_t *out = (uint8_t*)buf;
         size_t pos = 0;
         size_t written = 0;
-    /* include ttys + console + any registered block devices */
-    int total_entries = (DEVFS_TTY_COUNT + 1) + dev_block_count;
-    int total_with_special = (DEVFS_TTY_COUNT + 1) + devfs_special_count + dev_block_count;
-    for (int i = 0; i < total_with_special; i++) {
+        /* include ttys + console + special devices + block devices + framebuffers */
+        int total_entries = (DEVFS_TTY_COUNT + 1) + devfs_special_count + dev_block_count + dev_fb_count;
+        
+        for (int i = 0; i < total_entries; i++) {
             const char *nm;
             char tmpn[64];
+            
             if (i == 0) {
                 nm = "console";
             } else if (i <= DEVFS_TTY_COUNT) {
@@ -326,26 +403,33 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                 nm = tmpn;
             } else if (i <= DEVFS_TTY_COUNT + devfs_special_count) {
                 int si = i - (DEVFS_TTY_COUNT + 1);
-                if (si >=0 && si < devfs_special_count) nm = devfs_special_names[si];
+                if (si >= 0 && si < devfs_special_count) nm = devfs_special_names[si];
                 else nm = "";
-            } else {
-                /* block device entries stored in dev_blocks[] */
+            } else if (i <= DEVFS_TTY_COUNT + devfs_special_count + dev_block_count) {
                 int bi = i - (DEVFS_TTY_COUNT + 1 + devfs_special_count);
                 const char *path = dev_blocks[bi].path;
                 const char *last = strrchr(path, '/');
                 if (last) nm = last + 1;
                 else nm = path;
+            } else {
+                /* framebuffer entries */
+                int fbi = i - (DEVFS_TTY_COUNT + 1 + devfs_special_count + dev_block_count);
+                snprintf(tmpn, sizeof(tmpn), "fb%d", fbi);
+                nm = tmpn;
             }
+            
             size_t namelen = strlen(nm);
             size_t rec_len = 8 + namelen;
             if (pos + rec_len <= (size_t)offset) { pos += rec_len; continue; }
             if (written >= size) break;
+            
             uint8_t tmp[512];
             if (rec_len > sizeof(tmp)) {
                 /* name too long for our entry buffer -> skip safely */
                 pos += rec_len;
                 continue;
             }
+            
             struct ext2_dir_entry de;
             de.inode = (uint32_t)(i + 1);
             de.rec_len = (uint16_t)rec_len;
@@ -353,17 +437,20 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             de.file_type = EXT2_FT_REG_FILE;
             memcpy(tmp, &de, 8);
             memcpy(tmp + 8, nm, namelen);
+            
             size_t entry_off = 0;
             if ((size_t)offset > pos) entry_off = (size_t)offset - pos;
             size_t avail = size - written;
             size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
             if (tocopy > avail) tocopy = avail;
+            
             memcpy(out + written, tmp + entry_off, tocopy);
             written += tocopy;
             pos += rec_len;
         }
         return (ssize_t)written;
     }
+    
     /* regular device read (tty) */
     struct devfs_tty *t = (struct devfs_tty*)file->driver_private;
     if (!t) return -1;
@@ -403,6 +490,7 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                 continue;
             }
         }
+        
         /* no data: block current thread until pushed */
         thread_t* cur = thread_current();
         if (cur) {
@@ -416,6 +504,7 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                 if (c == '\n') break;
                 continue;
             }
+            
             /* add to waiters if not already */
             int tid = (int)cur->tid;
             int already = 0;
@@ -439,6 +528,14 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
 static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, size_t offset) {
     (void)offset;
     if (!file || !buf) return -1;
+    
+    /* Framebuffer устройства */
+    if (file->driver_private && 
+        ((uintptr_t)file->driver_private >= (uintptr_t)&dev_framebuffers[0] &&
+         (uintptr_t)file->driver_private <= (uintptr_t)&dev_framebuffers[dev_fb_count])) {
+        return devfs_fb_write(file, buf, size, offset);
+    }
+    
     /* special devices via driver_private marker: handle /dev/null, /dev/zero, /dev/random writes */
     if (file->driver_private) {
         uintptr_t dp = (uintptr_t)file->driver_private;
@@ -473,6 +570,7 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
             }
         }
     }
+    
     /* block device write? */
     for (int bi = 0; bi < dev_block_count; bi++) {
         if (file->driver_private == &dev_blocks[bi]) {
@@ -496,6 +594,7 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
             return (ssize_t)size;
         }
     }
+    
     /* Resolve driver_private: it may be either a pointer into dev_ttys (tty handle)
        or a pointer to an allocated int marker for special devices (/dev/null, /dev/stdout, etc). */
     void *dp = file->driver_private;
@@ -530,6 +629,7 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
             return -1;
         }
     }
+    
     if (!t) return -1;
     int idx = t->id;
     const char *s = (const char*)buf;
@@ -666,76 +766,98 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                     tty->screen[off] = (uint8_t)ch;
                     tty->screen[off + 1] = tty->current_attr;
                     tty->cursor_x++;
-                    if (tty->cursor_x >= MAX_COLS) { tty->cursor_x = 0; tty->cursor_y++; if (tty->cursor_y >= MAX_ROWS) tty->cursor_y = MAX_ROWS - 1; }
-                }
-            }
-        }
-            /* write into saved screen buffer */
-            if (t->screen) {
-                /* very naive: append at bottom-right with no wrapping */
-                uint32_t x = t->cursor_x;
-                uint32_t y = t->cursor_y;
-                uint16_t off = (uint16_t)((y * MAX_COLS + x) * 2);
-                if (off + 1 < (MAX_ROWS * MAX_COLS * 2)) {
-                    t->screen[off] = (uint8_t)ch;
-                    t->screen[off + 1] = GRAY_ON_BLACK;
-                    t->cursor_x++;
-                    if (t->cursor_x >= MAX_COLS) { t->cursor_x = 0; t->cursor_y++; if (t->cursor_y >= MAX_ROWS) t->cursor_y = MAX_ROWS - 1; }
-                }
-            }
-        }
-        /* Also append written chars to stdout/stderr ring buffers if applicable */
-        if (file->path) {
-            int which = -1;
-            if (strcmp(file->path, "/dev/stdout") == 0) which = 0;
-            else if (strcmp(file->path, "/dev/stderr") == 0) which = 1;
-            if (which >= 0) {
-                stdio_ring_t *rb = &stdio_bufs[which];
-                unsigned long flags = 0;
-                acquire_irqsave(&rb->lock, &flags);
-                for (size_t ii = 0; ii < size; ii++) {
-                    char ch = ((const char*)buf)[ii];
-                    size_t next = (rb->tail + 1) % rb->cap;
-                    if (next != rb->head) {
-                        rb->buf[rb->tail] = ch;
-                        rb->tail = next;
-                    } else {
-                        /* buffer full: drop oldest */
-                        rb->head = (rb->head + 1) % rb->cap;
-                        rb->buf[rb->tail] = ch;
-                        rb->tail = (rb->tail + 1) % rb->cap;
+                    if (tty->cursor_x >= MAX_COLS) { 
+                        tty->cursor_x = 0; 
+                        tty->cursor_y++; 
+                        if (tty->cursor_y >= MAX_ROWS) tty->cursor_y = MAX_ROWS - 1; 
                     }
                 }
-                /* wake readers */
-                for (int wi = 0; wi < rb->waiters_count; wi++) {
-                    int tid = rb->waiters[wi];
-                    if (tid >= 0) thread_unblock(tid);
-                }
-                rb->waiters_count = 0;
-                release_irqrestore(&rb->lock, flags);
             }
         }
-        return (ssize_t)size;
+        
+        /* write into saved screen buffer */
+        if (t->screen) {
+            /* very naive: append at bottom-right with no wrapping */
+            uint32_t x = t->cursor_x;
+            uint32_t y = t->cursor_y;
+            uint16_t off = (uint16_t)((y * MAX_COLS + x) * 2);
+            if (off + 1 < (MAX_ROWS * MAX_COLS * 2)) {
+                t->screen[off] = (uint8_t)ch;
+                t->screen[off + 1] = GRAY_ON_BLACK;
+                t->cursor_x++;
+                if (t->cursor_x >= MAX_COLS) { 
+                    t->cursor_x = 0; 
+                    t->cursor_y++; 
+                    if (t->cursor_y >= MAX_ROWS) t->cursor_y = MAX_ROWS - 1; 
+                }
+            }
+        }
     }
+    
+    /* Also append written chars to stdout/stderr ring buffers if applicable */
+    if (file->path) {
+        int which = -1;
+        if (strcmp(file->path, "/dev/stdout") == 0) which = 0;
+        else if (strcmp(file->path, "/dev/stderr") == 0) which = 1;
+        if (which >= 0) {
+            stdio_ring_t *rb = &stdio_bufs[which];
+            unsigned long flags = 0;
+            acquire_irqsave(&rb->lock, &flags);
+            for (size_t ii = 0; ii < size; ii++) {
+                char ch = ((const char*)buf)[ii];
+                size_t next = (rb->tail + 1) % rb->cap;
+                if (next != rb->head) {
+                    rb->buf[rb->tail] = ch;
+                    rb->tail = next;
+                } else {
+                    /* buffer full: drop oldest */
+                    rb->head = (rb->head + 1) % rb->cap;
+                    rb->buf[rb->tail] = ch;
+                    rb->tail = (rb->tail + 1) % rb->cap;
+                }
+            }
+            /* wake readers */
+            for (int wi = 0; wi < rb->waiters_count; wi++) {
+                int tid = rb->waiters[wi];
+                if (tid >= 0) thread_unblock(tid);
+            }
+            rb->waiters_count = 0;
+            release_irqrestore(&rb->lock, flags);
+        }
+    }
+    
+    return (ssize_t)size;
+}
 
 static void devfs_release(struct fs_file *file) {
     if (!file) return;
-    // free driver_private if it was allocated for special device markers
+    
+    /* free driver_private if it was allocated for special device markers */
     if (file->driver_private) {
         uintptr_t dp = (uintptr_t)file->driver_private;
         uintptr_t base_tty = (uintptr_t)&dev_ttys[0];
         uintptr_t end_tty = (uintptr_t)&dev_ttys[DEVFS_TTY_COUNT];
         uintptr_t base_blk = (uintptr_t)&dev_blocks[0];
         uintptr_t end_blk = (uintptr_t)&dev_blocks[dev_block_count];
-        if (!(dp >= base_tty && dp < end_tty) && !(dp >= base_blk && dp < end_blk)) {
+        uintptr_t base_fb = (uintptr_t)&dev_framebuffers[0];
+        uintptr_t end_fb = (uintptr_t)&dev_framebuffers[dev_fb_count];
+        
+        if (!(dp >= base_tty && dp < end_tty) && 
+            !(dp >= base_blk && dp < end_blk) &&
+            !(dp >= base_fb && dp < end_fb)) {
             kfree(file->driver_private);
         }
     }
+    
     if (file->path) kfree((void*)file->path);
     kfree(file);
 }
 
 int devfs_register(void) {
+    /* init framebuffers first */
+    memset(dev_framebuffers, 0, sizeof(dev_framebuffers));
+    dev_fb_count = 0;
+    
     /* init ttys */
     for (int i = 0; i < DEVFS_TTY_COUNT; i++) {
         dev_ttys[i].id = i;
@@ -747,7 +869,10 @@ int devfs_register(void) {
         dev_ttys[i].fg_pgrp = -1;
         dev_ttys[i].screen = (uint8_t*)kmalloc(MAX_ROWS * MAX_COLS * 2);
         if (dev_ttys[i].screen) {
-            for (uint32_t j=0;j<MAX_ROWS*MAX_COLS*2;j+=2) { dev_ttys[i].screen[j] = ' '; dev_ttys[i].screen[j+1] = GRAY_ON_BLACK; }
+            for (uint32_t j=0;j<MAX_ROWS*MAX_COLS*2;j+=2) { 
+                dev_ttys[i].screen[j] = ' '; 
+                dev_ttys[i].screen[j+1] = GRAY_ON_BLACK; 
+            }
         }
         /* initialize ANSI/escape parsing state and current attribute */
         dev_ttys[i].current_attr = GRAY_ON_BLACK;
@@ -756,6 +881,7 @@ int devfs_register(void) {
         dev_ttys[i].ansi_current_param = 0;
         dev_ttys[i].controlling_sid = -1;
     }
+    
     /* init stdio ring buffers */
     for (int si = 0; si < 2; si++) {
         stdio_bufs[si].cap = 4096;
@@ -764,8 +890,10 @@ int devfs_register(void) {
         stdio_bufs[si].lock.lock = 0;
         stdio_bufs[si].waiters_count = 0;
     }
+    
     devfs_entropy = 0;
     devfs_random_waiters_count = 0;
+    
     devfs_ops.name = "devfs";
     devfs_ops.create = devfs_create;
     devfs_ops.open = devfs_open;
@@ -773,10 +901,156 @@ int devfs_register(void) {
     devfs_ops.write = devfs_write;
     devfs_ops.release = devfs_release;
     devfs_driver.ops = &devfs_ops;
+    
     /* set a unique non-NULL driver_data so VFS dispatch finds this driver for our files */
     devfs_driver_data = &devfs_driver; /* unique pointer */
     devfs_driver.driver_data = &devfs_driver_data;
+    
     return fs_register_driver(&devfs_driver);
+}
+
+/* Framebuffer функции */
+int devfs_add_framebuffer(const char *path, struct devfs_framebuffer *fb) {
+    if (!path || !fb || dev_fb_count >= (int)(sizeof(dev_framebuffers)/sizeof(dev_framebuffers[0]))) {
+        return -1;
+    }
+    
+    /* Проверяем путь - должен быть /dev/fb0, /dev/fb1 и т.д. */
+    if (strncmp(path, "/dev/fb", 7) != 0) {
+        kprintf("devfs: framebuffer path must start with /dev/fb\n");
+        return -1;
+    }
+    
+    int fb_num = path[7] - '0';
+    if (fb_num != dev_fb_count) {
+        kprintf("devfs: framebuffers must be added in order (expected fb%d, got fb%d)\n", 
+                dev_fb_count, fb_num);
+        return -1;
+    }
+    
+    /* Копируем структуру */
+    memcpy(&dev_framebuffers[dev_fb_count], fb, sizeof(*fb));
+    dev_framebuffers[dev_fb_count].id = dev_fb_count;
+    
+    /* Создаем файл в ramfs для отображения в /dev */
+    struct fs_file *f = fs_create_file(path);
+    if (f) {
+        f->driver_private = &dev_framebuffers[dev_fb_count];
+        f->size = fb->fb_size;
+        fs_file_free(f);
+    }
+    
+    kprintf("devfs: added framebuffer %s (%dx%d, %dbpp, size: %dKB)\n", 
+            path, fb->width, fb->height, fb->bpp, fb->fb_size / 1024);
+    
+    dev_fb_count++;
+    return 0;
+}
+
+int devfs_remove_framebuffer(const char *path) {
+    int fbi = devfs_path_to_fb(path);
+    if (fbi < 0) return -1;
+    
+    /* Сдвигаем оставшиеся устройства */
+    for (int i = fbi; i < dev_fb_count - 1; i++) {
+        memcpy(&dev_framebuffers[i], &dev_framebuffers[i + 1], sizeof(struct devfs_framebuffer));
+        dev_framebuffers[i].id = i;
+        
+        /* Обновляем путь */
+        char new_path[32];
+        snprintf(new_path, sizeof(new_path), "/dev/fb%d", i);
+        
+        /* Обновляем файл в ramfs */
+        struct fs_file *f = fs_open(new_path);
+        if (f) {
+            f->driver_private = &dev_framebuffers[i];
+            fs_file_free(f);
+        }
+    }
+    
+    dev_fb_count--;
+    return 0;
+}
+
+struct devfs_framebuffer *devfs_get_framebuffer(int index) {
+    if (index < 0 || index >= dev_fb_count) return NULL;
+    return &dev_framebuffers[index];
+}
+
+int devfs_framebuffer_count(void) {
+    return dev_fb_count;
+}
+
+void devfs_fb_init(void) {
+    memset(dev_framebuffers, 0, sizeof(dev_framebuffers));
+    dev_fb_count = 0;
+    kprintf("devfs: framebuffer subsystem initialized\n");
+}
+
+int devfs_fb_set_mode(int fb_id, uint32_t width, uint32_t height, uint32_t bpp) {
+    if (fb_id < 0 || fb_id >= dev_fb_count) return -1;
+    
+    struct devfs_framebuffer *fb = &dev_framebuffers[fb_id];
+    if (!fb->set_mode) return -1;
+    
+    int result = fb->set_mode(fb, width, height, bpp);
+    if (result == 0) {
+        kprintf("devfs: fb%d mode changed to %dx%d %dbpp\n", 
+                fb_id, width, height, bpp);
+    }
+    return result;
+}
+
+int devfs_fb_fill_rect(int fb_id, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color) {
+    if (fb_id < 0 || fb_id >= dev_fb_count) return -1;
+    
+    struct devfs_framebuffer *fb = &dev_framebuffers[fb_id];
+    if (!fb->fill_rect) return -1;
+    
+    fb->fill_rect(fb, x, y, w, h, color);
+    return 0;
+}
+
+int devfs_fb_put_pixel(int fb_id, uint32_t x, uint32_t y, uint32_t color) {
+    if (fb_id < 0 || fb_id >= dev_fb_count) return -1;
+    
+    struct devfs_framebuffer *fb = &dev_framebuffers[fb_id];
+    if (!fb->put_pixel) return -1;
+    
+    fb->put_pixel(fb, x, y, color);
+    return 0;
+}
+
+int devfs_fb_scroll(int fb_id, int lines) {
+    if (fb_id < 0 || fb_id >= dev_fb_count) return -1;
+    
+    struct devfs_framebuffer *fb = &dev_framebuffers[fb_id];
+    if (!fb->scroll) return -1;
+    
+    fb->scroll(fb, lines);
+    return 0;
+}
+
+int devfs_fb_get_info(int fb_id, uint32_t *width, uint32_t *height, uint32_t *bpp, uint32_t *pitch) {
+    if (fb_id < 0 || fb_id >= dev_fb_count) return -1;
+    
+    struct devfs_framebuffer *fb = &dev_framebuffers[fb_id];
+    if (width) *width = fb->width;
+    if (height) *height = fb->height;
+    if (bpp) *bpp = fb->bpp;
+    if (pitch) *pitch = fb->pitch;
+    
+    return 0;
+}
+
+uint32_t devfs_fb_get_phys_addr(int fb_id) {
+    if (fb_id < 0 || fb_id >= dev_fb_count) return 0;
+    return dev_framebuffers[fb_id].fb_base;
+}
+
+uint32_t devfs_fb_get_size(int fb_id) {
+    if (fb_id < 0 || fb_id >= dev_fb_count) return 0;
+    return dev_framebuffers[fb_id].fb_size;
 }
 
 int devfs_mount(const char *path) {
@@ -787,6 +1061,7 @@ int devfs_mount(const char *path) {
 void devfs_switch_tty(int index) {
     if (index < 0 || index >= DEVFS_TTY_COUNT) return;
     if (index == devfs_active) return;
+    
     /* save current VGA into current tty buffer */
     struct devfs_tty *cur = &dev_ttys[devfs_active];
     if (cur && cur->screen) {
@@ -797,7 +1072,9 @@ void devfs_switch_tty(int index) {
         cur->cursor_x = (pos % (MAX_COLS * 2)) / 2;
         cur->cursor_y = pos / (MAX_COLS * 2);
     }
+    
     devfs_active = index;
+    
     /* restore new active screen */
     struct devfs_tty *n = &dev_ttys[devfs_active];
     if (n && n->screen) {
@@ -805,6 +1082,7 @@ void devfs_switch_tty(int index) {
         memcpy(vga, n->screen, MAX_ROWS * MAX_COLS * 2);
         set_cursor((n->cursor_y * MAX_COLS + n->cursor_x) * 2);
     }
+    
     /* set current user/process to first process attached to this tty, if any */
     extern void thread_set_current_user(thread_t*);
     extern thread_t* thread_find_by_tty(int);
@@ -812,7 +1090,9 @@ void devfs_switch_tty(int index) {
     if (t) thread_set_current_user(t);
 }
 
-int devfs_tty_count(void) { return DEVFS_TTY_COUNT; }
+int devfs_tty_count(void) { 
+    return DEVFS_TTY_COUNT; 
+}
 
 int devfs_unregister(void) {
     for (int i = 0; i < DEVFS_TTY_COUNT; i++) {
@@ -827,7 +1107,6 @@ void devfs_tty_push_input(int tty, char c) {
     struct devfs_tty *t = &dev_ttys[tty];
     unsigned long flags = 0;
     acquire_irqsave(&t->in_lock, &flags);
-    qemu_debug_printf("devfs: push_input tty=%d char=0x%02x ('%c') in_count=%d\n", tty, (unsigned char)c, (c >= 32 && c < 127) ? c : '.', t->in_count);
     if (t->in_count < (int)sizeof(t->inbuf)) {
         t->inbuf[t->in_tail] = c;
         t->in_tail = (t->in_tail + 1) % (int)sizeof(t->inbuf);
@@ -842,14 +1121,15 @@ void devfs_tty_push_input(int tty, char c) {
     release_irqrestore(&t->in_lock, flags);
 }
 
-int devfs_get_active(void) { return devfs_active; }
+int devfs_get_active(void) { 
+    return devfs_active; 
+}
 
 /* Non-blocking push suitable for ISR: try to acquire lock, drop on failure */
 void devfs_tty_push_input_noblock(int tty, char c) {
     if (tty < 0 || tty >= DEVFS_TTY_COUNT) return;
     struct devfs_tty *t = &dev_ttys[tty];
     if (!try_acquire(&t->in_lock)) return;
-    qemu_debug_printf("devfs: push_input_noblock tty=%d char=0x%02x ('%c') in_count=%d\n", tty, (unsigned char)c, (c >= 32 && c < 127) ? c : '.', t->in_count);
     if (t->in_count < (int)sizeof(t->inbuf)) {
         t->inbuf[t->in_tail] = c;
         t->in_tail = (t->in_tail + 1) % (int)sizeof(t->inbuf);
@@ -867,9 +1147,6 @@ void devfs_tty_push_input_noblock(int tty, char c) {
             kputchar((uint8_t)c, t->current_attr);
         } else if (c == '\n' || c == '\r') {
             kputchar((uint8_t)c, t->current_attr);
-        } else {
-            /* for control chars, optionally show caret notation (e.g., ^C) */
-            // simple: ignore non-printable for now
         }
     }
     release(&t->in_lock);
@@ -880,7 +1157,10 @@ int devfs_tty_pop_nb(int tty) {
     struct devfs_tty *t = &dev_ttys[tty];
     unsigned long flags = 0;
     acquire_irqsave(&t->in_lock, &flags);
-    if (t->in_count == 0) { release_irqrestore(&t->in_lock, flags); return -1; }
+    if (t->in_count == 0) { 
+        release_irqrestore(&t->in_lock, flags); 
+        return -1; 
+    }
     char c = t->inbuf[t->in_head];
     t->in_head = (t->in_head + 1) % (int)sizeof(t->inbuf);
     t->in_count--;
@@ -1079,5 +1359,3 @@ int devfs_get_device_id(const char *path) {
     if (idx < 0) return -1;
     return dev_blocks[idx].device_id;
 }
-
-

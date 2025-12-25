@@ -5,6 +5,9 @@
 #include <stdint.h>
 #include <spinlock.h>
 
+#ifndef DEVFS_H
+#define DEVFS_H
+
 /* Number of virtual ttys provided by devfs (default) */
 #ifndef DEVFS_TTY_COUNT
 #define DEVFS_TTY_COUNT 6
@@ -47,6 +50,40 @@ struct devfs_tty {
     /* POSIX termios local flags (c_lflag) for this tty */
     uint32_t term_lflag;
 };
+
+/* Структура framebuffer устройства */
+struct devfs_framebuffer {
+    uint32_t id;
+    uint32_t width;
+    uint32_t height;
+    uint32_t bpp;
+    uint32_t pitch;
+    uint32_t fb_base;      /* физический адрес framebuffer */
+    uint32_t fb_size;
+    uint32_t mmio_base;    /* MMIO база */
+    void *priv;            /* приватные данные драйвера */
+    
+    /* Операции */
+    int (*set_mode)(struct devfs_framebuffer *fb, uint32_t width, uint32_t height, uint32_t bpp);
+    void (*put_pixel)(struct devfs_framebuffer *fb, uint32_t x, uint32_t y, uint32_t color);
+    void (*fill_rect)(struct devfs_framebuffer *fb, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color);
+    void (*copy_rect)(struct devfs_framebuffer *fb, uint32_t sx, uint32_t sy, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h);
+    void (*scroll)(struct devfs_framebuffer *fb, int lines);
+};
+
+/* ... существующие функции ... */
+
+/* Framebuffer функции */
+int devfs_add_framebuffer(const char *path, struct devfs_framebuffer *fb);
+int devfs_remove_framebuffer(const char *path);
+struct devfs_framebuffer *devfs_get_framebuffer(int index);
+int devfs_framebuffer_count(void);
+
+/* VESA/графические функции */
+void devfs_fb_init(void);
+int devfs_fb_set_mode(int fb_id, uint32_t width, uint32_t height, uint32_t bpp);
+
+#endif
 
 int devfs_register(void);
 int devfs_unregister(void);

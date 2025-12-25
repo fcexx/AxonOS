@@ -35,6 +35,7 @@
 #include <user.h>
 #include <serial.h>
 #include <exec.h>
+#include <cirrus.h>
 
 /* ATA DMA driver init (registered here) */
 void ata_dma_init(void);
@@ -242,6 +243,12 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     }
 
     pci_init();
+    pci_dump_devices();
+
+    /* Инициализировать драйвер видеокарты */
+    cirrus_init();
+
+intel_chipset_init();
     pci_dump_devices();
     intel_chipset_init();
     /* start threading and I/O subsystem, then initialize disk drivers from a kernel thread
