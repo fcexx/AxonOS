@@ -74,7 +74,7 @@ $(GRUB_DIR):
 iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg
 	@cp $(KERNEL_ELF) $(ISO_BOOT)/axonos.elf
 	@grub-mkrescue -o $(ISO_IMAGE) $(ISO_DIR) 2>/dev/null || { \
-		@echo "grub-mkrescue failed: try installing grub-pc-bin or xorriso" >&2; exit 1; \
+		echo "grub-mkrescue failed: try installing grub-pc-bin or xorriso" >&2; exit 1; \
 	}
 
 run: iso

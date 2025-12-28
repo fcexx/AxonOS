@@ -36,6 +36,152 @@
 #include <exec.h>
 #include <klog.h>
 
+/* ====== FIRMWARE AND CPU DETECTION ====== */
+
+#define FIRMWARE_BIOS   0
+#define FIRMWARE_UEFI   1
+#define FIRMWARE_UNKNOWN 2
+
+struct cpu_regs {
+    uint32_t eax;
+    uint32_t ebx;
+    uint32_t ecx;
+    uint32_t edx;
+};
+
+struct cpu_info {
+    char vendor[13];
+    char brand[49];
+    uint32_t family;
+    uint32_t model;
+    uint32_t stepping;
+    uint8_t apic_id;
+    uint32_t features_ecx;
+    uint32_t features_edx;
+};
+
+// Глобальные переменные
+static int g_firmware_type = FIRMWARE_UNKNOWN;
+static struct cpu_info g_cpu_info = {0};
+
+static inline void cpuid(uint32_t code, struct cpu_regs *regs) {
+    asm volatile("cpuid"
+        : "=a"(regs->eax), "=b"(regs->ebx), "=c"(regs->ecx), "=d"(regs->edx)
+        : "a"(code));
+}
+
+static int detect_firmware_type(uint32_t multiboot_magic, uint64_t multiboot_info) {
+    // 1. Multiboot2 EFI tag
+    if (multiboot_magic == 0x36d76289u && multiboot_info != 0) {
+        uint8_t *p = (uint8_t*)(uintptr_t)multiboot_info;
+        uint32_t total_size = *(uint32_t*)p;
+        uint32_t off = 8;
+        
+        while (off + 8 <= total_size) {
+            uint32_t type = *(uint32_t*)(p + off);
+            uint32_t size = *(uint32_t*)(p + off + 4);
+            
+            if (type == 0) break;
+            if (size < 8) break;
+            
+            if (type == 14) { // EFI system table
+                return FIRMWARE_UEFI;
+            }
+            off += (size + 7) & ~7u;
+        }
+    }
+    
+    // 2. Check ACPI RSDP
+    for (uintptr_t addr = 0xE0000; addr < 0x100000; addr += 16) {
+        if (*(uint64_t*)addr == 0x2052545020445352) { // "RSD PTR "
+            uint8_t sum = 0;
+            for (int i = 0; i < 20; i++) sum += ((uint8_t*)addr)[i];
+            if (sum == 0) {
+                uint64_t xsdt_addr = *(uint64_t*)(addr + 24);
+                if (xsdt_addr != 0) {
+                    return FIRMWARE_UEFI;
+                }
+            }
+        }
+    }
+    
+    // 3. Check EBDA
+    uint16_t ebda_seg = *(uint16_t*)0x40E;
+    if (ebda_seg != 0) {
+        uintptr_t ebda_addr = (uintptr_t)ebda_seg << 4;
+        if (ebda_addr >= 0x80000 && ebda_addr < 0xA0000) {
+            return FIRMWARE_BIOS;
+        }
+    }
+    
+    return FIRMWARE_BIOS; // Assume BIOS if not detected
+}
+
+static void detect_cpu(void) {
+    struct cpu_regs regs;
+    
+    // Get vendor string
+    cpuid(0, &regs);
+    uint32_t max_cpuid = regs.eax;
+    
+    // Copy vendor string
+    *(uint32_t*)(g_cpu_info.vendor) = regs.ebx;
+    *(uint32_t*)(g_cpu_info.vendor + 4) = regs.edx;
+    *(uint32_t*)(g_cpu_info.vendor + 8) = regs.ecx;
+    g_cpu_info.vendor[12] = 0;
+    
+    // Get processor info
+    if (max_cpuid >= 1) {
+        cpuid(1, &regs);
+        
+        g_cpu_info.stepping = regs.eax & 0xF;
+        g_cpu_info.model = (regs.eax >> 4) & 0xF;
+        g_cpu_info.family = (regs.eax >> 8) & 0xF;
+        
+        // Extended family/model
+        if (g_cpu_info.family == 0xF) {
+            g_cpu_info.family += (regs.eax >> 20) & 0xFF;
+            g_cpu_info.model |= ((regs.eax >> 16) & 0xF) << 4;
+        }
+        
+        g_cpu_info.apic_id = (regs.ebx >> 24) & 0xFF;
+        g_cpu_info.features_ecx = regs.ecx;
+        g_cpu_info.features_edx = regs.edx;
+    }
+    
+    // Get brand string if supported
+    cpuid(0x80000000, &regs);
+    if (regs.eax >= 0x80000004) {
+        uint32_t brand[12];
+        
+        cpuid(0x80000002, &regs);
+        brand[0] = regs.eax; brand[1] = regs.ebx;
+        brand[2] = regs.ecx; brand[3] = regs.edx;
+        
+        cpuid(0x80000003, &regs);
+        brand[4] = regs.eax; brand[5] = regs.ebx;
+        brand[6] = regs.ecx; brand[7] = regs.edx;
+        
+        cpuid(0x80000004, &regs);
+        brand[8] = regs.eax; brand[9] = regs.ebx;
+        brand[10] = regs.ecx; brand[11] = regs.edx;
+        
+        memcpy(g_cpu_info.brand, brand, 48);
+        g_cpu_info.brand[48] = 0;
+        
+        // Trim trailing spaces
+        for (int i = 47; i >= 0; i--) {
+            if (g_cpu_info.brand[i] == ' ') {
+                g_cpu_info.brand[i] = 0;
+            } else if (g_cpu_info.brand[i] != 0) {
+                break;
+            }
+        }
+    } else {
+        strcpy(g_cpu_info.brand, g_cpu_info.vendor);
+    }
+}
+
 /* ATA DMA driver init (registered here) */
 void ata_dma_init(void);
 
@@ -132,12 +278,164 @@ static ssize_t sysfs_show_ram_mb_attr(char *buf, size_t size, void *priv) {
 
 void ring0_shell()  { osh_run(); }
 
+/* ====== SYSFS ATTR FUNCTIONS ====== */
+
+static ssize_t sysfs_show_cpu_vendor(char *buf, size_t size, void *priv) {
+    (void)priv;
+    if (!buf || size == 0) return 0;
+    size_t len = strlen(g_cpu_info.vendor);
+    if (len > size) len = size;
+    memcpy(buf, g_cpu_info.vendor, len);
+    if (len < size) buf[len++] = '\n';
+    return (ssize_t)len;
+}
+
+static ssize_t sysfs_show_cpu_brand(char *buf, size_t size, void *priv) {
+    (void)priv;
+    if (!buf || size == 0) return 0;
+    size_t len = strlen(g_cpu_info.brand);
+    if (len > size) len = size;
+    memcpy(buf, g_cpu_info.brand, len);
+    if (len < size) buf[len++] = '\n';
+    return (ssize_t)len;
+}
+
+static ssize_t sysfs_show_cpu_family(char *buf, size_t size, void *priv) {
+    (void)priv;
+    if (!buf || size == 0) return 0;
+    char tmp[32];
+    size_t n = 0;
+    uint32_t v = g_cpu_info.family;
+    do {
+        tmp[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    } while (v && n < sizeof(tmp));
+    size_t written = 0;
+    while (n && written < size) {
+        buf[written++] = tmp[--n];
+    }
+    if (written < size) buf[written++] = '\n';
+    return (ssize_t)written;
+}
+
+static ssize_t sysfs_show_cpu_model(char *buf, size_t size, void *priv) {
+    (void)priv;
+    if (!buf || size == 0) return 0;
+    char tmp[32];
+    size_t n = 0;
+    uint32_t v = g_cpu_info.model;
+    do {
+        tmp[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    } while (v && n < sizeof(tmp));
+    size_t written = 0;
+    while (n && written < size) {
+        buf[written++] = tmp[--n];
+    }
+    if (written < size) buf[written++] = '\n';
+    return (ssize_t)written;
+}
+
+static ssize_t sysfs_show_cpu_stepping(char *buf, size_t size, void *priv) {
+    (void)priv;
+    if (!buf || size == 0) return 0;
+    char tmp[32];
+    size_t n = 0;
+    uint32_t v = g_cpu_info.stepping;
+    do {
+        tmp[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    } while (v && n < sizeof(tmp));
+    size_t written = 0;
+    while (n && written < size) {
+        buf[written++] = tmp[--n];
+    }
+    if (written < size) buf[written++] = '\n';
+    return (ssize_t)written;
+}
+
+static ssize_t sysfs_show_firmware_type(char *buf, size_t size, void *priv) {
+    (void)priv;
+    if (!buf || size == 0) return 0;
+    const char *type;
+    switch (g_firmware_type) {
+        case FIRMWARE_BIOS: type = "BIOS"; break;
+        case FIRMWARE_UEFI: type = "UEFI"; break;
+        default: type = "Unknown"; break;
+    }
+    size_t len = strlen(type);
+    if (len > size) len = size;
+    memcpy(buf, type, len);
+    if (len < size) buf[len++] = '\n';
+    return (ssize_t)len;
+}
+
+static ssize_t sysfs_show_cpuinfo_full(char *buf, size_t size, void *priv) {
+    (void)priv;
+    if (!buf || size == 0) return 0;
+    
+    char tmp[512];
+    const char *fw_type;
+    switch (g_firmware_type) {
+        case FIRMWARE_BIOS: fw_type = "BIOS"; break;
+        case FIRMWARE_UEFI: fw_type = "UEFI"; break;
+        default: fw_type = "Unknown"; break;
+    }
+    
+    int len = snprintf(tmp, sizeof(tmp),
+        "processor\t: 0\n"
+        "vendor_id\t: %s\n"
+        "cpu family\t: %u\n"
+        "model\t\t: %u\n"
+        "stepping\t: %u\n"
+        "apicid\t\t: %u\n"
+        "firmware\t: %s\n"
+        "flags\t\t: ",
+        g_cpu_info.vendor,
+        g_cpu_info.family,
+        g_cpu_info.model,
+        g_cpu_info.stepping,
+        g_cpu_info.apic_id,
+        fw_type);
+    
+    // Add CPU features
+    if (g_cpu_info.features_edx & (1 << 23)) len += snprintf(tmp + len, sizeof(tmp) - len, "mmx ");
+    if (g_cpu_info.features_edx & (1 << 25)) len += snprintf(tmp + len, sizeof(tmp) - len, "sse ");
+    if (g_cpu_info.features_edx & (1 << 26)) len += snprintf(tmp + len, sizeof(tmp) - len, "sse2 ");
+    if (g_cpu_info.features_edx & (1 << 28)) len += snprintf(tmp + len, sizeof(tmp) - len, "ht ");
+    if (g_cpu_info.features_ecx & (1 << 0)) len += snprintf(tmp + len, sizeof(tmp) - len, "sse3 ");
+    if (g_cpu_info.features_ecx & (1 << 9)) len += snprintf(tmp + len, sizeof(tmp) - len, "ssse3 ");
+    if (g_cpu_info.features_ecx & (1 << 19)) len += snprintf(tmp + len, sizeof(tmp) - len, "sse4.1 ");
+    if (g_cpu_info.features_ecx & (1 << 20)) len += snprintf(tmp + len, sizeof(tmp) - len, "sse4.2 ");
+    if (g_cpu_info.features_ecx & (1 << 25)) len += snprintf(tmp + len, sizeof(tmp) - len, "aes ");
+    
+    len += snprintf(tmp + len, sizeof(tmp) - len, "\n\n");
+    
+    size_t to_copy = len;
+    if (to_copy > size) to_copy = size;
+    memcpy(buf, tmp, to_copy);
+    return (ssize_t)to_copy;
+}
+
 void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     kclear();
     enable_cursor();
     kprint("Initializing kernel...\n");
     sysinfo_init(multiboot_magic, multiboot_info);
-
+    /* ====== DETECT FIRMWARE AND CPU ====== */
+    g_firmware_type = detect_firmware_type(multiboot_magic, multiboot_info);
+    detect_cpu();
+    
+    // Print to console
+    kprintf("firmware: %s\n", 
+        g_firmware_type == FIRMWARE_BIOS ? "BIOS" : 
+        g_firmware_type == FIRMWARE_UEFI ? "UEFI" : "Unknown");
+    kprintf("CPU vendor: %s\n", g_cpu_info.vendor);
+    kprintf("CPU: %s\n", g_cpu_info.brand);
+    kprintf("CPU family: %u, model: %u, stepping: %u\n", 
+           g_cpu_info.family, g_cpu_info.model, g_cpu_info.stepping);
+    kprintf("APIC ID: %u\n", g_cpu_info.apic_id);
+    /* ====== END DETECTION ====== */
     /* Initialize heap EARLY and place it above kernel + multiboot modules.
        Otherwise heap metadata can overwrite initfs module (seen on VMware). */
     {
@@ -211,6 +509,23 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         sysfs_create_file("/sys/kernel/cpu/name", &attr_cpu_name);
         sysfs_create_file("/sys/kernel/ram", &attr_ram_mb);
         sysfs_mount("/sys");
+        /* ====== CPU AND FIRMWARE INFO FILES ====== */
+        struct sysfs_attr attr_cpu_vendor = { sysfs_show_cpu_vendor, NULL, NULL };
+        struct sysfs_attr attr_cpu_brand = { sysfs_show_cpu_brand, NULL, NULL };
+        struct sysfs_attr attr_cpu_family = { sysfs_show_cpu_family, NULL, NULL };
+        struct sysfs_attr attr_cpu_model = { sysfs_show_cpu_model, NULL, NULL };
+        struct sysfs_attr attr_cpu_stepping = { sysfs_show_cpu_stepping, NULL, NULL };
+        struct sysfs_attr attr_firmware_type = { sysfs_show_firmware_type, NULL, NULL };
+        struct sysfs_attr attr_cpuinfo_full = { sysfs_show_cpuinfo_full, NULL, NULL };
+        
+        sysfs_create_file("/sys/kernel/cpu/vendor", &attr_cpu_vendor);
+        sysfs_create_file("/sys/kernel/cpu/brand", &attr_cpu_brand);
+        sysfs_create_file("/sys/kernel/cpu/family", &attr_cpu_family);
+        sysfs_create_file("/sys/kernel/cpu/model", &attr_cpu_model);
+        sysfs_create_file("/sys/kernel/cpu/stepping", &attr_cpu_stepping);
+        sysfs_create_file("/sys/kernel/firmware_type", &attr_firmware_type);
+        sysfs_create_file("/sys/kernel/cpuinfo", &attr_cpuinfo_full);
+        /* ====== END CPU INFO ====== */
 
         
         /* create /etc and write initial passwd/group files into ramfs */
