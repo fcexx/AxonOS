@@ -1,3 +1,9 @@
+/*
+ * core/osh_line.c
+ * OSH tools
+ * Author: fcexx
+*/
+
 #include <osh_line.h>
 #include <vga.h>
 #include <keyboard.h>

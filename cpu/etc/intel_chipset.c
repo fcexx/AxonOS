@@ -229,16 +229,12 @@ static void intel_enable_power_management(void) {
     );
 
 
-    pm_cntl |= INTEL_PM_SUSPEND_ENABLE;
-
-
-    intel_pci_write_config(
-        intel_chipset.lpc_controller->bus,
-        intel_chipset.lpc_controller->device,
-        intel_chipset.lpc_controller->function,
-        INTEL_LPC_PM1_CNT,
-        pm_cntl
-    );
+    /* Avoid setting the ACPI sleep enable bit (SLP_EN) here — writing that bit
+       will cause the platform to enter Sx (sleep) state and hang during boot.
+       Historically this code enabled suspend unconditionally which on some
+       chipsets (PIIX3/PIIX4) immediately put the machine to sleep. Skip the
+       write to PM1_CNT to prevent inadvertent suspend. */
+    klogprintf("Intel: skipping PM1_CNT write to avoid accidental SLP_EN\n");
 }
 
 
@@ -298,62 +294,6 @@ void intel_chipset_reset(void) {
     while ((inb(0x64) & 0x02) != 0);
     outb(0x64, 0xFE);
     asm volatile ("hlt");
-}
-
-
-void intel_print_chipset_info(void) {
-    if (!intel_detected) {
-        klogprintf("Intel: chipset not detected\n");
-        return;
-    }
-
-
-    if (intel_chipset.chipset_name) {
-        klogprintf("Intel: Chipset: %s\n", intel_chipset.chipset_name);
-    }
-
-
-    if (intel_chipset.lpc_controller) {
-        klogprintf("Intel: LPC: %04X:%04X\n", 
-               intel_chipset.lpc_controller->vendor_id,
-               intel_chipset.lpc_controller->device_id);
-    }
-
-
-    if (intel_chipset.usb_controller) {
-        klogprintf("Intel: USB: %d ports\n", intel_chipset.usb_ports);
-    }
-
-
-    if (intel_chipset.sata_controller) {
-        klogprintf("Intel: SATA: %d ports\n", intel_chipset.sata_ports);
-    }
-
-
-    if (intel_chipset.ethernet_controller) {
-        kprintf("Intel: Ethernet: Present\n");
-    }
-
-
-    if (intel_chipset.graphics_controller) {
-        kprintf("Intel: Graphics: Present\n");
-    }
-
-
-    if (intel_chipset.audio_controller) {
-        kprintf("Intel: Audio: Present\n");
-    }
-
-
-    kprintf("Features: ");
-    if (intel_chipset.supported_features & INTEL_FEATURE_ACPI) kprintf("ACPI ");
-    if (intel_chipset.supported_features & INTEL_FEATURE_USB) kprintf("USB ");
-    if (intel_chipset.supported_features & INTEL_FEATURE_SATA) kprintf("SATA ");
-    if (intel_chipset.supported_features & INTEL_FEATURE_ETHERNET) kprintf("ETH ");
-    if (intel_chipset.supported_features & INTEL_FEATURE_POWER_MGMT) kprintf("PM ");
-    if (intel_chipset.supported_features & INTEL_FEATURE_SMBUS) kprintf("SMBus ");
-    if (intel_chipset.supported_features & INTEL_FEATURE_HD_AUDIO) kprintf("HDA");
-    kprintf("\n");
 }
 
 

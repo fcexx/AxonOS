@@ -1,4 +1,8 @@
-// cpu/rtc.c
+/*
+ * cpu/rtc.c
+ * RTC driver
+ * Author: kotazz
+*/
 
 #include <rtc.h>
 #include <serial.h>

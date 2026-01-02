@@ -1,6 +1,9 @@
-/* initfs unpacker: find Multiboot2 module named "initfs" and extract cpio (newc) into VFS.
-   Code style aims to be clear and Linux-like.
+/*
+ * fs/virt/initfs.c
+ * Initfs unpacker: find Multiboot2 module named "initfs" and extract cpio (newc) into VFS
+ * Author: fcexx
 */
+
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
@@ -181,6 +184,9 @@ static int create_file_with_data(const char *path, const void *data, size_t size
     if (!f) {
         return -1;
     }
+    /* Ensure the created handle is recognized as a regular file by VFS/drivers.
+       Some drivers may return ambiguous types; force FS_TYPE_REG for initfs-created files. */
+    f->type = FS_TYPE_REG;
     ssize_t written = fs_write(f, data, size, 0);
     fs_file_free(f);
     if (written < 0 || (size_t)written != size) {

@@ -29,6 +29,13 @@ struct devfs_block {
 };
 static struct devfs_block dev_blocks[16];
 static int dev_block_count = 0;
+/* character device nodes (e.g., /dev/fb0) */
+struct devfs_char {
+    char path[32];
+    void *driver_private;
+};
+static struct devfs_char dev_chars[16];
+static int dev_char_count = 0;
 static uint32_t devfs_rand_state = 0x12345678;
 /* special device names exposed under /dev */
 static const char * const devfs_special_names[] = {
@@ -135,6 +142,26 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
         f->pos = 0;
         *out_file = f;
         return 0;
+    }
+    /* character device nodes (registered via devfs_create_char_node) */
+    for (int ci = 0; ci < dev_char_count; ci++) {
+        if (strcmp(path, dev_chars[ci].path) == 0) {
+            struct fs_file *f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
+            if (!f) return -1;
+            memset(f, 0, sizeof(*f));
+            size_t plen = strlen(path) + 1;
+            char *pp = (char*)kmalloc(plen);
+            if (!pp) { kfree(f); return -1; }
+            memcpy(pp, path, plen);
+            f->path = (const char*)pp;
+            f->fs_private = &devfs_driver_data;
+            f->driver_private = dev_chars[ci].driver_private;
+            f->type = FS_TYPE_REG;
+            f->size = 0;
+            f->pos = 0;
+            *out_file = f;
+            return 0;
+        }
     }
     /* special device nodes like /dev/null, /dev/zero, /dev/random, /dev/stdin/out/err */
     for (int si = 0; si < devfs_special_count; si++) {
@@ -313,7 +340,7 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
         size_t written = 0;
     /* include ttys + console + any registered block devices */
     int total_entries = (DEVFS_TTY_COUNT + 1) + dev_block_count;
-    int total_with_special = (DEVFS_TTY_COUNT + 1) + devfs_special_count + dev_block_count;
+    int total_with_special = (DEVFS_TTY_COUNT + 1) + devfs_special_count + dev_block_count + dev_char_count;
     for (int i = 0; i < total_with_special; i++) {
             const char *nm;
             char tmpn[64];
@@ -329,15 +356,30 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                 if (si >=0 && si < devfs_special_count) nm = devfs_special_names[si];
                 else nm = "";
             } else {
-                /* block device entries stored in dev_blocks[] */
+                /* block device entries stored in dev_blocks[] and character devices in dev_chars[] */
                 int bi = i - (DEVFS_TTY_COUNT + 1 + devfs_special_count);
-                const char *path = dev_blocks[bi].path;
-                const char *last = strrchr(path, '/');
-                if (last) nm = last + 1;
-                else nm = path;
+                if (bi < dev_block_count) {
+                    const char *path = dev_blocks[bi].path;
+                    const char *last = strrchr(path, '/');
+                    if (last) nm = last + 1;
+                    else nm = path;
+                } else {
+                    int ci = bi - dev_block_count;
+                    if (ci >= 0 && ci < dev_char_count) {
+                        const char *path = dev_chars[ci].path;
+                        const char *last = strrchr(path, '/');
+                        if (last) nm = last + 1;
+                        else nm = path;
+                    } else {
+                        nm = "";
+                    }
+                }
             }
             size_t namelen = strlen(nm);
             size_t rec_len = 8 + namelen;
+            /* pad to 4-byte boundary like ext2 dirent */
+            rec_len = (rec_len + 3) & ~3u;
+            if (rec_len < sizeof(struct ext2_dir_entry)) rec_len = sizeof(struct ext2_dir_entry);
             if (pos + rec_len <= (size_t)offset) { pos += rec_len; continue; }
             if (written >= size) break;
             uint8_t tmp[512];
@@ -346,7 +388,10 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                 pos += rec_len;
                 continue;
             }
+            /* initialize buffer and ext2_dir_entry */
+            for (size_t zi = 0; zi < rec_len; zi++) tmp[zi] = 0;
             struct ext2_dir_entry de;
+            memset(&de, 0, sizeof(de));
             de.inode = (uint32_t)(i + 1);
             de.rec_len = (uint16_t)rec_len;
             de.name_len = (uint8_t)namelen;
@@ -576,27 +621,43 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                         /* SGR - simple color management */
                         if (tty->ansi_param_count == 0) {
                             tty->current_attr = GRAY_ON_BLACK;
+                            tty->ansi_bold = 0;
                         } else {
+                            int bright = tty->ansi_bold ? 1 : 0;
                             for (int pi = 0; pi < tty->ansi_param_count; pi++) {
                                 int code = tty->ansi_param[pi];
                                 if (code == 0) {
                                     tty->current_attr = GRAY_ON_BLACK;
+                                    bright = 0;
+                                } else if (code == 1) {
+                                    bright = 1;
+                                } else if (code == 22) {
+                                    bright = 0;
                                 } else if (code == 39) {
                                     /* default foreground: keep current BG, set FG to white (7) */
                                     int bg = (tty->current_attr & 0xF0) >> 4;
-                                    tty->current_attr = (bg << 4) | 7;
+                                    int fg = 7;
+                                    if (bright) fg |= 8;
+                                    tty->current_attr = (bg << 4) | (fg & 0x0F);
                                 } else if (code >= 30 && code <= 37) {
-                                    int fg = code - 30;
+                                    /* Map ANSI colors to VGA palette indexes */
+                                    static const uint8_t ansi_to_vga[8] = {0, 4, 2, 6, 1, 5, 3, 7};
+                                    int ansi = code - 30;
+                                    int fg_vga = ansi_to_vga[ansi & 7];
+                                    if (bright) fg_vga |= 8;
                                     int bg = (tty->current_attr & 0xF0) >> 4;
-                                    tty->current_attr = (bg << 4) | (fg & 0x0F);
+                                    tty->current_attr = (uint8_t)((bg << 4) | (fg_vga & 0x0F));
                                 } else if (code >= 40 && code <= 47) {
-                                    int bg = code - 40;
+                                    static const uint8_t ansi_to_vga_bg[8] = {0, 4, 2, 6, 1, 5, 3, 0};
+                                    int ansi_bg = code - 40;
+                                    int bg_vga = ansi_to_vga_bg[ansi_bg & 7];
                                     int fg = tty->current_attr & 0x0F;
-                                    tty->current_attr = (bg << 4) | (fg & 0x0F);
+                                    tty->current_attr = (uint8_t)((bg_vga << 4) | (fg & 0x0F));
                                 } else {
-                                    /* ignore other codes (bold, reset etc.) for simplicity */
+                                    /* ignore other codes for simplicity */
                                 }
                             }
+                            tty->ansi_bold = bright ? 1 : 0;
                         }
                     } else if (final_byte == 'H' || final_byte == 'f') {
                         /* Cursor position: ESC [ <row> ; <col> H (1-based) */
@@ -727,7 +788,15 @@ static void devfs_release(struct fs_file *file) {
         uintptr_t end_tty = (uintptr_t)&dev_ttys[DEVFS_TTY_COUNT];
         uintptr_t base_blk = (uintptr_t)&dev_blocks[0];
         uintptr_t end_blk = (uintptr_t)&dev_blocks[dev_block_count];
-        if (!(dp >= base_tty && dp < end_tty) && !(dp >= base_blk && dp < end_blk)) {
+        int is_allocated_marker = 1;
+        /* if driver_private points into tty array or block array, don't free */
+        if (dp >= base_tty && dp < end_tty) is_allocated_marker = 0;
+        if (dp >= base_blk && dp < end_blk) is_allocated_marker = 0;
+        /* if driver_private matches any registered dev_chars entry, do not free (it's owned by caller) */
+        for (int ci = 0; ci < dev_char_count; ci++) {
+            if (file->driver_private == dev_chars[ci].driver_private) { is_allocated_marker = 0; break; }
+        }
+        if (is_allocated_marker) {
             kfree(file->driver_private);
         }
     }
@@ -1059,6 +1128,27 @@ int devfs_create_block_node(const char *path, int device_id, uint32_t sectors) {
         /* we don't need to keep the open handle; free it */
         fs_file_free(f);
     }
+    return 0;
+}
+
+/* Create a character device node and register mapping (e.g., /dev/fb0) */
+int devfs_create_char_node(const char *path, void *driver_private) {
+    if (!path) return -1;
+    if (dev_char_count >= (int)(sizeof(dev_chars)/sizeof(dev_chars[0]))) return -1;
+    /* avoid duplicate registrations for same path: update driver_private if provided */
+    for (int i = 0; i < dev_char_count; i++) {
+        if (strcmp(dev_chars[i].path, path) == 0) {
+            if (driver_private) dev_chars[i].driver_private = driver_private;
+            return 0;
+        }
+    }
+    strncpy(dev_chars[dev_char_count].path, path, sizeof(dev_chars[dev_char_count].path)-1);
+    dev_chars[dev_char_count].path[sizeof(dev_chars[dev_char_count].path)-1] = '\0';
+    dev_chars[dev_char_count].driver_private = driver_private;
+    dev_char_count++;
+    /* create visible node in ramfs so tools listing /dev see it */
+    struct fs_file *f = fs_create_file(path);
+    if (f) fs_file_free(f);
     return 0;
 }
 

@@ -1,3 +1,9 @@
+/*
+ * core/klog.c
+ * klog tools
+ * Author: fcexx
+*/
+
 #include <klog.h>
 #include <stdarg.h>
 #include <stdio.h>

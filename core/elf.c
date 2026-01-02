@@ -1,3 +1,9 @@
+/*
+ * core/elf.c
+ * ELF file parser
+ * Author: fcexx
+*/
+
 #include <axonos.h>
 #include <stdint.h>
 #include <stddef.h>

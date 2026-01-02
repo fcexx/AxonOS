@@ -24,7 +24,7 @@ typedef struct {
 } Theme;
 
 static const Theme THEMES[] = {
-	{"Classic",   0x78, 0x78, 0x8F, 0x87}, // white on blue menu, black on light gray status, white text, gray tildes
+	{"Classic",   0x78, 0x78, 0x07, 0x87}, // white on blue menu, black on light gray status, white text, gray tildes
 	{"Midnight",  0x17, 0x71, 0x1F, 0x19}, // white on navy, blue-ish status, bright text, dim blue tildes
 	{"Solarized", 0x3F, 0xE0, 0x0E, 0x06}, // white on cyan menu, black on yellow status, yellow text, brown tildes
 	{"Contrast",  0xF0, 0x0F, 0xF0, 0x70}, // black on white menu, white on black status, black on white text, dim gray
