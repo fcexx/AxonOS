@@ -23,6 +23,7 @@
 #define SYS_prlimit64 302
 #define SYS_set_robust_list 273
 #define SYS_rseq 334
+#define SYS_futex 202
 #define SYS_rt_sigaction 13
 #define SYS_rt_sigprocmask 14
 #define SYS_ioctl   16

@@ -74,9 +74,19 @@ static void ud_fault_handler(cpu_registers_t* regs) {
                 const uint8_t *ip = (const uint8_t*)(uintptr_t)regs->rip;
                 /* Encoding: F3 0F AE /r with reg field:
                    /0 RDFSBASE, /1 RDGSBASE, /2 WRFSBASE, /3 WRGSBASE */
-                if ((uintptr_t)ip + 4 < (uintptr_t)MMIO_IDENTITY_LIMIT &&
-                    ip[0] == 0xF3 && ip[1] == 0x0F && ip[2] == 0xAE) {
-                        uint8_t modrm = ip[3];
+                /* Match F3 0F AE /r sequence possibly preceded by optional REX prefix(es).
+                   Some libc implementations emit a REX prefix before the F3 byte (e.g. 0x48 F3 0F AE ...).
+                   Scan a few bytes for the canonical F3 0F AE pattern and emulate when found. */
+                int found_off = -1;
+                for (int off = 0; off <= 3; off++) {
+                        if ((uintptr_t)ip + off + 3 < (uintptr_t)MMIO_IDENTITY_LIMIT &&
+                            ip[off] == 0xF3 && ip[off + 1] == 0x0F && ip[off + 2] == 0xAE) {
+                                found_off = off;
+                                break;
+                        }
+                }
+                if (found_off >= 0) {
+                        uint8_t modrm = ip[found_off + 3];
                         uint8_t mod = (modrm >> 6) & 3;
                         uint8_t reg = (modrm >> 3) & 7;
                         uint8_t rm  = (modrm >> 0) & 7;
@@ -98,11 +108,11 @@ static void ud_fault_handler(cpu_registers_t* regs) {
 
                                 if (reg == 0 /* RDFSBASE */) {
                                         if (gpr) *gpr = rdmsr_u64(MSR_FS_BASE);
-                                        regs->rip += 4;
+                                        regs->rip += (uint64_t)(found_off + 4);
                                         return;
                                 } else if (reg == 1 /* RDGSBASE */) {
                                         if (gpr) *gpr = rdmsr_u64(MSR_GS_BASE);
-                                        regs->rip += 4;
+                                        regs->rip += (uint64_t)(found_off + 4);
                                         return;
                                 } else if (reg == 2 /* WRFSBASE */) {
                                         uint64_t new_fs = gpr ? *gpr : 0;
@@ -113,12 +123,12 @@ static void ud_fault_handler(cpu_registers_t* regs) {
                                         else if (0x30 < (uint64_t)MMIO_IDENTITY_LIMIT) old_guard = *(volatile uint64_t*)(uintptr_t)0x28;
                                         wrmsr_u64(MSR_FS_BASE, new_fs);
                                         if (new_fs + 0x30 < (uint64_t)MMIO_IDENTITY_LIMIT) *(volatile uint64_t*)(uintptr_t)(new_fs + 0x28) = old_guard;
-                                        regs->rip += 4;
+                                        regs->rip += (uint64_t)(found_off + 4);
                                         return;
                                 } else if (reg == 3 /* WRGSBASE */) {
                                         uint64_t new_gs = gpr ? *gpr : 0;
                                         wrmsr_u64(MSR_GS_BASE, new_gs);
-                                        regs->rip += 4;
+                                        regs->rip += (uint64_t)(found_off + 4);
                                         return;
                                 }
                         }
@@ -134,8 +144,8 @@ static void ud_fault_handler(cpu_registers_t* regs) {
                         klogprintf("user code dump around RIP=0x%llx:\n", (unsigned long long)rip);
                         const unsigned char *p = (const unsigned char*)(uintptr_t)start;
                         for (int i = 0; i < BYTES*2; i++) {
-                            klogprintf("%02x ", (unsigned int)p[i]);
-                            if ((i & 0xF) == 0xF) klogprintf("\n");
+                            kprintf("%02x ", (unsigned int)p[i]);
+                            if ((i & 0xF) == 0xF) kprintf("\n");
                         }
                         klogprintf("\n");
                     } else {
@@ -212,8 +222,8 @@ static void page_fault_handler(cpu_registers_t* regs) {
             if ((uintptr_t)regs->rip < (uintptr_t)MMIO_IDENTITY_LIMIT) {
                 const unsigned char *code = (const unsigned char*)(uintptr_t)regs->rip;
                 klogprintf("code @ RIP: ");
-                for (int i = 0; i < 32; i++) klogprintf("%02x ", (unsigned)code[i]);
-                klogprintf("\n");
+                for (int i = 0; i < 32; i++) kprintf("%02x ", (unsigned)code[i]);
+                kprintf("\n");
             } else {
                 klogprintf("code @ RIP: (outside identity map)\n");
             }
@@ -221,8 +231,8 @@ static void page_fault_handler(cpu_registers_t* regs) {
             if ((uintptr_t)regs->rsp < (uintptr_t)MMIO_IDENTITY_LIMIT) {
                 const uint64_t *stk = (const uint64_t*)(uintptr_t)regs->rsp;
                 klogprintf("stack @ RSP: ");
-                for (int i = 0; i < 8; i++) klogprintf("0x%016llx ", (unsigned long long)stk[i]);
-                klogprintf("\n");
+                for (int i = 0; i < 8; i++) kprintf("0x%016llx ", (unsigned long long)stk[i]);
+                kprintf("\n");
             } else {
                 klogprintf("stack @ RSP: (outside identity map)\n");
             }
@@ -230,8 +240,8 @@ static void page_fault_handler(cpu_registers_t* regs) {
             if ((uintptr_t)cr2 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
                 klogprintf("bytes @ CR2: ");
                 const unsigned char *p = (const unsigned char*)(uintptr_t)cr2;
-                for (int i = 0; i < 32; i++) klogprintf("%02x ", (unsigned)p[i]);
-                klogprintf("\n");
+                for (int i = 0; i < 32; i++) kprintf("%02x ", (unsigned)p[i]);
+                kprintf("\n");
             } else {
                 klogprintf("bytes @ CR2: (outside identity map)\n");
             }
@@ -286,7 +296,7 @@ static void gp_fault_handler(cpu_registers_t* regs){
     // Строгая семантика для POSIX-подобного поведения: никаких эмуляций в ring3.
     // General Protection Fault в пользовательском процессе рассматривается как фатальная ошибка процесса.
     if ((regs->cs & 3) == 3) {
-        klogprintf("<(0c)>\nGPF (user-mode) trap.\n");
+        klogprintf("\nGPF (user-mode) trap.\n");
         klogprintf("RIP: 0x%016llx\n", (unsigned long long)regs->rip);
         klogprintf("RSP: 0x%016llx\n", (unsigned long long)regs->rsp);
         klogprintf("RBP: 0x%016llx\n", (unsigned long long)regs->rbp);
@@ -308,8 +318,8 @@ static void gp_fault_handler(cpu_registers_t* regs){
         if ((uintptr_t)regs->rip < (uintptr_t)0x100000000ULL) {
             const uint8_t *code = (const uint8_t*)(uintptr_t)regs->rip;
             klogprintf("code @ RIP: ");
-            for (int i = 0; i < 16; i++) klogprintf("%02x ", (unsigned)code[i]);
-            klogprintf("\n");
+            for (int i = 0; i < 16; i++) kprintf("%02x ", (unsigned)code[i]);
+            kprintf("\n");
         } else {
             klogprintf("code @ RIP: (outside identity map)\n");
         }
@@ -318,8 +328,8 @@ static void gp_fault_handler(cpu_registers_t* regs){
         if ((uintptr_t)regs->rsp < (uintptr_t)0x100000000ULL) {
             const uint64_t *stk = (const uint64_t*)(uintptr_t)regs->rsp;
             klogprintf("stack @ RSP: ");
-            for (int i = 0; i < 8; i++) klogprintf("0x%016llx ", (unsigned long long)stk[i]);
-            klogprintf("\n");
+            for (int i = 0; i < 8; i++) kprintf("0x%016llx ", (unsigned long long)stk[i]);
+            kprintf("\n");
         } else {
             klogprintf("stack @ RSP: (outside identity map)\n");
         }

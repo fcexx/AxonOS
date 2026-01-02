@@ -457,6 +457,13 @@ int vfs_fstat(struct fs_file *file, struct stat *st) {
     st->st_mode = (file->type == FS_TYPE_DIR) ? (S_IFDIR | 0755) : (S_IFREG | 0644);
     st->st_size = (off_t)file->size;
     st->st_nlink = 1;
+    /* Debug: if this is /init, log what mode we return to userspace to help diagnose
+       why userland considers it non-regular. */
+    if (file->path && strcmp(file->path, "/init") == 0) {
+        /* vfs_fstat diagnostic: print mode in hex (qemu_debug_printf supports %x and %llu) */
+        qemu_debug_printf("vfs_fstat: path=%s file->type=%d st_mode=0x%04x st_size=%llu\n",
+                   file->path, file->type, (unsigned)st->st_mode, (unsigned long long)st->st_size);
+    }
     return 0;
 }
 

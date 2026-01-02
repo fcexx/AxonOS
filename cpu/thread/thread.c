@@ -3,6 +3,7 @@
 #include <debug.h>
 #include <string.h>
 #include <pit.h>
+#include <mmio.h>
 #include <vga.h>
 #include <context.h>
 #include <debug.h>
@@ -205,6 +206,14 @@ void user_thread_entry(void) {
 			  (unsigned long long)self->user_rip,
 			  (unsigned long long)self->user_stack,
 			  (int)self->tid);
+	/* Diagnostic: dump first bytes at user RIP before entering user mode */
+	if ((uintptr_t)self->user_rip + 32 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+		qemu_debug_printf("user_thread_entry: bytes at user RIP 0x%llx:\n", (unsigned long long)self->user_rip);
+		for (int i = 0; i < 32; i++) qemu_debug_printf("%02x", *((unsigned char*)(uintptr_t)(self->user_rip + i)));
+		qemu_debug_printf("\n");
+	} else {
+		qemu_debug_printf("user_thread_entry: user RIP outside identity map, skipping bytes dump\n");
+	}
 	// Jump to user mode
 	enter_user_mode(self->user_rip, self->user_stack);
 	// Should not return

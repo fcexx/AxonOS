@@ -1,3 +1,9 @@
+ /*
+ * core/user.c
+ * POSIX user structure
+ * Author: fcexx
+*/
+
 #include <user.h>
 #include <heap.h>
 #include <string.h>

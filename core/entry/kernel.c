@@ -1,3 +1,9 @@
+/*
+ * core/entry/kernel.c
+ * Kernel entry point implementation
+ * Author: fcexx
+*/
+
 #include <axonos.h>
 #include <keyboard.h>
 #include <stdint.h>
@@ -35,11 +41,8 @@
 #include <serial.h>
 #include <exec.h>
 #include <klog.h>
-
-/* ATA DMA driver init (registered here) */
 void ata_dma_init(void);
-
-int exit = 0;
+void ahci_init(void);
 
 static char g_cwd[256] = "/";
 
@@ -54,19 +57,24 @@ static inline uintptr_t align_up_uintptr(uintptr_t v, uintptr_t a) {
    (this is exactly what happens on VMware in your log). */
 static uintptr_t mb2_modules_max_end(uint32_t multiboot_magic, uint64_t multiboot_info) {
     if (multiboot_magic != 0x36d76289u || multiboot_info == 0) return 0;
+
     uint8_t *p = (uint8_t*)(uintptr_t)multiboot_info;
     uint32_t total_size = *(uint32_t*)p;
+
     if (total_size < 16 || total_size > (64u * 1024u * 1024u)) return 0;
 
     uint32_t off = 8;
     uintptr_t max_end = 0;
+
     while (off + 8 <= total_size) {
         uint32_t type = *(uint32_t*)(p + off);
         uint32_t size = *(uint32_t*)(p + off + 4);
+
         if (size < 8) break;
         if ((uint64_t)off + (uint64_t)size > (uint64_t)total_size) break;
         if (type == 0) break;
-        if (type == 3 && size >= 16) { /* module */
+
+        if (type == 3 && size >= 16) { /* its a module */
             const uint8_t *fp = p + off + 8;
             uint32_t mod_end = *(uint32_t*)(fp + 4);
             if ((uintptr_t)mod_end > max_end) max_end = (uintptr_t)mod_end;
@@ -78,28 +86,33 @@ static uintptr_t mb2_modules_max_end(uint32_t multiboot_magic, uint64_t multiboo
 
 static ssize_t sysfs_show_const(char *buf, size_t size, void *priv) {
     if (!buf || size == 0) return 0;
+
     const char *text = (const char*)priv;
     if (!text) text = "";
     size_t len = strlen(text);
     if (len > size) len = size;
     memcpy(buf, text, len);
     if (len < size) buf[len++] = '\n';
+
     return (ssize_t)len;
 }
 
 static ssize_t sysfs_show_cpu_name_attr(char *buf, size_t size, void *priv) {
     (void)priv;
+
     if (!buf || size == 0) return 0;
     const char *name = sysinfo_cpu_name();
     size_t len = strlen(name);
     if (len > size) len = size;
     memcpy(buf, name, len);
     if (len < size) buf[len++] = '\n';
+
     return (ssize_t)len;
 }
 
 static size_t sysfs_write_int(char *buf, size_t size, int value) {
     if (!buf || size == 0) return 0;
+
     char tmp[32];
     size_t n = 0;
     unsigned int v;
@@ -121,12 +134,15 @@ static size_t sysfs_write_int(char *buf, size_t size, int value) {
 static ssize_t sysfs_show_ram_mb_attr(char *buf, size_t size, void *priv) {
     (void)priv;
     if (!buf || size == 0) return 0;
+
     int mb = sysinfo_ram_mb();
     if (mb < 0) {
         return sysfs_show_const(buf, size, (void*)"unknown");
     }
+    
     size_t written = sysfs_write_int(buf, size, mb);
     if (written < size) buf[written++] = '\n';
+
     return (ssize_t)written;
 }
 
@@ -147,39 +163,32 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             uintptr_t mods_end_aligned = align_up_uintptr(mods_end, 0x1000);
             if (mods_end_aligned > heap_start) heap_start = mods_end_aligned;
         }
-        /* 
-           IMPORTANT:
-           User ELF binaries are currently loaded by copying PT_LOAD segments into their p_vaddr
-           in the identity-mapped region. Typical ELF64 ET_EXEC uses 0x00400000.. (4MiB+).
-           If the kernel heap also lives in low memory, exec will literally overwrite heap blocks
-           (we already observed this as a heap canary overflow during `exec /bin/busybox`).
-           Keep heap above a safe floor to avoid collisions with user image mappings. 
-        */
-        const uintptr_t HEAP_MIN_START = (uintptr_t)(64u * 1024u * 1024u); /* 64 MiB */
+        
+        // DO NOT TOUCH
+        const uintptr_t HEAP_MIN_START = (uintptr_t)(64u * 1024u * 1024u); /* 64 MiB minimal heap start */
         if (heap_start < HEAP_MIN_START) heap_start = HEAP_MIN_START;
         heap_init(heap_start, 0);
-        kprintf("kernel: heap_start=%p kernel_end=%p mods_end=%p\n",
+        kprintf("loading kernel: heap_start=%p kernel_end=%p mods_end=%p\n",
                 (void*)heap_start, (void*)(uintptr_t)_end, (void*)mods_end);
     }
 
     gdt_init();
+
     /* allocate IST1 stack for Double Fault handler to avoid triple-faults */
-    {
-        void *df_stack = kmalloc(8192 + 16);
-        if (df_stack) {
-            uint64_t df_top = (uint64_t)df_stack + 8192 + 16;
-            tss_set_ist(1, df_top);
-            kprintf("kernel: set DF IST1 stack at %p\n", (void*)(uintptr_t)df_top);
-        } else {
-            kprintf("kernel: WARNING: failed to allocate DF IST stack\n");
-        }
+    void *df_stack = kmalloc(8192 + 16);
+    if (df_stack) {
+        uint64_t df_top = (uint64_t)df_stack + 8192 + 16;
+        tss_set_ist(1, df_top);
+        kprintf("kernel: set DF IST1 stack at %p\n", (void*)(uintptr_t)df_top);
+    } else {
+        kprintf("kernel: WARNING: failed to allocate DF IST stack\n");
     }
+
     idt_init();
     pic_init();
     pit_init();
-    
+
     mmio_init();
-    
     ramfs_register();
     ext2_register();
 
@@ -212,45 +221,44 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         sysfs_create_file("/sys/kernel/ram", &attr_ram_mb);
         sysfs_mount("/sys");
 
-        
         /* create /etc and write initial passwd/group files into ramfs */
         ramfs_mkdir("/etc");
-        {
-            char *buf = NULL; size_t bl = 0;
-            if (user_export_passwd(&buf, &bl) == 0 && buf) {
-                struct fs_file *f = fs_create_file("/etc/passwd");
-                if (f) {
-                    fs_write(f, buf, bl, 0);
-                    fs_file_free(f);
-                }
-                kfree(buf);
+        
+        char *buf = NULL; size_t bl = 0;
+        if (user_export_passwd(&buf, &bl) == 0 && buf) {
+            struct fs_file *f = fs_create_file("/etc/passwd");
+            if (f) {
+                fs_write(f, buf, bl, 0);
+                fs_file_free(f);
             }
-            /* simple /etc/group with only root group initially */
-            const char *gline = "root:x:0:root\n";
-            struct fs_file *g = fs_create_file("/etc/group");
-            if (g) {
-                fs_write(g, gline, strlen(gline), 0);
-                fs_file_free(g);
-            }
+            kfree(buf);
+        }
+        /* simple /etc/group with only root group initially */
+        const char *gline = "root:x:0:root\n";
+        struct fs_file *g = fs_create_file("/etc/group");
+        if (g) {
+            fs_write(g, gline, strlen(gline), 0);
+            fs_file_free(g);
         }
     } else {
         kprintf("sysfs: failed to register\n");
     }
-    klog_init();
+
+    klog_init(); // for logging into /var/log/kernel file
     
     apic_init();
     apic_timer_init();
     idt_set_handler(APIC_TIMER_VECTOR, apic_timer_handler);
-    /* syscall (int 0x80) initialization */
-    syscall_init();
+
+    syscall_init();/* syscall (int 0x80) initialization */
     
     paging_init();
 
-    // Включаем прерывания
+    // Enabling interrupts
     asm volatile("sti");
 
+    // Enabling APIC timer, or PIT
     apic_timer_start(100);
-
     for (int i = 0; i < 50; i++) {
         pit_sleep_ms(10);
         if (apic_timer_ticks > 0) break;
@@ -259,44 +267,46 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         apic_timer_stop();
         pit_disable();
         pic_mask_irq(0);
-        apic_timer_start(1000);
+        apic_timer_start(1000); // Yeah, APIC is working so we turn on it
     } else {
         kprintf("APIC: using PIT\n");
-        apic_timer_stop();
+        apic_timer_stop(); // Nah, we use PIT
     }
 
-    /* Calibrate TSC for high-resolution timestamps now that APIC timer is running */
+    // Calibrate TSC for high resolution timestamps now that APIC timer is running
+    // Otherwise, for microseconds.
     klog_calibrate_tsc();
 
     pci_init();
     pci_dump_devices();
     pci_sysfs_init();
     intel_chipset_init();
-    /* start threading and I/O subsystem, then initialize disk drivers from a kernel thread
-       to avoid probing hardware too early during boot. */
+
+    // Scheduler and I/O scheduler
     thread_init();
     iothread_init();
-    /* create kernel thread to initialize ATA/SATA drivers after scheduler is ready */
-    if (!thread_create(ata_dma_init, "ata_init")) {
-        kprintf("ata: failed to create init thread\n");
-    }
+
+    ata_dma_init();
+    ahci_init();
     
-    /* user subsystem */
+    // POSIX user subsystem
     user_init();
+
+    // Registering all disk file systems
     fat32_register();
 
     
     /* If an initfs module was provided by the bootloader, unpack it into ramfs */
-    {
-        int r = initfs_process_multiboot_module(multiboot_magic, multiboot_info, "initfs");
-        if (r == 0) klogprintf("initfs: unpacked successfully\n");
-        else klogprintf("initfs: error: failed, code: %d\n", r);
-    }
+    int r = initfs_process_multiboot_module(multiboot_magic, multiboot_info, "initfs");
+    if (r == 0) klogprintf("initfs: unpacked successfully\n");
+    else klogprintf("initfs: error: failed, code: %d\n", r);
+
     /* register and mount devfs at /dev */
     if (devfs_register() == 0) {
         klogprintf("devfs: registering devfs\n");
         ramfs_mkdir("/dev");
         devfs_mount("/dev");
+
         /* initialize stdio fds for current thread (main) */
         struct fs_file *console = fs_open("/dev/console");
         if (console) {
@@ -333,40 +343,10 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 
     ps2_keyboard_init();
     rtc_init();
-    
-    //autostart: run /start script once if present
-    // {
-    //     struct fs_file *f = fs_open("/start");
-    //     if (f) { fs_file_free(f); (void)exec_line("osh /start"); }
-    //     else { kprintf("FATAL: /start file not found; fallback to osh\n"); exec_line("PS1=\"\\w # \""); exec_line("osh"); }
-    // }
 
-    {
-        /* Try standard init paths in order. Use kernel_execve_from_path to directly
-           transfer to user init; if it returns, the exec failed and we try next. */
-        const char *inits[] = { "/sbin/init",  NULL };
-        for (int i = 0; inits[i]; i++) {
-            const char *path = inits[i];
-            struct fs_file *f = fs_open(path);
-            if (!f) continue;
-            fs_file_free(f);
-            if (strcmp(path, "/bin/busybox") == 0) {
-                /* busybox invoked with 'init' arg */
-                const char *kargv[] = { "/bin/busybox", "init", NULL };
-                kprintf("execve: launching %s %s\n", kargv[0], kargv[1]);
-                (void)kernel_execve_from_path(kargv[0], kargv, NULL);
-            } else {
-                const char *kargv[] = { path, NULL };
-                kprintf("execve: launching %s\n", path);
-                (void)kernel_execve_from_path(path, kargv, NULL);
-            }
-            /* If we get here, exec failed; try next candidate */
-            kprintf("execve: %s failed, trying next\n", path);
-        }
-        kprintf("fatal: unable to run initial process; falling back to osh\n");
-        exec_line("PS1=\"osh-2.0# \"");
-        exec_line("osh");
-    }
+    // Simple kernel shell
+    exec_line("PS1=\"osh-2.0# \"");
+    exec_line("osh");
     
     for(;;) {
         asm volatile("hlt");

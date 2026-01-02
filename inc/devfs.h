@@ -42,6 +42,8 @@ struct devfs_tty {
     int ansi_param[8];
     int ansi_param_count;
     int ansi_current_param;
+    /* bold/bright flag from SGR (1) */
+    uint8_t ansi_bold;
     /* controlling session id for this tty (-1 if none) */
     int controlling_sid;
     /* POSIX termios local flags (c_lflag) for this tty */
@@ -51,6 +53,9 @@ struct devfs_tty {
 int devfs_register(void);
 int devfs_unregister(void);
 int devfs_mount(const char *path);
+/* Create a character device node at given path and associate with driver_private.
+   driver_private is stored and later returned in fs_file->driver_private on open. */
+int devfs_create_char_node(const char *path, void *driver_private);
 /* Find block device index by path (returns -1 if not found) */
 int devfs_find_block_by_path(const char *path);
 /* Return underlying disk device_id for block node path, or -1 if not found */

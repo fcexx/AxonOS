@@ -398,6 +398,12 @@ int ramfs_fill_stat(struct fs_file *file, struct stat *st) {
     st->st_atime = n->atime;
     st->st_mtime = n->mtime;
     st->st_ctime = n->ctime;
+    /* Debug: log when /init is queried */
+    if (file->path && strcmp(file->path, "/init") == 0) {
+        /* Use formats supported by qemu_debug_printf: print mode in hex and size as %llu */
+        qemu_debug_printf("ramfs_fill_stat: path=%s node->mode=0x%04x is_dir=%d size=%llu\n",
+                   file->path, (unsigned)n->mode, n->is_dir, (unsigned long long)n->size);
+    }
     return 0;
 }
 

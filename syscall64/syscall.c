@@ -1,9 +1,3 @@
-/*
- * core/syscall.c
- * Linux-like musl 64-bit syscall table implementation
- * Author: fcexx
-*/
-
 #include <axonos.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -566,60 +560,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                                       verify[4], verify[5], verify[6], verify[7],
                                       verify[8], verify[9], verify[10], verify[11],
                                       verify[12], verify[13], verify[14], verify[15]);
-                    /* Dump full trampoline (64 bytes) for diagnostics */
-                    if ((uintptr_t)tramp + sizeof(stub) < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                        unsigned char full[64];
-                        memcpy(full, (void*)(uintptr_t)tramp, sizeof(full));
-                        qemu_debug_printf("vfork: trampoline full dump at %p:\n", (void*)(uintptr_t)tramp);
-                        for (int zz = 0; zz < (int)sizeof(full); zz++) qemu_debug_printf("%02x", full[zz]);
-                        qemu_debug_printf("\n");
-                    } else {
-                        qemu_debug_printf("vfork: trampoline write outside identity map, skipping full dump\n");
-                    }
-                    /* Dump first bytes at saved_rcx (target) to verify target code */
-                    if ((uintptr_t)saved_rcx + 32 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                        unsigned char targ[32];
-                        for (int j = 0; j < 32; j++) targ[j] = *((unsigned char*)(uintptr_t)(saved_rcx + j));
-                        qemu_debug_printf("vfork: target bytes @0x%llx:\n", (unsigned long long)saved_rcx);
-                        for (int j = 0; j < 32; j++) qemu_debug_printf("%02x", targ[j]);
-                        qemu_debug_printf("\n");
-                    } else {
-                        qemu_debug_printf("vfork: saved_rcx target outside identity map, skipping target dump\n");
-                    }
-                    /* Dump page table entries for saved_rcx for debugging */
-                    {
-                        extern uint64_t page_table_l4[];
-                        uint64_t v = (uint64_t)saved_rcx;
-                        uint64_t *l4 = (uint64_t*)page_table_l4;
-                        int l4i = (v >> 39) & 0x1FF;
-                        int l3i = (v >> 30) & 0x1FF;
-                        int l2i = (v >> 21) & 0x1FF;
-                        int l1i = (v >> 12) & 0x1FF;
-                        qemu_debug_printf("vfork: ptes for saved_rcx (v=0x%llx): l4[%d]=0x%016llx\n", (unsigned long long)v, l4i, (unsigned long long)l4[l4i]);
-                        if (l4[l4i] & PG_PRESENT) {
-                            uint64_t l3e = l4[l4i];
-                            uint64_t *l3 = (uint64_t*)(uintptr_t)(l3e & ~0xFFFULL);
-                            qemu_debug_printf("vfork: ptes: l3[%d]=0x%016llx\n", l3i, (unsigned long long)l3[l3i]);
-                            if (l3[l3i] & PG_PRESENT) {
-                                uint64_t l3ee = l3[l3i];
-                                if (l3ee & PG_PS_2M) {
-                                    qemu_debug_printf("vfork: ptes: 1GiB/2MiB large at L3\n");
-                                } else {
-                                    uint64_t *l2 = (uint64_t*)(uintptr_t)(l3ee & ~0xFFFULL);
-                                    qemu_debug_printf("vfork: ptes: l2[%d]=0x%016llx\n", l2i, (unsigned long long)l2[l2i]);
-                                    if (l2[l2i] & PG_PRESENT) {
-                                        uint64_t l2e = l2[l2i];
-                                        if (l2e & PG_PS_2M) {
-                                            qemu_debug_printf("vfork: ptes: 2MiB large at L2\n");
-                                        } else {
-                                            uint64_t *l1 = (uint64_t*)(uintptr_t)(l2e & ~0xFFFULL);
-                                            qemu_debug_printf("vfork: ptes: l1[%d]=0x%016llx\n", l1i, (unsigned long long)l1[l1i]);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
                     child->user_rip = (uint64_t)tramp;
                 } else {
                     /* fallback: use saved_rcx if tramp can't be used */
@@ -668,6 +608,13 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             /* set_robust_list(head, len): accept (no robust futex handling yet) */
             (void)a1; (void)a2;
             return 0;
+        case SYS_futex: {
+            /* minimal futex handler: FUTEX_WAIT / FUTEX_WAKE */
+            extern int futex_syscall(uintptr_t uaddr, int op, int val, const void *timeout, uintptr_t uaddr2, int val3);
+            int res = futex_syscall((uintptr_t)a1, (int)a2, (int)a3, (const void*)(uintptr_t)a4, (uintptr_t)a5, (int)a6);
+            if (res < 0) return ret_err(-res);
+            return (uint64_t)res;
+        }
         case SYS_rseq:
             /* Minimal rseq registration:
                int rseq(struct rseq *rseq, uint32_t rseq_len, int flags, uint32_t sig)
@@ -1293,19 +1240,8 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     (unsigned long long)(cur->tid ? cur->tid : 1),
                     (unsigned long long)saved_rcx, (unsigned long long)saved_rsp);
             if (saved_rcx == 0) {
-                qemu_debug_printf("fork: no valid saved return RIP; attempting fallback to current user_rip/user_stack\n");
-                /* Fallback: use registered user_rip/user_stack if available.
-                   This is a less precise fallback than using the saved syscall return site,
-                   but allows fork to proceed in cases where syscall entry didn't record RIP. */
-                if (cur->user_rip != 0) {
-                    saved_rcx = cur->user_rip;
-                    saved_rsp = cur->user_stack ? cur->user_stack : saved_rsp;
-                    qemu_debug_printf("fork: fallback chosen user_rip=0x%llx user_stack=0x%llx\n",
-                                      (unsigned long long)saved_rcx, (unsigned long long)saved_rsp);
-                } else {
-                    qemu_debug_printf("fork: fallback failed - no user_rip available, refusing\n");
-                    return ret_err(EINVAL);
-                }
+                qemu_debug_printf("fork: refused - no valid saved return RIP\n");
+                return ret_err(EINVAL);
             }
             /* Try to ensure the user pages around saved_rcx are user-accessible to avoid PF
                when the child enters user mode. This sets PG_US on the containing 2MiB region. */

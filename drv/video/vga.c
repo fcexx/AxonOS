@@ -7,13 +7,46 @@
 
 static uint8_t parse_color_code(char bg, char fg);
 
+/* Simple spinlock to serialize VGA/console access and avoid interleaved output
+   from multiple threads/interrupts. */
+static volatile int vga_lock = 0;
+static inline void vga_lock_acquire(void) {
+	while(__sync_lock_test_and_set(&vga_lock, 1)) { asm volatile("pause"); }
+}
+static inline void vga_lock_release(void) {
+	__sync_lock_release(&vga_lock);
+}
+
+/* Internal nolock primitives for callers that already hold the lock. */
+static inline void write_nolock(uint8_t character, uint8_t attribute_byte, uint16_t offset) {
+	uint8_t *vga = (uint8_t *) VIDEO_ADDRESS;
+	vga[offset] = character;
+	vga[offset + 1] = attribute_byte;
+}
+
+static inline uint16_t get_cursor_nolock(void) {
+	outb(REG_SCREEN_CTRL, 14);
+	uint8_t high_byte = inb(REG_SCREEN_DATA);
+	outb(REG_SCREEN_CTRL, 15);
+	uint8_t low_byte = inb(REG_SCREEN_DATA);
+	return (((high_byte << 8) + low_byte) * 2);
+}
+
+static inline void set_cursor_nolock(uint16_t pos) {
+	pos /= 2;
+	outb(REG_SCREEN_CTRL, 14);
+	outb(REG_SCREEN_DATA, (uint8_t)(pos >> 8));
+	outb(REG_SCREEN_CTRL, 15);
+	outb(REG_SCREEN_DATA, (uint8_t)(pos & 0xff));
+}
+
 /* Fast direct VGA helpers */
 void vga_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
-    uint8_t *vga = (uint8_t*)VIDEO_ADDRESS;
     if (x >= MAX_COLS || y >= MAX_ROWS) return;
-    uint32_t off = (y * MAX_COLS + x) * 2;
-    vga[off] = ch;
-    vga[off + 1] = attr;
+    uint16_t off = (uint16_t)((y * MAX_COLS + x) * 2);
+    vga_lock_acquire();
+    write_nolock(ch, attr, off);
+    vga_lock_release();
 }
 
 void vga_clear_screen_attr(uint8_t attr) {
@@ -26,19 +59,35 @@ void vga_clear_screen_attr(uint8_t attr) {
 }
 
 void vga_write_str_xy(uint32_t x, uint32_t y, const char *s, uint8_t attr) {
-    uint8_t *vga = (uint8_t*)VIDEO_ADDRESS;
     if (y >= MAX_ROWS) return;
     uint32_t px = x;
     uint32_t py = y;
+    vga_lock_acquire();
     for (size_t i = 0; s[i]; i++) {
         if (px >= MAX_COLS) { px = 0; py++; }
         if (py >= MAX_ROWS) {
-            scroll_line();
+            /* perform scroll while holding lock */
+            /* reuse existing scroll_line logic but inline to avoid double-lock */
+            uint8_t i2 = 1;
+            while (i2 < MAX_ROWS) {
+                memcpy(
+                    (uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * (i2-1) * 2)), /* dst <- src */
+                    (uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * i2 * 2)),     /* src */
+                    (MAX_COLS*2)
+                );
+                i2++;
+            }
+            uint16_t last_line = (MAX_COLS*MAX_ROWS*2) - MAX_COLS*2;
+            for (uint32_t ii = 0; ii < MAX_COLS; ii++) {
+                write_nolock('\0', WHITE_ON_BLACK, (uint16_t)(last_line + ii * 2));
+            }
+            set_cursor_nolock(last_line);
             py = MAX_ROWS - 1;
         }
-        vga_putch_xy(px, py, (uint8_t)s[i], attr);
+        write_nolock((uint8_t)s[i], attr, (uint16_t)((py * MAX_COLS + px) * 2));
         px++;
     }
+    vga_lock_release();
 }
 
 void vga_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t ch, uint8_t attr) {
@@ -66,15 +115,36 @@ void kprint(uint8_t *str) {
 
 void kputchar(uint8_t character, uint8_t attribute_byte)
 {
-	uint16_t offset;
-
-	offset = get_cursor();
+	/* Make the entire character output atomic: read cursor, update video memory,
+	   handle scrolling and update hardware cursor while holding the VGA lock. */
+	vga_lock_acquire();
+	uint16_t offset = get_cursor_nolock();
 	if (character == '\n')
 	{
-		if ((offset / 2 / MAX_COLS) == (MAX_ROWS - 1)) 
-			scroll_line();
+		if ((offset / 2 / MAX_COLS) == (MAX_ROWS - 1))
+			/* scroll while holding lock */
+			;
 		else
-			set_cursor((offset - offset % (MAX_COLS*2)) + MAX_COLS*2);
+			set_cursor_nolock((uint16_t)((offset - offset % (MAX_COLS*2)) + MAX_COLS*2));
+
+		/* if we're on last line, perform scroll now */
+		if ((offset / 2 / MAX_COLS) == (MAX_ROWS - 1)) {
+			/* scroll */
+			uint8_t i = 1;
+			while (i < MAX_ROWS) {
+				memcpy(
+					(uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * (i-1) * 2)), /* dst <- src */
+					(uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * i * 2)),     /* src */
+					(MAX_COLS*2)
+				);
+				i++;
+			}
+			uint16_t last_line = (MAX_COLS*MAX_ROWS*2) - MAX_COLS*2;
+			for (uint32_t ii = 0; ii < MAX_COLS; ii++) {
+				write_nolock('\0', WHITE_ON_BLACK, (uint16_t)(last_line + ii * 2));
+			}
+			set_cursor_nolock(last_line);
+		}
 	}
 	else if (character == '\t')
 	{
@@ -82,36 +152,81 @@ void kputchar(uint8_t character, uint8_t attribute_byte)
 		uint16_t col = (uint16_t)((offset / 2) % MAX_COLS);
 		uint16_t spaces = (uint16_t)(8 - (col % 8));
 		for (uint16_t i = 0; i < spaces; i++) {
-			if (offset == (MAX_COLS * MAX_ROWS * 2)) scroll_line();
-			write(' ', attribute_byte, offset);
+			if (offset == (MAX_COLS * MAX_ROWS * 2)) {
+				/* scroll */
+				uint8_t i2 = 1;
+				while (i2 < MAX_ROWS) {
+					memcpy(
+						(uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * (i2-1) * 2)),
+						(uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * i2 * 2)),
+						(MAX_COLS*2)
+					);
+					i2++;
+				}
+				uint16_t last_line = (MAX_COLS*MAX_ROWS*2) - MAX_COLS*2;
+				for (uint32_t ii = 0; ii < MAX_COLS; ii++) {
+					write_nolock('\0', WHITE_ON_BLACK, (uint16_t)(last_line + ii * 2));
+				}
+				set_cursor_nolock(last_line);
+				offset = last_line;
+			}
+			write_nolock(' ', attribute_byte, offset);
 			offset += 2;
 		}
-		set_cursor(offset);
+		set_cursor_nolock(offset);
 	}
 	else if (character == '\b')
     {
-        set_cursor(get_cursor() - 1);
-        kputchar(' ', attribute_byte);
-        set_cursor(get_cursor() - 2);
+        set_cursor_nolock(get_cursor_nolock() - 1);
+        /* recursive call intentionally outside critical section would be unsafe;
+           handle backspace inline */
+        write_nolock(' ', attribute_byte, (uint16_t)(get_cursor_nolock()));
+        set_cursor_nolock((uint16_t)(get_cursor_nolock() - 2));
     }
-	else 
+	else
 	{
 		/* write char and handle end-of-line / scroll correctly */
 		if (offset >= (MAX_COLS * MAX_ROWS * 2)) {
-			scroll_line();
+			/* scroll */
+			uint8_t i = 1;
+			while (i < MAX_ROWS) {
+				memcpy(
+					(uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * (i-1) * 2)),
+					(uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * i * 2)),
+					(MAX_COLS*2)
+				);
+				i++;
+			}
+			uint16_t last_line = (MAX_COLS*MAX_ROWS*2) - MAX_COLS*2;
+			for (uint32_t ii = 0; ii < MAX_COLS; ii++) {
+				write_nolock('\0', WHITE_ON_BLACK, (uint16_t)(last_line + ii * 2));
+			}
 			/* reset offset to start of last line */
 			offset = (MAX_ROWS - 1) * MAX_COLS * 2;
 		}
-		write(character, attribute_byte, offset);
+		write_nolock(character, attribute_byte, offset);
 		uint32_t new_offset = offset + 2;
 		if (new_offset >= (MAX_COLS * MAX_ROWS * 2)) {
 			/* writing past the last cell: scroll and set cursor to start of last line */
-			scroll_line();
-			set_cursor((MAX_ROWS - 1) * MAX_COLS * 2);
+			uint8_t i = 1;
+			while (i < MAX_ROWS) {
+				memcpy(
+					(uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * (i-1) * 2)),
+					(uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * i * 2)),
+					(MAX_COLS*2)
+				);
+				i++;
+			}
+			uint16_t last_line = (MAX_COLS*MAX_ROWS*2) - MAX_COLS*2;
+			for (uint32_t ii = 0; ii < MAX_COLS; ii++) {
+				write_nolock('\0', WHITE_ON_BLACK, (uint16_t)(last_line + ii * 2));
+			}
+			set_cursor_nolock((uint16_t)((MAX_ROWS - 1) * MAX_COLS * 2));
 		} else {
-			set_cursor((uint16_t)new_offset);
+			set_cursor_nolock((uint16_t)new_offset);
 		}
 	}
+	vga_lock_release();
 }
 
 void kprint_colorized(const char* str)
@@ -122,14 +237,15 @@ void kprint_colorized(const char* str)
 
 void	scroll_line()
 {
+	vga_lock_acquire();
 	uint8_t i = 1;
 	uint16_t last_line;
 
 	while (i < MAX_ROWS)
 	{
 		memcpy(
-			(uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * (i-1) * 2)), /* src */
-			(uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * i * 2)),     /* dst */
+			(uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * (i-1) * 2)), /* dst <- src */
+			(uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * i * 2)),     /* src */
 			(MAX_COLS*2)
 		);
 		i++;
@@ -139,10 +255,11 @@ void	scroll_line()
 	i = 0;
 	while (i < MAX_COLS)
 	{
-		write('\0', WHITE_ON_BLACK, (last_line + i * 2));
+		write_nolock('\0', WHITE_ON_BLACK, (uint16_t)(last_line + i * 2));
 		i++;
 	}
-	set_cursor(last_line);
+	set_cursor_nolock(last_line);
+	vga_lock_release();
 }
 
 void	kclear()
@@ -169,27 +286,24 @@ void kclear_col(uint8_t attribute_byte)
 
 void	write(uint8_t character, uint8_t attribute_byte, uint16_t offset)
 {
-	uint8_t *vga = (uint8_t *) VIDEO_ADDRESS;
-	vga[offset] = character;
-	vga[offset + 1] = attribute_byte;
+	vga_lock_acquire();
+	write_nolock(character, attribute_byte, offset);
+	vga_lock_release();
 }
 
 uint16_t		get_cursor()
 {
-	outb(REG_SCREEN_CTRL, 14);
-	uint8_t high_byte = inb(REG_SCREEN_DATA);
-	outb(REG_SCREEN_CTRL, 15);
-	uint8_t low_byte = inb(REG_SCREEN_DATA);
-	return (((high_byte << 8) + low_byte) * 2);
+	vga_lock_acquire();
+	uint16_t r = get_cursor_nolock();
+	vga_lock_release();
+	return r;
 }
 
 void	set_cursor(uint16_t pos)
 {
-	pos /= 2;
-	outb(REG_SCREEN_CTRL, 14);
-	outb(REG_SCREEN_DATA, (uint8_t)(pos >> 8));
-	outb(REG_SCREEN_CTRL, 15);
-	outb(REG_SCREEN_DATA, (uint8_t)(pos & 0xff));
+	vga_lock_acquire();
+	set_cursor_nolock(pos);
+	vga_lock_release();
 }
 
 // Получить текущую позицию курсора по X

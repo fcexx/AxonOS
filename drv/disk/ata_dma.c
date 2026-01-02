@@ -27,6 +27,8 @@
 
 #include <fat32.h>
 
+#include <ahci.h>
+
 #define ATA_PRIMARY_IO      0x1F0
 #define ATA_PRIMARY_CTRL    0x3F6
 #define ATA_SECONDARY_IO    0x170
@@ -401,6 +403,7 @@ void ata_dma_init(void) {
 			}
 		}
 	}
+
 	if (ata_device_count == 0) {
 		klogprintf("ata: No devices detected.\n");
 		return;

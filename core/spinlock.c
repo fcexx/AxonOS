@@ -1,3 +1,10 @@
+/*
+ * core/spinlock.c
+ * spinlock implementation
+ * Author: fcexx
+*/
+
+
 #include <spinlock.h>
 
 void acquire(spinlock_t* lock) {
