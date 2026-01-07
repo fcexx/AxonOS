@@ -11,6 +11,14 @@ extern int sys_pc_type;
 // Инициализация — вызывается из kernel_main
 void sysinfo_init(uint32_t multiboot_magic, uint64_t multiboot_info_ptr);
 
+void sysinfo_print_e820(uint32_t multiboot_magic, uint64_t multiboot_info_ptr);
+
+/* Print SMBIOS/DMI system vendor/product info if available. */
+void sysinfo_print_dmi(void);
+
+/* Detect hypervisor and read TSC info (CPUID-based). */
+void detect_hv_and_read_tsc(void);
+
 // Получатели
 const char* sysinfo_cpu_name(void);
 int sysinfo_ram_mb(void);

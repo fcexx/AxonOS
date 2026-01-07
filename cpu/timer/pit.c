@@ -25,6 +25,7 @@ void pit_handler(cpu_registers_t* regs) {
         if ((pit_ticks % 10) == 0) {
                 thread_schedule();
         }
+        vbe_flush_full();
 }
 
 // Initialize PIT with default frequency (100 Hz)

@@ -41,8 +41,8 @@
 #include <serial.h>
 #include <exec.h>
 #include <klog.h>
+#include <vbe.h>
 void ata_dma_init(void);
-void ahci_init(void);
 
 static char g_cwd[256] = "/";
 
@@ -183,6 +183,24 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     } else {
         kprintf("kernel: WARNING: failed to allocate DF IST stack\n");
     }
+    /* Initialize VBE framebuffer console after heap is available */
+    if (multiboot_info != 0) {
+        if (vbe_init_from_multiboot(multiboot_magic, multiboot_info)) {
+            if (vbe_is_available()) {
+                uint32_t w = vbe_get_width();
+                uint32_t h = vbe_get_height();
+                uint32_t p = vbe_get_pitch();
+                uint32_t b = vbe_get_bpp();
+                if (vbefb_init(w, h, p, b) == 0) {
+                    kprintf("vbe: console initialized %ux%u bpp=%u\n", (unsigned)w, (unsigned)h, (unsigned)b);
+                } else {
+                    kprintf("vbe: console init failed\n");
+                }
+            }
+        } else {
+            kprintf("vbe: init_from_multiboot returned false\n");
+        }
+    }
 
     idt_init();
     pic_init();
@@ -287,7 +305,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     iothread_init();
 
     ata_dma_init();
-    ahci_init();
     
     // POSIX user subsystem
     user_init();

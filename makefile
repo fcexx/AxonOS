@@ -78,7 +78,7 @@ iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg
 	}
 
 run: iso
-	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 512M -serial stdio -boot d -vga cirrus -hda ../disk.img 
+	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 512M -serial stdio -boot d -hda ../disk.img
 
 debug: iso
 	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 512M -serial stdio -hda ../disk.img -boot d -s -S & gdb -ex "target remote localhost:1234" $(KERNEL_ELF)

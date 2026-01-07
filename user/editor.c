@@ -3,6 +3,12 @@
 #include <vga.h>
 #include <keyboard.h>
 #include <fs.h>
+#include <console.h>
+#define vga_putch_xy console_putch_xy
+#define vga_write_str_xy console_write_str_xy
+#define vga_fill_rect console_fill_rect
+#define vga_set_cursor console_set_cursor
+#define vga_get_cursor console_get_cursor
 #include <string.h>
 #include <heap.h>
 #include <axosh.h>
@@ -11,7 +17,7 @@
 // ---- UI layout ----
 #define VIEW_Y0 1
 #define VIEW_H (MAX_ROWS - 2) // 1..23
-#define VIEW_W (MAX_COLS)
+#define VIEW_W (console_max_cols())
 #define TAB_WIDTH 4
 
 // Темы оформления
@@ -37,7 +43,7 @@ static uint8_t g_attr_text = 0x8F;
 static uint8_t g_attr_text_dim = 0x87;
 
 // View cache to avoid flicker (only update changed cells)
-static uint16_t g_view_cache[VIEW_H][VIEW_W];
+static uint16_t *g_view_cache[VIEW_H];
 static int g_view_cache_valid = 0;
 
 static inline void view_cache_invalidate(void) { g_view_cache_valid = 0; }
@@ -290,10 +296,10 @@ static void buf_join_with_next(Editor *E, int r) {
 // ---- UI ----
 static void ui_draw_menu(void) {
 	// верхняя панель с пунктами File / View
-	vga_fill_rect(0, 0, MAX_COLS, 1, ' ', g_attr_menu);
+	vga_fill_rect(0, 0, console_max_cols(), 1, ' ', g_attr_menu);
 	/* Пишем меню без переполнений: строка очень длинная, поэтому используем snprintf
 	   и ограничиваем вывод шириной экрана (с учётом x=2). */
-	char line[(MAX_COLS > 2 ? (MAX_COLS - 2) : MAX_COLS) + 1];
+	char line[(console_max_cols() > 2 ? (console_max_cols() - 2) : console_max_cols()) + 1];
 	const char *name = THEMES[g_theme_index].name ? THEMES[g_theme_index].name : "";
 	snprintf(
 		line, sizeof(line),
@@ -305,9 +311,9 @@ static void ui_draw_menu(void) {
 }
 
 static void ui_draw_status(Editor *E, const char *msg) {
-	vga_fill_rect(0, MAX_ROWS - 1, MAX_COLS, 1, ' ', g_attr_status);
+	vga_fill_rect(0, MAX_ROWS - 1, console_max_cols(), 1, ' ', g_attr_status);
 	// left: file name and modified flag
-	char left[(MAX_COLS > 1 ? (MAX_COLS - 1) : MAX_COLS) + 1];
+	char left[(console_max_cols() > 1 ? (console_max_cols() - 1) : console_max_cols()) + 1];
 	const char *fname = (E && E->filename[0]) ? E->filename : "[No Name]";
 	snprintf(left, sizeof(left), "%s%s", fname, (E && E->modified) ? " *" : "");
 	left[sizeof(left) - 1] = '\0';
@@ -319,11 +325,11 @@ static void ui_draw_status(Editor *E, const char *msg) {
 	const char *mode = (E && E->insert_mode) ? "INS" : "OVR";
 	snprintf(rbuf, sizeof(rbuf), "Ln %d, Col %d  %s", ln, col, mode);
 	rbuf[sizeof(rbuf) - 1] = '\0';
-	int x = MAX_COLS - (int)strlen(rbuf) - 2; if (x < 0) x = 0;
+	int x = console_max_cols() - (int)strlen(rbuf) - 2; if (x < 0) x = 0;
 	vga_write_str_xy((uint32_t)x, MAX_ROWS - 1, rbuf, g_attr_status);
 	// center message if any
 	if (msg && msg[0]) {
-		int cx = (MAX_COLS - (int)strlen(msg)) / 2; if (cx < 0) cx = 0;
+		int cx = (console_max_cols() - (int)strlen(msg)) / 2; if (cx < 0) cx = 0;
 		vga_write_str_xy((uint32_t)cx, MAX_ROWS - 1, msg, g_attr_status);
 	}
 }
@@ -628,7 +634,7 @@ static void ui_place_cursor(Editor *E) {
 
 // ---- ESC top menu ----
 static void draw_menu_panel_header(void) {
-	vga_fill_rect(0, 0, MAX_COLS, 1, ' ', g_attr_menu);
+	vga_fill_rect(0, 0, console_max_cols(), 1, ' ', g_attr_menu);
 	vga_write_str_xy(2, 0, "Menu  (Esc: close, Enter: select)", g_attr_menu);
 }
 
@@ -636,7 +642,7 @@ static void draw_menu_items(int sel) {
 	const char *items[] = {"Open", "Save", "Exit", "About"};
 	const int n = 4;
 	// clear area under header
-	for (uint32_t y = 1; y < 6; y++) vga_fill_rect(0, y, MAX_COLS, 1, ' ', g_attr_status);
+	for (uint32_t y = 1; y < 6; y++) vga_fill_rect(0, y, console_max_cols(), 1, ' ', g_attr_status);
 	for (int i = 0; i < n; i++) {
 		uint32_t y = 1 + (uint32_t)i;
 		if (i == sel) {
@@ -652,7 +658,7 @@ static void draw_menu_items(int sel) {
 
 static void show_about_screen(void) {
 	// simple about text overlaying top area
-	for (uint32_t y = 1; y < 6; y++) vga_fill_rect(0, y, MAX_COLS, 1, ' ', g_attr_status);
+	for (uint32_t y = 1; y < 6; y++) vga_fill_rect(0, y, console_max_cols(), 1, ' ', g_attr_status);
 	vga_write_str_xy(4, 2, "AxonEdit - text editor for AxonOS", g_attr_status);
 	vga_write_str_xy(4, 3, "ESC: close menu, Ctrl+O/S/N/G/X, Ctrl+T: themes", g_attr_status);
 	vga_write_str_xy(4, 4, "Press any key to return", g_attr_status);
@@ -717,7 +723,7 @@ static int prompt_input(const char *title, char *out, int out_size, const char *
 	out[len] = '\0';
 	for (;;) {
 		// draw prompt on status line
-		vga_fill_rect(0, MAX_ROWS - 1, MAX_COLS, 1, ' ', g_attr_status);
+		vga_fill_rect(0, MAX_ROWS - 1, console_max_cols(), 1, ' ', g_attr_status);
 		vga_write_str_xy(1, MAX_ROWS - 1, title, g_attr_status);
 		vga_write_str_xy((uint32_t)(1 + (int)strlen(title)), MAX_ROWS - 1, out, g_attr_status);
 		vga_set_cursor((uint32_t)(1 + (int)strlen(title) + len), MAX_ROWS - 1);

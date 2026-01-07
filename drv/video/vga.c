@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stddef.h>
+#include <vbe.h>
 
 static uint8_t parse_color_code(char bg, char fg);
 
@@ -42,90 +43,90 @@ static inline void set_cursor_nolock(uint16_t pos) {
 
 /* Fast direct VGA helpers */
 void vga_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
-    if (x >= MAX_COLS || y >= MAX_ROWS) return;
-    uint16_t off = (uint16_t)((y * MAX_COLS + x) * 2);
-    vga_lock_acquire();
-    write_nolock(ch, attr, off);
-    vga_lock_release();
+	if (x >= MAX_COLS || y >= MAX_ROWS) return;
+	uint16_t off = (uint16_t)((y * MAX_COLS + x) * 2);
+	vga_lock_acquire();
+	write_nolock(ch, attr, off);
+	vga_lock_release();
 }
 
 void vga_clear_screen_attr(uint8_t attr) {
-    uint8_t *vga = (uint8_t*)VIDEO_ADDRESS;
-    uint32_t total = MAX_ROWS * MAX_COLS;
-    for (uint32_t i = 0; i < total; i++) {
-        vga[i*2] = ' ';
-        vga[i*2 + 1] = attr;
-    }
+	uint8_t *vga = (uint8_t*)VIDEO_ADDRESS;
+	uint32_t total = MAX_ROWS * MAX_COLS;
+	for (uint32_t i = 0; i < total; i++) {
+		vga[i*2] = ' ';
+		vga[i*2 + 1] = attr;
+	}
 }
 
 void vga_write_str_xy(uint32_t x, uint32_t y, const char *s, uint8_t attr) {
-    if (y >= MAX_ROWS) return;
-    uint32_t px = x;
-    uint32_t py = y;
-    vga_lock_acquire();
-    for (size_t i = 0; s[i]; i++) {
-        if (px >= MAX_COLS) { px = 0; py++; }
-        if (py >= MAX_ROWS) {
-            /* perform scroll while holding lock */
-            /* reuse existing scroll_line logic but inline to avoid double-lock */
-            uint8_t i2 = 1;
-            while (i2 < MAX_ROWS) {
-                memcpy(
-                    (uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * (i2-1) * 2)), /* dst <- src */
-                    (uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * i2 * 2)),     /* src */
-                    (MAX_COLS*2)
-                );
-                i2++;
-            }
-            uint16_t last_line = (MAX_COLS*MAX_ROWS*2) - MAX_COLS*2;
-            for (uint32_t ii = 0; ii < MAX_COLS; ii++) {
-                write_nolock('\0', WHITE_ON_BLACK, (uint16_t)(last_line + ii * 2));
-            }
-            set_cursor_nolock(last_line);
-            py = MAX_ROWS - 1;
-        }
-        write_nolock((uint8_t)s[i], attr, (uint16_t)((py * MAX_COLS + px) * 2));
-        px++;
-    }
-    vga_lock_release();
+	if (y >= MAX_ROWS) return;
+	uint32_t px = x;
+	uint32_t py = y;
+	vga_lock_acquire();
+	for (size_t i = 0; s[i]; i++) {
+		if (px >= MAX_COLS) { px = 0; py++; }
+		if (py >= MAX_ROWS) {
+			/* perform scroll while holding lock */
+			/* reuse existing scroll_line logic but inline to avoid double-lock */
+			uint8_t i2 = 1;
+			while (i2 < MAX_ROWS) {
+				memcpy(
+					(uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * (i2-1) * 2)), /* dst <- src */
+					(uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * i2 * 2)),	 /* src */
+					(MAX_COLS*2)
+				);
+				i2++;
+			}
+			uint16_t last_line = (MAX_COLS*MAX_ROWS*2) - MAX_COLS*2;
+			for (uint32_t ii = 0; ii < MAX_COLS; ii++) {
+				write_nolock('\0', WHITE_ON_BLACK, (uint16_t)(last_line + ii * 2));
+			}
+			set_cursor_nolock(last_line);
+			py = MAX_ROWS - 1;
+		}
+		write_nolock((uint8_t)s[i], attr, (uint16_t)((py * MAX_COLS + px) * 2));
+		px++;
+	}
+	vga_lock_release();
 }
 
 void vga_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t ch, uint8_t attr) {
-    for (uint32_t ry = 0; ry < h; ry++) {
-        if (y + ry >= MAX_ROWS) break;
-        for (uint32_t rx = 0; rx < w; rx++) {
-            if (x + rx >= MAX_COLS) break;
-            vga_putch_xy(x + rx, y + ry, ch, attr);
-        }
-    }
+	for (uint32_t ry = 0; ry < h; ry++) {
+		if (y + ry >= MAX_ROWS) break;
+		for (uint32_t rx = 0; rx < w; rx++) {
+			if (x + rx >= MAX_COLS) break;
+			vga_putch_xy(x + rx, y + ry, ch, attr);
+		}
+	}
 }
 
 uint32_t vga_write_colorized_xy(uint32_t x, uint32_t y, const char *s, uint8_t default_attr) {
-    if (y >= MAX_ROWS) return 0;
-    /* Color tags are no longer supported; print the string as-is. */
-    (void)default_attr;
-    vga_write_str_xy(x, y, s, GRAY_ON_BLACK);
-    return (uint32_t)strlen(s);
+	if (y >= MAX_ROWS) return 0;
+	/* Color tags are no longer supported; print the string as-is. */
+	(void)default_attr;
+	vga_write_str_xy(x, y, s, GRAY_ON_BLACK);
+	return (uint32_t)strlen(s);
 }
 
 void kprint(uint8_t *str) {
-    if (!str) return;
-    while (*str) kputchar(*str++, GRAY_ON_BLACK);
+	if (!str) return;
+	while (*str) kputchar(*str++, GRAY_ON_BLACK);
 }
 
 void kputchar(uint8_t character, uint8_t attribute_byte)
 {
+	/* If VBE framebuffer console available, delegate */
+	if (vbe_is_available()) { vbefb_putchar(character, attribute_byte); return; }
+
 	/* Make the entire character output atomic: read cursor, update video memory,
 	   handle scrolling and update hardware cursor while holding the VGA lock. */
 	vga_lock_acquire();
 	uint16_t offset = get_cursor_nolock();
 	if (character == '\n')
 	{
-		if ((offset / 2 / MAX_COLS) == (MAX_ROWS - 1))
-			/* scroll while holding lock */
-			;
-		else
-			set_cursor_nolock((uint16_t)((offset - offset % (MAX_COLS*2)) + MAX_COLS*2));
+		if ((offset / 2 / MAX_COLS) == (MAX_ROWS - 1));
+		else set_cursor_nolock((uint16_t)((offset - offset % (MAX_COLS*2)) + MAX_COLS*2));
 
 		/* if we're on last line, perform scroll now */
 		if ((offset / 2 / MAX_COLS) == (MAX_ROWS - 1)) {
@@ -134,7 +135,7 @@ void kputchar(uint8_t character, uint8_t attribute_byte)
 			while (i < MAX_ROWS) {
 				memcpy(
 					(uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * (i-1) * 2)), /* dst <- src */
-					(uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * i * 2)),     /* src */
+					(uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * i * 2)),	 /* src */
 					(MAX_COLS*2)
 				);
 				i++;
@@ -176,13 +177,13 @@ void kputchar(uint8_t character, uint8_t attribute_byte)
 		set_cursor_nolock(offset);
 	}
 	else if (character == '\b')
-    {
-        set_cursor_nolock(get_cursor_nolock() - 1);
-        /* recursive call intentionally outside critical section would be unsafe;
-           handle backspace inline */
-        write_nolock(' ', attribute_byte, (uint16_t)(get_cursor_nolock()));
-        set_cursor_nolock((uint16_t)(get_cursor_nolock() - 2));
-    }
+	{
+		set_cursor_nolock(get_cursor_nolock() - 1);
+		/* recursive call intentionally outside critical section would be unsafe;
+		   handle backspace inline */
+		write_nolock(' ', attribute_byte, (uint16_t)(get_cursor_nolock()));
+		set_cursor_nolock((uint16_t)(get_cursor_nolock() - 2));
+	}
 	else
 	{
 		/* write char and handle end-of-line / scroll correctly */
@@ -231,8 +232,8 @@ void kputchar(uint8_t character, uint8_t attribute_byte)
 
 void kprint_colorized(const char* str)
 {
-    /* Color tags removed: print text literally using default color. */
-    kprint((uint8_t*)str);
+	/* Color tags removed: print text literally using default color. */
+	kprint((uint8_t*)str);
 }
 
 void	scroll_line()
@@ -245,7 +246,7 @@ void	scroll_line()
 	{
 		memcpy(
 			(uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * (i-1) * 2)), /* dst <- src */
-			(uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * i * 2)),     /* src */
+			(uint8_t *)(VIDEO_ADDRESS + (MAX_COLS * i * 2)),	 /* src */
 			(MAX_COLS*2)
 		);
 		i++;
@@ -308,132 +309,133 @@ void	set_cursor(uint16_t pos)
 
 // Получить текущую позицию курсора по X
 uint16_t get_cursor_x() {
-    uint16_t offset = get_cursor();
-    return offset % (MAX_COLS * 2);
+	uint16_t offset = get_cursor();
+	return offset % (MAX_COLS * 2);
 }
 
 // Получить текущую позицию курсора по Y
 uint16_t get_cursor_y() {
-    uint16_t offset = get_cursor();
-    return offset / (MAX_COLS * 2);
+	uint16_t offset = get_cursor();
+	return offset / (MAX_COLS * 2);
 }
 
 // Установить позицию курсора по X
 void set_cursor_x(uint16_t x) {
-    uint16_t offset = get_cursor();
-    uint16_t new_offset = (offset / (MAX_COLS * 2)) * (MAX_COLS * 2) + x * 2;
-    set_cursor(new_offset);
+	uint16_t offset = get_cursor();
+	uint16_t new_offset = (offset / (MAX_COLS * 2)) * (MAX_COLS * 2) + x * 2;
+	set_cursor(new_offset);
 }
 
 // Установить позицию курсора по Y
 void set_cursor_y(uint16_t y) {
-    uint16_t offset = get_cursor();
-    uint16_t new_offset = (y * MAX_COLS * 2) + (offset % (MAX_COLS * 2));
-    set_cursor(new_offset);
+	uint16_t offset = get_cursor();
+	uint16_t new_offset = (y * MAX_COLS * 2) + (offset % (MAX_COLS * 2));
+	set_cursor(new_offset);
 }
 
 void hex_to_str(uint32_t num, char *str);
 void hex_to_str(uint32_t num, char *str) {
-    int i = 0;
-    
-    if (num == 0) {
-        str[i++] = '0';
-        str[i] = '\0';
-        return;
-    }
+	int i = 0;
+	
+	if (num == 0) {
+		str[i++] = '0';
+		str[i] = '\0';
+		return;
+	}
 
-    while (num != 0) {
-        uint32_t rem = num % 16;
-        if (rem < 10) {
-            str[i++] = rem + '0';
-        } else {
-            str[i++] = (rem - 10) + 'A';
-        }
-        num = num / 16;
-    }
+	while (num != 0) {
+		uint32_t rem = num % 16;
+		if (rem < 10) {
+			str[i++] = rem + '0';
+		} else {
+			str[i++] = (rem - 10) + 'A';
+		}
+		num = num / 16;
+	}
 
-    str[i] = '\0';
+	str[i] = '\0';
 
-    // Reverse the string
-    int start = 0;
-    int end = i - 1;
-    while (start < end) {
-        char temp = str[start];
-        str[start] = str[end];
-        str[end] = temp;
-        start++;
-        end--;
-    }
+	// Reverse the string
+	int start = 0;
+	int end = i - 1;
+	while (start < end) {
+		char temp = str[start];
+		str[start] = str[end];
+		str[end] = temp;
+		start++;
+		end--;
+	}
 }
 
 static uint8_t parse_color_code(char bg, char fg) {
-    uint8_t background = 0;
-    uint8_t foreground = 0;
-    
-    // Преобразование шестнадцатеричного символа в число
-    if (bg >= '0' && bg <= '9') {
-        background = bg - '0';
-    } else if (bg >= 'a' && bg <= 'f') {
-        background = bg - 'a' + 0xa;
-    } else if (bg >= 'A' && bg <= 'F') {
-        background = bg - 'A' + 0xa;
-    }
+	uint8_t background = 0;
+	uint8_t foreground = 0;
+	
+	// Преобразование шестнадцатеричного символа в число
+	if (bg >= '0' && bg <= '9') {
+		background = bg - '0';
+	} else if (bg >= 'a' && bg <= 'f') {
+		background = bg - 'a' + 0xa;
+	} else if (bg >= 'A' && bg <= 'F') {
+		background = bg - 'A' + 0xa;
+	}
 
-    if (fg >= '0' && fg <= '9') {
-        foreground = fg - '0';
-    } else if (fg >= 'a' && fg <= 'f') {
-        foreground = fg - 'a' + 0xa;
-    } else if (fg >= 'A' && fg <= 'F') {
-        foreground = fg - 'A' + 0xa;
-    }
-    
-    return (background << 4) | foreground;
+	if (fg >= '0' && fg <= '9') {
+		foreground = fg - '0';
+	} else if (fg >= 'a' && fg <= 'f') {
+		foreground = fg - 'a' + 0xa;
+	} else if (fg >= 'A' && fg <= 'F') {
+		foreground = fg - 'A' + 0xa;
+	}
+	
+	return (background << 4) | foreground;
 }
 
 void ftos(double n, char *buf, int precision) {
-    int i = 0;
-    int sign = 1;
-    if (n < 0) {
-        sign = -1;
-        n = -n;
-    }
+	int i = 0;
+	int sign = 1;
+	if (n < 0) {
+		sign = -1;
+		n = -n;
+	}
 
-    double integer_part = (int)n;
-    double fractional_part = n - integer_part;
+	double integer_part = (int)n;
+	double fractional_part = n - integer_part;
 
-    // Вывод целой части
-    while (integer_part > 0) {
-        buf[i++] = ((int)integer_part % 10) + '0';
-        integer_part /= 10;
-    }
+	// Вывод целой части
+	while (integer_part > 0) {
+		buf[i++] = ((int)integer_part % 10) + '0';
+		integer_part /= 10;
+	}
 
-    // Вывод точки
-    buf[i++] = '.';
+	// Вывод точки
+	buf[i++] = '.';
 
-    // Вывод дробной части
-    for (int j = 0; j < precision; j++) {
-        fractional_part *= 10;
-        buf[i++] = (int)fractional_part + '0';
-        fractional_part -= (int)fractional_part;
-    }
+	// Вывод дробной части
+	for (int j = 0; j < precision; j++) {
+		fractional_part *= 10;
+		buf[i++] = (int)fractional_part + '0';
+		fractional_part -= (int)fractional_part;
+	}
 
-    // Добавление знака
-    if (sign == -1) {
-        buf[i++] = '-';
-    }
+	// Добавление знака
+	if (sign == -1) {
+		buf[i++] = '-';
+	}
 
-    // Обратная запись строки
-    for (int j = 0; j < i / 2; j++) {
-        char temp = buf[j];
-        buf[j] = buf[i - j - 1];
-        buf[i - j - 1] = temp;
-    }
+	// Обратная запись строки
+	for (int j = 0; j < i / 2; j++) {
+		char temp = buf[j];
+		buf[j] = buf[i - j - 1];
+		buf[i - j - 1] = temp;
+	}
 
-    buf[i] = '\0';
+	buf[i] = '\0';
 }
 
 static void kputn(char ch, int count, uint8_t color)
 {
+	if (vbe_is_available()) { for (int i = 0; i < count; i++) vbefb_putchar((uint8_t)ch, color); return; }
 	for (int i = 0; i < count; i++) kputchar(ch, color);
 }
 
@@ -451,18 +453,18 @@ void kprintf(const char* fmt, ...)
 	va_list ap;
 	va_start(ap, fmt);
 
-    uint8_t color = 0x07; // светло-серый на чёрном
-    for (const char *p = fmt; *p; ) {
-        // Color tags are no longer supported; treat them as normal characters.
-        // support tab character: move to next tab stop (8 columns) like Linux
-        if (*p == '\t') {
-            uint32_t cx = 0, cy = 0;
-            vga_get_cursor(&cx, &cy);
-            uint32_t spaces = 8 - (cx % 8);
-            if (spaces == 0) spaces = 8;
-            kputn(' ', spaces, color);
-            p++; continue;
-        }
+	uint8_t color = 0x07; // светло-серый на чёрном
+	for (const char *p = fmt; *p; ) {
+		// Color tags are no longer supported; treat them as normal characters.
+		// support tab character: move to next tab stop (8 columns) like Linux
+		if (*p == '\t') {
+			uint32_t cx = 0, cy = 0;
+			vga_get_cursor(&cx, &cy);
+			uint32_t spaces = 8 - (cx % 8);
+			if (spaces == 0) spaces = 8;
+			kputn(' ', spaces, color);
+			p++; continue;
+		}
 
 		if (*p != '%') { kputchar(*p++, color); continue; }
  		p++;
@@ -609,34 +611,36 @@ PRINT_NUMBER_BASE10:
 }
 
 void vga_set_cursor(uint32_t x, uint32_t y) {
-    set_cursor_x(x);
-    set_cursor_y(y);
+	if (vbe_is_available()) { vbefb_set_cursor(x,y); return; }
+	set_cursor_x(x);
+	set_cursor_y(y);
 }
 
 void vga_get_cursor(uint32_t* x, uint32_t* y) {
-    uint16_t pos = get_cursor();
-    if (x) *x = (pos % (MAX_COLS * 2)) / 2;
-    if (y) *y = pos / (MAX_COLS * 2);
+	if (vbe_is_available()) { vbefb_get_cursor(x,y); return; }
+	uint16_t pos = get_cursor();
+	if (x) *x = (pos % (MAX_COLS * 2)) / 2;
+	if (y) *y = pos / (MAX_COLS * 2);
 }
 
 uint16_t cell_offset(uint8_t x, uint8_t y) {
-    return (uint16_t)((y * MAX_COLS + x) * 2);
+	return (uint16_t)((y * MAX_COLS + x) * 2);
 }
 
 void draw_cell(uint8_t x, uint8_t y, uint8_t ch, uint8_t color) {
-    write(ch, color, cell_offset(x, y));
+	write(ch, color, cell_offset(x, y));
 }
 
 void draw_text(uint8_t x, uint8_t y, const char* s, uint8_t color) {
-    for (uint8_t i = 0; s[i]; i++) draw_cell(x + i, y, (uint8_t)s[i], color);
+	for (uint8_t i = 0; s[i]; i++) draw_cell(x + i, y, (uint8_t)s[i], color);
 }
 
 /* Set hardware cursor shape (scanline start/end). */
 void set_cursor_shape(uint8_t start, uint8_t end) {
-    outb(REG_SCREEN_CTRL, 0x0A);
-    outb(REG_SCREEN_DATA, start & 0x1F);
-    outb(REG_SCREEN_CTRL, 0x0B);
-    outb(REG_SCREEN_DATA, end & 0x1F);
+	outb(REG_SCREEN_CTRL, 0x0A);
+	outb(REG_SCREEN_DATA, start & 0x1F);
+	outb(REG_SCREEN_CTRL, 0x0B);
+	outb(REG_SCREEN_DATA, end & 0x1F);
 }
 
 // ---- minimal printf-to-buffer (vsnprintf/snprintf/sprintf) ----
@@ -788,15 +792,15 @@ int __vsnprintf(char* out, size_t outsz, const char* fmt, va_list ap_in) {
 }
 
 void enable_cursor() {
-    outb(0x3D4, 0x0A);
-    char curstart = inb(0x3D5) & 0x1F; // cursor scanline start (bits 0-4)
+	outb(0x3D4, 0x0A);
+	char curstart = inb(0x3D5) & 0x1F; // cursor scanline start (bits 0-4)
 
-    // Clear bit 5 (cursor disable) to enable the cursor
-    outb(0x3D4, 0x0A);
-    outb(0x3D5, (curstart & ~0x20));
+	// Clear bit 5 (cursor disable) to enable the cursor
+	outb(0x3D4, 0x0A);
+	outb(0x3D5, (curstart & ~0x20));
 
-    // custom shape!
-    set_cursor_shape(14, 15);
+	// custom shape!
+	set_cursor_shape(14, 15);
 }
 
 int vsnprintf(char* out, size_t outsz, const char* fmt, va_list ap) { return __vsnprintf(out, outsz, fmt, ap); }
