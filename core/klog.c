@@ -143,6 +143,7 @@ void klogprintf(const char *fmt, ...) {
         }
         fs_file_free(f);
     }
+    //qemu_debug_printf(full);
     if (full) kfree(full);
     kfree(buf);
     release(&klog_lock);

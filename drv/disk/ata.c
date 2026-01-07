@@ -347,6 +347,12 @@ static void ata_register_device(uint16_t io_base, uint16_t ctrl_base, int is_sla
 }
 
 void ata_dma_init(void) {
+	/* Prefer AHCI-based discovery if available so SATA/ATAPI drivers can be attached later */
+	int ahci_count = ahci_probe_and_register();
+	if (ahci_count > 0) {
+		klogprintf("ahci: devices: %d, skipping legacy ATA probe\n", ahci_count);
+		return;
+	}
 	/* perform software reset on legacy channels to mimic cold-boot behavior
 	   which helps virtual machines (VMware) that do not reset ATA on soft reboot */
 	{

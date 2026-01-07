@@ -41,7 +41,7 @@ static uint32_t quick_calibrate(void) {
 
     if (eax != 0) {
         uint32_t base_mhz = eax;
-        kprintf("APIC: CPUID reports base CPU frequency %u MHz; using for APIC calibration\n", base_mhz);
+        klogprintf("APIC: CPUID reports base CPU frequency %u MHz; using for APIC calibration\n", base_mhz);
         return base_mhz * 1000000u;
     }
 
@@ -186,6 +186,7 @@ void apic_timer_handler(cpu_registers_t* regs) {
         }
         thread_yield();
     }
+    if (apic_timer_ticks % 5) vbe_flush_full();
     apic_eoi();
 }
 
