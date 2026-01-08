@@ -43,7 +43,7 @@ void *mmio_map_phys(uint64_t pa, size_t len) {
 	size_t total = offset_in_page + len;
 	size_t pages_needed = (total + PAGE_SIZE_2M - 1) / PAGE_SIZE_2M;
 	if (pages_needed == 0 || pages_needed > MMIO_POOL_SLOTS) {
-		kprintf("mmio: request too large pages_needed=%u\n", (unsigned)pages_needed);
+		klogprintf("MMIO: request too large pages_needed: %u\n", (unsigned)pages_needed);
 		return NULL;
 	}
 
@@ -91,7 +91,7 @@ void *mmio_map_phys(uint64_t pa, size_t len) {
 				mmio_alloc_count[start + j] = 0;
 			}
 			release(&mmio_pool_lock);
-			kprintf("mmio: map_page_2m failed for pa=0x%llx\n", (unsigned long long)pa);
+			klogprintf("MMIO: map_page_2m failed for PA: 0x%llx\n", (unsigned long long)pa);
 			return NULL;
 		}
 	}
@@ -146,7 +146,7 @@ void mmio_init(void) {
 		mmio_alloc_count[i] = 0;
 	}
 	mmio_inited = 1;
-	kprintf("mmio: initialized with %u slots\n", (unsigned)MMIO_POOL_SLOTS);
+	klogprintf("MMIO initialized with %u slots.\n", (unsigned)MMIO_POOL_SLOTS);
 	release(&mmio_pool_lock);
 }
 

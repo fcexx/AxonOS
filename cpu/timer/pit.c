@@ -6,7 +6,7 @@
 #include <vga.h>
 // VGA text mode uses hardware cursor; no backbuffer swap needed
 #include <thread.h>
-//#include <vbe.h>
+#include <vbe.h>
 //#include <vbetty.h>
 
 // Global variables
@@ -26,6 +26,7 @@ void pit_handler(cpu_registers_t* regs) {
                 thread_schedule();
         }
         vbe_flush_full();
+        vbefb_update_cursor();
 }
 
 // Initialize PIT with default frequency (100 Hz)

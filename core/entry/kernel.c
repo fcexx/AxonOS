@@ -151,7 +151,6 @@ void ring0_shell()  { osh_run(); }
 void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     kclear();
     enable_cursor();
-    kprint("Initializing kernel...\n");
     sysinfo_init(multiboot_magic, multiboot_info);
 
     /* Initialize heap EARLY and place it above kernel + multiboot modules.
@@ -168,7 +167,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         const uintptr_t HEAP_MIN_START = (uintptr_t)(64u * 1024u * 1024u); /* 64 MiB minimal heap start */
         if (heap_start < HEAP_MIN_START) heap_start = HEAP_MIN_START;
         heap_init(heap_start, 0);
-        kprintf("loading kernel: heap_start=%p kernel_end=%p mods_end=%p\n",
+        kprintf("Loading kernel without compression: heap_start: %p kernel_end: %p mods_end: %p\n",
                 (void*)heap_start, (void*)(uintptr_t)_end, (void*)mods_end);
     }
 
@@ -179,10 +178,11 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     if (df_stack) {
         uint64_t df_top = (uint64_t)df_stack + 8192 + 16;
         tss_set_ist(1, df_top);
-        kprintf("kernel: set DF IST1 stack at %p\n", (void*)(uintptr_t)df_top);
+        kprintf("Set kernel DF IST1 stack at %p.\n", (void*)(uintptr_t)df_top);
     } else {
-        kprintf("kernel: WARNING: failed to allocate DF IST stack\n");
+        kprintf("Failed to allocate DF IST stack (warning)\n");
     }
+    int vbe_init;
     /* Initialize VBE framebuffer console after heap is available */
     if (multiboot_info != 0) {
         if (vbe_init_from_multiboot(multiboot_magic, multiboot_info)) {
@@ -192,13 +192,16 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 uint32_t p = vbe_get_pitch();
                 uint32_t b = vbe_get_bpp();
                 if (vbefb_init(w, h, p, b) == 0) {
-                    kprintf("vbe: console initialized %ux%u bpp=%u\n", (unsigned)w, (unsigned)h, (unsigned)b);
+                    kprintf("vbe: framebuffer initialized %ux%u@%u\n", (unsigned)w, (unsigned)h, (unsigned)b);
+                    vbe_init = 1;
                 } else {
-                    kprintf("vbe: console init failed\n");
+                    kprintf("vbe: framebuffer init failed\n");
+                    vbe_init = 0;
                 }
             }
         } else {
-            kprintf("vbe: init_from_multiboot returned false\n");
+            kprintf("vbe: init_from_multiboot returned error\n");
+            vbe_init = 0;
         }
     }
 
@@ -263,6 +266,9 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     }
 
     klog_init(); // for logging into /var/log/kernel file
+    sysinfo_print_e820(multiboot_magic, multiboot_info);
+    if (vbe_init = 1) klogprintf("Set VBE framebuffer mode: %ux%u@%u.\n", vbe_get_width(), vbe_get_height(), vbe_get_bpp());
+    else klogprintf("Set VGA default 80x25 mode.\n");
     
     apic_init();
     apic_timer_init();

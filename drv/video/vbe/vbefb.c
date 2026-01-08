@@ -37,6 +37,8 @@ static uint8_t current_attr = 0x07; /* default light gray on black */
 static int esc_mode = 0;
 static char esc_buf[32];
 static int esc_len = 0;
+static int cursor_visible = 1; /* cursor blink state */
+static uint32_t cursor_blink_counter = 0;
 
 static uint32_t vga_palette[16] = {
 	0x00000000, 0x000000AA, 0x0000AA00, 0x0000AAAA,
@@ -58,21 +60,35 @@ static void draw_cell_to_backbuffer(uint32_t cx, uint32_t cy) {
 	uint32_t fg = vga_attr_to_rgb(attr, 1);
 	uint32_t bg = vga_attr_to_rgb(attr, 0);
 
-	if (fb_bpp != 32) return;
 	uint8_t *front = (uint8_t*)vbe_get_frontbuffer();
 	if (!front) return;
 
 	uint32_t px = cx * font_w;
 	uint32_t py = cy * font_h;
 	uint32_t pitch = vbe_get_pitch();
-	uint32_t bytespp = fb_bpp / 8;
+	uint32_t bytespp = (vbe_get_bpp() + 7) / 8;
 
 	for (uint32_t row = 0; row < font_h; row++) {
 		uint8_t glyph = font8x16[(uint8_t)ch][row];
 		uint8_t *line = front + (size_t)( (py + row) * pitch + px * bytespp );
 		for (uint32_t bit = 0; bit < font_w; bit++) {
-			uint32_t color = (glyph & (1 << (7 - bit))) ? fg : bg;
-			*(uint32_t*)(line + bit * bytespp) = color;
+			uint32_t pal = (glyph & (1 << (7 - bit))) ? fg : bg; /* 0x00RRGGBB */
+			/* map pal (8-bit per channel) into framebuffer's RGB fields */
+			uint32_t r = (pal >> 16) & 0xFF;
+			uint32_t g = (pal >> 8) & 0xFF;
+			uint32_t b = pal & 0xFF;
+			uint32_t pixel = vbe_pack_pixel((uint8_t)r, (uint8_t)g, (uint8_t)b);
+			/* write pixel as little-endian bytes */
+			if (bytespp == 4) {
+				*(uint32_t*)(line + bit * 4) = pixel;
+			} else if (bytespp == 3) {
+				line[bit*3 + 0] = (uint8_t)(pixel & 0xFF);
+				line[bit*3 + 1] = (uint8_t)((pixel >> 8) & 0xFF);
+				line[bit*3 + 2] = (uint8_t)((pixel >> 16) & 0xFF);
+			} else if (bytespp == 2) {
+				line[bit*2 + 0] = (uint8_t)(pixel & 0xFF);
+				line[bit*2 + 1] = (uint8_t)((pixel >> 8) & 0xFF);
+			}
 		}
 	}
 }
@@ -114,6 +130,18 @@ void vbefb_putchar(uint8_t ch, uint8_t attr) {
 		return;
 	}
 
+	/* remember old cursor position before update */
+	uint32_t old_cx = cursor_x;
+	uint32_t old_cy = cursor_y;
+	/* erase cursor at old position if visible (before moving) */
+	if (cursor_visible && old_cx < cols && old_cy < rows) {
+		/* temporarily set cursor to old position to erase */
+		uint32_t save_x = cursor_x, save_y = cursor_y;
+		cursor_x = old_cx; cursor_y = old_cy;
+		erase_cursor();
+		cursor_x = save_x; cursor_y = save_y;
+	}
+	
 	/* remember current position where the character will be placed */
 	uint32_t ox = cursor_x;
 	uint32_t oy = cursor_y;
@@ -152,16 +180,90 @@ void vbefb_putchar(uint8_t ch, uint8_t attr) {
 		memset(textbuf + cols * (rows - 1), 0, (size_t)(cols * sizeof(cell_t)));
 		cursor_y = rows - 1;
 		/* redraw whole backbuffer from textbuf */
-		for (uint32_t ry = 0; ry < rows; ry++) {
-			for (uint32_t rx = 0; rx < cols; rx++) draw_cell_to_backbuffer(rx, ry);
+		/* scroll framebuffer pixels up by font_h */
+		vbe_scroll_up_pixels(font_h);
+		/* redraw only last text row into framebuffer */
+		uint32_t last_row = rows - 1;
+		for (uint32_t rx = 0; rx < cols; rx++) draw_cell_to_backbuffer(rx, last_row);
+		/* redraw cursor at new position after scroll */
+		if (cursor_visible) {
+			draw_cursor();
 		}
-		//vbe_flush_full();
+		/* flush last row region (no-op if front-only) */
+		vbe_flush_region(0, last_row * font_h, fb_width, font_h);
 	} else {
 		/* draw only the single updated cell and flush small rect */
 		draw_cell_to_backbuffer(ox, oy);
+		/* redraw cursor at new position if visible (timer will handle blinking) */
+		if (cursor_visible) {
+			draw_cursor();
+		}
 		uint32_t px = ox * font_w;
 		uint32_t py = oy * font_h;
 		//vbe_flush_region(px, py, font_w, font_h);
+	}
+}
+
+void draw_cursor(void) {
+	if (!vbe_is_available() || !textbuf) return;
+	if (cursor_x >= cols || cursor_y >= rows) return;
+	
+	uint8_t *front = (uint8_t*)vbe_get_frontbuffer();
+	if (!front) return;
+	
+	uint32_t px = cursor_x * font_w;
+	uint32_t py = cursor_y * font_h;
+	uint32_t pitch = vbe_get_pitch();
+	uint32_t bytespp = (vbe_get_bpp() + 7) / 8;
+	
+	/* get cell colors */
+	uint8_t attr = textbuf[cursor_y * cols + cursor_x].attr;
+	uint32_t fg = vga_attr_to_rgb(attr, 1);
+	uint32_t bg = vga_attr_to_rgb(attr, 0);
+	
+	/* cursor: draw foreground color on bottom 2 scanlines (like VGA hardware cursor) */
+	uint32_t cursor_start_row = font_h - 2;
+	for (uint32_t row = cursor_start_row; row < font_h; row++) {
+		uint8_t *line = front + (size_t)( (py + row) * pitch + px * bytespp );
+		for (uint32_t bit = 0; bit < font_w; bit++) {
+			/* draw cursor with foreground color (visible on dark background) */
+			uint32_t r = (fg >> 16) & 0xFF;
+			uint32_t g = (fg >> 8) & 0xFF;
+			uint32_t b = fg & 0xFF;
+			uint32_t pixel = vbe_pack_pixel((uint8_t)r, (uint8_t)g, (uint8_t)b);
+			if (bytespp == 4) {
+				*(uint32_t*)(line + bit * 4) = pixel;
+			} else if (bytespp == 3) {
+				line[bit*3 + 0] = (uint8_t)(pixel & 0xFF);
+				line[bit*3 + 1] = (uint8_t)((pixel >> 8) & 0xFF);
+				line[bit*3 + 2] = (uint8_t)((pixel >> 16) & 0xFF);
+			} else if (bytespp == 2) {
+				line[bit*2 + 0] = (uint8_t)(pixel & 0xFF);
+				line[bit*2 + 1] = (uint8_t)((pixel >> 8) & 0xFF);
+			}
+		}
+	}
+}
+
+void erase_cursor(void) {
+	if (!vbe_is_available() || !textbuf) return;
+	if (cursor_x >= cols || cursor_y >= rows) return;
+	/* redraw cell normally (restores original appearance) */
+	draw_cell_to_backbuffer(cursor_x, cursor_y);
+}
+
+void vbefb_update_cursor(void) {
+	if (!vbe_is_available()) return;
+	/* blink at ~2 Hz: toggle every 500 ticks at 1000 Hz timer */
+	cursor_blink_counter++;
+	if (cursor_blink_counter >= 500) {
+		cursor_blink_counter = 0;
+		cursor_visible = !cursor_visible;
+		if (cursor_visible) {
+			draw_cursor();
+		} else {
+			erase_cursor();
+		}
 	}
 }
 
@@ -177,7 +279,11 @@ void vbefb_get_cursor(uint32_t *x, uint32_t *y) {
 void vbefb_set_cursor(uint32_t x, uint32_t y) {
 	if (x >= cols) x = cols - 1;
 	if (y >= rows) y = rows - 1;
+	/* erase old cursor */
+	if (cursor_visible) erase_cursor();
 	cursor_x = x; cursor_y = y;
+	/* draw new cursor */
+	if (cursor_visible) draw_cursor();
 }
 
 void vbefb_clear(uint8_t attr) {
@@ -197,12 +303,16 @@ int vbefb_init(uint32_t width, uint32_t height, uint32_t pitch, uint32_t bpp) {
 	if (!textbuf) return -1;
 	memset(textbuf, 0, (size_t)cols * rows * sizeof(cell_t));
 	cursor_x = 0; cursor_y = 0;
+	cursor_visible = 1;
+	cursor_blink_counter = 0;
 	klogprintf("vbefb: initialized cols=%u rows=%u\n", (unsigned)cols, (unsigned)rows);
 	/* draw first few lines into backbuffer and flush */
 	for (uint32_t ry = 0; ry < 2 && ry < rows; ry++) {
 		for (uint32_t rx = 0; rx < cols; rx++) draw_cell_to_backbuffer(rx, ry);
 		//vbe_flush_region(0, ry * font_h, fb_width, font_h);
 	}
+	/* draw initial cursor */
+	draw_cursor();
 	return 0;
 }
 

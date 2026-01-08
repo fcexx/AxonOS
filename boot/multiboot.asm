@@ -7,7 +7,7 @@ mb2_start:
         dd 0x100000000 - (0xe85250d6 + 0 + (mb2_end - mb2_start))
 
         align 8
-        dw 5
+        dw 0
         dw 0 
         dd 20
         dd 0
