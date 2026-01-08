@@ -180,9 +180,6 @@ int vbe_init_from_multiboot(uint32_t multiboot_magic, uint64_t multiboot_info) {
 					(unsigned)g_rpos, (unsigned)g_rsize, (unsigned)g_gpos, (unsigned)g_gsize, (unsigned)g_bpos, (unsigned)g_bsize);
 			}
 
-			/* Reject framebuffer tags that actually describe a text/legacy VGA mode:
-			   some boot environments report 80x25 text as a framebuffer; ensure we
-			   only enable VBE if resolution and bpp look like a graphical mode. */
 			if (width < 320 || height < 200 || bpp < 15) {
 				// klogprintf("vbe: framebuffer looks like text mode (%ux%u bpp=%u) - skipping\n",
 				// 	(unsigned)width, (unsigned)height, (unsigned)bpp);
