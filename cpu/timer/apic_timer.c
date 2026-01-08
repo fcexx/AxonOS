@@ -1,5 +1,6 @@
 #include <apic_timer.h>
 #include <vga.h>
+#include <vbe.h>
 #include <apic.h>
 #include <thread.h>
 #include <stdio.h>
@@ -187,6 +188,7 @@ void apic_timer_handler(cpu_registers_t* regs) {
         thread_yield();
     }
     if (apic_timer_ticks % 5) vbe_flush_full();
+    vbefb_update_cursor();
     apic_eoi();
 }
 

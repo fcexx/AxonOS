@@ -23,7 +23,15 @@ uint32_t vbe_get_width(void);
 uint32_t vbe_get_height(void);
 /* Initialize vbe text console after framebuffer is available */
 int vbefb_init(uint32_t width, uint32_t height, uint32_t pitch, uint32_t bpp);
+/* Pack 8-bit r,g,b into framebuffer pixel according to detected masks */
+uint32_t vbe_pack_pixel(uint8_t r, uint8_t g, uint8_t b);
 /* Front buffer access (direct framebuffer VA) */
 void *vbe_get_frontbuffer(void);
+/* Scroll framebuffer up by given pixel rows (fast memmove). */
+void vbe_scroll_up_pixels(uint32_t pixels);
+/* Clear pixel region in front buffer using packed pixel value. */
+void vbe_clear_region(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t packed_pixel);
+/* Update blinking cursor (call from timer interrupt). */
+void vbefb_update_cursor(void);
 
 
