@@ -24,6 +24,44 @@ extern uint8_t _end[]; /* kernel end symbol from linker */
    support isn't available. */
 static const uint64_t ELF_ET_DYN_BASE = 0x00400000ULL; /* 4MiB */
 
+/* In AxonOS, user programs currently run as kernel threads in a shared identity-mapped
+   address space. That means user stacks and TLS must not overlap between threads,
+   otherwise vfork/exec will clobber the parent's stack/TLS and trigger user-mode #GP
+   after the child exits. We carve out per-tid stack/TLS regions below USER_STACK_TOP. */
+static uintptr_t user_stack_top_for_tid(uint64_t tid) {
+    const uintptr_t top = (uintptr_t)USER_STACK_TOP;
+    /* Each slot: stack + tls + small guard. */
+    const uintptr_t stride = (uintptr_t)USER_STACK_SIZE + (uintptr_t)USER_TLS_SIZE + (uintptr_t)(64 * 1024);
+    /* Avoid colliding with tid0/ring0 assumptions; shift by 1. */
+    const uint64_t slot = tid + 1ULL;
+    /* Defensive programming:
+       - if tid is corrupted/huge, (slot * stride) can overflow and later cause unsigned underflow
+         in (top - off), producing a bogus "TLS base outside identity map".
+       - avoid overflow and avoid (off + 0x10000) wrap by using a non-overflowing comparison. */
+    if (stride == 0) return top;
+    if (slot > (uint64_t)((uintptr_t)-1) / (uint64_t)stride) {
+        return top;
+    }
+    const uintptr_t off = (uintptr_t)(slot * (uint64_t)stride);
+    /* We must guarantee that the computed stack_top leaves room for BOTH:
+       - the full reserved user stack (USER_STACK_SIZE)
+       - the reserved TLS region (USER_TLS_SIZE)
+       Otherwise TLS base = stack_top - stack - tls will underflow and become huge,
+       triggering "tls base outside identity map" after enough process launches. */
+    const uintptr_t min_room = (uintptr_t)USER_STACK_SIZE + (uintptr_t)USER_TLS_SIZE + 0x10000u;
+    if (top <= min_room) return top;
+    if (off >= (top - min_room)) {
+        /* Out of reserved per-tid slots: reuse the top slot.
+           This is safe for the common "run one program at a time from osh" case. */
+        return top;
+    }
+    return top - off;
+}
+
+static inline uintptr_t user_tls_base_for_stack_top(uintptr_t stack_top) {
+    return (uintptr_t)stack_top - (uintptr_t)USER_STACK_SIZE - (uintptr_t)USER_TLS_SIZE;
+}
+
 static inline uint64_t msr_read_u64_local(uint32_t msr) {
     uint32_t lo = 0, hi = 0;
     asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
@@ -196,11 +234,71 @@ static int elf_validate_header(const Elf64_Ehdr *eh, size_t len) {
     return 1;
 }
 
+/* User images are loaded into the low identity-mapped region by copying to p_vaddr.
+   To avoid corrupting the kernel heap (which is also identity-mapped), keep user
+   segments strictly below the heap base. */
+static uint64_t user_image_limit_bytes(void) {
+    uintptr_t hb = heap_base_addr();
+    /* If heap isn't initialized for some reason, fall back to 64MiB. */
+    if (hb == 0) return 64ULL * 1024ULL * 1024ULL;
+    return (uint64_t)hb;
+}
+
+/* Mark an identity-mapped VA range as user-accessible and writable, and clear NX
+   on the relevant page table entries. This is required for instruction fetch and
+   data access in ring3. We best-effort handle existing 1GiB/2MiB mappings without
+   splitting; for 4KiB mappings we update the leaf entry. */
+static int mark_user_range_exec(uint64_t va_begin, uint64_t va_end) {
+    extern uint64_t page_table_l4[];
+    if (va_end < va_begin) return -1;
+
+    uint64_t begin = va_begin & ~(PAGE_SIZE_2M - 1);
+    uint64_t end = (va_end + PAGE_SIZE_2M - 1) & ~(PAGE_SIZE_2M - 1);
+    for (uint64_t va = begin; va < end; va += PAGE_SIZE_2M) {
+        uint64_t l4i = (va >> 39) & 0x1FF;
+        uint64_t l3i = (va >> 30) & 0x1FF;
+        uint64_t l2i = (va >> 21) & 0x1FF;
+        uint64_t l1i = (va >> 12) & 0x1FF;
+        uint64_t *l4 = (uint64_t*)page_table_l4;
+        if (!(l4[l4i] & PG_PRESENT)) return -1;
+        l4[l4i] |= PG_US | PG_RW;
+        l4[l4i] &= ~PG_NX;
+
+        uint64_t *l3 = (uint64_t*)(uintptr_t)(l4[l4i] & ~0xFFFULL);
+        if (!(l3[l3i] & PG_PRESENT)) return -1;
+        l3[l3i] |= PG_US | PG_RW;
+        l3[l3i] &= ~PG_NX;
+        uint64_t l3e = l3[l3i];
+        if (l3e & PG_PS_2M) {
+            /* 1GiB mapping */
+            invlpg((void*)(uintptr_t)va);
+            continue;
+        }
+
+        uint64_t *l2 = (uint64_t*)(uintptr_t)(l3e & ~0xFFFULL);
+        if (!(l2[l2i] & PG_PRESENT)) return -1;
+        uint64_t l2e = l2[l2i];
+        if (l2e & PG_PS_2M) {
+            /* 2MiB mapping */
+            l2[l2i] |= PG_US | PG_RW;
+            l2[l2i] &= ~PG_NX;
+            invlpg((void*)(uintptr_t)va);
+            continue;
+        }
+
+        uint64_t *l1 = (uint64_t*)(uintptr_t)(l2e & ~0xFFFULL);
+        l1[l1i] |= PG_US | PG_RW;
+        l1[l1i] &= ~PG_NX;
+        invlpg((void*)(uintptr_t)va);
+    }
+    return 0;
+}
+
 int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
-    if (!buf || len < sizeof(Elf64_Ehdr)) return -1;
+    if (!buf || len < sizeof(Elf64_Ehdr)) {kprintf("!buf || len < sizeof(Elf64_Ehdr)\n");return -1;}
     const Elf64_Ehdr *eh = (const Elf64_Ehdr*)buf;
-    if (!elf_validate_header(eh, len)) return -1;
-    if (eh->e_phoff == 0 || eh->e_phnum == 0) return -1;
+    if (!elf_validate_header(eh, len)) return -2;
+    if (eh->e_phoff == 0 || eh->e_phnum == 0) return -3;
 
     /* For ET_DYN (PIE) load at a fixed base within identity-mapped region. */
     uint64_t load_base = 0;
@@ -213,37 +311,37 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
     /* iterate program headers */
     const Elf64_Phdr *ph = (const Elf64_Phdr*)((const char*)buf + eh->e_phoff);
     for (int i = 0; i < eh->e_phnum; i++) {
-        if ((const char*)ph + sizeof(Elf64_Phdr) > (const char*)buf + len) return -1;
+        if ((const char*)ph + sizeof(Elf64_Phdr) > (const char*)buf + len) return -4;
         if (ph->p_type != 1) { ph++; continue; } /* PT_LOAD */
 
         /* Check bounds */
         uint64_t vstart = ph->p_vaddr + load_base;
         uint64_t vend = ph->p_vaddr + load_base + ph->p_memsz;
-        if (vend < vstart) return -1;
+        if (vend < vstart) return -5;
         /* Hard limit for user image virtual range.
            We currently load user binaries into the low identity-mapped region by copying to p_vaddr.
            Keep them below the heap floor (64MiB) to prevent corrupting kernel heap. */
-        const uint64_t USER_IMAGE_LIMIT = 64ULL * 1024ULL * 1024ULL;
+        const uint64_t USER_IMAGE_LIMIT = user_image_limit_bytes();
         if (vend > USER_IMAGE_LIMIT) {
             kprintf("elf: user image too high (segment 0x%llx..0x%llx, limit 0x%llx)\n",
                     (unsigned long long)vstart, (unsigned long long)vend,
                     (unsigned long long)USER_IMAGE_LIMIT);
-            return -4;
+            return -6;
         }
         if (vstart < kernel_end && vend > kernel_start) {
             kprintf("elf: segment overlaps kernel (vaddr 0x%llx..0x%llx kernel 0x%llx..0x%llx)\n",
                 (unsigned long long)vstart, (unsigned long long)vend,
                 (unsigned long long)kernel_start, (unsigned long long)kernel_end);
-            return -2;
+            return -7;
         }
         if (vstart + ph->p_filesz > MMIO_IDENTITY_LIMIT) {
             /* avoid writing above identity-mapped region for now */
             kprintf("elf: segment outside identity-mapped range, unsupported vaddr=0x%llx\n", (unsigned long long)vstart);
-            return -3;
+            return -8;
         }
 
         /* Copy file data into target vaddr (assumes identity mapping) */
-        if (ph->p_offset + ph->p_filesz > len) return -1;
+        if (ph->p_offset + ph->p_filesz > len) return -12;
         void *dst = (void*)(uintptr_t)(ph->p_vaddr + load_base);
         const void *src = (const char*)buf + ph->p_offset;
         /* copy filesz bytes */
@@ -253,62 +351,10 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
             memset((char*)dst + ph->p_filesz, 0, (size_t)(ph->p_memsz - ph->p_filesz));
         }
 
-        /* Ensure pages are user-accessible: set PG_US on existing page-table entries
-           (handles large 1GiB/2MiB mappings created at bootstrap). We don't attempt
-           to split large pages; instead mark the existing mapping as user-accessible. */
-        extern uint64_t page_table_l4[];
-        uint64_t va_begin = ph->p_vaddr & ~(PAGE_SIZE_2M - 1);
-        uint64_t va_end = (ph->p_vaddr + ph->p_memsz + PAGE_SIZE_2M - 1) & ~(PAGE_SIZE_2M - 1);
-        for (uint64_t va = va_begin; va < va_end; va += PAGE_SIZE_2M) {
-            uint64_t l4i = (va >> 39) & 0x1FF;
-            uint64_t l3i = (va >> 30) & 0x1FF;
-            uint64_t l2i = (va >> 21) & 0x1FF;
-            uint64_t l1i = (va >> 12) & 0x1FF;
-            uint64_t *l4 = (uint64_t*)page_table_l4;
-            if (!(l4[l4i] & PG_PRESENT)) {
-                kprintf("elf: no L4 entry for va=0x%llx\n", (unsigned long long)va);
-                return -1;
-            }
-            /* Make sure the PML4 entry itself permits user access (parent entries must not block) */
-            l4[l4i] |= PG_US | PG_RW;
-            l4[l4i] &= ~PG_NX;
-            invlpg((void*)(uintptr_t)va);
-
-            uint64_t *l3 = (uint64_t*)(uintptr_t)(l4[l4i] & ~0xFFFULL);
-            if (!(l3[l3i] & PG_PRESENT)) {
-                kprintf("elf: no L3 entry for va=0x%llx\n", (unsigned long long)va);
-                return -1;
-            }
-            /* PDPT entry must also allow user access, иначе будет #PF err=0x5 при fetch/чтении из ring3. */
-            l3[l3i] |= PG_US | PG_RW;
-            l3[l3i] &= ~PG_NX;
-            uint64_t l3e = l3[l3i];
-            if (l3e & PG_PS_2M) {
-                /* 1GiB mapping at L3: set US and clear NX on L3 entry */
-                l3[l3i] |= PG_US;
-                l3[l3i] &= ~PG_NX;
-                invlpg((void*)(uintptr_t)va);
-                continue;
-            }
-            uint64_t *l2 = (uint64_t*)(uintptr_t)(l3e & ~0xFFFULL);
-            if (!(l2[l2i] & PG_PRESENT)) {
-                kprintf("elf: no L2 entry for va=0x%llx\n", (unsigned long long)va);
-                return -1;
-            }
-            uint64_t l2e = l2[l2i];
-            if (l2e & PG_PS_2M) {
-                /* 2MiB mapping at L2: set US and clear NX on L2 entry */
-                l2[l2i] |= PG_US | PG_RW;
-                l2[l2i] &= ~PG_NX;
-                invlpg((void*)(uintptr_t)va);
-                continue;
-            }
-            uint64_t *l1 = (uint64_t*)(uintptr_t)(l2e & ~0xFFFULL);
-            /* set US and clear NX on L1 entry covering this 4KiB range */
-            l1[l1i] |= PG_US | PG_RW;
-            l1[l1i] &= ~PG_NX;
-            invlpg((void*)(uintptr_t)va);
-        }
+        /* Ensure pages are user-accessible (include load_base for ET_DYN). */
+        uint64_t ua_begin = (ph->p_vaddr + load_base);
+        uint64_t ua_end = (ph->p_vaddr + load_base + ph->p_memsz);
+        if (mark_user_range_exec(ua_begin, ua_end) != 0) return -9;
         ph++;
     }
 
@@ -359,16 +405,101 @@ static void mark_broad_user_ranges_for_exec(void) {
 int elf_load_from_path(const char *path, uint64_t *out_entry) {
     struct fs_file *f = fs_open(path);
     if (!f) return -1;
-    size_t sz = f->size;
-    if (sz == 0 || sz > 16*1024*1024) { fs_file_free(f); return -1; } /* limit 16MB */
-    void *buf = kmalloc(sz);
-    if (!buf) { fs_file_free(f); return -1; }
-    ssize_t r = fs_read(f, buf, sz, 0);
+    size_t fsz = f->size;
+
+    /* Read only the ELF header first (avoid buffering whole file). */
+    Elf64_Ehdr eh;
+    ssize_t rh = fs_read(f, &eh, sizeof(eh), 0);
+    if (rh != (ssize_t)sizeof(eh) || !elf_validate_header(&eh, sizeof(eh))) {
+        fs_file_free(f);
+        return -1;
+    }
+    if (eh.e_phoff == 0 || eh.e_phnum == 0 || eh.e_phentsize != sizeof(Elf64_Phdr)) {
+        fs_file_free(f);
+        return -1;
+    }
+
+    /* For ET_DYN (PIE) load at a fixed base within identity-mapped region. */
+    uint64_t load_base = 0;
+    if (eh.e_type == 3) load_base = ELF_ET_DYN_BASE;
+
+    /* Basic safety: do not allow loading segments that overlap kernel image */
+    uintptr_t kernel_start = (uintptr_t)0x100000; /* from linker.ld */
+    uintptr_t kernel_end = (uintptr_t)_end;
+
+    /* Read program headers */
+    size_t phsz = (size_t)eh.e_phnum * (size_t)eh.e_phentsize;
+    if (phsz == 0 || phsz > 256u * 1024u) { fs_file_free(f); return -1; } /* sanity */
+    Elf64_Phdr *phdrs = (Elf64_Phdr*)kmalloc(phsz);
+    if (!phdrs) { fs_file_free(f); return -1; }
+    ssize_t rp = fs_read(f, phdrs, phsz, (size_t)eh.e_phoff);
+    if (rp != (ssize_t)phsz) { kfree(phdrs); fs_file_free(f); return -1; }
+
+    /* Load PT_LOAD segments directly from file into their target VAs */
+    for (int i = 0; i < (int)eh.e_phnum; i++) {
+        Elf64_Phdr *ph = &phdrs[i];
+        if (ph->p_type != 1) continue; /* PT_LOAD */
+
+        uint64_t vstart = ph->p_vaddr + load_base;
+        uint64_t vend = ph->p_vaddr + load_base + ph->p_memsz;
+        if (vend < vstart) { kfree(phdrs); fs_file_free(f); return -1; }
+
+        /* Keep user images below heap floor (64MiB) to avoid corrupting heap. */
+        const uint64_t USER_IMAGE_LIMIT = user_image_limit_bytes();
+        if (vend > USER_IMAGE_LIMIT) {
+            kprintf("elf: user image too high (segment 0x%llx..0x%llx, limit 0x%llx)\n",
+                    (unsigned long long)vstart, (unsigned long long)vend,
+                    (unsigned long long)USER_IMAGE_LIMIT);
+            kfree(phdrs);
+            fs_file_free(f);
+            return -1;
+        }
+        if (vstart < kernel_end && vend > kernel_start) {
+            kprintf("elf: segment overlaps kernel (vaddr 0x%llx..0x%llx kernel 0x%llx..0x%llx)\n",
+                    (unsigned long long)vstart, (unsigned long long)vend,
+                    (unsigned long long)kernel_start, (unsigned long long)kernel_end);
+            kfree(phdrs);
+            fs_file_free(f);
+            return -1;
+        }
+        if (vstart + ph->p_filesz > MMIO_IDENTITY_LIMIT) {
+            kprintf("elf: segment outside identity-mapped range, unsupported vaddr=0x%llx\n",
+                    (unsigned long long)vstart);
+            kfree(phdrs);
+            fs_file_free(f);
+            return -1;
+        }
+
+        /* Sanity: file bounds if size is known */
+        if (fsz && (uint64_t)ph->p_offset + (uint64_t)ph->p_filesz > (uint64_t)fsz) {
+            kfree(phdrs);
+            fs_file_free(f);
+            return -1;
+        }
+
+        void *dst = (void*)(uintptr_t)(ph->p_vaddr + load_base);
+        if (ph->p_filesz > 0) {
+            ssize_t rr = fs_read(f, dst, (size_t)ph->p_filesz, (size_t)ph->p_offset);
+            if (rr != (ssize_t)ph->p_filesz) {
+                kfree(phdrs);
+                fs_file_free(f);
+                return -1;
+            }
+        }
+        if (ph->p_memsz > ph->p_filesz) {
+            memset((char*)dst + ph->p_filesz, 0, (size_t)(ph->p_memsz - ph->p_filesz));
+        }
+        if (mark_user_range_exec(vstart, vend) != 0) {
+            kfree(phdrs);
+            fs_file_free(f);
+            return -1;
+        }
+    }
+
+    if (out_entry) *out_entry = (uint64_t)eh.e_entry + load_base;
+    kfree(phdrs);
     fs_file_free(f);
-    if (r <= 0 || (size_t)r != sz) { kfree(buf); return -1; }
-    int rc = elf_load_from_memory(buf, sz, out_entry);
-    kfree(buf);
-    return rc;
+    return 0;
 }
 
 /* Kernel execve: load ELF and prepare user stack then transfer to user mode.
@@ -435,7 +566,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     int r = elf_load_from_path(curpath, &entry);
     if (curpath) kfree(curpath);
     if (r != 0) {
-        kprintf("execve: elf_load_from_path failed for %s (rc=%d)\n", path, r);
+        // kprintf("execve: elf_load_from_path failed for %s (rc=%d)\n", path, r);
         return -1;
     }
     /* NOTE:
@@ -504,6 +635,24 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         }
     }
 
+    /* Determine which tid we are preparing the stack/TLS for.
+       If called from ring0 (osh/kernel), we must base the per-thread stack/TLS layout
+       on the tid of the NEW user thread we are about to run, not on the caller's tid0.
+       Using tid0 here causes all user programs spawned from osh to share the same stack
+       slot, which breaks vfork/exec and leads to user-mode #GP after child exit. */
+    thread_t *cur_user = thread_get_current_user();
+    thread_t *planned_ut = NULL;
+    uint64_t planned_tid = 0;
+    if (cur_user) {
+        planned_tid = (uint64_t)cur_user->tid;
+    } else {
+        /* Create the user thread early (BLOCKED) to reserve a unique tid for layout. */
+        extern void user_thread_entry(void);
+        planned_ut = thread_create_blocked(user_thread_entry, path ? path : "user");
+        if (!planned_ut) return -1;
+        planned_tid = (uint64_t)planned_ut->tid;
+    }
+
     /* Build argv strings and pointers in kernel, then copy into user stack area.
        We must ensure the final RSP passed to user mode is 16-byte aligned to avoid
        misaligned iret frame / ABI issues. Compute aligned base accordingly. */
@@ -537,7 +686,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     }
 
     /* Align stack_top downward to 16 bytes */
-    uintptr_t stack_top = (uintptr_t)USER_STACK_TOP;
+    uintptr_t stack_top = user_stack_top_for_tid(planned_tid);
     stack_top &= ~((uintptr_t)0xFULL);
 
     /* provisional base then align final_stack (base-8) to 16 */
@@ -592,8 +741,8 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     /* Ensure the entire user stack mapping is user-accessible (PG_US).
        Without this, the first user push/read will trigger #PF err=0x5. */
     {
-        uintptr_t stack_base = ((uintptr_t)USER_STACK_TOP - USER_STACK_SIZE) & ~0xFFFULL;
-        uintptr_t stack_end = (uintptr_t)USER_STACK_TOP;
+        uintptr_t stack_base = (stack_top - USER_STACK_SIZE) & ~0xFFFULL;
+        uintptr_t stack_end = stack_top;
         if (mark_user_identity_range_2m((uint64_t)stack_base, (uint64_t)stack_end) != 0) {
             kprintf("execve: failed to mark user stack range user-accessible\n");
             return -1;
@@ -606,7 +755,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
        identity mapping and may change -> false "*** stack smashing detected ***".
        We ensure FS points to a stable, user-accessible TLS page with a guard at +0x28. */
     enum { MSR_FS_BASE_LOCAL = 0xC0000100u };
-    const uintptr_t user_tls_base = (uintptr_t)USER_TLS_BASE; /* reserved TLS region (see inc/exec.h) */
+    const uintptr_t user_tls_base = user_tls_base_for_stack_top(stack_top);
     {
         if (user_tls_base + 0x1000u >= (uintptr_t)MMIO_IDENTITY_LIMIT) {
             kprintf("execve: tls base outside identity map\n");
@@ -627,20 +776,60 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     }
 
 
-    /* register user thread info for debugger/listing purposes and allocate kernel stack */
-    thread_t *ut = thread_register_user(entry, final_stack, path);
-    if (ut) {
-        ut->user_fs_base = (uint64_t)user_tls_base;
-        /* allocate kernel stack for the user thread so hardware can switch to a valid RSP0 */
-        void *kst = kmalloc(8192 + 16);
-        if (kst) {
-            ut->kernel_stack = (uint64_t)kst + 8192 + 16;
-            tss_set_rsp0(ut->kernel_stack);
-        } else {
-            /* keep going (less safe), but avoid noisy warnings */
+    /* IMPORTANT: userspace must run from a scheduled kernel thread.
+       Otherwise syscalls run on the TSS RSP0 stack but the scheduler saves/restores
+       `thread_current()->context` for a different stack, and vfork/fork will corrupt
+       kernel context (seen as user-mode #GP with non-canonical pointers after vfork).
+       
+       Strategy:
+       - If we are already in a user thread (thread_get_current_user()!=NULL), perform an
+         in-place exec: update current user thread metadata and jump to user entry.
+       - If called from ring0 (osh/kernel), spawn a new kernel thread that will enter
+         user mode via user_thread_entry, block the caller until it exits, and schedule. */
+    if (cur_user) {
+        /* in-place exec for current user thread */
+        cur_user->user_rip = entry;
+        cur_user->user_stack = final_stack;
+        cur_user->user_fs_base = (uint64_t)user_tls_base;
+        /* update display name */
+        strncpy(cur_user->name, path, sizeof(cur_user->name) - 1);
+        cur_user->name[sizeof(cur_user->name) - 1] = '\0';
+        /* ensure TSS RSP0 points to this thread's kernel stack */
+        if (cur_user->kernel_stack) {
+            tss_set_rsp0(cur_user->kernel_stack);
         }
     } else {
-        /* keep going without a registered user thread */
+        /* spawn a scheduled user thread (already created as planned_ut) and block the caller until it terminates */
+        thread_t *caller = thread_current();
+        thread_t *ut = planned_ut;
+        if (!ut) return -1;
+        ut->ring = 3;
+        ut->user_rip = entry;
+        ut->user_stack = final_stack;
+        ut->user_fs_base = (uint64_t)user_tls_base;
+        /* inherit basic POSIX-ish attributes and stdio from caller (usually tid0 osh) */
+        if (caller) {
+            ut->euid = caller->euid;
+            ut->egid = caller->egid;
+            ut->attached_tty = caller->attached_tty;
+            strncpy(ut->cwd, caller->cwd[0] ? caller->cwd : "/", sizeof(ut->cwd));
+            ut->cwd[sizeof(ut->cwd) - 1] = '\0';
+            for (int i = 0; i < THREAD_MAX_FD; i++) {
+                ut->fds[i] = caller->fds[i];
+                if (ut->fds[i]) {
+                    if (ut->fds[i]->refcount <= 0) ut->fds[i]->refcount = 1;
+                    else ut->fds[i]->refcount++;
+                }
+            }
+            /* block caller until user program exits */
+            ut->waiter_tid = (int)caller->tid;
+            caller->state = THREAD_BLOCKED;
+        }
+        /* Now make the new user thread runnable. */
+        thread_unblock((int)ut->tid);
+        /* schedule immediately; when caller resumes, the program has terminated */
+        thread_schedule();
+        return 0;
     }
 
     /* Debug: print argv/env passed to execve for user debugging (qemu debug) */
@@ -708,7 +897,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     /* Mark 0..ELF_ET_DYN_BASE (0..4MiB) as user-accessible for diagnostic */
     (void)mark_user_identity_range_2m(0, ELF_ET_DYN_BASE);
 
-    /* Transfer to user mode (does not return) */
+    /* Transfer to user mode (does not return on success). */
     enter_user_mode(entry, final_stack);
     return 0; /* not reached */
 }

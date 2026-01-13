@@ -160,21 +160,19 @@ static void ensure_parent_dirs(const char *path) {
     if (len >= sizeof(tmp)) return;
     strcpy(tmp, path);
     /* remove trailing slash if any */
-    if (len > 1 && tmp[len-1] == '/') tmp[len-1] = '\0';
-    for (size_t i = 1; i < strlen(tmp); i++) {
+    if (len > 1 && tmp[len - 1] == '/') {
+        tmp[len - 1] = '\0';
+        len--;
+    }
+    /* IMPORTANT:
+       - do not call strlen() inside the loop (O(n^2) on long paths)
+       - creating prefixes "/a", "/a/b", "/a/b/c" is enough; no extra parent mkdir needed */
+    for (size_t i = 1; i < len; i++) {
         if (tmp[i] == '/') {
             tmp[i] = '\0';
             ramfs_mkdir(tmp);
             tmp[i] = '/';
         }
-    }
-    /* also ensure full parent (directory containing the file) */
-    char *slash = strrchr(tmp, '/');
-    if (slash && slash != tmp) {
-        *slash = '\0';
-        ramfs_mkdir(tmp);
-    } else {
-        /* parent is root - already exists */
     }
 }
 
@@ -182,6 +180,7 @@ static void ensure_parent_dirs(const char *path) {
 static int create_file_with_data(const char *path, const void *data, size_t size) {
     struct fs_file *f = fs_create_file(path);
     if (!f) {
+        klogprintf("initfs: create_file_with_data: fs_create_file returned NULL for %s\n", path);
         return -1;
     }
     /* Ensure the created handle is recognized as a regular file by VFS/drivers.
@@ -342,7 +341,9 @@ int initfs_process_multiboot_module(uint32_t multiboot_magic, uint64_t multiboot
     uint32_t total_size = *(uint32_t*)p;
     /* Deep diagnostic: print header + first tags; this helps when some VMs
        pass different structures / pointers. */
-    if (total_size < 16 || total_size > (64u * 1024u * 1024u)) {
+    /* Allow larger multiboot info blocks (some loaders place large modules).
+       Increase cap to 256 MiB to avoid false-positive 'suspicious' aborts. */
+    if (total_size < 16 || total_size > (256u * 1024u * 1024u)) {
         klogprintf("initfs: suspicious total_size=%u, aborting mb2 scan\n", (unsigned)total_size);
         return 4;
     }
@@ -375,19 +376,24 @@ int initfs_process_multiboot_module(uint32_t multiboot_magic, uint64_t multiboot
                 const void *mod_ptr = (const void*)(uintptr_t)mod_start;
                 klogprintf("initfs: found module '%s' at %p size %u\n", module_name, mod_ptr, (unsigned)mod_size);
                 if (mod_size == 0) return -2;
-                /* Diagnostic / robustness: attempt to copy module into heap and unpack from there.
-                   This can bypass issues with remapped/readonly regions in some VMs. */
+                /* Prefer unpacking directly from the module pointer.
+                   Copying the whole module into heap can easily OOM while we are also
+                   allocating extracted files into ramfs. */
+                int r_direct = unpack_cpio_newc(mod_ptr, mod_size);
+                if (r_direct == 0) return 0;
+
+                /* Fallback: copy module into heap and unpack from there for environments
+                   where direct reads from the module region are unreliable. */
+                klogprintf("initfs: direct unpack failed (%d), trying heap copy fallback\n", r_direct);
                 void *buf = kmalloc(mod_size);
-                if (buf) {
-                    memcpy(buf, mod_ptr, mod_size);
-                    int r = unpack_cpio_newc(buf, mod_size);
-                    kfree(buf);
-                    if (r == 0) return 0;
-                } else {
-                    /* kmalloc failed - will try direct unpack */
+                if (!buf) {
+                    klogprintf("initfs: heap copy fallback failed (kmalloc %u)\n", (unsigned)mod_size);
+                    return r_direct;
                 }
-                /* fallback: try direct unpack from module pointer */
-                return unpack_cpio_newc(mod_ptr, mod_size);
+                memcpy(buf, mod_ptr, mod_size);
+                int r_copy = unpack_cpio_newc(buf, mod_size);
+                kfree(buf);
+                return r_copy;
             }
             }
         }
@@ -397,13 +403,15 @@ int initfs_process_multiboot_module(uint32_t multiboot_magic, uint64_t multiboot
     }
     /* If we didn't find a multiboot module, attempt a tolerant fallback:
        scan low physical memory for a cpio newc magic ("070701"/"070702")
-       and try to unpack from there. This handles environments where the
-       bootloader did not provide multiboot module tags (some VMs/loaders). */
+       and try to unpack from there.
+
+       NOTE: This can be EXTREMELY slow if done byte-by-byte over hundreds of MiB.
+       Keep the scan bounded and coarse; this fallback is only for broken loaders. */
     {
         const uintptr_t scan_start = 0x10000; /* 64KB */
-        const uintptr_t scan_end = 0x4000000; /* 64MB (increased from 16MB for deeper scan) */
-        const uint8_t *mem = (const uint8_t*)(uintptr_t)scan_start;
-        for (uintptr_t a = scan_start; a + 6 <= scan_end; a++) {
+        const uintptr_t scan_end = 0x02000000; /* 32MB max scan to avoid long boot stalls */
+        const uintptr_t stride = 4;            /* cpio newc headers are 4-byte aligned */
+        for (uintptr_t a = scan_start; a + 6 <= scan_end; a += stride) {
             const uint8_t *p6 = (const uint8_t*)(uintptr_t)a;
             if (memcmp(p6, "070701", 6) == 0 || memcmp(p6, "070702", 6) == 0) {
                 size_t remaining = (size_t)(scan_end - a);

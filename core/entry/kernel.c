@@ -61,7 +61,9 @@ static uintptr_t mb2_modules_max_end(uint32_t multiboot_magic, uint64_t multiboo
     uint8_t *p = (uint8_t*)(uintptr_t)multiboot_info;
     uint32_t total_size = *(uint32_t*)p;
 
-    if (total_size < 16 || total_size > (64u * 1024u * 1024u)) return 0;
+    /* Allow larger multiboot info blocks (some bootloaders/VMs may pass large
+       tag regions when modules are large). Increase cap to 256 MiB. */
+    if (total_size < 16 || total_size > (256u * 1024u * 1024u)) return 0;
 
     uint32_t off = 8;
     uintptr_t max_end = 0;
@@ -149,6 +151,7 @@ static ssize_t sysfs_show_ram_mb_attr(char *buf, size_t size, void *priv) {
 void ring0_shell()  { osh_run(); }
 
 void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
+    qemu_debug_printf("Kernel started\n");
     kclear();
     enable_cursor();
     sysinfo_init(multiboot_magic, multiboot_info);
@@ -173,14 +176,19 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 
     gdt_init();
 
-    /* allocate IST1 stack for Double Fault handler to avoid triple-faults */
-    void *df_stack = kmalloc(8192 + 16);
-    if (df_stack) {
-        uint64_t df_top = (uint64_t)df_stack + 8192 + 16;
-        tss_set_ist(1, df_top);
-        kprintf("Set kernel DF IST1 stack at %p.\n", (void*)(uintptr_t)df_top);
-    } else {
-        kprintf("Failed to allocate DF IST stack (warning)\n");
+    /* allocate IST1 stack for Double Fault handler to avoid triple-faults.
+       Use a larger (16KiB) stack and ensure 16-byte alignment of the top. */
+    {
+        const size_t DF_STACK_SIZE = 16 * 1024;
+        void *df_stack = kmalloc(DF_STACK_SIZE + 16);
+        if (df_stack) {
+            uintptr_t top = (uintptr_t)df_stack + DF_STACK_SIZE + 16;
+            uintptr_t df_top = align_up_uintptr(top, 16);
+            tss_set_ist(1, (uint64_t)df_top);
+            kprintf("Set kernel DF IST1 stack at %p.\n", (void*)(uintptr_t)df_top);
+        } else {
+            kprintf("Failed to allocate DF IST stack (warning)\n");
+        }
     }
     int vbe_init;
     /* Initialize VBE framebuffer console after heap is available */
@@ -372,6 +380,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     exec_line("osh");
     
     for(;;) {
-        asm volatile("hlt");
+        asm volatile("sti; hlt" ::: "memory");
     }
 }

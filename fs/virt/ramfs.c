@@ -131,6 +131,46 @@ static struct ramfs_node *ramfs_find_child(struct ramfs_node *parent, const char
     return NULL;
 }
 
+/* Build absolute path to a node into buf. Returns 0 on success.
+   If node is root, returns "/". */
+static int ramfs_build_path(struct ramfs_node *node, char *buf, size_t bufsz) {
+    if (!buf || bufsz == 0) return -1;
+    if (!node) { buf[0] = '\0'; return -1; }
+    if (node == ramfs_root) {
+        if (bufsz < 2) { buf[0] = '\0'; return -1; }
+        buf[0] = '/'; buf[1] = '\0';
+        return 0;
+    }
+
+    /* collect components from node up to (but excluding) root */
+    const char *parts[64];
+    int count = 0;
+    struct ramfs_node *cur = node;
+    while (cur && cur != ramfs_root && count < (int)(sizeof(parts)/sizeof(parts[0]))) {
+        parts[count++] = cur->name ? cur->name : "";
+        cur = cur->parent;
+    }
+    if (!cur) { buf[0] = '\0'; return -1; }
+
+    /* write in reverse */
+    size_t pos = 0;
+    if (pos + 1 >= bufsz) { buf[0] = '\0'; return -1; }
+    buf[pos++] = '/';
+    for (int i = count - 1; i >= 0; i--) {
+        const char *p = parts[i];
+        size_t l = p ? strlen(p) : 0;
+        if (l == 0) continue;
+        if (pos + l + 1 >= bufsz) { buf[0] = '\0'; return -1; }
+        memcpy(buf + pos, p, l);
+        pos += l;
+        if (i != 0) buf[pos++] = '/';
+    }
+    buf[pos] = '\0';
+    /* ensure it is absolute */
+    if (buf[0] != '/') return -1;
+    return 0;
+}
+
 static struct ramfs_node *ramfs_lookup(const char *path) {
     if (!path) return NULL;
     if (strcmp(path, "/") == 0) return ramfs_root;
@@ -173,16 +213,14 @@ static struct ramfs_node *ramfs_lookup(const char *path) {
                     /* relative to parent directory of symlink */
                     /* build parent path */
                     char parentbuf[512];
-                    /* compute parent path of current node */
-                    struct ramfs_node *p = child->parent;
-                    size_t plenp = 0;
                     parentbuf[0] = '\0';
-                    if (p && p != ramfs_root) {
-                        /* reconstruct path by walking up - simple approach: ignore, treat as '/' */
-                        strcpy(parentbuf, "/");
-                    } else {
+                    /* compute absolute directory path of the symlink's parent */
+                    if (ramfs_build_path(child->parent ? child->parent : ramfs_root, parentbuf, sizeof(parentbuf)) != 0) {
                         strcpy(parentbuf, "/");
                     }
+                    /* join parent path + relative target */
+                    size_t plen = strlen(parentbuf);
+                    if (plen > 1 && parentbuf[plen - 1] == '/') parentbuf[plen - 1] = '\0';
                     snprintf(newpath, newlen, "%s/%s", parentbuf, child->data);
                 }
                 if (rest) {
@@ -419,14 +457,33 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
     } else {
         /* kernel context: allow writes */
     }
-    size_t new_size = offset + size;
-    if (new_size > n->size) {
-        char *d = (char*)krealloc(n->data, new_size);
-        if (!d) return -1;
-        n->data = d;
-        n->size = new_size;
+    /* Grow and copy in chunks to avoid one-shot large reallocs where possible.
+       This may allow progress when large contiguous allocations fail. */
+    const size_t CHUNK = 64 * 1024; /* 64 KiB */
+    size_t write_pos = offset;
+    size_t src_pos = 0;
+    size_t remaining = size;
+    while (remaining > 0) {
+        size_t chunk = remaining > CHUNK ? CHUNK : remaining;
+        size_t needed_end = write_pos + chunk;
+        if (needed_end > n->size) {
+            char *d = (char*)krealloc(n->data, needed_end);
+            if (!d) {
+                /* log diagnostic info to help root cause allocation failure */
+                klogprintf("ramfs: write: krealloc failed path=%s offset=%u write_size=%u needed_end=%u heap_used=%llu heap_total=%llu\n",
+                           file && file->path ? file->path : "(null)",
+                           (unsigned)offset, (unsigned)size, (unsigned)needed_end,
+                           (unsigned long long)heap_used_bytes(), (unsigned long long)heap_total_bytes());
+                return -1;
+            }
+            n->data = d;
+            n->size = needed_end;
+        }
+        memcpy(n->data + write_pos, (const char*)buf + src_pos, chunk);
+        write_pos += chunk;
+        src_pos += chunk;
+        remaining -= chunk;
     }
-    memcpy(n->data + offset, buf, size);
     return (ssize_t)size;
 }
 

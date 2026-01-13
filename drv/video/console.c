@@ -14,6 +14,16 @@ void console_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
 	}
 }
 
+int console_max_rows() {
+	if (vbe_is_available()) {
+		uint32_t w = vbe_get_height();
+		uint32_t fontw = 16; /* vbefb uses 8x16 font */
+		if (fontw == 0) return MAX_ROWS;
+		return (int)(w / fontw);
+	}
+	return MAX_ROWS;
+}
+
 int console_max_cols() {
 	if (vbe_is_available()) {
 		uint32_t w = vbe_get_width();

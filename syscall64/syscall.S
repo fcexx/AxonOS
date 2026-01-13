@@ -3,6 +3,20 @@
 .extern syscall_do
 .extern syscall_kernel_rsp0
 .extern syscall_user_rsp_saved
+.extern syscall_user_saved_rbx
+.extern syscall_user_saved_rbp
+.extern syscall_user_saved_r12
+.extern syscall_user_saved_r13
+.extern syscall_user_saved_r14
+.extern syscall_user_saved_r15
+.extern syscall_user_saved_rdi
+.extern syscall_user_saved_rsi
+.extern syscall_user_saved_rdx
+.extern syscall_user_saved_r8
+.extern syscall_user_saved_r9
+.extern syscall_user_saved_r10
+.extern syscall_user_saved_rcx
+.extern syscall_user_saved_r11
 .extern syscall_exit_to_shell_flag
 .extern syscall_return_to_shell
 .extern syscall_exec_trampoline_active
@@ -34,6 +48,11 @@ syscall_entry64:
     movq    syscall_kernel_rsp0(%rip), %rsp
 .no_switch_syscall_stack:
 
+    // Store this syscall's user RSP on the kernel stack too.
+    // Using a global is racy when multiple user threads make syscalls (vfork/exec),
+    // but storing it on each thread's kernel stack keeps it per-thread.
+    pushq   syscall_user_rsp_saved(%rip)
+
     // Save registers (order matches our offset math below).
     pushq   %rax
     pushq   %rcx
@@ -50,6 +69,39 @@ syscall_entry64:
     pushq   %r13
     pushq   %r14
     pushq   %r15
+
+    // Capture callee-saved user registers from the saved frame (needed for vfork).
+    // Frame base: rsp points to saved r15; offsets match the comment below.
+    movq    88(%rsp), %rax      // rbx
+    movq    %rax, syscall_user_saved_rbx(%rip)
+    movq    80(%rsp), %rax      // rbp
+    movq    %rax, syscall_user_saved_rbp(%rip)
+    movq    24(%rsp), %rax      // r12
+    movq    %rax, syscall_user_saved_r12(%rip)
+    movq    16(%rsp), %rax      // r13
+    movq    %rax, syscall_user_saved_r13(%rip)
+    movq    8(%rsp),  %rax      // r14
+    movq    %rax, syscall_user_saved_r14(%rip)
+    movq    0(%rsp),  %rax      // r15
+    movq    %rax, syscall_user_saved_r15(%rip)
+
+    // Capture caller-saved regs as well (to emulate a real SYSCALL return in vfork child).
+    movq    64(%rsp), %rax      // rdi
+    movq    %rax, syscall_user_saved_rdi(%rip)
+    movq    72(%rsp), %rax      // rsi
+    movq    %rax, syscall_user_saved_rsi(%rip)
+    movq    96(%rsp), %rax      // rdx
+    movq    %rax, syscall_user_saved_rdx(%rip)
+    movq    56(%rsp), %rax      // r8
+    movq    %rax, syscall_user_saved_r8(%rip)
+    movq    48(%rsp), %rax      // r9
+    movq    %rax, syscall_user_saved_r9(%rip)
+    movq    40(%rsp), %rax      // r10
+    movq    %rax, syscall_user_saved_r10(%rip)
+    movq    104(%rsp), %rax     // rcx (return RIP)
+    movq    %rax, syscall_user_saved_rcx(%rip)
+    movq    32(%rsp), %rax      // r11 (saved RFLAGS from SYSCALL)
+    movq    %rax, syscall_user_saved_r11(%rip)
 
     // Stack layout at this point (rsp points to r15):
     //  0   r15
@@ -78,9 +130,6 @@ syscall_entry64:
        Here: a4 is saved r10. a5 must be saved r8, a6 must be saved r9. */
     movq    56(%rsp),  %r9      // a5 = user r8
     pushq   48(%rsp)            // a6 = user r9 (7th arg on stack)
-    // save user return RIP (stored by syscall in stack at offset 104) to kernel-global for syscall handlers
-    movq    104(%rsp), %rax
-    movq    %rax, syscall_user_return_rip(%rip)
     call    syscall_do
     addq    $8, %rsp
 
@@ -129,7 +178,13 @@ syscall_entry64:
     // Return to user with IRETQ using the saved return RIP (rcx), flags (r11) and user RSP.
     // USER_DS = 0x23, USER_CS = 0x1B (see cpu/gdt.c)
     pushq   $0x23
-    pushq   syscall_user_rsp_saved(%rip)
+    // push saved user RSP from our per-syscall stack slot (just above this SS)
+    pushq   8(%rsp)
+    /* Ensure user returns with interrupts enabled (IF=1).
+       Some implementations of SYSCALL may present masked RFLAGS in r11
+       (per MSR_FMASK), and restoring them verbatim would leave user mode
+       with IF=0, effectively "disabling interrupts" for the user process. */
+    orq     $0x200, %r11
     pushq   %r11
     pushq   $0x1B
     pushq   %rcx

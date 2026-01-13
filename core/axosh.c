@@ -2409,10 +2409,16 @@ static builtin_fn find_builtin(const char* name) {
    - only from main interactive shell thread (tid==0) and only while we are in ring0 shell.
      This avoids starting ring3 from background jobs (`cmd &` runs in a kernel thread). */
 static int osh_try_exec_external(char **argv, int argc) {
-    if (!argv || argc <= 0 || !argv[0] || !argv[0][0]) return 0;
-    if (thread_get_current_user() != NULL) return 0;
+    /* Return semantics:
+       - returns >=0: command was executed (return value is its status code, usually 0)
+       - returns <0 : not executed / not found
+       Historically kernel_execve_from_path() never returned on success, so this helper
+       always returned 0 and relied on non-return. We now support "spawn + wait" exec
+       from ring0, so we must report execution to avoid "command not found". */
+    if (!argv || argc <= 0 || !argv[0] || !argv[0][0]) return -1;
+    if (thread_get_current_user() != NULL) return -1;
     thread_t *cur = thread_current();
-    if (!cur || cur->tid != 0) return 0;
+    if (!cur || cur->tid != 0) return -1;
 
     const char *cmd = argv[0];
     char fullpath[512];
@@ -2448,9 +2454,10 @@ static int osh_try_exec_external(char **argv, int argc) {
         kfree(kargv);
     }
 
-    /* r==0 doesn't return; if we got here, exec failed -> let caller handle "not found". */
-    (void)r;
-    return 0;
+    /* If exec succeeded, it either did not return (old behavior) or returned after the
+       program exited (spawn+wait). In both cases, treat r==0 as "executed successfully". */
+    if (r == 0) return 0;
+    return -1;
 }
 
 // export builtin names for completion
@@ -2528,8 +2535,8 @@ static int exec_simple(char **argv, int argc, const char *in, char **out, size_t
     builtin_fn fn = find_builtin(argv[0]);
     if (!fn) {
         int tr = osh_try_exec_external(argv, argc);
-        if (tr != 0) return tr;
-        kprintf("<(0c)>osh: %s: command not found\n", argv[0]);
+        if (tr >= 0) return tr; /* executed */
+        kprintf("osh: %s: command not found\n", argv[0]);
         return 1;
     }
     cmd_ctx c = { .argv=argv, .argc=argc, .in=in, .out=out, .out_len=out_len, .out_cap=out_cap };

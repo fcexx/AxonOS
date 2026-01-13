@@ -875,10 +875,11 @@ void devfs_switch_tty(int index) {
         set_cursor((n->cursor_y * MAX_COLS + n->cursor_x) * 2);
     }
     /* set current user/process to first process attached to this tty, if any */
-    extern void thread_set_current_user(thread_t*);
-    extern thread_t* thread_find_by_tty(int);
-    thread_t* t = thread_find_by_tty(index);
-    if (t) thread_set_current_user(t);
+    /* NOTE:
+       Do NOT call thread_set_current_user() here.
+       current_user must track the *currently running* user thread (scheduler-owned),
+       not "foreground tty process". Desync causes syscalls to be dispatched using the
+       wrong thread struct and leads to user-mode GPF after vfork/exec. */
 }
 
 int devfs_tty_count(void) { return DEVFS_TTY_COUNT; }

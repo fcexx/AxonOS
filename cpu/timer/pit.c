@@ -12,10 +12,13 @@
 // Global variables
 volatile uint64_t pit_ticks = 0;
 volatile uint32_t pit_frequency = 1000; // Default 100 Hz
+/* Common tick source used by scheduler/userspace timeouts (monotonic). */
+volatile uint64_t timer_ticks = 0;
 
 // PIT handler - called on IRQ 0
 void pit_handler(cpu_registers_t* regs) {
         pit_ticks++;
+        timer_ticks++;
 
         if (!init) return;
         /* То же правило, что и для APIC: не планируем из IRQ, пришедшего из ring3. */
@@ -92,9 +95,10 @@ uint16_t pit_get_current_count() {
 
 // Sleep for specified number of milliseconds
 void pit_sleep_ms(uint32_t milliseconds) {
-        uint64_t target_ticks = pit_ticks + (milliseconds * pit_frequency / 1000);
+        /* Use common ticks so this keeps working even if PIT is disabled later. */
+        uint64_t target_ticks = timer_ticks + (milliseconds * pit_frequency / 1000);
         
-        while (pit_ticks < target_ticks);
+        while (timer_ticks < target_ticks);
 }
 
 // Get current tick count
@@ -104,7 +108,8 @@ uint64_t pit_get_ticks() {
 
 // Get time in milliseconds since boot
 uint64_t pit_get_time_ms() {
-        return (pit_ticks * 1000) / pit_frequency;
+        /* Prefer common ticks (expected 1ms tick when configured at 1000Hz). */
+        return (timer_ticks * 1000) / pit_frequency;
 }
 
 uint64_t pit_get_frequency() {

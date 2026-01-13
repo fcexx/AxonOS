@@ -16,7 +16,7 @@
 
 // ---- UI layout ----
 #define VIEW_Y0 1
-#define VIEW_H (MAX_ROWS - 2) // 1..23
+#define VIEW_H (console_max_rows() - 2) // 1..23
 #define VIEW_W (console_max_cols())
 #define TAB_WIDTH 4
 
@@ -42,19 +42,43 @@ static uint8_t g_attr_status = 0x78;
 static uint8_t g_attr_text = 0x8F;
 static uint8_t g_attr_text_dim = 0x87;
 
-// View cache to avoid flicker (only update changed cells)
-static uint16_t *g_view_cache[VIEW_H];
+// View cache to avoid flicker (only update changed cells).
+// Use dynamic allocation because console size can be queried at runtime.
+static uint16_t **g_view_cache = NULL;
 static int g_view_cache_valid = 0;
 
 static inline void view_cache_invalidate(void) { g_view_cache_valid = 0; }
-static inline void view_cache_invalidate_row_idx(int idx) {
-    if (idx < 0 || idx >= VIEW_H) return;
-    for (uint32_t x = 0; x < VIEW_W; x++) g_view_cache[idx][x] = 0xFFFF;
-    g_view_cache_valid = 1; // keep valid but row invalidated
+
+static void view_cache_alloc_and_init(void) {
+	int rows = console_max_rows() - 2;
+	int cols = console_max_cols();
+	if (rows <= 0 || cols <= 0) return;
+	if (!g_view_cache) {
+		g_view_cache = (uint16_t**)kcalloc((size_t)rows, sizeof(uint16_t*));
+		if (!g_view_cache) return;
+	}
+	for (int i = 0; i < rows; i++) {
+		if (!g_view_cache[i]) g_view_cache[i] = (uint16_t*)kcalloc((size_t)cols, sizeof(uint16_t));
+		if (g_view_cache[i]) {
+			for (int x = 0; x < cols; x++) g_view_cache[i][x] = 0xFFFF;
+		}
+	}
+	g_view_cache_valid = 1;
 }
+
+static inline void view_cache_invalidate_row_idx(int idx) {
+	int rows = console_max_rows() - 2;
+	if (idx < 0 || idx >= rows) return;
+	if (!g_view_cache) return;
+	int cols = console_max_cols();
+	for (int x = 0; x < cols; x++) g_view_cache[idx][x] = 0xFFFF;
+	/* Mark cache as invalid so next draw will refresh rows. */
+	g_view_cache_valid = 0;
+}
+
 static inline void view_cache_invalidate_line_with_viewtop(int view_top, int row) {
-    int v = row - view_top;
-    view_cache_invalidate_row_idx(v);
+	int v = row - view_top;
+	view_cache_invalidate_row_idx(v);
 }
 
 static void apply_theme(int idx) {
@@ -311,13 +335,13 @@ static void ui_draw_menu(void) {
 }
 
 static void ui_draw_status(Editor *E, const char *msg) {
-	vga_fill_rect(0, MAX_ROWS - 1, console_max_cols(), 1, ' ', g_attr_status);
+	vga_fill_rect(0, console_max_rows() - 1, console_max_cols(), 1, ' ', g_attr_status);
 	// left: file name and modified flag
 	char left[(console_max_cols() > 1 ? (console_max_cols() - 1) : console_max_cols()) + 1];
 	const char *fname = (E && E->filename[0]) ? E->filename : "[No Name]";
 	snprintf(left, sizeof(left), "%s%s", fname, (E && E->modified) ? " *" : "");
 	left[sizeof(left) - 1] = '\0';
-	vga_write_str_xy(1, MAX_ROWS - 1, left, g_attr_status);
+	vga_write_str_xy(1, console_max_rows() - 1, left, g_attr_status);
 	// right: Ln/Col and mode
 	char rbuf[64];
 	int ln = (E ? E->cursor_row : 0) + 1;
@@ -326,11 +350,11 @@ static void ui_draw_status(Editor *E, const char *msg) {
 	snprintf(rbuf, sizeof(rbuf), "Ln %d, Col %d  %s", ln, col, mode);
 	rbuf[sizeof(rbuf) - 1] = '\0';
 	int x = console_max_cols() - (int)strlen(rbuf) - 2; if (x < 0) x = 0;
-	vga_write_str_xy((uint32_t)x, MAX_ROWS - 1, rbuf, g_attr_status);
+	vga_write_str_xy((uint32_t)x, console_max_rows() - 1, rbuf, g_attr_status);
 	// center message if any
 	if (msg && msg[0]) {
 		int cx = (console_max_cols() - (int)strlen(msg)) / 2; if (cx < 0) cx = 0;
-		vga_write_str_xy((uint32_t)cx, MAX_ROWS - 1, msg, g_attr_status);
+		vga_write_str_xy((uint32_t)cx, console_max_rows() - 1, msg, g_attr_status);
 	}
 }
 
@@ -723,10 +747,10 @@ static int prompt_input(const char *title, char *out, int out_size, const char *
 	out[len] = '\0';
 	for (;;) {
 		// draw prompt on status line
-		vga_fill_rect(0, MAX_ROWS - 1, console_max_cols(), 1, ' ', g_attr_status);
-		vga_write_str_xy(1, MAX_ROWS - 1, title, g_attr_status);
-		vga_write_str_xy((uint32_t)(1 + (int)strlen(title)), MAX_ROWS - 1, out, g_attr_status);
-		vga_set_cursor((uint32_t)(1 + (int)strlen(title) + len), MAX_ROWS - 1);
+		vga_fill_rect(0, console_max_rows() - 1, console_max_cols(), 1, ' ', g_attr_status);
+		vga_write_str_xy(1, console_max_rows() - 1, title, g_attr_status);
+		vga_write_str_xy((uint32_t)(1 + (int)strlen(title)), console_max_rows() - 1, out, g_attr_status);
+		vga_set_cursor((uint32_t)(1 + (int)strlen(title) + len), console_max_rows() - 1);
 		char c = kgetc();
 		if (c == '\n' || c == '\r') { out[len] = '\0'; return len > 0; }
 		if (c == 27) { return 0; } // ESC cancel
@@ -972,6 +996,23 @@ void editor_run(const char *path) {
 		return;
 	}
 	apply_theme(0);
+	/* Allocate per-row view cache lazily for current console width.
+	   g_view_cache is an array of row pointers; allocate each row as
+	   uint16_t[cols] so code can safely index g_view_cache[row][col]. */
+	{
+		int cols = console_max_cols();
+		for (int i = 0; i < VIEW_H; i++) {
+			if (!g_view_cache[i]) {
+				g_view_cache[i] = (uint16_t*)kcalloc((size_t)cols, sizeof(uint16_t));
+				if (g_view_cache[i]) {
+					for (int x = 0; x < cols; x++) g_view_cache[i][x] = 0xFFFF;
+				} else {
+					/* allocation failed: ensure cache is treated as invalid */
+					g_view_cache_valid = 0;
+				}
+			}
+		}
+	}
 	if (path && path[0]) {
 		char abs[512]; const char* use = path;
         if (path[0] != '/') { char cwd[256]; osh_get_cwd(cwd, sizeof(cwd)); make_absolute_path(cwd, path, abs, sizeof(abs)); use = abs; }
@@ -992,6 +1033,8 @@ void editor_run(const char *path) {
 	// initial draw
 	kclear_col(0x08);
 	ui_draw_menu();
+	/* Ensure view cache allocated/initialized for current console size. */
+	view_cache_alloc_and_init();
 	ui_draw_view(&E);                                            ///
 	ui_draw_status(&E, "                                    ");
 	ui_place_cursor(&E);
@@ -1102,6 +1145,17 @@ void editor_run(const char *path) {
 	// leave screen clean
 	kclear();
 	buf_free(&E);
+	/* Free per-row view cache allocated for this editor session. */
+	if (g_view_cache) {
+		int rows = console_max_rows() - 2;
+		int cols = console_max_cols();
+		for (int i = 0; i < rows; i++) {
+			if (g_view_cache[i]) { kfree(g_view_cache[i]); g_view_cache[i] = NULL; }
+		}
+		kfree(g_view_cache);
+		g_view_cache = NULL;
+	}
+	g_view_cache_valid = 0;
 }
 
 

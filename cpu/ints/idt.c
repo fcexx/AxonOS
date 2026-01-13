@@ -297,6 +297,25 @@ static void gp_fault_handler(cpu_registers_t* regs){
     // General Protection Fault в пользовательском процессе рассматривается как фатальная ошибка процесса.
     if ((regs->cs & 3) == 3) {
         klogprintf("\nGPF (user-mode) trap.\n");
+        /* Identify which kernel thread/user-thread this happened in */
+        {
+            extern thread_t* thread_current(void);
+            extern thread_t* thread_get_current_user(void);
+            thread_t *kc = thread_current();
+            thread_t *uc = thread_get_current_user();
+            klogprintf("GPF: thread_current tid=%d name=%s ring=%u fs_base=0x%llx state=%d\n",
+                       kc ? (int)kc->tid : -1,
+                       kc ? kc->name : "(null)",
+                       kc ? (unsigned)kc->ring : 0,
+                       (unsigned long long)(kc ? kc->user_fs_base : 0ULL),
+                       kc ? (int)kc->state : -1);
+            klogprintf("GPF: current_user   tid=%d name=%s ring=%u fs_base=0x%llx state=%d\n",
+                       uc ? (int)uc->tid : -1,
+                       uc ? uc->name : "(null)",
+                       uc ? (unsigned)uc->ring : 0,
+                       (unsigned long long)(uc ? uc->user_fs_base : 0ULL),
+                       uc ? (int)uc->state : -1);
+        }
         klogprintf("RIP: 0x%016llx\n", (unsigned long long)regs->rip);
         klogprintf("RSP: 0x%016llx\n", (unsigned long long)regs->rsp);
         klogprintf("RBP: 0x%016llx\n", (unsigned long long)regs->rbp);

@@ -66,6 +66,9 @@ extern int init;
 
 void thread_init();
 thread_t* thread_create(void (*entry)(void), const char* name);
+/* Create a thread but keep it BLOCKED initially (not runnable) so callers can
+   safely initialize fields before scheduling can run it. */
+thread_t* thread_create_blocked(void (*entry)(void), const char* name);
 void thread_yield();
 void thread_schedule();
 thread_t* thread_current();
