@@ -681,7 +681,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     const size_t random_bytes = 16;
     size_t total = ptrs_bytes + strings_size + random_bytes + 32;
     if (total > USER_STACK_SIZE - 128) {
-        kprintf("execve: required stack size too large %u\n", (unsigned)total);
+        kprintf("required stack size too large %u\n", (unsigned)total);
         return -1;
     }
 
@@ -744,7 +744,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         uintptr_t stack_base = (stack_top - USER_STACK_SIZE) & ~0xFFFULL;
         uintptr_t stack_end = stack_top;
         if (mark_user_identity_range_2m((uint64_t)stack_base, (uint64_t)stack_end) != 0) {
-            kprintf("execve: failed to mark user stack range user-accessible\n");
+            kprintf("Failed to mark user stack range user-accessible\n");
             return -1;
         }
     }
