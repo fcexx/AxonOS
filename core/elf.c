@@ -308,6 +308,7 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
     uintptr_t kernel_start = (uintptr_t)0x100000; /* from linker.ld */
     uintptr_t kernel_end = (uintptr_t)_end;
 
+    uint64_t brk_end = 0;
     /* iterate program headers */
     const Elf64_Phdr *ph = (const Elf64_Phdr*)((const char*)buf + eh->e_phoff);
     for (int i = 0; i < eh->e_phnum; i++) {
@@ -355,9 +356,11 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
         uint64_t ua_begin = (ph->p_vaddr + load_base);
         uint64_t ua_end = (ph->p_vaddr + load_base + ph->p_memsz);
         if (mark_user_range_exec(ua_begin, ua_end) != 0) return -9;
+        if (vend > brk_end) brk_end = vend;
         ph++;
     }
 
+    if (brk_end) syscall_set_user_brk((uintptr_t)brk_end);
     if (out_entry) *out_entry = eh->e_entry + load_base;
     return 0;
 }
@@ -419,9 +422,17 @@ int elf_load_from_path(const char *path, uint64_t *out_entry) {
         return -1;
     }
 
-    /* For ET_DYN (PIE) load at a fixed base within identity-mapped region. */
+    /* IMPORTANT:
+       We do not implement dynamic linking (PT_INTERP) nor relocation processing for PIE/ET_DYN yet.
+       Loading ET_DYN images without relocations commonly crashes immediately (NULL/GOT derefs).
+       Return a distinct error so execve can translate it to ENOEXEC instead of letting userspace fault. */
+    if (eh.e_type == 3) {
+        qemu_debug_printf("elf: refusing ET_DYN (PIE) without relocations: %s\n", path ? path : "(null)");
+        fs_file_free(f);
+        return -2;
+    }
+
     uint64_t load_base = 0;
-    if (eh.e_type == 3) load_base = ELF_ET_DYN_BASE;
 
     /* Basic safety: do not allow loading segments that overlap kernel image */
     uintptr_t kernel_start = (uintptr_t)0x100000; /* from linker.ld */
@@ -435,6 +446,17 @@ int elf_load_from_path(const char *path, uint64_t *out_entry) {
     ssize_t rp = fs_read(f, phdrs, phsz, (size_t)eh.e_phoff);
     if (rp != (ssize_t)phsz) { kfree(phdrs); fs_file_free(f); return -1; }
 
+    /* Reject dynamically linked binaries (PT_INTERP) until we have a loader. */
+    for (int i = 0; i < (int)eh.e_phnum; i++) {
+        if (phdrs[i].p_type == 3 /* PT_INTERP */) {
+            qemu_debug_printf("elf: refusing PT_INTERP (dynamic) binary: %s\n", path ? path : "(null)");
+            kfree(phdrs);
+            fs_file_free(f);
+            return -2;
+        }
+    }
+
+    uint64_t brk_end = 0;
     /* Load PT_LOAD segments directly from file into their target VAs */
     for (int i = 0; i < (int)eh.e_phnum; i++) {
         Elf64_Phdr *ph = &phdrs[i];
@@ -494,8 +516,10 @@ int elf_load_from_path(const char *path, uint64_t *out_entry) {
             fs_file_free(f);
             return -1;
         }
+        if (vend > brk_end) brk_end = vend;
     }
 
+    if (brk_end) syscall_set_user_brk((uintptr_t)brk_end);
     if (out_entry) *out_entry = (uint64_t)eh.e_entry + load_base;
     kfree(phdrs);
     fs_file_free(f);
@@ -505,69 +529,125 @@ int elf_load_from_path(const char *path, uint64_t *out_entry) {
 /* Kernel execve: load ELF and prepare user stack then transfer to user mode.
    Simple implementation: expects identity mapping for all segments and stack
    under USER_STACK_TOP (<4GiB). Returns negative on error; on success does not return. */
+static int is_space_char(char c) {
+    return (c == ' ' || c == '\t' || c == '\r' || c == '\n');
+}
+
+/* Parse "#!<interp> [arg]\n" from buffer.
+   Returns 1 on success, 0 if not a shebang or parse error. */
+static int parse_shebang(const uint8_t *buf, size_t n,
+                         char *out_interp, size_t out_interp_sz,
+                         char *out_arg, size_t out_arg_sz) {
+    if (!buf || n < 3) return 0;
+    if (buf[0] != '#' || buf[1] != '!') return 0;
+    if (!out_interp || out_interp_sz == 0) return 0;
+    if (!out_arg || out_arg_sz == 0) return 0;
+
+    size_t i = 2;
+    while (i < n && (buf[i] == ' ' || buf[i] == '\t')) i++;
+    if (i >= n) return 0;
+
+    /* interp path */
+    size_t ip = 0;
+    while (i < n && !is_space_char((char)buf[i])) {
+        if (ip + 1 < out_interp_sz) out_interp[ip++] = (char)buf[i];
+        i++;
+    }
+    out_interp[ip] = '\0';
+    if (ip == 0) return 0;
+
+    /* optional arg */
+    while (i < n && (buf[i] == ' ' || buf[i] == '\t')) i++;
+    size_t ap = 0;
+    while (i < n && !is_space_char((char)buf[i])) {
+        if (ap + 1 < out_arg_sz) out_arg[ap++] = (char)buf[i];
+        i++;
+    }
+    out_arg[ap] = '\0';
+    return 1;
+}
+
+static char *kstrdup_local(const char *s) {
+    if (!s) return NULL;
+    size_t n = strlen(s);
+    char *p = (char*)kmalloc(n + 1);
+    if (!p) return NULL;
+    memcpy(p, s, n + 1);
+    return p;
+}
+
+/* If `path` is a script with shebang, exec its interpreter. */
+static int try_exec_shebang(const char *resolved_path,
+                            const char *orig_path,
+                            const char *const argv[],
+                            const char *const envp[]) {
+    if (!resolved_path || !orig_path) return -1;
+    struct fs_file *f = fs_open(resolved_path);
+    if (!f) return -1;
+
+    uint8_t hdr[256];
+    memset(hdr, 0, sizeof(hdr));
+    ssize_t rr = fs_read(f, hdr, sizeof(hdr) - 1, 0);
+    fs_file_free(f);
+    if (rr <= 0) return -1;
+
+    char interp[192];
+    char arg[64];
+    if (!parse_shebang(hdr, (size_t)rr, interp, sizeof(interp), arg, sizeof(arg))) return -1;
+
+    /* Build new argv: [interp, (arg?), orig_path, argv[1..]] */
+    int argc = 0;
+    while (argv && argv[argc]) argc++;
+    const int has_arg = (arg[0] != '\0');
+    const int tail = (argc > 1) ? (argc - 1) : 0;
+    const int new_argc = 1 + (has_arg ? 1 : 0) + 1 + tail;
+
+    char *k_interp = kstrdup_local(interp);
+    char *k_arg = has_arg ? kstrdup_local(arg) : NULL;
+    const char **nargv = (const char**)kmalloc((size_t)(new_argc + 1) * sizeof(char*));
+    if (!k_interp || (has_arg && !k_arg) || !nargv) {
+        if (nargv) kfree((void*)nargv);
+        if (k_interp) kfree(k_interp);
+        if (k_arg) kfree(k_arg);
+        return -1;
+    }
+
+    int p = 0;
+    nargv[p++] = k_interp;
+    if (has_arg) nargv[p++] = k_arg;
+    nargv[p++] = orig_path;
+    for (int i = 1; i < argc; i++) nargv[p++] = argv[i];
+    nargv[p] = NULL;
+
+    qemu_debug_printf("execve: shebang '%s' -> interp='%s'%s%s%s\n",
+                      resolved_path, interp,
+                      has_arg ? " arg='" : "",
+                      has_arg ? arg : "",
+                      has_arg ? "'" : "");
+
+    int rc = kernel_execve_from_path(k_interp, nargv, envp);
+    kfree((void*)nargv);
+    kfree(k_interp);
+    if (k_arg) kfree(k_arg);
+    return rc;
+}
+
 int kernel_execve_from_path(const char *path, const char *const argv[], const char *const envp[]) {
     if (!path) return -1;
-    /* Resolve symlinks (follow up to 16 levels) */
-    char *curpath = (char*)kmalloc(strlen(path) + 1);
-    if (!curpath) return -1;
-    strcpy(curpath, path);
-    for (int depth = 0; depth < 16; depth++) {
-        struct stat st;
-        if (vfs_stat(curpath, &st) != 0) break;
-        if ((st.st_mode & S_IFLNK) == S_IFLNK) {
-            /* read link target */
-            struct fs_file *lf = fs_open(curpath);
-            if (!lf) break;
-            size_t tsize = (size_t)lf->size;
-            if (tsize == 0) { fs_file_free(lf); break; }
-            size_t cap = tsize + 1;
-            char *tbuf = (char*)kmalloc(cap);
-            if (!tbuf) { fs_file_free(lf); break; }
-            ssize_t rr = fs_read(lf, tbuf, tsize, 0);
-            fs_file_free(lf);
-            if (rr <= 0) { kfree(tbuf); break; }
-            tbuf[rr] = '\\0';
-            /* build new absolute path */
-            char *newpath = NULL;
-            if (tbuf[0] == '/') {
-                newpath = (char*)kmalloc(strlen(tbuf) + 1);
-                if (newpath) strcpy(newpath, tbuf);
-            } else {
-                /* relative: parent dir of curpath + '/' + tbuf */
-                const char *slash = strrchr(curpath, '/');
-                size_t plen = slash ? (size_t)(slash - curpath) : 0;
-                if (plen == 0) plen = 1; /* root */
-                size_t nlen = plen + 1 + strlen(tbuf) + 1;
-                newpath = (char*)kmalloc(nlen);
-                if (newpath) {
-                    if (plen == 1) {
-                        /* parent is root */
-                        newpath[0] = '/'; newpath[1] = '\\0';
-                    } else {
-                        strncpy(newpath, curpath, plen);
-                        newpath[plen] = '\\0';
-                    }
-                    /* ensure trailing slash */
-                    size_t curl = strlen(newpath);
-                    if (newpath[curl-1] != '/') strncat(newpath, "/", nlen - curl - 1);
-                    strncat(newpath, tbuf, nlen - strlen(newpath) - 1);
-                }
-            }
-            kfree(tbuf);
-            if (!newpath) break;
-            kfree(curpath);
-            curpath = newpath;
-            /* continue resolving */
-            continue;
-        }
-        break;
-    }
+    /* IMPORTANT:
+       Symlinks are resolved by VFS (`fs_open()` does it via `fs_resolve_symlinks()`).
+       Do NOT attempt to "readlink" via fs_open() here, because that would read the
+       *target file* (already resolved) rather than the symlink contents. */
+    const char *curpath = path;
     uint64_t entry = 0;
     int r = elf_load_from_path(curpath, &entry);
-    if (curpath) kfree(curpath);
+    if (r == -2) {
+        /* unsupported ELF format (dynamic/PIE without relocations) */
+        return -2;
+    }
     if (r != 0) {
-        // kprintf("execve: elf_load_from_path failed for %s (rc=%d)\n", path, r);
-        return -1;
+        /* Not an ELF. Try shebang scripts (e.g. /linuxrc). */
+        return try_exec_shebang(curpath, path, argv, envp);
     }
     /* NOTE:
        We currently execute user programs in the *same* address space (same CR3),
@@ -749,30 +829,61 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         }
     }
 
-    /* Seed an initial TLS base + stack canary guard before entering userspace.
-       Some libcs may execute stack-protected code before they set up TLS. If FS base is 0,
-       GCC's stack protector reads canary from fs:0x28, which is physical address 0x28 under
-       identity mapping and may change -> false "*** stack smashing detected ***".
-       We ensure FS points to a stable, user-accessible TLS page with a guard at +0x28. */
+    /* Seed a minimal TLS/TCB layout before entering userspace.
+       Why: busybox in your initfs is **glibc static**, and glibc expects some TLS/TCB
+       fields to exist immediately. In particular, early code may call pthread_getspecific(),
+       which on x86_64 glibc reads a pointer from %fs:-0x78 and then indexes at +0x80.
+       If %fs points to an uninitialized area, this turns into a NULL/low-memory deref
+       (exactly the CR2=0xa8 fault you saw).
+
+       Strategy (minimal, single-thread-friendly):
+       - Reserve a TLS region of size USER_TLS_SIZE (already carved in layout).
+       - Place %fs base one page *inside* the region so both positive offsets (e.g. canary at +0x28)
+         and negative offsets (e.g. -0x78) stay inside mapped memory.
+       - Write a pointer at %fs:-0x78 to a zeroed "fake pthread" structure which contains a
+         zeroed specifics array starting at +0x80. This makes pthread_getspecific() return NULL
+         instead of crashing, which is enough for glibc/busybox to continue bootstrap. */
     enum { MSR_FS_BASE_LOCAL = 0xC0000100u };
-    const uintptr_t user_tls_base = user_tls_base_for_stack_top(stack_top);
+    const uintptr_t tls_region_base = user_tls_base_for_stack_top(stack_top);
+    const uintptr_t fs_base = tls_region_base + 0x1000u;      /* keep -0x78 and +0x28 in-range */
+    const uintptr_t pthread_fake = tls_region_base + 0x2000u; /* within first few pages */
     {
-        if (user_tls_base + 0x1000u >= (uintptr_t)MMIO_IDENTITY_LIMIT) {
+        /* Need a few pages inside the TLS region for our minimal layout. */
+        if (pthread_fake + 0x1000u >= (uintptr_t)MMIO_IDENTITY_LIMIT) {
             kprintf("execve: tls base outside identity map\n");
             return -1;
         }
-        if (mark_user_identity_range_2m((uint64_t)user_tls_base, (uint64_t)(user_tls_base + 0x1000u)) != 0) {
+        if (mark_user_identity_range_2m((uint64_t)tls_region_base, (uint64_t)(pthread_fake + 0x1000u)) != 0) {
             kprintf("execve: failed to mark TLS range user-accessible\n");
             return -1;
         }
-        memset((void*)user_tls_base, 0, 0x1000u);
+        /* Clear the first 3 pages we use */
+        memset((void*)tls_region_base, 0, 0x3000u);
         uint64_t guard = 0;
         if (random_addr + 16 <= (uintptr_t)MMIO_IDENTITY_LIMIT) guard = *(uint64_t*)(uintptr_t)random_addr;
         else guard = 0x8b13f00d2a11c0deULL;
         /* glibc uses a "terminator canary": least-significant byte is 0 */
         guard &= ~0xFFULL;
-        *(volatile uint64_t*)(uintptr_t)(user_tls_base + 0x28u) = guard;
-        msr_write_u64_local(MSR_FS_BASE_LOCAL, (uint64_t)user_tls_base);
+        *(volatile uint64_t*)(uintptr_t)(fs_base + 0x28u) = guard;
+
+        /* pthread_getspecific() expects *(%fs:-0x78) to be a valid pointer. */
+        *(volatile uint64_t*)(uintptr_t)(fs_base - 0x78u) = (uint64_t)pthread_fake;
+
+        /* glibc locale bootstrap:
+           Some early code uses pthread_getspecific(5) and expects a non-NULL pointer whose
+           first byte can be compared to 'C'. Provide a minimal default "C" string. */
+        {
+            const uintptr_t c_str = tls_region_base + 0x2800u;
+            if (c_str + 2 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                *(volatile uint8_t*)(uintptr_t)(c_str + 0) = (uint8_t)'C';
+                *(volatile uint8_t*)(uintptr_t)(c_str + 1) = 0;
+                /* specifics array base is at +0x80 in glibc's struct pthread */
+                const uintptr_t specific5_slot = pthread_fake + 0x80u + (uintptr_t)(5u * 8u);
+                *(volatile uint64_t*)(uintptr_t)specific5_slot = (uint64_t)c_str;
+            }
+        }
+
+        msr_write_u64_local(MSR_FS_BASE_LOCAL, (uint64_t)fs_base);
     }
 
 
@@ -790,7 +901,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         /* in-place exec for current user thread */
         cur_user->user_rip = entry;
         cur_user->user_stack = final_stack;
-        cur_user->user_fs_base = (uint64_t)user_tls_base;
+        cur_user->user_fs_base = (uint64_t)fs_base;
         /* update display name */
         strncpy(cur_user->name, path, sizeof(cur_user->name) - 1);
         cur_user->name[sizeof(cur_user->name) - 1] = '\0';
@@ -806,7 +917,11 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         ut->ring = 3;
         ut->user_rip = entry;
         ut->user_stack = final_stack;
-        ut->user_fs_base = (uint64_t)user_tls_base;
+        ut->user_fs_base = (uint64_t)fs_base;
+        /* Mark PID 1 only for kernel-launched init candidates */
+        if (strcmp(path, "/init") == 0 || strcmp(path, "/sbin/init") == 0) {
+            thread_mark_init_user(ut);
+        }
         /* inherit basic POSIX-ish attributes and stdio from caller (usually tid0 osh) */
         if (caller) {
             ut->euid = caller->euid;
@@ -866,12 +981,16 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     /* wrap read in a benign check */
     first = entry_b[0];
 
-    /* If this thread was created via vfork, wake parent now (child is about to exec). */
+    /* If this thread was created via vfork, we normally wake parent on exec.
+       However, in a shared address space we keep the parent blocked when a full
+       memory snapshot is active, and only restore/unblock on child exit. */
     {
         thread_t *tc = thread_current();
         if (tc && tc->vfork_parent_tid >= 0) {
-            thread_unblock(tc->vfork_parent_tid);
-            tc->vfork_parent_tid = -1;
+            if (!tc->vfork_parent_mem_backup) {
+                thread_unblock(tc->vfork_parent_tid);
+                tc->vfork_parent_tid = -1;
+            }
         }
     }
 

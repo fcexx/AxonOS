@@ -171,6 +171,39 @@ static int ramfs_build_path(struct ramfs_node *node, char *buf, size_t bufsz) {
     return 0;
 }
 
+/* Lookup node by absolute path WITHOUT following symlinks.
+   If a symlink appears in the middle of the path, we treat it as non-directory and fail. */
+static struct ramfs_node *ramfs_lookup_nofollow(const char *path) {
+    if (!path) return NULL;
+    if (strcmp(path, "/") == 0) return ramfs_root;
+    if (path[0] != '/') return NULL;
+
+    size_t plen = strlen(path);
+    char *tmp = (char*)kmalloc(plen + 1);
+    if (!tmp) return NULL;
+    memcpy(tmp, path + 1, plen); /* skip leading '/' */
+    tmp[plen] = '\0';
+
+    struct ramfs_node *cur = ramfs_root;
+    char *tok = strtok(tmp, "/");
+    while (tok && cur) {
+        struct ramfs_node *child = ramfs_find_child(cur, tok);
+        if (!child) { kfree(tmp); return NULL; }
+        /* If this is a symlink and there are more components, fail (nofollow). */
+        if ((child->mode & S_IFLNK) == S_IFLNK) {
+            char *peek = strtok(NULL, "/");
+            if (peek) { kfree(tmp); return NULL; }
+            /* it was the last component */
+            kfree(tmp);
+            return child;
+        }
+        cur = child;
+        tok = strtok(NULL, "/");
+    }
+    kfree(tmp);
+    return cur;
+}
+
 static struct ramfs_node *ramfs_lookup(const char *path) {
     if (!path) return NULL;
     if (strcmp(path, "/") == 0) return ramfs_root;
@@ -343,7 +376,10 @@ static int ramfs_create(const char *path, struct fs_file **out_file) {
 }
 
 static int ramfs_open(const char *path, struct fs_file **out_file) {
-    struct ramfs_node *n = ramfs_lookup(path);
+    /* IMPORTANT: do NOT follow symlinks here.
+       VFS (`fs_open`) is responsible for resolving symlinks in paths.
+       Returning the symlink node allows lstat/readlink to work. */
+    struct ramfs_node *n = ramfs_lookup_nofollow(path);
     if (!n) return -1;
     struct fs_file *f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
     if (!f) return -2;

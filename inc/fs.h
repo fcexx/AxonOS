@@ -80,6 +80,8 @@ ssize_t fs_readdir_next(struct fs_file *file, void *buf, size_t size);
 /* POSIX-like stat helpers */
 int vfs_fstat(struct fs_file *file, struct stat *st);
 int vfs_stat(const char *path, struct stat *st);
+int vfs_lstat(const char *path, struct stat *st);
+ssize_t vfs_readlink(const char *path, char *buf, size_t bufsiz);
 int fs_chmod(const char *path, mode_t mode);
 int fs_mkdir(const char *path);
 

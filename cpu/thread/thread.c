@@ -18,6 +18,22 @@ static thread_t* current_user = NULL; // регистрируемый юзер-�
 static thread_t* idle_thread = NULL;  /* always-runnable idle task */
 static int idle_tid = -1;
 int init = 0;
+static int init_user_tid = -1;
+
+/* forward declaration */
+thread_t* thread_get(int pid);
+
+void thread_mark_init_user(thread_t* t) {
+        if (!t) return;
+        if (init_user_tid < 0) {
+                init_user_tid = (int)t->tid;
+                return;
+        }
+        thread_t *it = thread_get(init_user_tid);
+        if (!it || it->state == THREAD_TERMINATED) {
+                init_user_tid = (int)t->tid;
+        }
+}
 static thread_t main_thread;
 
 /* Kernel stack size per thread.
@@ -130,10 +146,36 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->egid = 0;
         t->attached_tty = -1;
         t->vfork_parent_tid = -1;
+        t->vfork_parent_saved_rsp = 0;
+        t->vfork_parent_stack_backup = NULL;
+        t->vfork_parent_stack_backup_len = 0;
+        t->vfork_parent_mem_backup = NULL;
+        t->vfork_parent_mem_backup_len = 0;
+        t->vfork_parent_mem_backup_base = 0;
+        t->vfork_parent_brk_saved = 0;
+        t->user_brk_base = 0;
+        t->user_brk_cur = 0;
+        t->user_mmap_next = 0;
         t->rseq_ptr = NULL;
         t->parent_tid = -1;
         t->saved_user_rip = 0;
         t->saved_user_rsp = 0;
+        t->saved_user_rbx = 0;
+        t->saved_user_rbp = 0;
+        t->saved_user_r12 = 0;
+        t->saved_user_r13 = 0;
+        t->saved_user_r14 = 0;
+        t->saved_user_r15 = 0;
+        t->saved_user_rdi = 0;
+        t->saved_user_rsi = 0;
+        t->saved_user_rdx = 0;
+        t->saved_user_r8 = 0;
+        t->saved_user_r9 = 0;
+        t->saved_user_r10 = 0;
+        t->saved_user_r11 = 0;
+        t->saved_user_rcx = 0;
+        t->saved_syscall_frame = NULL;
+        t->pending_signals = 0;
         t->waiter_tid = -1;
         t->exit_status = 0;
         t->exec_trampoline_flag = 0;
@@ -188,8 +230,36 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         } else { t->euid = 0; t->egid = 0; t->attached_tty = devfs_get_active(); }
         if (!t->cwd[0]) { strncpy(t->cwd, "/", sizeof(t->cwd)); t->cwd[sizeof(t->cwd)-1] = '\0'; }
         t->vfork_parent_tid = -1;
+        t->vfork_parent_saved_rsp = 0;
+        t->vfork_parent_stack_backup = NULL;
+        t->vfork_parent_stack_backup_len = 0;
+        t->vfork_parent_mem_backup = NULL;
+        t->vfork_parent_mem_backup_len = 0;
+        t->vfork_parent_mem_backup_base = 0;
+        t->vfork_parent_brk_saved = 0;
+        t->user_brk_base = 0;
+        t->user_brk_cur = 0;
+        t->user_mmap_next = 0;
         t->rseq_ptr = NULL;
         t->parent_tid = -1;
+        t->saved_user_rip = 0;
+        t->saved_user_rsp = 0;
+        t->saved_user_rbx = 0;
+        t->saved_user_rbp = 0;
+        t->saved_user_r12 = 0;
+        t->saved_user_r13 = 0;
+        t->saved_user_r14 = 0;
+        t->saved_user_r15 = 0;
+        t->saved_user_rdi = 0;
+        t->saved_user_rsi = 0;
+        t->saved_user_rdx = 0;
+        t->saved_user_r8 = 0;
+        t->saved_user_r9 = 0;
+        t->saved_user_r10 = 0;
+        t->saved_user_r11 = 0;
+        t->saved_user_rcx = 0;
+        t->saved_syscall_frame = NULL;
+        t->pending_signals = 0;
         t->waiter_tid = -1;
         t->exit_status = 0;
         t->exec_trampoline_flag = 0;
@@ -199,6 +269,10 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         threads[thread_count++] = t;
         current_user = t;
         return t;
+}
+
+int thread_get_init_user_tid(void) {
+        return init_user_tid;
 }
 
 // Entry for kernel-created user threads: set up per-thread kernel stack as TSS, mark as current_user

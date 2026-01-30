@@ -56,6 +56,11 @@
 #define SYS_newfstatat 262
 #define SYS_tgkill  234
 #define SYS_sendfile 40
+#define SYS_mount   165
+#define SYS_rt_sigtimedwait 128
+#define SYS_clock_nanosleep 230
+#define SYS_gettimeofday 169
+#define SYS_access 21
 
 /* initialize syscall subsystem (register handler) */
 void syscall_init(void);

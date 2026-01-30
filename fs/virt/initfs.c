@@ -282,12 +282,17 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
             if (ramfs_mkdir(target) < 0) {
                 /* ignore existing or other minor errors */
             }
+            /* Apply exact mode bits from archive (includes S_IFDIR + perms). */
+            (void)fs_chmod(target, (mode_t)mode);
         } else if ((mode & 0170000u) == 0100000u) {
             /* regular file */
             ensure_parent_dirs(target);
             const void *file_data = base + file_data_offset;
             if (create_file_with_data(target, file_data, filesize) != 0) {
                 klogprintf("initfs: warning: failed to create %s (ingore)\n", target);
+            } else {
+                /* Apply exact mode bits from archive (includes S_IFREG + perms, esp. +x). */
+                (void)fs_chmod(target, (mode_t)mode);
             }
         } else if ((mode & 0170000u) == 0120000u) {
             /* symbolic link: file data contains link target */

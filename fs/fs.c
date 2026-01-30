@@ -189,108 +189,190 @@ static struct fs_file *fs_open_no_resolve(const char *path) {
 
 /* Разрешает симлинки в пути, возвращает новый путь или NULL при ошибке.
    Вызывающий должен освободить возвращенный путь через kfree. */
+static int fs_readlink_no_resolve(const char *path, char *out, size_t out_cap, size_t *out_len) {
+    if (!path || !out || out_cap == 0) return -1;
+    struct fs_file *lf = fs_open_no_resolve(path);
+    if (!lf) return -1;
+    struct stat st;
+    int sr = vfs_fstat(lf, &st);
+    if (sr != 0 || ((st.st_mode & S_IFLNK) != S_IFLNK)) {
+        fs_file_free(lf);
+        return -1;
+    }
+    size_t sz = (size_t)lf->size;
+    if (sz == 0) { fs_file_free(lf); return -1; }
+    if (sz >= out_cap) sz = out_cap - 1;
+    ssize_t rr = fs_read(lf, out, sz, 0);
+    fs_file_free(lf);
+    if (rr <= 0) return -1;
+    out[(size_t)rr] = '\0';
+    if (out_len) *out_len = (size_t)rr;
+    return 0;
+}
+
+/* Normalize an absolute path:
+   - collapse repeated '/'
+   - remove '.' components
+   - resolve '..' components (without going above '/')
+   Returns newly allocated string (caller must kfree), or NULL on OOM. */
+static char *fs_normalize_abs_path(const char *in) {
+    if (!in) return NULL;
+    if (in[0] != '/') {
+        /* only absolute supported here */
+        char *cp = (char*)kmalloc(strlen(in) + 1);
+        if (cp) strcpy(cp, in);
+        return cp;
+    }
+    const char *parts[96];
+    size_t plen[96];
+    int pc = 0;
+    const char *p = in;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *seg = p;
+        while (*p && *p != '/') p++;
+        size_t len = (size_t)(p - seg);
+        if (len == 0) continue;
+        if (len == 1 && seg[0] == '.') {
+            /* skip */
+        } else if (len == 2 && seg[0] == '.' && seg[1] == '.') {
+            if (pc > 0) pc--;
+        } else {
+            if (pc < (int)(sizeof(parts)/sizeof(parts[0]))) {
+                parts[pc] = seg;
+                plen[pc] = len;
+                pc++;
+            }
+        }
+    }
+    /* compute size */
+    size_t out_len = 1; /* leading '/' */
+    for (int i = 0; i < pc; i++) out_len += plen[i] + 1;
+    if (out_len < 2) out_len = 2;
+    char *out = (char*)kmalloc(out_len);
+    if (!out) return NULL;
+    size_t w = 0;
+    out[w++] = '/';
+    for (int i = 0; i < pc; i++) {
+        if (w > 1 && out[w - 1] != '/') out[w++] = '/';
+        memcpy(out + w, parts[i], plen[i]);
+        w += plen[i];
+        out[w] = '\0';
+        if (i + 1 < pc) out[w++] = '/';
+    }
+    if (w == 0) { out[0] = '/'; w = 1; }
+    out[w] = '\0';
+    return out;
+}
+
+/* Resolve symlinks anywhere in the path (like a simplified realpath).
+   - follows up to 16 symlinks
+   - follows symlinks in intermediate components always
+   - follows final symlink too (for open/exec)
+   Returns newly allocated absolute path on success; caller must kfree(). */
 static char *fs_resolve_symlinks(const char *path) {
     if (!path) return NULL;
-    char *curpath = (char*)kmalloc(strlen(path) + 1);
-    if (!curpath) return NULL;
-    strcpy(curpath, path);
-    
+    char *cur = (char*)kmalloc(strlen(path) + 1);
+    if (!cur) return NULL;
+    strcpy(cur, path);
+
     for (int depth = 0; depth < 16; depth++) {
-        struct stat st;
-        /* используем fs_open_no_resolve для проверки, чтобы избежать рекурсии */
-        struct fs_file *check_file = fs_open_no_resolve(curpath);
-        if (!check_file) {
-            /* файл не существует, возвращаем текущий путь */
-            return curpath;
-        }
-        int stat_result = vfs_fstat(check_file, &st);
-        fs_file_free(check_file);
-        if (stat_result != 0) {
-            /* не удалось получить stat, возвращаем текущий путь */
-            return curpath;
-        }
-        
-        /* если это не симлинк, возвращаем текущий путь */
-        if ((st.st_mode & S_IFLNK) != S_IFLNK) {
-            return curpath;
-        }
-        
-        /* читаем содержимое симлинка (без разрешения симлинков) */
-        struct fs_file *lf = fs_open_no_resolve(curpath);
-        if (!lf) {
-            /* не удалось открыть симлинк, возвращаем текущий путь */
-            return curpath;
-        }
-        
-        size_t tsize = (size_t)lf->size;
-        if (tsize == 0) {
-            fs_file_free(lf);
-            return curpath;
-        }
-        
-        size_t cap = tsize + 1;
-        char *tbuf = (char*)kmalloc(cap);
-        if (!tbuf) {
-            fs_file_free(lf);
-            kfree(curpath);
-            return NULL;
-        }
-        
-        ssize_t rr = fs_read(lf, tbuf, tsize, 0);
-        fs_file_free(lf);
-        if (rr <= 0) {
-            kfree(tbuf);
-            return curpath;
-        }
-        tbuf[rr] = '\0';
-        
-        /* строим новый абсолютный путь */
-        char *newpath = NULL;
-        if (tbuf[0] == '/') {
-            /* абсолютный путь */
-            newpath = (char*)kmalloc(strlen(tbuf) + 1);
-            if (newpath) {
-                strcpy(newpath, tbuf);
+        /* Walk prefixes: /a, /a/b, /a/b/c ... and detect first symlink. */
+        if (cur[0] != '/') return cur;
+        size_t len = strlen(cur);
+        size_t i = 1;
+        int restarted = 0;
+        while (i < len) {
+            while (i < len && cur[i] == '/') i++;
+            if (i >= len) break;
+            size_t comp_end = i;
+            while (comp_end < len && cur[comp_end] != '/') comp_end++;
+
+            /* prefix = cur[0:comp_end] */
+            size_t prefix_len = comp_end;
+            char *prefix = (char*)kmalloc(prefix_len + 1);
+            if (!prefix) { kfree(cur); return NULL; }
+            memcpy(prefix, cur, prefix_len);
+            prefix[prefix_len] = '\0';
+
+            struct fs_file *pf = fs_open_no_resolve(prefix);
+            if (!pf) {
+                /* prefix does not exist -> stop resolving and return current path */
+                kfree(prefix);
+                return cur;
             }
-        } else {
-            /* относительный путь: родительская директория curpath + '/' + tbuf */
-            const char *slash = strrchr(curpath, '/');
-            size_t plen = slash ? (size_t)(slash - curpath) : 0;
-            if (plen == 0) plen = 1; /* корень */
-            
-            size_t nlen = plen + 1 + strlen(tbuf) + 1;
-            newpath = (char*)kmalloc(nlen);
-            if (newpath) {
-                if (plen == 1) {
-                    /* родитель - корень */
-                    newpath[0] = '/';
-                    newpath[1] = '\0';
+            struct stat st;
+            int sr = vfs_fstat(pf, &st);
+            fs_file_free(pf);
+            if (sr != 0) { kfree(prefix); return cur; }
+
+            if ((st.st_mode & S_IFLNK) == S_IFLNK) {
+                /* read link target */
+                char target[512];
+                size_t tlen = 0;
+                if (fs_readlink_no_resolve(prefix, target, sizeof(target), &tlen) != 0) {
+                    kfree(prefix);
+                    return cur;
+                }
+
+                /* remaining path after this component (including leading slash if any) */
+                const char *rest = (comp_end < len) ? (cur + comp_end) : "";
+
+                /* build base path from target (absolute or relative-to-parent) */
+                char base[768];
+                if (target[0] == '/') {
+                    strncpy(base, target, sizeof(base) - 1);
+                    base[sizeof(base) - 1] = '\0';
                 } else {
-                    strncpy(newpath, curpath, plen);
-                    newpath[plen] = '\0';
+                    /* parent directory of prefix */
+                    const char *slash = strrchr(prefix, '/');
+                    size_t plen = slash ? (size_t)(slash - prefix) : 0;
+                    if (plen == 0) plen = 1;
+                    if (plen >= sizeof(base) - 2) plen = sizeof(base) - 2;
+                    memcpy(base, prefix, plen);
+                    base[plen] = '\0';
+                    if (plen == 1) { base[0] = '/'; base[1] = '\0'; }
+                    size_t bl = strlen(base);
+                    if (bl > 1 && base[bl - 1] == '/') base[bl - 1] = '\0';
+                    bl = strlen(base);
+                    if (bl + 1 < sizeof(base)) { base[bl] = '/'; base[bl + 1] = '\0'; }
+                    strncat(base, target, sizeof(base) - strlen(base) - 1);
                 }
-                /* добавляем '/' если нужно */
-                size_t curl = strlen(newpath);
-                if (newpath[curl-1] != '/') {
-                    strncat(newpath, "/", nlen - curl - 1);
+
+                /* join base + rest */
+                size_t newcap = strlen(base) + strlen(rest) + 2;
+                char *newp = (char*)kmalloc(newcap);
+                if (!newp) { kfree(prefix); kfree(cur); return NULL; }
+                strcpy(newp, base);
+                if (rest[0]) {
+                    size_t bl = strlen(newp);
+                    if (bl > 0 && newp[bl - 1] == '/' && rest[0] == '/') {
+                        strncat(newp, rest + 1, newcap - strlen(newp) - 1);
+                    } else {
+                        strncat(newp, rest, newcap - strlen(newp) - 1);
+                    }
                 }
-                strncat(newpath, tbuf, nlen - strlen(newpath) - 1);
+
+                kfree(prefix);
+                kfree(cur);
+                /* normalize (handle ../ in symlink target) */
+                {
+                    char *norm = fs_normalize_abs_path(newp);
+                    kfree(newp);
+                    if (!norm) return NULL;
+                    cur = norm;
+                }
+                restarted = 1;
+                break; /* restart outer depth loop */
             }
+
+            kfree(prefix);
+            i = comp_end;
         }
-        
-        kfree(tbuf);
-        kfree(curpath);
-        
-        if (!newpath) {
-            return NULL;
-        }
-        
-        curpath = newpath;
-        /* продолжаем цикл для разрешения следующего уровня */
+        if (!restarted) return cur;
     }
-    
-    /* достигнут лимит глубины, возвращаем последний путь */
-    return curpath;
+    return cur;
 }
 
 /* Try drivers in registration order. Drivers should return -1 if they do not handle the path. */
@@ -474,4 +556,31 @@ int vfs_stat(const char *path, struct stat *st) {
     int r = vfs_fstat(f, st);
     fs_file_free(f);
     return r;
+}
+
+/* Like lstat(): do not follow the final symlink. */
+int vfs_lstat(const char *path, struct stat *st) {
+    if (!path || !st) return -1;
+    struct fs_file *f = fs_open_no_resolve(path);
+    if (!f) return -1;
+    int r = vfs_fstat(f, st);
+    fs_file_free(f);
+    return r;
+}
+
+/* Read symlink target into buf. Returns bytes copied (no NUL) or -1 on error. */
+ssize_t vfs_readlink(const char *path, char *buf, size_t bufsiz) {
+    if (!path || !buf || bufsiz == 0) return -1;
+    struct fs_file *f = fs_open_no_resolve(path);
+    if (!f) return -1;
+    struct stat st;
+    if (vfs_fstat(f, &st) != 0 || ((st.st_mode & S_IFLNK) != S_IFLNK)) {
+        fs_file_free(f);
+        return -1;
+    }
+    size_t sz = (size_t)f->size;
+    if (sz > bufsiz) sz = bufsiz;
+    ssize_t rr = fs_read(f, buf, sz, 0);
+    fs_file_free(f);
+    return rr;
 }

@@ -178,11 +178,12 @@ void kputchar(uint8_t character, uint8_t attribute_byte)
 	}
 	else if (character == '\b')
 	{
-		set_cursor_nolock(get_cursor_nolock() - 1);
-		/* recursive call intentionally outside critical section would be unsafe;
-		   handle backspace inline */
-		write_nolock(' ', attribute_byte, (uint16_t)(get_cursor_nolock()));
-		set_cursor_nolock((uint16_t)(get_cursor_nolock() - 2));
+		/* Move left by one cell and clear it */
+		if (offset >= 2) {
+			offset -= 2;
+			write_nolock(' ', attribute_byte, offset);
+			set_cursor_nolock(offset);
+		}
 	}
 	else
 	{

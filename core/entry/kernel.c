@@ -150,6 +150,30 @@ static ssize_t sysfs_show_ram_mb_attr(char *buf, size_t size, void *priv) {
 
 void ring0_shell()  { osh_run(); }
 
+static int boot_try_run_init(void) {
+    /* initramfs-style init selection:
+       prefer /linuxrc when present, then fall back to /init and classic paths. */
+    static const char *candidates[] = {
+        "/init",
+        "/sbin/init",
+        "/bin/init",
+        NULL
+    };
+    for (int i = 0; candidates[i]; i++) {
+        const char *p = candidates[i];
+        struct stat st;
+        if (vfs_stat(p, &st) != 0) continue;
+        /* Accept regular files and symlinks (symlinks already resolved by exec). */
+        if (!((st.st_mode & S_IFREG) == S_IFREG || (st.st_mode & S_IFLNK) == S_IFLNK)) continue;
+        const char *argv0[2] = { p, NULL };
+        klogprintf("boot: starting init candidate %s\n", p);
+        int rc = kernel_execve_from_path(p, argv0, NULL);
+        if (rc == 0) return 0;
+        klogprintf("boot: init %s returned rc=%d\n", p, rc);
+    }
+    return -1;
+}
+
 void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     qemu_debug_printf("Kernel started\n");
     kclear();
@@ -190,7 +214,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             kprintf("Failed to allocate DF IST stack (warning)\n");
         }
     }
-    int vbe_init;
+    int vbe_init = 0;
     /* Initialize VBE framebuffer console after heap is available */
     if (multiboot_info != 0) {
         if (vbe_init_from_multiboot(multiboot_magic, multiboot_info)) {
@@ -222,7 +246,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     ext2_register();
 
     if (sysfs_register() == 0) {
-        kprintf("sysfs: mounting sysfs in /sys\n");
+        kprintf("sysfs: registered\n");
         ramfs_mkdir("/sys");
         sysfs_mkdir("/sys");
         sysfs_mkdir("/sys/kernel");
@@ -248,8 +272,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         sysfs_create_file("/sys/kernel/sysver", &attr_os_version);
         sysfs_create_file("/sys/kernel/cpu/name", &attr_cpu_name);
         sysfs_create_file("/sys/kernel/ram", &attr_ram_mb);
-        sysfs_mount("/sys");
-
         /* create /etc and write initial passwd/group files into ramfs */
         ramfs_mkdir("/etc");
         
@@ -275,7 +297,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 
     klog_init(); // for logging into /var/log/kernel file
     sysinfo_print_e820(multiboot_magic, multiboot_info);
-    if (vbe_init = 1) klogprintf("Set VBE framebuffer mode: %ux%u@%u.\n", vbe_get_width(), vbe_get_height(), vbe_get_bpp());
+    if (vbe_init == 1) klogprintf("Set VBE framebuffer mode: %ux%u@%u.\n", vbe_get_width(), vbe_get_height(), vbe_get_bpp());
     else klogprintf("Set VGA default 80x25 mode.\n");
     
     apic_init();
@@ -332,14 +354,11 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     if (r == 0) klogprintf("initfs: unpacked successfully\n");
     else klogprintf("initfs: error: failed, code: %d\n", r);
 
-    /* register and mount devfs at /dev */
+    /* register devfs (mount done by linuxrc via mount syscall) */
     if (devfs_register() == 0) {
         klogprintf("devfs: registering devfs\n");
-        ramfs_mkdir("/dev");
-        devfs_mount("/dev");
-
-        /* initialize stdio fds for current thread (main) */
-        struct fs_file *console = fs_open("/dev/console");
+        /* initialize stdio fds for current thread (main) without mounting devfs */
+        struct fs_file *console = devfs_open_direct("/dev/console");
         if (console) {
             /* allocate fd slots for main thread using helper to manage refcounts */
             int fd0 = thread_fd_alloc(console);
@@ -363,21 +382,18 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         klogprintf("devfs: failed to register\n");
     }
 
-    /* register and mount procfs at /proc */
-    if (procfs_register() == 0) {
-        klogprintf("procfs: mounting procfs in /proc\n");
-        ramfs_mkdir("/proc");
-        procfs_mount("/proc");
-    } else {
-        klogprintf("procfs: error: failed to register\n");
-    }
+    /* procfs will be mounted by linuxrc via mount syscall */
+    (void)procfs_register();
 
     ps2_keyboard_init();
     rtc_init();
 
-    // Simple kernel shell
-    exec_line("PS1=\"osh-2.0# \"");
-    exec_line("osh");
+    
+    // Prefer linuxrc/init if present; fallback to kernel shell.
+    if (boot_try_run_init() != 0) {
+        exec_line("PS1=\"osh-2.0# \"");
+        exec_line("osh");
+    }
     
     for(;;) {
         asm volatile("sti; hlt" ::: "memory");

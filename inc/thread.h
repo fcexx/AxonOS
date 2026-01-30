@@ -42,6 +42,21 @@ typedef struct thread {
         /* vfork parent PID: if >=0 then this thread was created by vfork and parent is blocked;
            on execve/exit child must unblock parent. */
         int vfork_parent_tid;
+        /* vfork parent stack snapshot (to restore parent's frames on child exit).
+           In our shared-address-space model, the vfork child can temporarily run on the
+           parent's userspace stack; we keep a copy of the active region starting at the
+           parent's saved RSP, and restore it right before waking the parent. */
+        uint64_t vfork_parent_saved_rsp;
+        void *vfork_parent_stack_backup;
+        uint64_t vfork_parent_stack_backup_len;
+        void *vfork_parent_mem_backup;
+        uint64_t vfork_parent_mem_backup_len;
+        uint64_t vfork_parent_mem_backup_base;
+        uint64_t vfork_parent_brk_saved;
+        /* per-thread brk state (heap) */
+        uintptr_t user_brk_base;
+        uintptr_t user_brk_cur;
+        uintptr_t user_mmap_next;
         /* exec trampoline support: when set, kernel will patch the saved syscall return
            frame so that on syscall return the thread resumes at exec_trampoline_rip/rsp
            with RAX=exec_trampoline_rax. Used to implement vfork-by-reusing-current-thread. */
@@ -56,6 +71,26 @@ typedef struct thread {
         /* saved syscall return site for current syscall (per-thread) */
         uint64_t saved_user_rip;
         uint64_t saved_user_rsp;
+        /* saved user register snapshot captured at syscall entry (per-thread).
+           Needed for vfork trampoline without relying on global, non-reentrant state. */
+        uint64_t saved_user_rbx;
+        uint64_t saved_user_rbp;
+        uint64_t saved_user_r12;
+        uint64_t saved_user_r13;
+        uint64_t saved_user_r14;
+        uint64_t saved_user_r15;
+        uint64_t saved_user_rdi;
+        uint64_t saved_user_rsi;
+        uint64_t saved_user_rdx;
+        uint64_t saved_user_r8;
+        uint64_t saved_user_r9;
+        uint64_t saved_user_r10;
+        uint64_t saved_user_r11;
+        uint64_t saved_user_rcx;
+        /* pointer to saved syscall frame on kernel stack (rsp at entry) */
+        uint64_t *saved_syscall_frame;
+        /* pending signal bitmask (1-based signal numbers, bit0 unused) */
+        uint64_t pending_signals;
         /* if non-negative, tid of thread waiting for this child (wait/waitpid) */
         int waiter_tid;
         /* exit status encoded like wait(2) returns (status word) */
@@ -83,6 +118,8 @@ void thread_sleep(uint32_t ms);
 
 // access thread by index (0..thread_get_count()-1)
 thread_t* thread_get_by_index(int idx);
+int thread_get_init_user_tid(void);
+void thread_mark_init_user(thread_t* t);
 
 // register user thread (process) for display in list
 thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char* name);

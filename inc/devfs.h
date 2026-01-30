@@ -53,6 +53,8 @@ struct devfs_tty {
 int devfs_register(void);
 int devfs_unregister(void);
 int devfs_mount(const char *path);
+/* Open a devfs node directly without requiring a VFS mount. */
+struct fs_file *devfs_open_direct(const char *path);
 /* Create a character device node at given path and associate with driver_private.
    driver_private is stored and later returned in fs_file->driver_private on open. */
 int devfs_create_char_node(const char *path, void *driver_private);

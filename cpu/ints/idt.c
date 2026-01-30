@@ -52,6 +52,23 @@ static void dump(const char* what, const char* who, cpu_registers_t* regs, uint6
         klogprintf("RSI: 0x%llx\n", (unsigned long long)regs->rsi);
         klogprintf("RDX: 0x%llx\n", (unsigned long long)regs->rdx);
         klogprintf("RCX: 0x%llx\n", (unsigned long long)regs->rcx);
+
+        /* Mirror the most important fault info to serial (qemu -serial stdio),
+           otherwise user-mode faults printed to VGA are not visible in terminal logs. */
+        qemu_debug_printf("Oops! %s in %s RIP=0x%llx err=0x%llx user=%d cr2=0x%llx\n",
+                          what, who,
+                          (unsigned long long)regs->rip,
+                          (unsigned long long)regs->error_code,
+                          user_mode ? 1 : 0,
+                          (unsigned long long)cr2);
+        qemu_debug_printf(" regs: RSP=0x%llx RBP=0x%llx RDI=0x%llx RSI=0x%llx RDX=0x%llx RCX=0x%llx RAX=0x%llx\n",
+                          (unsigned long long)regs->rsp,
+                          (unsigned long long)regs->rbp,
+                          (unsigned long long)regs->rdi,
+                          (unsigned long long)regs->rsi,
+                          (unsigned long long)regs->rdx,
+                          (unsigned long long)regs->rcx,
+                          (unsigned long long)regs->rax);
 }
 
 static inline uint64_t rdmsr_u64(uint32_t msr) {
@@ -216,6 +233,11 @@ static void page_fault_handler(cpu_registers_t* regs) {
         uint64_t fsbase = ((uint64_t)fsbase_hi << 32) | fsbase_lo;
         klogprintf("page fault MSR_FS_BASE=0x%016llx\n", (unsigned long long)fsbase);
         klogprintf("page fault details: CR2=0x%llx err=0x%llx user=%d\n", (unsigned long long)cr2, (unsigned long long)regs->error_code, user);
+        qemu_debug_printf("page fault: MSR_FS_BASE=0x%016llx CR2=0x%llx err=0x%llx user=%d\n",
+                          (unsigned long long)fsbase,
+                          (unsigned long long)cr2,
+                          (unsigned long long)regs->error_code,
+                          user ? 1 : 0);
         /* Additional diagnostics to help pinpoint cause in user mode */
         if (user) {
             /* dump instruction bytes at RIP */
@@ -224,8 +246,12 @@ static void page_fault_handler(cpu_registers_t* regs) {
                 klogprintf("code @ RIP: ");
                 for (int i = 0; i < 32; i++) kprintf("%02x ", (unsigned)code[i]);
                 kprintf("\n");
+                qemu_debug_printf("code @ RIP:");
+                for (int i = 0; i < 16; i++) qemu_debug_printf(" %02x", (unsigned)code[i]);
+                qemu_debug_printf("\n");
             } else {
                 klogprintf("code @ RIP: (outside identity map)\n");
+                qemu_debug_printf("code @ RIP: (outside identity map)\n");
             }
             /* dump stack words */
             if ((uintptr_t)regs->rsp < (uintptr_t)MMIO_IDENTITY_LIMIT) {

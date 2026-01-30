@@ -9,3 +9,4 @@
 /* Syscall globals (defined in syscall64/syscall.c). */
 extern uint64_t syscall_kernel_rsp0;
 extern uint64_t syscall_user_return_rip;
+void syscall_set_user_brk(uintptr_t base);

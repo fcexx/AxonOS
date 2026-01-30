@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 /* User stack constants for simple exec (must be below identity limit) */
-#define USER_STACK_TOP ((uintptr_t)0x03000000ULL) /* 48MiB (must be in RAM on small QEMU configs) */
+#define USER_STACK_TOP ((uintptr_t)0x08000000ULL) /* 128MiB (gives more room for user heap/mmap) */
 #define USER_STACK_SIZE (2 * 1024 * 1024) /* 2MiB */
 
 /* Reserve a separate user TLS region just below the stack guard area.

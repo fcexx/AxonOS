@@ -13,6 +13,8 @@
 #include <pit.h>
 #include <ext2.h>
 #include <devfs.h>
+#include <procfs.h>
+#include <sysfs.h>
 #include <rtc.h>
 
 extern void kprintf(const char *fmt, ...);
@@ -134,6 +136,138 @@ static int apply_exec_trampoline(thread_t *t) {
     return 0;
 }
 
+/* Snapshot user registers from syscall entry stack frame into current thread.
+   Frame layout matches syscall_entry64 push order (rsp points to saved r15). */
+void syscall_snapshot_user_regs(uint64_t *frame) {
+    if (!frame) return;
+    thread_t *cur = thread_current();
+    if (!cur || cur->ring != 3) {
+        cur = thread_get_current_user();
+        if (!cur) return;
+    }
+    cur->saved_syscall_frame = frame;
+    /* Indexes into frame */
+    cur->saved_user_r15 = frame[0];
+    cur->saved_user_r14 = frame[1];
+    cur->saved_user_r13 = frame[2];
+    cur->saved_user_r12 = frame[3];
+    cur->saved_user_r11 = frame[4];
+    cur->saved_user_r10 = frame[5];
+    cur->saved_user_r9  = frame[6];
+    cur->saved_user_r8  = frame[7];
+    cur->saved_user_rdi = frame[8];
+    cur->saved_user_rsi = frame[9];
+    cur->saved_user_rbp = frame[10];
+    cur->saved_user_rbx = frame[11];
+    cur->saved_user_rdx = frame[12];
+    cur->saved_user_rcx = frame[13];
+    cur->saved_user_rip = frame[13];
+    /* saved rax is frame[14] */
+    cur->saved_user_rsp = frame[15]; /* pushed before regs */
+}
+
+static void rebuild_syscall_frame(thread_t *t) {
+    if (!t || !t->saved_syscall_frame) return;
+    uintptr_t base = (uintptr_t)t->saved_syscall_frame;
+    if (base + (16u * 8u) > (uintptr_t)MMIO_IDENTITY_LIMIT) return;
+    uint64_t *frame = t->saved_syscall_frame;
+    frame[0]  = t->saved_user_r15;
+    frame[1]  = t->saved_user_r14;
+    frame[2]  = t->saved_user_r13;
+    frame[3]  = t->saved_user_r12;
+    frame[4]  = t->saved_user_r11;
+    frame[5]  = t->saved_user_r10;
+    frame[6]  = t->saved_user_r9;
+    frame[7]  = t->saved_user_r8;
+    frame[8]  = t->saved_user_rdi;
+    frame[9]  = t->saved_user_rsi;
+    frame[10] = t->saved_user_rbp;
+    frame[11] = t->saved_user_rbx;
+    frame[12] = t->saved_user_rdx;
+    frame[13] = t->saved_user_rcx;
+    /* leave frame[14] (saved rax) to be overwritten by syscall_entry64 */
+    frame[15] = t->saved_user_rsp;
+}
+
+/* Keep stack layout consistent with core/elf.c user_stack_top_for_tid().
+   Duplicated here because elf.c helper is static. */
+static uintptr_t user_stack_top_for_tid_like_exec(uint64_t tid) {
+    const uintptr_t top = (uintptr_t)USER_STACK_TOP;
+    const uintptr_t stride = (uintptr_t)USER_STACK_SIZE + (uintptr_t)USER_TLS_SIZE + (uintptr_t)(64 * 1024);
+    const uint64_t slot = tid + 1ULL;
+    if (stride == 0) return top;
+    if (slot > (uint64_t)((uintptr_t)-1) / (uint64_t)stride) return top;
+    const uintptr_t off = (uintptr_t)(slot * (uint64_t)stride);
+    const uintptr_t min_room = (uintptr_t)USER_STACK_SIZE + (uintptr_t)USER_TLS_SIZE + 0x10000u;
+    if (top <= min_room) return top;
+    if (off >= (top - min_room)) return top;
+    return top - off;
+}
+
+/* Restore parent's userspace stack snapshot for a vfork child.
+   In AxonOS we block the parent until the child exits; however the child still
+   runs in the same address space and may temporarily modify the parent's stack
+   frames above the saved RSP. To avoid post-vfork corruption (seen as #GP with
+   non-canonical RBP in busybox sh), we snapshot that region in SYS_vfork and
+   restore it right before waking the parent on SYS_exit/SYS_exit_group. */
+static void vfork_restore_parent_stack(thread_t *child) {
+    if (!child) return;
+    if (!child->vfork_parent_stack_backup) return;
+    uintptr_t dst = (uintptr_t)child->vfork_parent_saved_rsp;
+    uint64_t len64 = child->vfork_parent_stack_backup_len;
+    if (dst != 0 && len64 != 0) {
+        uintptr_t end = dst + (uintptr_t)len64;
+        if (end > dst && end <= (uintptr_t)MMIO_IDENTITY_LIMIT) {
+            memcpy((void*)dst, child->vfork_parent_stack_backup, (size_t)len64);
+        } else {
+            qemu_debug_printf("vfork_restore_parent_stack: bad dst=%p len=%llu\n",
+                              (void*)dst, (unsigned long long)len64);
+        }
+    }
+    /* TEMPORARY DIAGNOSTIC:
+       Do NOT free the backup buffer yet.
+       We observed post-vfork #GP with corrupted user registers (RBP/RDI), which strongly
+       suggests the *kernel syscall frame* on the parent's kernel stack got overwritten.
+       Since kernel stacks and this backup are both heap allocations, a buggy kfree/merge
+       path can corrupt adjacent allocations and smash the parent's kernel stack.
+       Leaking this buffer avoids exercising that path and helps confirm allocator corruption. */
+    //kfree(child->vfork_parent_stack_backup);
+    child->vfork_parent_stack_backup = NULL;
+    child->vfork_parent_saved_rsp = 0;
+    child->vfork_parent_stack_backup_len = 0;
+}
+
+/* forward for user brk state used in vfork restore */
+static uintptr_t user_brk_cur;
+
+static void vfork_restore_parent_memory(thread_t *child) {
+    if (!child) return;
+    if (!child->vfork_parent_mem_backup) return;
+    uintptr_t base = (uintptr_t)child->vfork_parent_mem_backup_base;
+    uint64_t len64 = child->vfork_parent_mem_backup_len;
+    if (base != 0 && len64 != 0) {
+        uintptr_t end = base + (uintptr_t)len64;
+        if (end > base && end <= (uintptr_t)MMIO_IDENTITY_LIMIT) {
+            memcpy((void*)base, child->vfork_parent_mem_backup, (size_t)len64);
+            thread_t *pt = NULL;
+            if (child->vfork_parent_tid >= 0) pt = thread_get(child->vfork_parent_tid);
+            if (pt) {
+                pt->user_brk_cur = (uintptr_t)child->vfork_parent_brk_saved;
+            } else {
+                user_brk_cur = (uintptr_t)child->vfork_parent_brk_saved;
+            }
+        } else {
+            qemu_debug_printf("vfork_restore_parent_memory: bad base=%p len=%llu\n",
+                              (void*)base, (unsigned long long)len64);
+        }
+    }
+    kfree(child->vfork_parent_mem_backup);
+    child->vfork_parent_mem_backup = NULL;
+    child->vfork_parent_mem_backup_len = 0;
+    child->vfork_parent_mem_backup_base = 0;
+    child->vfork_parent_brk_saved = 0;
+}
+
 enum {
     MSR_EFER  = 0xC0000080u,
     MSR_STAR  = 0xC0000081u,
@@ -173,10 +307,13 @@ static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, siz
 #define ENOMEM  12
 #define ERANGE  34
 #define EMFILE  24
+#define ENOEXEC 8
 /* no child processes */
 #define ECHILD  10
 /* filename too long */
 #define ENAMETOOLONG 36
+#define EAGAIN  11
+#define EINTR   4
 static uint64_t last_syscall_debug = 0;
 static inline uint64_t ret_err(int e) {
     /* Log ENOSYS occurrences for the user shell (tid==3) to help musl compatibility debugging. */
@@ -188,6 +325,66 @@ static inline uint64_t ret_err(int e) {
                 (unsigned long long)last_syscall_debug);
     }
     return (uint64_t)(-(int64_t)e);
+}
+
+/* minimal signal numbers used */
+#ifndef SIGCHLD
+#define SIGCHLD 17
+#endif
+
+static void thread_set_pending_signal(thread_t *t, int signum) {
+    if (!t || signum <= 0 || signum > 63) return;
+    t->pending_signals |= (1ULL << (signum - 1));
+    /* Wake any thread blocked in sigtimedwait so it can observe the signal. */
+    if (t->state == THREAD_BLOCKED) {
+        thread_unblock((int)(t->tid ? t->tid : 1));
+    }
+}
+
+static int thread_fetch_pending_signal(thread_t *t, uint64_t mask) {
+    if (!t) return 0;
+    if (mask == 0) mask = ~0ULL;
+    /* Always allow SIGCHLD to wake waits to avoid init deadlocks. */
+    mask |= (1ULL << (SIGCHLD - 1));
+    for (int sig = 1; sig <= 63; sig++) {
+        uint64_t bit = 1ULL << (sig - 1);
+        if ((mask & bit) && (t->pending_signals & bit)) {
+            t->pending_signals &= ~bit;
+            return sig;
+        }
+    }
+    return 0;
+}
+
+static int is_init_user(thread_t *t) {
+    int init_tid = thread_get_init_user_tid();
+    return t && init_tid >= 0 && (int)t->tid == init_tid;
+}
+
+static int has_terminated_child(thread_t *t) {
+    if (!t) return 0;
+    for (int i = 0; i < thread_get_count(); i++) {
+        thread_t *c = thread_get_by_index(i);
+        if (!c) continue;
+        if (c->parent_tid != (int)t->tid) continue;
+        if (c->state == THREAD_TERMINATED && c->exit_status != 0x80000000) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static thread_t *find_terminated_child(thread_t *t) {
+    if (!t) return NULL;
+    for (int i = 0; i < thread_get_count(); i++) {
+        thread_t *c = thread_get_by_index(i);
+        if (!c) continue;
+        if (c->parent_tid != (int)t->tid) continue;
+        if (c->state == THREAD_TERMINATED && c->exit_status != 0x80000000) {
+            return c;
+        }
+    }
+    return NULL;
 }
 
 static void resolve_user_path(thread_t *cur, const char *path_u, char *out, size_t out_cap) {
@@ -211,16 +408,18 @@ static void resolve_user_path(thread_t *cur, const char *path_u, char *out, size
     }
 }
 
+static inline int user_range_ok(const void *uaddr, size_t nbytes);
+
 static int copy_to_user_safe(void *uptr, const void *kptr, size_t n) {
     if (!uptr || !kptr || n == 0) return -1;
-    if ((uintptr_t)uptr + n > (uintptr_t)MMIO_IDENTITY_LIMIT) return -1;
+    if (!user_range_ok(uptr, n)) return -1;
     memcpy(uptr, kptr, n);
     return 0;
 }
 
 static int copy_from_user_raw(void *kdst, const void *usrc, size_t n) {
     if (!kdst || !usrc || n == 0) return -1;
-    if ((uintptr_t)usrc + n > (uintptr_t)MMIO_IDENTITY_LIMIT) return -1;
+    if (!user_range_ok(usrc, n)) return -1;
     memcpy(kdst, usrc, n);
     return 0;
 }
@@ -236,7 +435,13 @@ static inline int user_range_ok(const void *uaddr, size_t nbytes) {
     uintptr_t start = (uintptr_t)uaddr;
     uintptr_t end = start + nbytes;
     if (end < start) return 0;
-    return end <= (uintptr_t)MMIO_IDENTITY_LIMIT;
+    /* Restrict to user-mapped identity range only.
+       This prevents user pointers from targeting kernel heap/stack, which can
+       corrupt saved syscall frames and thread structs (seen as #GP after vfork). */
+    const uintptr_t user_min = 0x00200000u; /* 2MiB */
+    if (start < user_min) return 0;
+    if (end > (uintptr_t)USER_STACK_TOP) return 0;
+    return 1;
 }
 
 static int user_read_u64(const void *uaddr, uint64_t *out) {
@@ -256,6 +461,18 @@ static size_t user_strnlen_bounded(const char *s, size_t max) {
     return max;
 }
 
+static char *copy_user_cstr(const char *u, size_t maxlen) {
+    if (!u) return NULL;
+    size_t L = user_strnlen_bounded(u, maxlen - 1);
+    if (L >= maxlen) L = maxlen - 1;
+    if (!user_range_ok(u, L + 1)) return NULL;
+    char *k = (char*)kmalloc(L + 1);
+    if (!k) return NULL;
+    if (copy_from_user_raw(k, u, L + 1) != 0) { kfree(k); return NULL; }
+    k[L] = '\0';
+    return k;
+}
+
 /* Minimal tty state for job control-ish ioctls (single session). */
 static uint64_t user_pgrp = 1;
 
@@ -273,6 +490,32 @@ static uint32_t user_rand_state = 0xA53C9E11u;
 static uintptr_t user_mmap_next = 0;
 static uintptr_t user_brk_base = 0;
 static uintptr_t user_brk_cur = 0;
+static inline uintptr_t align_up_u(uintptr_t v, uintptr_t a);
+static inline uintptr_t user_tls_base_for_tid_local(uint64_t tid) {
+    uintptr_t stack_top = user_stack_top_for_tid_like_exec(tid);
+    return (uintptr_t)stack_top - (uintptr_t)USER_STACK_SIZE - (uintptr_t)USER_TLS_SIZE;
+}
+
+void syscall_set_user_brk(uintptr_t base) {
+    /* Establish initial program break after exec load. */
+    if (base < (8u * 1024u * 1024u)) base = 8u * 1024u * 1024u;
+    base = align_up_u(base, 4096);
+    thread_t *tcur = thread_get_current_user();
+    if (!tcur) tcur = thread_current();
+    if (tcur) {
+        tcur->user_brk_base = base;
+        tcur->user_brk_cur = base;
+        if (tcur->user_mmap_next && tcur->user_mmap_next < base) {
+            tcur->user_mmap_next = align_up_u(base, 4096);
+        }
+    } else {
+        user_brk_base = base;
+        user_brk_cur = base;
+    }
+    if (user_mmap_next && user_mmap_next < base) {
+        user_mmap_next = align_up_u(base, 4096);
+    }
+}
 
 static inline uintptr_t align_up_u(uintptr_t v, uintptr_t a) { return (v + (a - 1)) & ~(a - 1); }
 
@@ -487,9 +730,10 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
         if (!cur) cur = thread_current();
     }
     if (!cur) return ret_err(EPERM);
-    /* copy syscall entry saved RIP/RSP into per-thread slots to avoid races */
-    cur->saved_user_rip = syscall_user_return_rip;
-    cur->saved_user_rsp = syscall_user_rsp_saved;
+    /* saved_user_* are normally captured in syscall_entry64 via syscall_snapshot_user_regs().
+       If that path wasn't used (fallback/int0x80), fall back to globals once. */
+    if (cur->saved_user_rip == 0) cur->saved_user_rip = syscall_user_return_rip;
+    if (cur->saved_user_rsp == 0) cur->saved_user_rsp = syscall_user_rsp_saved;
 
     /* If return RIP wasn't recorded by entry path, dump kernel syscall stack for diagnosis */
     if (syscall_user_return_rip == 0) {
@@ -573,21 +817,15 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     qemu_debug_printf("vfork: could not ensure broad user range [0x200000 - %p]\n", (void*)(uintptr_t)USER_STACK_TOP);
                 }
             }
-            kprintf("DBG: vfork: syscall_user_return_rip=0x%llx syscall_user_rsp_saved=0x%llx (saved_rcx=0x%llx saved_rsp=0x%llx)\n",
-                    (unsigned long long)syscall_user_return_rip, (unsigned long long)syscall_user_rsp_saved,
-                    (unsigned long long)saved_rcx, (unsigned long long)saved_rsp);
-            /* Implement vfork by creating a child thread that will run at saved_rcx/saved_rsp,
-               block the parent until the child either calls execve or _exit.
-
-               NOTE: AxonOS currently uses a shared address space (no COW). A "real" vfork
-               would run the child on the parent's stack; however the child then clobbers
-               the parent's stack frames (libc wrappers, execve path), and when the parent
-               resumes we see user-mode #GP with non-canonical RBP/RDI (exactly what you hit).
-               So we implement vfork as a safe fork-like clone of the user stack/TLS:
-               - allocate a separate per-thread stack region
-               - copy the active portion of the parent's stack into it
-               - give the child its own TLS page (copy 4KiB so stack canary stays valid)
-               This preserves correctness (at the cost of vfork semantics/perf). */
+            // kprintf("DBG: vfork: syscall_user_return_rip=0x%llx syscall_user_rsp_saved=0x%llx (saved_rcx=0x%llx saved_rsp=0x%llx)\n",
+            //         (unsigned long long)syscall_user_return_rip, (unsigned long long)syscall_user_rsp_saved,
+            //         (unsigned long long)saved_rcx, (unsigned long long)saved_rsp);
+            /* vfork semantics for AxonOS (safe variant):
+               - create child thread, but do NOT run it on the parent's stack
+               - copy active portion of parent's stack into a dedicated child stack
+               - parent is NOT blocked in-kernel (avoids returning from a blocked syscall frame)
+               This behaves closer to fork(), but avoids the post-exit #GP caused by
+               corruption of the parent's syscall frame while it is blocked in-kernel. */
             if (saved_rcx == 0) {
                 /* cannot create child if we don't have return site */
                 return ret_err(EINVAL);
@@ -601,20 +839,14 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             /* Create a small user-mode trampoline that zeroes RAX and jumps to saved_rcx.
                This avoids executing user code directly in an unknown register/stack snapshot. */
             {
-                /* ---- choose separate child stack and copy parent's active stack ---- */
-                /* We cannot reliably infer the parent's stack top from FS base:
-                   libc may set FS to its TCB (often in low memory), unrelated to our
-                   reserved [TLS..STACK] layout. Instead, conservatively copy a window
-                   of the parent's current stack starting at saved_rsp. This is enough
-                   to preserve active frames for the child to reach exec/exit, without
-                   corrupting the parent's stack in our shared address space. */
-                uintptr_t parent_tls = (uintptr_t)p->user_fs_base;
+                /* ---- clone parent's active stack slice into child's own stack ---- */
+                uintptr_t parent_fs = (uintptr_t)p->user_fs_base;
+                uintptr_t parent_tls_region = (parent_fs >= 0x1000u) ? (parent_fs - 0x1000u) : 0;
                 if ((uintptr_t)saved_rsp == 0 || (uintptr_t)saved_rsp >= (uintptr_t)MMIO_IDENTITY_LIMIT) {
                     qemu_debug_printf("vfork: invalid saved_rsp=0x%llx -> EINVAL\n", (unsigned long long)saved_rsp);
                     return ret_err(EINVAL);
                 }
                 uintptr_t max_copy = (uintptr_t)USER_STACK_SIZE;
-                /* Copy at most 1MiB for speed; should cover typical userspace frames. */
                 if (max_copy > (uintptr_t)(1024 * 1024)) max_copy = (uintptr_t)(1024 * 1024);
                 uintptr_t avail = (uintptr_t)MMIO_IDENTITY_LIMIT - (uintptr_t)saved_rsp;
                 uintptr_t copy_bytes = (avail < max_copy) ? avail : max_copy;
@@ -647,7 +879,14 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     }
                 }
                 child_stack_top &= ~((uintptr_t)0xFULL);
-                uintptr_t child_rsp = (child_stack_top - copy_bytes) & ~((uintptr_t)0xFULL);
+                uintptr_t child_rsp = (child_stack_top - copy_bytes);
+                /* Preserve original stack alignment (SSE movdqa expects this). */
+                uintptr_t align_mask = (uintptr_t)0xFULL;
+                uintptr_t want = (uintptr_t)saved_rsp & align_mask;
+                uintptr_t have = (uintptr_t)child_rsp & align_mask;
+                if (have != want) {
+                    child_rsp += (want - have) & align_mask;
+                }
 
                 /* ensure child stack region is user-accessible */
                 {
@@ -659,25 +898,68 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 }
                 /* copy active stack slice */
                 memcpy((void*)child_rsp, (void*)(uintptr_t)saved_rsp, (size_t)copy_bytes);
+                /* Relocate pointers inside the copied stack slice itself */
+                {
+                    const uintptr_t parent_lo = (uintptr_t)saved_rsp;
+                    const uintptr_t parent_hi = parent_lo + (uintptr_t)copy_bytes;
+                    const uintptr_t delta = (uintptr_t)child_rsp - parent_lo;
+                    uintptr_t pp = (uintptr_t)child_rsp;
+                    uintptr_t end = (uintptr_t)child_rsp + (uintptr_t)copy_bytes;
+                    for (; pp + 8 <= end; pp += 8) {
+                        uint64_t v = *(uint64_t*)(uintptr_t)pp;
+                        uintptr_t vv = (uintptr_t)v;
+                        if (vv >= parent_lo && vv < parent_hi) {
+                            *(uint64_t*)(uintptr_t)pp = (uint64_t)(vv + delta);
+                        }
+                    }
+                }
 
                 /* ---- set up separate TLS (copy 4KiB from parent) ---- */
-                uintptr_t child_tls = child_stack_top - (uintptr_t)USER_STACK_SIZE - (uintptr_t)USER_TLS_SIZE;
-                if (mark_user_identity_range_2m_sys((uint64_t)child_tls, (uint64_t)(child_tls + 0x1000u)) != 0) {
+                uintptr_t child_tls_region = child_stack_top - (uintptr_t)USER_STACK_SIZE - (uintptr_t)USER_TLS_SIZE;
+                /* Use same layout as exec: FS base inside region, fake pthread on next page. */
+                uintptr_t child_fs = child_tls_region + 0x1000u;
+                uintptr_t child_pthread_fake = child_tls_region + 0x2000u;
+                if (mark_user_identity_range_2m_sys((uint64_t)child_tls_region, (uint64_t)(child_pthread_fake + 0x1000u)) != 0) {
                     qemu_debug_printf("vfork: failed to mark child TLS range\n");
                     return ret_err(EFAULT);
                 }
-                if (parent_tls != 0 && parent_tls + 0x1000u < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                    memcpy((void*)child_tls, (void*)parent_tls, 0x1000u);
+                /* clear/clone minimal TLS layout (3 pages) */
+                memset((void*)child_tls_region, 0, 0x3000u);
+                if (parent_tls_region != 0 && parent_tls_region + 0x3000u < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                    memcpy((void*)child_tls_region, (void*)parent_tls_region, 0x3000u);
                 } else {
-                    memset((void*)child_tls, 0, 0x1000u);
+                    /* already zeroed */
                 }
-                child->user_fs_base = (uint64_t)child_tls;
+                /* Ensure the self pointer slot used by glibc pthread_getspecific is valid. */
+                *(volatile uint64_t*)(uintptr_t)(child_fs - 0x78u) = (uint64_t)child_pthread_fake;
+                /* Provide default "C" locale string for specifics[5] (see core/elf.c). */
+                {
+                    const uintptr_t c_str = child_tls_region + 0x2800u;
+                    if (c_str + 2 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                        *(volatile uint8_t*)(uintptr_t)(c_str + 0) = (uint8_t)'C';
+                        *(volatile uint8_t*)(uintptr_t)(c_str + 1) = 0;
+                        const uintptr_t specific5_slot = child_pthread_fake + 0x80u + (uintptr_t)(5u * 8u);
+                        /* The TLS region may have been cloned from parent and contain garbage/non-canonical
+                           pointers in the specifics area. Clear a small window and force slot 5. */
+                        for (int si = 0; si < 32; si++) {
+                            *(volatile uint64_t*)(uintptr_t)(child_pthread_fake + 0x80u + (uintptr_t)(si * 8u)) = 0;
+                        }
+                        *(volatile uint64_t*)(uintptr_t)specific5_slot = (uint64_t)c_str;
+                    }
+                }
+                child->user_fs_base = (uint64_t)child_fs;
 
                 uintptr_t tramp = (uintptr_t)USER_VFORK_TRAMP;
                 /* ensure tramp region is user-accessible */
                 mark_user_identity_range_2m_sys((uint64_t)(tramp & ~((uintptr_t)(PAGE_SIZE_2M - 1))),
                                                (uint64_t)((tramp & ~((uintptr_t)(PAGE_SIZE_2M - 1))) + PAGE_SIZE_2M));
                 if ((uintptr_t)tramp + 64 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                    const uintptr_t parent_lo = (uintptr_t)saved_rsp;
+                    const uintptr_t parent_hi = parent_lo + (uintptr_t)copy_bytes;
+                    #define VFORK_RELOC(val64) \
+                        ((((uintptr_t)(val64) >= parent_lo) && ((uintptr_t)(val64) < parent_hi)) ? \
+                         (uint64_t)((uintptr_t)child_rsp + ((uintptr_t)(val64) - parent_lo)) : \
+                         (uint64_t)(val64))
                     /* Build a vfork trampoline that restores a full user register snapshot
                        (as if we returned from a real SYSCALL instruction):
                          - restore caller-saved regs: RDI,RSI,RDX,R8,R9,R10,RCX,R11
@@ -688,46 +970,46 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     unsigned char stub[160];
                     int off = 0;
                     /* movabs rdi, imm64 */
-                    uint64_t imm_rdi = syscall_user_saved_rdi;
+                    uint64_t imm_rdi = VFORK_RELOC(p->saved_user_rdi);
                     stub[off++] = 0x48; stub[off++] = 0xBF; memcpy(&stub[off], &imm_rdi, 8); off += 8;
                     /* movabs rsi, imm64 */
-                    uint64_t imm_rsi = syscall_user_saved_rsi;
+                    uint64_t imm_rsi = VFORK_RELOC(p->saved_user_rsi);
                     stub[off++] = 0x48; stub[off++] = 0xBE; memcpy(&stub[off], &imm_rsi, 8); off += 8;
                     /* movabs rdx, imm64 */
-                    uint64_t imm_rdx = syscall_user_saved_rdx;
+                    uint64_t imm_rdx = VFORK_RELOC(p->saved_user_rdx);
                     stub[off++] = 0x48; stub[off++] = 0xBA; memcpy(&stub[off], &imm_rdx, 8); off += 8;
                     /* movabs r8, imm64 */
-                    uint64_t imm_r8 = syscall_user_saved_r8;
+                    uint64_t imm_r8 = VFORK_RELOC(p->saved_user_r8);
                     stub[off++] = 0x49; stub[off++] = 0xB8; memcpy(&stub[off], &imm_r8, 8); off += 8;
                     /* movabs r9, imm64 */
-                    uint64_t imm_r9 = syscall_user_saved_r9;
+                    uint64_t imm_r9 = VFORK_RELOC(p->saved_user_r9);
                     stub[off++] = 0x49; stub[off++] = 0xB9; memcpy(&stub[off], &imm_r9, 8); off += 8;
                     /* movabs r10, imm64 */
-                    uint64_t imm_r10 = syscall_user_saved_r10;
+                    uint64_t imm_r10 = VFORK_RELOC(p->saved_user_r10);
                     stub[off++] = 0x49; stub[off++] = 0xBA; memcpy(&stub[off], &imm_r10, 8); off += 8;
                     /* movabs rcx, imm64 (return RIP) */
                     uint64_t imm_rcx = (uint64_t)saved_rcx;
                     stub[off++] = 0x48; stub[off++] = 0xB9; memcpy(&stub[off], &imm_rcx, 8); off += 8;
                     /* movabs r11, imm64 (saved RFLAGS from SYSCALL) */
-                    uint64_t imm_r11_flags = syscall_user_saved_r11;
+                    uint64_t imm_r11_flags = p->saved_user_r11;
                     stub[off++] = 0x49; stub[off++] = 0xBB; memcpy(&stub[off], &imm_r11_flags, 8); off += 8;
                     /* movabs rbx, imm64 */
-                    uint64_t imm_rbx = syscall_user_saved_rbx;
+                    uint64_t imm_rbx = VFORK_RELOC(p->saved_user_rbx);
                     stub[off++] = 0x48; stub[off++] = 0xBB; memcpy(&stub[off], &imm_rbx, 8); off += 8;
                     /* movabs rbp, imm64 */
-                    uint64_t imm_rbp = syscall_user_saved_rbp;
+                    uint64_t imm_rbp = VFORK_RELOC(p->saved_user_rbp);
                     stub[off++] = 0x48; stub[off++] = 0xBD; memcpy(&stub[off], &imm_rbp, 8); off += 8;
                     /* movabs r12, imm64 */
-                    uint64_t imm_r12 = syscall_user_saved_r12;
+                    uint64_t imm_r12 = VFORK_RELOC(p->saved_user_r12);
                     stub[off++] = 0x49; stub[off++] = 0xBC; memcpy(&stub[off], &imm_r12, 8); off += 8;
                     /* movabs r13, imm64 */
-                    uint64_t imm_r13 = syscall_user_saved_r13;
+                    uint64_t imm_r13 = VFORK_RELOC(p->saved_user_r13);
                     stub[off++] = 0x49; stub[off++] = 0xBD; memcpy(&stub[off], &imm_r13, 8); off += 8;
                     /* movabs r14, imm64 */
-                    uint64_t imm_r14 = syscall_user_saved_r14;
+                    uint64_t imm_r14 = VFORK_RELOC(p->saved_user_r14);
                     stub[off++] = 0x49; stub[off++] = 0xBE; memcpy(&stub[off], &imm_r14, 8); off += 8;
                     /* movabs r15, imm64 */
-                    uint64_t imm_r15 = syscall_user_saved_r15;
+                    uint64_t imm_r15 = VFORK_RELOC(p->saved_user_r15);
                     stub[off++] = 0x49; stub[off++] = 0xBF; memcpy(&stub[off], &imm_r15, 8); off += 8;
                     /* xor rax, rax -> return value 0 in child */
                     stub[off++] = 0x48; stub[off++] = 0x31; stub[off++] = 0xC0;
@@ -736,6 +1018,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     stub[off++] = 0x48; stub[off++] = 0xBC; memcpy(&stub[off], &imm_rsp, 8); off += 8;
                     /* jmp rcx -> FF E1 */
                     stub[off++] = 0xFF; stub[off++] = 0xE1;
+                    #undef VFORK_RELOC
                     /* pad with NOPs */
                     for (int z = off; z < (int)sizeof(stub); z++) stub[z] = 0x90;
                     memcpy((void*)(uintptr_t)tramp, stub, (size_t)off);
@@ -765,6 +1048,32 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             child->pgid = p->pgid;
             child->euid = p->euid; child->egid = p->egid;
             child->attached_tty = p->attached_tty;
+            /* Preserve parent userspace memory across vfork/exec.
+               In our shared-address-space model, exec in the child overwrites
+               parent memory, so we must snapshot+restore for correctness. */
+            {
+                const uintptr_t base = (uintptr_t)0x00200000u;
+                uintptr_t end = (uintptr_t)USER_TLS_BASE;
+                if (end < base) end = base;
+                uint64_t len64 = (uint64_t)(end - base);
+                if (len64 == 0 || len64 > (uint64_t)(256u * 1024u * 1024u)) {
+                    qemu_debug_printf("vfork: mem backup skipped len=%llu\n", (unsigned long long)len64);
+                    return ret_err(ENOMEM);
+                }
+                child->vfork_parent_mem_backup = kmalloc((size_t)len64);
+                if (!child->vfork_parent_mem_backup) {
+                    qemu_debug_printf("vfork: mem backup alloc failed len=%llu\n", (unsigned long long)len64);
+                    return ret_err(ENOMEM);
+                }
+                memcpy(child->vfork_parent_mem_backup, (void*)base, (size_t)len64);
+                child->vfork_parent_mem_backup_len = len64;
+                child->vfork_parent_mem_backup_base = (uint64_t)base;
+                child->vfork_parent_brk_saved = (uint64_t)p->user_brk_cur;
+                child->vfork_parent_tid = (int)(p->tid ? p->tid : 1);
+                /* block parent until child exits */
+                p->vfork_parent_tid = -1;
+                p->state = THREAD_BLOCKED;
+            }
             /* duplicate file descriptors (increase refcounts) */
             for (int i = 0; i < THREAD_MAX_FD; i++) {
                 child->fds[i] = p->fds[i];
@@ -773,14 +1082,17 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     else child->fds[i]->refcount++;
                 }
             }
-            /* mark child as vfork child: set vfork_parent_tid so child will wake parent on exec/exit */
-            child->vfork_parent_tid = (int)(p->tid ? p->tid : 1);
-            /* block parent until child unblocks it */
-            p->state = THREAD_BLOCKED;
-            /* now allow child to run */
+            /* If parent was blocked (init backup path), yield to run child now. */
+            if (p->state == THREAD_BLOCKED && child->vfork_parent_tid >= 0) {
+                thread_unblock((int)(child->tid ? child->tid : 1));
+                thread_schedule();
+                /* parent resumed after child exit; restore syscall frame */
+                rebuild_syscall_frame(p);
+                return (uint64_t)(child->tid ? child->tid : 1);
+            }
+            /* default path: do not block parent; just allow child to run */
+            child->vfork_parent_tid = -1;
             thread_unblock((int)(child->tid ? child->tid : 1));
-            /* schedule to let child run immediately */
-            thread_schedule();
             /* when parent is unblocked and resumes here, return child's pid to parent */
             return (uint64_t)(child->tid ? child->tid : 1);
         }
@@ -861,19 +1173,22 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if ((uintptr_t)path >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
             if ((uintptr_t)buf + bufsiz > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
 
-            /* Provide /proc/self/exe for libc/busybox: point to current "process name". */
-            const char *target = NULL;
-            if (strcmp(path, "/proc/self/exe") == 0) {
-                /* thread name often contains the executed path passed to execve */
-                target = cur->name[0] ? cur->name : "/bin/busybox";
-            } else {
-                return ret_err(ENOENT);
+            /* First try the real VFS symlink implementation. */
+            char kpath[256];
+            resolve_user_path(cur, path, kpath, sizeof(kpath));
+            ssize_t rr = vfs_readlink(kpath, buf, bufsiz);
+            if (rr >= 0) return (uint64_t)rr;
+
+            /* Fallback: provide /proc/self/exe for libc/busybox even if procfs doesn't implement it yet. */
+            if (strcmp(kpath, "/proc/self/exe") == 0) {
+                const char *target = cur->name[0] ? cur->name : "/bin/busybox";
+                size_t L = strlen(target);
+                if (bufsiz == 0) return ret_err(EINVAL);
+                if (L > bufsiz) L = bufsiz;
+                memcpy(buf, target, L);
+                return (uint64_t)L; /* no NUL terminator */
             }
-            size_t L = strlen(target);
-            if (bufsiz == 0) return ret_err(EINVAL);
-            if (L > bufsiz) L = bufsiz;
-            memcpy(buf, target, L);
-            return (uint64_t)L; /* note: no NUL terminator */
+            return ret_err(ENOENT);
         }
         case SYS_getrandom: {
             void *bufp = (void*)(uintptr_t)a1;
@@ -906,6 +1221,49 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             ((int64_t*)tp)[0] = sec;
             ((int64_t*)tp)[1] = nsec;
             return 0;
+        }
+        case SYS_gettimeofday: {
+            /* gettimeofday(struct timeval *tv, struct timezone *tz) */
+            void *tv_u = (void*)(uintptr_t)a1;
+            (void)a2;
+            if (!tv_u) return ret_err(EFAULT);
+            struct timeval_k { int64_t tv_sec; int64_t tv_usec; } tv;
+            rtc_datetime_t dt;
+            rtc_read_datetime(&dt);
+            uint64_t secs = rtc_datetime_to_epoch(&dt);
+            uint64_t usec = (uint64_t)(pit_get_time_ms() % 1000ULL) * 1000ULL;
+            tv.tv_sec = (int64_t)secs;
+            tv.tv_usec = (int64_t)usec;
+            if (copy_to_user_safe(tv_u, &tv, sizeof(tv)) != 0) return ret_err(EFAULT);
+            return 0;
+        }
+        case SYS_clock_nanosleep: {
+            /* clock_nanosleep(clockid, flags, req, rem) */
+            (void)a1;
+            uint64_t flags = a2;
+            const void *req_u = (const void*)(uintptr_t)a3;
+            void *rem_u = (void*)(uintptr_t)a4;
+            (void)rem_u;
+            if (flags != 0) return ret_err(EINVAL);
+            if (!req_u) return ret_err(EFAULT);
+            struct timespec_k { int64_t tv_sec; int64_t tv_nsec; } ts;
+            if (copy_from_user_raw(&ts, req_u, sizeof(ts)) != 0) return ret_err(EFAULT);
+            if (ts.tv_sec < 0 || ts.tv_nsec < 0) return ret_err(EINVAL);
+            uint64_t ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
+            if (ms == 0 && ts.tv_nsec > 0) ms = 1;
+            if (ms > 0) thread_sleep((uint32_t)ms);
+            return 0;
+        }
+        case SYS_access: {
+            /* access(path, mode) */
+            const char *path_u = (const char*)(uintptr_t)a1;
+            (void)a2;
+            if (!path_u) return ret_err(EFAULT);
+            char path[256];
+            resolve_user_path(cur, path_u, path, sizeof(path));
+            struct stat st;
+            if (vfs_stat(path, &st) == 0) return 0;
+            return ret_err(ENOENT);
         }
         case 201: { /* time(time_t *tloc) */
             void *tloc = (void*)(uintptr_t)a1;
@@ -1010,10 +1368,14 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             return total;
         }
         case SYS_getpid:
+            if (is_init_user(cur)) return 1;
             return (uint64_t)(cur->tid ? cur->tid : 1);
         case SYS_getppid:
+            if (is_init_user(cur)) return 0;
+            if (cur && cur->parent_tid >= 0) return (uint64_t)cur->parent_tid;
             return 1;
         case SYS_gettid:
+            if (is_init_user(cur)) return 1;
             return (uint64_t)(cur->tid ? cur->tid : 1);
         case SYS_getuid:
         case SYS_geteuid:
@@ -1059,7 +1421,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     /* Additional guard: do not allow setting arbitrary pgid==1 (init) unless
                        caller is pid 1. This avoids user processes mistakenly moving into
                        init's pgrp which later confuses job control and can cause shells to exit. */
-                    if (pgid == 1 && (int)self != 1) {
+                    if (pgid == 1 && (int)self != 1 && !is_init_user(cur)) {
                         kprintf("sys_setpgid: pid=%d attempted to set pgid=1 -> EPERM (denied)\n", pid);
                         return ret_err(EPERM);
                     }
@@ -1308,6 +1670,180 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             return 0;
         }
+        case SYS_rt_sigtimedwait: {
+            /* rt_sigtimedwait(const sigset_t *set, siginfo_t *info, const struct timespec *timeout, size_t sigsetsize) */
+            const void *timeout_u = (const void*)(uintptr_t)a3;
+            size_t sigsetsize = (size_t)a4;
+            void *info_u = (void*)(uintptr_t)a2;
+            /* accept 0, 8, or glibc-sized 128-byte sigset; we use lower 64 bits */
+            if (!(sigsetsize == 0 || sigsetsize == 8 || sigsetsize == 128)) return ret_err(EINVAL);
+            uint64_t mask = 0;
+            if (sigsetsize >= 8 && a1) {
+                if (copy_from_user_raw(&mask, (const void*)(uintptr_t)a1, sizeof(mask)) != 0) return ret_err(EFAULT);
+            }
+            thread_t *tcur = thread_get_current_user();
+            if (!tcur) tcur = thread_current();
+            int sig = thread_fetch_pending_signal(tcur, mask ? mask : ~0ULL);
+            if (sig) {
+                if (sig == SIGCHLD && info_u) {
+                    thread_t *c = find_terminated_child(tcur);
+                    struct siginfo_k {
+                        int si_signo;
+                        int si_errno;
+                        int si_code;
+                        int si_pid;
+                        int si_uid;
+                        int si_status;
+                        long si_utime;
+                        long si_stime;
+                    } info;
+                    memset(&info, 0, sizeof(info));
+                    info.si_signo = SIGCHLD;
+                    info.si_code = 1; /* CLD_EXITED */
+                    if (c) {
+                        info.si_pid = (int)(c->tid ? c->tid : 1);
+                        info.si_status = (int)((c->exit_status >> 8) & 0xFF);
+                    }
+                    copy_to_user_safe(info_u, &info, sizeof(info));
+                }
+                return (uint64_t)sig;
+            }
+            if (mask & (1ULL << (SIGCHLD - 1))) {
+                thread_t *c = find_terminated_child(tcur);
+                if (c) {
+                    if (info_u) {
+                        struct siginfo_k {
+                            int si_signo;
+                            int si_errno;
+                            int si_code;
+                            int si_pid;
+                            int si_uid;
+                            int si_status;
+                            long si_utime;
+                            long si_stime;
+                        } info;
+                        memset(&info, 0, sizeof(info));
+                        info.si_signo = SIGCHLD;
+                        info.si_code = 1; /* CLD_EXITED */
+                        info.si_pid = (int)(c->tid ? c->tid : 1);
+                        info.si_status = (int)((c->exit_status >> 8) & 0xFF);
+                        copy_to_user_safe(info_u, &info, sizeof(info));
+                    }
+                    return (uint64_t)SIGCHLD;
+                }
+            }
+            if (timeout_u) {
+                struct timespec_k { int64_t tv_sec; int64_t tv_nsec; } ts;
+                if (copy_from_user_raw(&ts, timeout_u, sizeof(ts)) != 0) return ret_err(EFAULT);
+                if (ts.tv_sec < 0 || ts.tv_nsec < 0) return ret_err(EINVAL);
+                uint64_t ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
+                if (ms == 0 && ts.tv_nsec > 0) ms = 1;
+                if (ms > 0) thread_sleep((uint32_t)ms);
+                sig = thread_fetch_pending_signal(tcur, mask ? mask : ~0ULL);
+                if (sig) {
+                    if (sig == SIGCHLD && info_u) {
+                        thread_t *c = find_terminated_child(tcur);
+                        struct siginfo_k {
+                            int si_signo;
+                            int si_errno;
+                            int si_code;
+                            int si_pid;
+                            int si_uid;
+                            int si_status;
+                            long si_utime;
+                            long si_stime;
+                        } info;
+                        memset(&info, 0, sizeof(info));
+                        info.si_signo = SIGCHLD;
+                        info.si_code = 1; /* CLD_EXITED */
+                        if (c) {
+                            info.si_pid = (int)(c->tid ? c->tid : 1);
+                            info.si_status = (int)((c->exit_status >> 8) & 0xFF);
+                        }
+                        copy_to_user_safe(info_u, &info, sizeof(info));
+                    }
+                    return (uint64_t)sig;
+                }
+                if (mask & (1ULL << (SIGCHLD - 1))) {
+                    thread_t *c = find_terminated_child(tcur);
+                    if (c) {
+                        if (info_u) {
+                            struct siginfo_k {
+                                int si_signo;
+                                int si_errno;
+                                int si_code;
+                                int si_pid;
+                                int si_uid;
+                                int si_status;
+                                long si_utime;
+                                long si_stime;
+                            } info;
+                            memset(&info, 0, sizeof(info));
+                            info.si_signo = SIGCHLD;
+                            info.si_code = 1; /* CLD_EXITED */
+                            info.si_pid = (int)(c->tid ? c->tid : 1);
+                            info.si_status = (int)((c->exit_status >> 8) & 0xFF);
+                            copy_to_user_safe(info_u, &info, sizeof(info));
+                        }
+                        return (uint64_t)SIGCHLD;
+                    }
+                }
+                return ret_err(EAGAIN);
+            }
+            /* no timeout: block until signal */
+            for (;;) {
+                thread_sleep(10);
+                sig = thread_fetch_pending_signal(tcur, mask ? mask : ~0ULL);
+                if (sig) {
+                    if (sig == SIGCHLD && info_u) {
+                        thread_t *c = find_terminated_child(tcur);
+                        struct siginfo_k {
+                            int si_signo;
+                            int si_errno;
+                            int si_code;
+                            int si_pid;
+                            int si_uid;
+                            int si_status;
+                            long si_utime;
+                            long si_stime;
+                        } info;
+                        memset(&info, 0, sizeof(info));
+                        info.si_signo = SIGCHLD;
+                        info.si_code = 1; /* CLD_EXITED */
+                        if (c) {
+                            info.si_pid = (int)(c->tid ? c->tid : 1);
+                            info.si_status = (int)((c->exit_status >> 8) & 0xFF);
+                        }
+                        copy_to_user_safe(info_u, &info, sizeof(info));
+                    }
+                    return (uint64_t)sig;
+                }
+                if (mask & (1ULL << (SIGCHLD - 1))) {
+                    thread_t *c = find_terminated_child(tcur);
+                    if (c) {
+                        if (info_u) {
+                            struct siginfo_k {
+                                int si_signo;
+                                int si_errno;
+                                int si_code;
+                                int si_pid;
+                                int si_uid;
+                                int si_status;
+                                long si_utime;
+                                long si_stime;
+                            } info;
+                            memset(&info, 0, sizeof(info));
+                            info.si_signo = SIGCHLD;
+                            info.si_code = 1; /* CLD_EXITED */
+                            info.si_pid = (int)(c->tid ? c->tid : 1);
+                            info.si_status = (int)((c->exit_status >> 8) & 0xFF);
+                            copy_to_user_safe(info_u, &info, sizeof(info));
+                        }
+                        return (uint64_t)SIGCHLD;
+                    }
+                }
+            }
+        }
         case SYS_execve: {
             /* copy path, argv, envp from user and call kernel_execve_from_path */
             const char *path_u = (const char*)(uintptr_t)a1;
@@ -1327,6 +1863,9 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 kfree(path);
                 return ret_err(EFAULT);
             }
+            char resolved_path[512];
+            resolve_user_path(cur, path, resolved_path, sizeof(resolved_path));
+            qemu_debug_printf("execve(syscall): path='%s' resolved='%s'\n", path, resolved_path);
 
             /* Copy argv array (NULL-terminated) */
             int argc = 0;
@@ -1365,6 +1904,10 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 kargv[i] = ks;
             }
             kargv[argc] = NULL;
+            /* brief argv preview for debugging */
+            if (argc > 0) {
+                qemu_debug_printf("execve(syscall): argv0='%s'\n", kargv[0] ? kargv[0] : "(null)");
+            }
 
             /* Copy envp similarly (but allow NULL) */
             int envc = 0;
@@ -1405,13 +1948,14 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
 
             /* call kernel execve (does not return on success) */
-            int rc = kernel_execve_from_path(path, (const char *const *)kargv, (const char *const *)kenvp);
+            int rc = kernel_execve_from_path(resolved_path, (const char *const *)kargv, (const char *const *)kenvp);
 
             /* cleanup on failure */
             if (kenvp) { for (int i=0;i<envc;i++) if (kenvp[i]) kfree((void*)kenvp[i]); kfree(kenvp); }
             for (int i=0;i<argc;i++) if (kargv[i]) kfree((void*)kargv[i]);
             if (kargv) kfree((void*)kargv);
             kfree(path);
+            if (rc == -2) return ret_err(ENOEXEC);
             return (rc == 0) ? 0 : ret_err(ENOENT);
         }
         case SYS_rt_sigprocmask: {
@@ -1460,6 +2004,9 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             uint64_t saved_rsp = cur->saved_user_rsp;
 
             /* create kernel thread that will enter user mode at saved_rcx/saved_rsp */
+            qemu_debug_printf("fork: pid=%llu enter saved_ret=0x%llx saved_rsp=0x%llx\n",
+                    (unsigned long long)(cur->tid ? cur->tid : 1),
+                    (unsigned long long)saved_rcx, (unsigned long long)saved_rsp);
             qemu_debug_printf("fork: pid=%llu saved_ret=0x%llx saved_rsp=0x%llx\n",
                     (unsigned long long)(cur->tid ? cur->tid : 1),
                     (unsigned long long)saved_rcx, (unsigned long long)saved_rsp);
@@ -1486,58 +2033,177 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             char child_name[32];
             snprintf(child_name, sizeof(child_name), "%s.child", cur->name);
-            kprintf("DBG: fork: syscall_user_return_rip=0x%llx syscall_user_rsp_saved=0x%llx (saved_rcx=0x%llx saved_rsp=0x%llx)\n",
-                    (unsigned long long)syscall_user_return_rip, (unsigned long long)syscall_user_rsp_saved,
-                    (unsigned long long)saved_rcx, (unsigned long long)saved_rsp);
+            // kprintf("DBG: fork: syscall_user_return_rip=0x%llx syscall_user_rsp_saved=0x%llx (saved_rcx=0x%llx saved_rsp=0x%llx)\n",
+            //         (unsigned long long)syscall_user_return_rip, (unsigned long long)syscall_user_rsp_saved,
+            //         (unsigned long long)saved_rcx, (unsigned long long)saved_rsp);
             /* Create BLOCKED first to avoid running before initialization. */
             thread_t *child = thread_create_blocked(user_thread_entry, child_name);
             if (!child) return ret_err(ENOMEM);
-            /* set up user entry and stack for the child.
-               Use a small safe trampoline (like vfork) so the child doesn't resume
-               into a potentially fragile user register snapshot. The trampoline
-               will set RAX=0, set RSP to saved_rsp and jump to saved_rcx. */
+            /* clone parent's active stack slice into child's own stack (like vfork safe variant) */
             {
-                uintptr_t tramp = (uintptr_t)USER_VFORK_TRAMP;
-                /* ensure tramp region is user-accessible */
-                mark_user_identity_range_2m_sys((uint64_t)(tramp & ~((uintptr_t)(PAGE_SIZE_2M - 1))),
-                                               (uint64_t)((tramp & ~((uintptr_t)(PAGE_SIZE_2M - 1))) + PAGE_SIZE_2M));
-                if ((uintptr_t)tramp + 64 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                    unsigned char stub[64];
-                    int off = 0;
-                    /* xor rax, rax -> return value 0 in child */
-                    stub[off++] = 0x48; stub[off++] = 0x31; stub[off++] = 0xC0;
-                    /* movabs rsp, saved_rsp -> 48 BC imm64 */
-                    uint64_t imm_rsp = (uint64_t)saved_rsp;
-                    stub[off++] = 0x48; stub[off++] = 0xBC; memcpy(&stub[off], &imm_rsp, 8); off += 8;
-                    /* movabs r11, saved_rcx -> 49 BB imm64 */
-                    uint64_t imm_r11 = (uint64_t)saved_rcx;
-                    stub[off++] = 0x49; stub[off++] = 0xBB; memcpy(&stub[off], &imm_r11, 8); off += 8;
-                    /* jmp r11 -> 41 FF E3 */
-                    stub[off++] = 0x41; stub[off++] = 0xFF; stub[off++] = 0xE3;
-                    /* pad with NOPs */
-                    for (int z = off; z < (int)sizeof(stub); z++) stub[z] = 0x90;
-                    memcpy((void*)(uintptr_t)tramp, stub, off);
-                    /* Read back bytes to verify write succeeded */
-                    unsigned char verify[16];
-                    memcpy(verify, (void*)(uintptr_t)tramp, sizeof(verify));
-                    qemu_debug_printf("fork: wrote trampoline at %p bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
-                                      (void*)(uintptr_t)tramp,
-                                      verify[0], verify[1], verify[2], verify[3],
-                                      verify[4], verify[5], verify[6], verify[7],
-                                      verify[8], verify[9], verify[10], verify[11],
-                                      verify[12], verify[13], verify[14], verify[15]);
-                    child->user_rip = (uint64_t)tramp;
-                } else {
-                    /* fallback: use saved_rcx if tramp can't be used */
-                    child->user_rip = saved_rcx;
+                uintptr_t parent_fs = (uintptr_t)cur->user_fs_base;
+                uintptr_t parent_tls_region = (parent_fs >= 0x1000u) ? (parent_fs - 0x1000u) : 0;
+                if ((uintptr_t)saved_rsp == 0 || (uintptr_t)saved_rsp >= (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                    qemu_debug_printf("fork: invalid saved_rsp=0x%llx -> EINVAL\n", (unsigned long long)saved_rsp);
+                    return ret_err(EINVAL);
                 }
-                child->user_stack = saved_rsp;
-                child->ring = 3;
+                uintptr_t max_copy = (uintptr_t)USER_STACK_SIZE;
+                if (max_copy > (uintptr_t)(1024 * 1024)) max_copy = (uintptr_t)(1024 * 1024);
+                uintptr_t avail = (uintptr_t)MMIO_IDENTITY_LIMIT - (uintptr_t)saved_rsp;
+                uintptr_t copy_bytes = (avail < max_copy) ? avail : max_copy;
+                if (copy_bytes < 256) {
+                    qemu_debug_printf("fork: too little stack to copy (%u) -> EINVAL\n", (unsigned)copy_bytes);
+                    return ret_err(EINVAL);
+                }
+
+                uintptr_t child_stack_top = (uintptr_t)USER_STACK_TOP;
+                {
+                    const uintptr_t stride = (uintptr_t)USER_STACK_SIZE + (uintptr_t)USER_TLS_SIZE + (uintptr_t)(64 * 1024);
+                    const uint64_t slot = (uint64_t)child->tid + 1ULL;
+                    if (stride != 0 && slot <= (uint64_t)((uintptr_t)-1) / (uint64_t)stride) {
+                        const uintptr_t off = (uintptr_t)(slot * (uint64_t)stride);
+                        const uintptr_t top = (uintptr_t)USER_STACK_TOP;
+                        const uintptr_t min_room = (uintptr_t)USER_STACK_SIZE + (uintptr_t)USER_TLS_SIZE + 0x10000u;
+                        if (top > min_room && off < (top - min_room)) {
+                            child_stack_top = (uintptr_t)USER_STACK_TOP - off;
+                        }
+                    }
+                }
+                child_stack_top &= ~((uintptr_t)0xFULL);
+                uintptr_t child_rsp = (child_stack_top - copy_bytes);
+                /* Preserve original stack alignment (SSE movdqa expects this). */
+                uintptr_t align_mask = (uintptr_t)0xFULL;
+                uintptr_t want = (uintptr_t)saved_rsp & align_mask;
+                uintptr_t have = (uintptr_t)child_rsp & align_mask;
+                if (have != want) {
+                    child_rsp += (want - have) & align_mask;
+                }
+
+                {
+                    uintptr_t sb = (child_stack_top - (uintptr_t)USER_STACK_SIZE) & ~0xFFFULL;
+                    if (mark_user_identity_range_2m_sys((uint64_t)sb, (uint64_t)child_stack_top) != 0) {
+                        qemu_debug_printf("fork: failed to mark child stack user range\n");
+                        return ret_err(EFAULT);
+                    }
+                }
+                memcpy((void*)child_rsp, (void*)(uintptr_t)saved_rsp, (size_t)copy_bytes);
+                {
+                    const uintptr_t parent_lo = (uintptr_t)saved_rsp;
+                    const uintptr_t parent_hi = parent_lo + (uintptr_t)copy_bytes;
+                    const uintptr_t delta = (uintptr_t)child_rsp - parent_lo;
+                    uintptr_t pp = (uintptr_t)child_rsp;
+                    uintptr_t end = (uintptr_t)child_rsp + (uintptr_t)copy_bytes;
+                    for (; pp + 8 <= end; pp += 8) {
+                        uint64_t v = *(uint64_t*)(uintptr_t)pp;
+                        uintptr_t vv = (uintptr_t)v;
+                        if (vv >= parent_lo && vv < parent_hi) {
+                            *(uint64_t*)(uintptr_t)pp = (uint64_t)(vv + delta);
+                        }
+                    }
+                }
+
+                /* set up TLS for child */
+                uintptr_t child_tls_region = child_stack_top - (uintptr_t)USER_STACK_SIZE - (uintptr_t)USER_TLS_SIZE;
+                uintptr_t child_fs = child_tls_region + 0x1000u;
+                uintptr_t child_pthread_fake = child_tls_region + 0x2000u;
+                if (mark_user_identity_range_2m_sys((uint64_t)child_tls_region, (uint64_t)(child_pthread_fake + 0x1000u)) != 0) {
+                    qemu_debug_printf("fork: failed to mark child TLS range\n");
+                    return ret_err(EFAULT);
+                }
+                memset((void*)child_tls_region, 0, 0x3000u);
+                if (parent_tls_region != 0 && parent_tls_region + 0x3000u < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                    memcpy((void*)child_tls_region, (void*)parent_tls_region, 0x3000u);
+                }
+                *(volatile uint64_t*)(uintptr_t)(child_fs - 0x78u) = (uint64_t)child_pthread_fake;
+                {
+                    const uintptr_t c_str = child_tls_region + 0x2800u;
+                    if (c_str + 2 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                        *(volatile uint8_t*)(uintptr_t)(c_str + 0) = (uint8_t)'C';
+                        *(volatile uint8_t*)(uintptr_t)(c_str + 1) = 0;
+                        const uintptr_t specific5_slot = child_pthread_fake + 0x80u + (uintptr_t)(5u * 8u);
+                        for (int si = 0; si < 32; si++) {
+                            *(volatile uint64_t*)(uintptr_t)(child_pthread_fake + 0x80u + (uintptr_t)(si * 8u)) = 0;
+                        }
+                        *(volatile uint64_t*)(uintptr_t)specific5_slot = (uint64_t)c_str;
+                    }
+                }
+                child->user_fs_base = (uint64_t)child_fs;
+
+                /* set up user entry and stack for the child (restore full regs, relocate stack pointers) */
+                {
+                    uintptr_t tramp = (uintptr_t)USER_VFORK_TRAMP;
+                    mark_user_identity_range_2m_sys((uint64_t)(tramp & ~((uintptr_t)(PAGE_SIZE_2M - 1))),
+                                                   (uint64_t)((tramp & ~((uintptr_t)(PAGE_SIZE_2M - 1))) + PAGE_SIZE_2M));
+                    if ((uintptr_t)tramp + 64 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                        const uintptr_t parent_lo = (uintptr_t)saved_rsp;
+                        const uintptr_t parent_hi = parent_lo + (uintptr_t)copy_bytes;
+                        #define VFORK_RELOC(val64) \
+                            ((((uintptr_t)(val64) >= parent_lo) && ((uintptr_t)(val64) < parent_hi)) ? \
+                             (uint64_t)((uintptr_t)child_rsp + ((uintptr_t)(val64) - parent_lo)) : \
+                             (uint64_t)(val64))
+                        unsigned char stub[160];
+                        int off = 0;
+                        uint64_t imm_rdi = VFORK_RELOC(cur->saved_user_rdi);
+                        stub[off++] = 0x48; stub[off++] = 0xBF; memcpy(&stub[off], &imm_rdi, 8); off += 8;
+                        uint64_t imm_rsi = VFORK_RELOC(cur->saved_user_rsi);
+                        stub[off++] = 0x48; stub[off++] = 0xBE; memcpy(&stub[off], &imm_rsi, 8); off += 8;
+                        uint64_t imm_rdx = VFORK_RELOC(cur->saved_user_rdx);
+                        stub[off++] = 0x48; stub[off++] = 0xBA; memcpy(&stub[off], &imm_rdx, 8); off += 8;
+                        uint64_t imm_r8 = VFORK_RELOC(cur->saved_user_r8);
+                        stub[off++] = 0x49; stub[off++] = 0xB8; memcpy(&stub[off], &imm_r8, 8); off += 8;
+                        uint64_t imm_r9 = VFORK_RELOC(cur->saved_user_r9);
+                        stub[off++] = 0x49; stub[off++] = 0xB9; memcpy(&stub[off], &imm_r9, 8); off += 8;
+                        uint64_t imm_r10 = VFORK_RELOC(cur->saved_user_r10);
+                        stub[off++] = 0x49; stub[off++] = 0xBA; memcpy(&stub[off], &imm_r10, 8); off += 8;
+                        uint64_t imm_rcx = (uint64_t)saved_rcx;
+                        stub[off++] = 0x48; stub[off++] = 0xB9; memcpy(&stub[off], &imm_rcx, 8); off += 8;
+                        uint64_t imm_r11_flags = cur->saved_user_r11;
+                        stub[off++] = 0x49; stub[off++] = 0xBB; memcpy(&stub[off], &imm_r11_flags, 8); off += 8;
+                        uint64_t imm_rbx = VFORK_RELOC(cur->saved_user_rbx);
+                        stub[off++] = 0x48; stub[off++] = 0xBB; memcpy(&stub[off], &imm_rbx, 8); off += 8;
+                        uint64_t imm_rbp = VFORK_RELOC(cur->saved_user_rbp);
+                        stub[off++] = 0x48; stub[off++] = 0xBD; memcpy(&stub[off], &imm_rbp, 8); off += 8;
+                        uint64_t imm_r12 = VFORK_RELOC(cur->saved_user_r12);
+                        stub[off++] = 0x49; stub[off++] = 0xBC; memcpy(&stub[off], &imm_r12, 8); off += 8;
+                        uint64_t imm_r13 = VFORK_RELOC(cur->saved_user_r13);
+                        stub[off++] = 0x49; stub[off++] = 0xBD; memcpy(&stub[off], &imm_r13, 8); off += 8;
+                        uint64_t imm_r14 = VFORK_RELOC(cur->saved_user_r14);
+                        stub[off++] = 0x49; stub[off++] = 0xBE; memcpy(&stub[off], &imm_r14, 8); off += 8;
+                        uint64_t imm_r15 = VFORK_RELOC(cur->saved_user_r15);
+                        stub[off++] = 0x49; stub[off++] = 0xBF; memcpy(&stub[off], &imm_r15, 8); off += 8;
+                        stub[off++] = 0x48; stub[off++] = 0x31; stub[off++] = 0xC0;
+                        uint64_t imm_rsp = (uint64_t)child_rsp;
+                        stub[off++] = 0x48; stub[off++] = 0xBC; memcpy(&stub[off], &imm_rsp, 8); off += 8;
+                        stub[off++] = 0xFF; stub[off++] = 0xE1;
+                        #undef VFORK_RELOC
+                        for (int z = off; z < (int)sizeof(stub); z++) stub[z] = 0x90;
+                        memcpy((void*)(uintptr_t)tramp, stub, off);
+                        unsigned char verify[16];
+                        memcpy(verify, (void*)(uintptr_t)tramp, sizeof(verify));
+                        qemu_debug_printf("fork: wrote trampoline at %p bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                                          (void*)(uintptr_t)tramp,
+                                          verify[0], verify[1], verify[2], verify[3],
+                                          verify[4], verify[5], verify[6], verify[7],
+                                          verify[8], verify[9], verify[10], verify[11],
+                                          verify[12], verify[13], verify[14], verify[15]);
+                        child->user_rip = (uint64_t)tramp;
+                    } else {
+                        child->user_rip = saved_rcx;
+                    }
+                    child->user_stack = (uint64_t)child_rsp;
+                    child->ring = 3;
+                }
             }
             /* inherit credentials */
             child->euid = cur->euid;
             child->egid = cur->egid;
             child->attached_tty = cur->attached_tty;
+            /* inherit userspace TLS base so child doesn't fault on %fs */
+            child->user_fs_base = cur->user_fs_base;
+            /* inherit job control + parent */
+            child->parent_tid = (int)(cur->tid ? cur->tid : 1);
+            child->sid = cur->sid;
+            child->pgid = cur->pgid;
             /* copy cwd */
             strncpy(child->cwd, cur->cwd, sizeof(child->cwd)-1);
             child->cwd[sizeof(child->cwd)-1] = '\0';
@@ -1552,6 +2218,9 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             /* now allow child to run */
             thread_unblock((int)(child->tid ? child->tid : 1));
             /* child is ready, return child's pid to parent */
+            qemu_debug_printf("fork: parent=%llu child=%llu\n",
+                    (unsigned long long)(cur->tid ? cur->tid : 1),
+                    (unsigned long long)(child->tid ? child->tid : 1));
             return (uint64_t)(child->tid ? child->tid : 1);
         }
         case SYS_wait4: {
@@ -1563,7 +2232,9 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             int *status_u = (int*)(uintptr_t)a2;
             int options = (int)a3;
             (void)a4;
-            if (options != 0) return ret_err(ENOSYS);
+            /* Support WNOHANG (1), WUNTRACED (2), WCONTINUED (8) as no-ops. */
+            enum { WNOHANG = 1, WUNTRACED = 2, WCONTINUED = 8 };
+            if (options & ~(WNOHANG | WUNTRACED | WCONTINUED)) return ret_err(ENOSYS);
             thread_t *tcur = thread_get_current_user();
             if (!tcur) tcur = thread_current();
             if (!tcur) return ret_err(EINVAL);
@@ -1586,9 +2257,32 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 } else {
                     return ret_err(EINVAL);
                 }
-                if (!found) return ret_err(ECHILD);
+                if (!found) {
+                    /* Init fallback: if we somehow lost parent linkage, still reap any terminated child. */
+                    if (pid == -1 && is_init_user(tcur)) {
+                        for (int i = 0; i < thread_get_count(); i++) {
+                            thread_t *c = thread_get_by_index(i);
+                            if (!c) continue;
+                            if (c->state == THREAD_TERMINATED && c->exit_status != 0x80000000) {
+                                found = c;
+                                break;
+                            }
+                        }
+                    }
+                    if (!found) {
+                        if (options & WNOHANG) {
+                            thread_sleep(1);
+                            return 0;
+                        }
+                        return ret_err(ECHILD);
+                    }
+                }
                 /* If child was already reaped, behave like Linux: ECHILD */
                 if (found->state == THREAD_TERMINATED && found->exit_status == 0x80000000) {
+                    if (options & WNOHANG) {
+                        thread_sleep(1);
+                        return 0;
+                    }
                     return ret_err(ECHILD);
                 }
                 /* If already terminated -> return immediately */
@@ -1601,7 +2295,12 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     found->exit_status = 0x80000000;
                     return (uint64_t)(found->tid ? found->tid : 1);
                 }
-                /* not terminated -> block current thread and set waiter on child */
+                /* not terminated -> WNOHANG returns immediately */
+                if (options & WNOHANG) {
+                    thread_sleep(1);
+                    return 0;
+                }
+                /* block current thread and set waiter on child */
                 found->waiter_tid = (int)tcur->tid;
                 /* block current and yield */
                 thread_block((int)tcur->tid);
@@ -1720,22 +2419,8 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 qemu_debug_printf("ioctl: TIOCSPGRP on fd=%d -> set pgrp=%u (caller pid=%llu name=%s)\n",
                         fd, p, (unsigned long long)(cur->tid ? cur->tid : 1),
                         cur && cur->name ? cur->name : "(null)");
-                /* Restrict who may set terminal foreground pgrp:
-                   allow if caller's pgid == p (self-assign), or caller is session leader (sid == tid).
-                   Otherwise deny to avoid arbitrary pgrp resets that confuse job-control. */
-                int allow = 0;
-                if (cur) {
-                    int caller_pgid = cur->pgid;
-                    int caller_sid = cur->sid;
-                    int caller_tid = (int)(cur->tid ? cur->tid : 1);
-                    if (p == (uint32_t)caller_pgid) allow = 1;
-                    if (caller_sid == caller_tid) allow = 1; /* session leader may set */
-                }
-                if (!allow) {
-                    qemu_debug_printf("ioctl: TIOCSPGRP denied for pid=%llu trying to set pgrp=%u\\n",
-                            (unsigned long long)(cur->tid ? cur->tid : 1), p);
-                    return ret_err(EPERM);
-                }
+                /* Be permissive: allow any pgrp for now to avoid shells exiting
+                   due to strict job-control checks in this minimal tty model. */
                 /* Try to set tty-specific foreground pgrp; fall back to global user_pgrp */
                 if (devfs_tty_set_fg_pgrp(f, (int)p) != 0) {
                     if (p != 0) user_pgrp = (uint64_t)p;
@@ -1832,6 +2517,58 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             ssize_t rr = fs_read(f, tmp, to_read, f->pos);
 
             if (rr > 0) {
+                if (f->path && strcmp(f->path, "/etc/inittab") == 0) {
+                    /* Normalize CRLF -> LF for busybox init parser. */
+                    for (ssize_t i = 0; i < rr; i++) {
+                        if (((char*)tmp)[i] == '\r') ((char*)tmp)[i] = '\n';
+                    }
+                    if (f->pos == 0) {
+                        char preview[129];
+                        size_t plen = (rr < 128) ? (size_t)rr : 128;
+                        int has_nul = 0;
+                        int has_respawn = 0;
+                        int has_askfirst = 0;
+                        int lines = 0;
+                        for (size_t i = 0; i < plen; i++) {
+                            char c = ((char*)tmp)[i];
+                            if (c == '\0') has_nul = 1;
+                            if (c < 32 || c > 126) c = '.';
+                            preview[i] = c;
+                        }
+                        preview[plen] = '\0';
+                        for (ssize_t i = 0; i < rr; i++) {
+                            char c = ((char*)tmp)[i];
+                            if (c == '\n') lines++;
+                        }
+                        if (rr >= 7) {
+                            for (ssize_t i = 0; i + 7 <= rr; i++) {
+                                if (memcmp((char*)tmp + i, "respawn", 7) == 0) { has_respawn = 1; break; }
+                            }
+                        }
+                        if (rr >= 8) {
+                            for (ssize_t i = 0; i + 8 <= rr; i++) {
+                                if (memcmp((char*)tmp + i, "askfirst", 8) == 0) { has_askfirst = 1; break; }
+                            }
+                        }
+                        qemu_debug_printf("read: /etc/inittab size=%u rr=%d preview='%s'\n",
+                                          (unsigned)f->size, (int)rr, preview);
+                        {
+                            char hex[3 * 32 + 1];
+                            size_t hlen = (rr < 32) ? (size_t)rr : 32;
+                            size_t w = 0;
+                            for (size_t i = 0; i < hlen && w + 3 < sizeof(hex); i++) {
+                                static const char *hx = "0123456789abcdef";
+                                unsigned char b = (unsigned char)((char*)tmp)[i];
+                                hex[w++] = hx[(b >> 4) & 0xF];
+                                hex[w++] = hx[b & 0xF];
+                                hex[w++] = ' ';
+                            }
+                            hex[w] = '\0';
+                            qemu_debug_printf("read: /etc/inittab hex32='%s' nul=%d lines=%d respawn=%d askfirst=%d\n",
+                                              hex, has_nul, lines, has_respawn, has_askfirst);
+                        }
+                    }
+                }
                 if ((uintptr_t)bufp + (size_t)rr <= (uintptr_t)MMIO_IDENTITY_LIMIT) {
                     memcpy(bufp, tmp, (size_t)rr);
                     f->pos += (size_t)rr;
@@ -1840,6 +2577,9 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 }
                 kfree(tmp);
                 return ret_err(EFAULT);
+            }
+            if (f->path && strcmp(f->path, "/etc/inittab") == 0 && f->pos == 0) {
+                qemu_debug_printf("read: /etc/inittab rr=0 size=%u\n", (unsigned)f->size);
             }
             kfree(tmp);
             return (rr >= 0) ? (uint64_t)rr : ret_err(EINVAL);
@@ -2025,6 +2765,13 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             char path[256];
             resolve_user_path(cur, path_u, path, sizeof(path));
             qemu_debug_printf("open: pid=%llu path='%s' resolved='%s'\n", (unsigned long long)(cur->tid ? cur->tid : 1), path_u, path);
+            if (strcmp(path, "/etc/inittab") == 0) {
+                struct stat st;
+                if (vfs_stat(path, &st) == 0 && st.st_size == 0) {
+                    qemu_debug_printf("open: %s is empty -> ENOENT (force init defaults)\n", path);
+                    return ret_err(ENOENT);
+                }
+            }
             struct fs_file *f = fs_open(path);
             if (!f) {
                 qemu_debug_printf("open: failed to open '%s' -> ENOENT\n", path);
@@ -2048,6 +2795,13 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             char path[256];
             resolve_user_path(cur, path_u, path, sizeof(path));
             qemu_debug_printf("openat: resolved path='%s'\n", path);
+            if (strcmp(path, "/etc/inittab") == 0) {
+                struct stat st;
+                if (vfs_stat(path, &st) == 0 && st.st_size == 0) {
+                    qemu_debug_printf("openat: %s is empty -> ENOENT (force init defaults)\n", path);
+                    return ret_err(ENOENT);
+                }
+            }
             struct fs_file *f = fs_open(path);
             if (!f) {
                 const int O_CREAT_MASK = 0x40;
@@ -2085,7 +2839,8 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             char path[256];
             resolve_user_path(cur, path_u, path, sizeof(path));
             struct stat st;
-            if (vfs_stat(path, &st) != 0) return ret_err(ENOENT);
+            int rc_st = (num == SYS_lstat) ? vfs_lstat(path, &st) : vfs_stat(path, &st);
+            if (rc_st != 0) return ret_err(ENOENT);
             /* Diagnostic: log stat calls for /init */
             if (strcmp(path, "/init") == 0) {
                 qemu_debug_printf("SYS_stat/lstat: path=%s st_mode=0x%04x st_size=%llu\n",
@@ -2412,26 +3167,74 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             return ret_err(EINVAL);
         }
+        case SYS_mount: {
+            /* mount(source, target, fstype, flags, data) */
+            const char *src_u = (const char*)(uintptr_t)a1;
+            const char *tgt_u = (const char*)(uintptr_t)a2;
+            const char *type_u = (const char*)(uintptr_t)a3;
+            (void)src_u; (void)a4; (void)a5;
+            if (!tgt_u || !type_u) return ret_err(EINVAL);
+            char *k_type = copy_user_cstr(type_u, 64);
+            if (!k_type) return ret_err(EFAULT);
+            char *k_tgt_raw = copy_user_cstr(tgt_u, 256);
+            if (!k_tgt_raw) { kfree(k_type); return ret_err(EFAULT); }
+            char target[256];
+            resolve_user_path(cur, k_tgt_raw, target, sizeof(target));
+            kfree(k_tgt_raw);
+            if (target[0] == '\0') { kfree(k_type); return ret_err(EINVAL); }
+
+            int rc = -1;
+            if (strcmp(k_type, "proc") == 0 || strcmp(k_type, "procfs") == 0) {
+                (void)procfs_register();
+                ramfs_mkdir(target);
+                rc = procfs_mount(target);
+            } else if (strcmp(k_type, "sysfs") == 0) {
+                if (sysfs_register() == 0) {
+                    ramfs_mkdir(target);
+                    rc = sysfs_mount(target);
+                }
+            } else if (strcmp(k_type, "devfs") == 0 || strcmp(k_type, "devtmpfs") == 0) {
+                if (devfs_register() == 0) {
+                    ramfs_mkdir(target);
+                    rc = devfs_mount(target);
+                }
+            } else {
+                rc = -1;
+            }
+
+            kfree(k_type);
+            return (rc == 0) ? 0 : ret_err(ENOSYS);
+        }
         case SYS_brk: {
             /* Simple brk: bump within a safe range in identity-mapped low memory. */
             uintptr_t req = (uintptr_t)a1;
-            if (user_brk_base == 0) {
+            thread_t *tcur = thread_get_current_user();
+            if (!tcur) tcur = thread_current();
+            uintptr_t *p_base = tcur ? &tcur->user_brk_base : &user_brk_base;
+            uintptr_t *p_cur = tcur ? &tcur->user_brk_cur : &user_brk_cur;
+            if (*p_base == 0) {
                 /* initialize lazy: place brk after 8MiB by default */
-                user_brk_base = 8u * 1024u * 1024u;
-                user_brk_cur = user_brk_base;
+                *p_base = 8u * 1024u * 1024u;
+                *p_cur = *p_base;
             }
-            if (req == 0) return (uint64_t)user_brk_cur;
+            if (req == 0) return (uint64_t)(*p_cur);
             req = align_up_u(req, 16);
             /* Don't allow brk to collide with reserved TLS/stack area. */
-            uintptr_t top_limit = (uintptr_t)USER_TLS_BASE; /* reserve [USER_TLS_BASE .. USER_STACK_TOP) */
-            if (req < user_brk_base || req >= top_limit) return (uint64_t)user_brk_cur;
-            /* mark and zero new range */
-            if (req > user_brk_cur) {
-                if (mark_user_identity_range_2m_sys((uint64_t)user_brk_cur, (uint64_t)req) != 0) return ret_err(EFAULT);
-                memset((void*)user_brk_cur, 0, req - user_brk_cur);
+            uintptr_t top_limit = (uintptr_t)USER_TLS_BASE;
+            if (tcur) {
+                uintptr_t tls_base = user_tls_base_for_tid_local(tcur->tid);
+                if (tls_base > 0x200000 && tls_base < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                    top_limit = tls_base;
+                }
             }
-            user_brk_cur = req;
-            return (uint64_t)user_brk_cur;
+            if (req < *p_base || req >= top_limit) return (uint64_t)(*p_cur);
+            /* mark and zero new range */
+            if (req > *p_cur) {
+                if (mark_user_identity_range_2m_sys((uint64_t)(*p_cur), (uint64_t)req) != 0) return ret_err(EFAULT);
+                memset((void*)(*p_cur), 0, req - (*p_cur));
+            }
+            *p_cur = req;
+            return (uint64_t)(*p_cur);
         }
         case SYS_mmap: {
             /* mmap(addr,len,prot,flags,fd,off) - only anonymous/private supported */
@@ -2443,18 +3246,30 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             (void)a5; (void)a6;
             if (len == 0) return ret_err(EINVAL);
             len = (size_t)align_up_u((uintptr_t)len, 4096);
-            enum { MAP_FIXED = 0x10, MAP_ANONYMOUS = 0x20, MAP_PRIVATE = 0x02 };
+            enum { MAP_FIXED = 0x10, MAP_ANONYMOUS = 0x20, MAP_PRIVATE = 0x02,
+                   MAP_STACK = 0x20000, MAP_GROWSDOWN = 0x0100, MAP_NORESERVE = 0x4000 };
             if (flags & MAP_FIXED) return ret_err(EINVAL);
             if (!(flags & MAP_ANONYMOUS) || !(flags & MAP_PRIVATE)) return ret_err(ENOSYS);
-            if (user_mmap_next == 0) user_mmap_next = 32u * 1024u * 1024u; /* 32MiB */
-            uintptr_t addr = align_up_u(user_mmap_next, 4096);
+            /* tolerate additional common flags used by bash/glibc */
+            flags &= ~(MAP_ANONYMOUS | MAP_PRIVATE | MAP_STACK | MAP_GROWSDOWN | MAP_NORESERVE);
+            if (flags != 0) return ret_err(ENOSYS);
+            thread_t *tcur = thread_get_current_user();
+            if (!tcur) tcur = thread_current();
+            uintptr_t *p_mmap_next = tcur ? &tcur->user_mmap_next : &user_mmap_next;
+            if (*p_mmap_next == 0) *p_mmap_next = 32u * 1024u * 1024u; /* 32MiB */
+            uintptr_t addr = align_up_u(*p_mmap_next, 4096);
             /* Do not allow mappings to collide with this thread's TLS/stack region. */
             uintptr_t top_limit = (uintptr_t)USER_TLS_BASE;
-            if (cur && cur->user_fs_base) top_limit = (uintptr_t)cur->user_fs_base;
+            if (tcur) {
+                uintptr_t tls_base = user_tls_base_for_tid_local(tcur->tid);
+                if (tls_base > 0x200000 && tls_base < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                    top_limit = tls_base;
+                }
+            }
             if (addr + len >= top_limit) return ret_err(ENOMEM);
             if (mark_user_identity_range_2m_sys((uint64_t)addr, (uint64_t)(addr + len)) != 0) return ret_err(EFAULT);
             memset((void*)addr, 0, len);
-            user_mmap_next = addr + len;
+            *p_mmap_next = addr + len;
             return (uint64_t)addr;
         }
         case SYS_munmap:
@@ -2471,8 +3286,14 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (cur) {
                 int code = (int)a1;
                 cur->exit_status = (code & 0xFF) << 8;
-                /* wake vfork parent if any */
+                if (cur->parent_tid >= 0) {
+                    thread_t *pt = thread_get(cur->parent_tid);
+                    if (pt) thread_set_pending_signal(pt, SIGCHLD);
+                }
+                /* wake vfork parent if any (restore parent's stack snapshot first) */
                 if (cur->vfork_parent_tid >= 0) {
+                    vfork_restore_parent_memory(cur);
+                    vfork_restore_parent_stack(cur);
                     thread_unblock(cur->vfork_parent_tid);
                     cur->vfork_parent_tid = -1;
                 }
@@ -2506,7 +3327,13 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (cur) {
                 int code = (int)a1;
                 cur->exit_status = (code & 0xFF) << 8;
+                if (cur->parent_tid >= 0) {
+                    thread_t *pt = thread_get(cur->parent_tid);
+                    if (pt) thread_set_pending_signal(pt, SIGCHLD);
+                }
                 if (cur->vfork_parent_tid >= 0) {
+                    vfork_restore_parent_memory(cur);
+                    vfork_restore_parent_stack(cur);
                     thread_unblock(cur->vfork_parent_tid);
                     cur->vfork_parent_tid = -1;
                 }

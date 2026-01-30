@@ -61,11 +61,22 @@ enter_user_mode_asm:
         call enter_user_post_iret
 
         /* Userspace entry registers:
-           On Linux x86_64, %rdx is used to pass rtld_fini from the dynamic loader.
-           For static executables (our current target), it must be 0. If we leave
-           kernel garbage (or our user_ds selector) in %rdx, libc may later call it
-           during exit and jump into low memory (e.g. RIP=0x3d5). */
+           Make process entry deterministic (avoid "kernel garbage" leaking into userland).
+           Keep %rdx == 0 for static executables; some crt0 variants treat %rdx as
+           rtld_fini callback pointer and may call it at exit. */
+        xor %rbp, %rbp
+        xor %rax, %rax
+        xor %rbx, %rbx
+        xor %rcx, %rcx
+        xor %rdi, %rdi
+        xor %rsi, %rsi
         xor %rdx, %rdx
+        xor %r8,  %r8
+        xor %r9,  %r9
+        xor %r10, %r10
+        xor %r11, %r11
+        xor %r14, %r14
+        xor %r15, %r15
 
         cld
         iretq

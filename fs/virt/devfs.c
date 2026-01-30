@@ -68,8 +68,15 @@ static int devfs_path_to_tty(const char *path) {
     if (!path) return -1;
     if (strcmp(path, "/dev/console") == 0) return 0;
     if (strncmp(path, "/dev/tty", 8) == 0) {
+        /* /dev/ttyN (virtual consoles) */
         int n = path[8] - '0';
         if (n >= 0 && n < DEVFS_TTY_COUNT) return n;
+        /* /dev/ttyS0 -> map to tty0 (serial console alias) */
+        if (path[8] == 'S' && path[9] >= '0' && path[9] <= '9' && path[10] == '\0') {
+            int sn = path[9] - '0';
+            if (sn >= 0 && sn < DEVFS_TTY_COUNT) return sn;
+            return 0;
+        }
     }
     return -1;
 }
@@ -193,6 +200,12 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
     if (!f) return -1;
     *out_file = f;
     return 0;
+}
+
+struct fs_file *devfs_open_direct(const char *path) {
+    struct fs_file *f = NULL;
+    if (devfs_open(path, &f) == 0) return f;
+    return NULL;
 }
 
 static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t offset) {
@@ -891,12 +904,41 @@ int devfs_unregister(void) {
     return fs_unregister_driver(&devfs_driver);
 }
 
+static int devfs_tty_try_erase(struct devfs_tty *t, int tty) {
+    if (!t || t->in_count <= 0) return 0;
+    /* Do not erase past a newline (start of current line). */
+    int last_idx = t->in_tail - 1;
+    if (last_idx < 0) last_idx += (int)sizeof(t->inbuf);
+    if (t->inbuf[last_idx] == '\n') return 0;
+    /* Remove last buffered character. */
+    t->in_tail = last_idx;
+    t->in_count--;
+    /* Echo erase sequence if enabled and active tty. */
+    if ((t->term_lflag & 0x00000008u) /* ECHO */ && tty == devfs_get_active()) {
+        /* Single backspace is enough; VGA/VBE handlers clear the cell. */
+        kputchar('\b', t->current_attr);
+    }
+    return 1;
+}
+
 /* push input char into tty's input queue and wake waiters */
 void devfs_tty_push_input(int tty, char c) {
     if (tty < 0 || tty >= DEVFS_TTY_COUNT) return;
     struct devfs_tty *t = &dev_ttys[tty];
     unsigned long flags = 0;
     acquire_irqsave(&t->in_lock, &flags);
+    /* Handle backspace locally in canonical mode. */
+    if ((t->term_lflag & 0x00000002u) /* ICANON */ && (c == '\b' || (unsigned char)c == 0x7F)) {
+        (void)devfs_tty_try_erase(t, tty);
+        /* wake waiters and return */
+        for (int i = 0; i < t->waiters_count; i++) {
+            int tid = t->waiters[i];
+            if (tid >= 0) thread_unblock(tid);
+        }
+        t->waiters_count = 0;
+        release_irqrestore(&t->in_lock, flags);
+        return;
+    }
     if (t->in_count < (int)sizeof(t->inbuf)) {
         t->inbuf[t->in_tail] = c;
         t->in_tail = (t->in_tail + 1) % (int)sizeof(t->inbuf);
@@ -918,6 +960,18 @@ void devfs_tty_push_input_noblock(int tty, char c) {
     if (tty < 0 || tty >= DEVFS_TTY_COUNT) return;
     struct devfs_tty *t = &dev_ttys[tty];
     if (!try_acquire(&t->in_lock)) return;
+    /* Handle backspace locally in canonical mode. */
+    if ((t->term_lflag & 0x00000002u) /* ICANON */ && (c == '\b' || (unsigned char)c == 0x7F)) {
+        (void)devfs_tty_try_erase(t, tty);
+        /* wake waiters (don't unblock in ISR) */
+        for (int i = 0; i < t->waiters_count; i++) {
+            int tid = t->waiters[i];
+            if (tid >= 0) thread_unblock(tid);
+        }
+        t->waiters_count = 0;
+        release(&t->in_lock);
+        return;
+    }
     if (t->in_count < (int)sizeof(t->inbuf)) {
         t->inbuf[t->in_tail] = c;
         t->in_tail = (t->in_tail + 1) % (int)sizeof(t->inbuf);

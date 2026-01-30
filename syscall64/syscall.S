@@ -20,6 +20,7 @@
 .extern syscall_exit_to_shell_flag
 .extern syscall_return_to_shell
 .extern syscall_exec_trampoline_active
+.extern syscall_snapshot_user_regs
 
 // x86_64 SYSCALL entry point
 // Assumptions/constraints (current AxonOS design):
@@ -102,6 +103,11 @@ syscall_entry64:
     movq    %rax, syscall_user_saved_rcx(%rip)
     movq    32(%rsp), %rax      // r11 (saved RFLAGS from SYSCALL)
     movq    %rax, syscall_user_saved_r11(%rip)
+
+    // Snapshot saved user regs into current thread (per-thread, avoids globals).
+    // Pass pointer to saved frame (rsp points to r15).
+    movq    %rsp, %rdi
+    call    syscall_snapshot_user_regs
 
     // Stack layout at this point (rsp points to r15):
     //  0   r15
