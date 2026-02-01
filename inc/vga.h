@@ -44,6 +44,8 @@ int sprintf(char* out, const char* fmt, ...);
 
 /* Fast direct VGA helpers (write directly to video memory) */
 void vga_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr);
+/* Clear segment [x0..x1] on line y with spaces; does not move cursor. */
+void vga_clear_line_segment(uint32_t x0, uint32_t x1, uint32_t y, uint8_t attr);
 void vga_clear_screen_attr(uint8_t attr);
 void vga_write_str_xy(uint32_t x, uint32_t y, const char *s, uint8_t attr);
 void vga_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t ch, uint8_t attr);

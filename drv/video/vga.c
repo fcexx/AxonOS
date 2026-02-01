@@ -50,7 +50,23 @@ void vga_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
 	vga_lock_release();
 }
 
+void vga_clear_line_segment(uint32_t x0, uint32_t x1, uint32_t y, uint8_t attr) {
+	if (y >= MAX_ROWS) return;
+	if (x0 > x1) return;
+	if (x1 >= MAX_COLS) x1 = MAX_COLS - 1;
+	if (vbe_is_available()) {
+		for (uint32_t x = x0; x <= x1; x++)
+			vbefb_putch_xy(x, y, ' ', attr);
+	} else {
+		vga_fill_rect(x0, y, x1 - x0 + 1, 1, ' ', attr);
+	}
+}
+
 void vga_clear_screen_attr(uint8_t attr) {
+	if (vbe_is_available()) {
+		vbefb_clear(attr);
+		return;
+	}
 	uint8_t *vga = (uint8_t*)VIDEO_ADDRESS;
 	uint32_t total = MAX_ROWS * MAX_COLS;
 	for (uint32_t i = 0; i < total; i++) {

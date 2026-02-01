@@ -9,7 +9,6 @@
 #ifndef DEVFS_TTY_COUNT
 #define DEVFS_TTY_COUNT 6
 #endif
-
 struct devfs_tty {
     int id;
     uint8_t *screen; /* saved VGA buffer (raw bytes 2 per cell) */
@@ -48,6 +47,10 @@ struct devfs_tty {
     int controlling_sid;
     /* POSIX termios local flags (c_lflag) for this tty */
     uint32_t term_lflag;
+    /* echo: skip escape sequences (0=normal, 1=after ESC, 2=after ESC [ or ESC O) */
+    uint8_t echo_escape_state;
+    /* single-byte pushback for readers (e.g. kgetc escape handling); -1 = none */
+    int unget_char;
 };
 
 int devfs_register(void);
@@ -76,8 +79,14 @@ int devfs_get_active(void);
 void devfs_tty_push_input_noblock(int tty, char c);
 /* Non-blocking pop: returns -1 if none, or char (0-255) */
 int devfs_tty_pop_nb(int tty);
+/* Push one byte back; will be returned by next pop. Returns 0 on success, -1 if already pushed. */
+int devfs_tty_unget(int tty, int c);
 /* Return number of available chars in input buffer */
 int devfs_tty_available(int tty);
+/* Add thread as waiter (for poll); returns 0 on success, -1 if full or already present */
+int devfs_tty_add_waiter(int tty, int tid);
+/* Remove thread from waiters (call when poll wakes so we are not woken again by other ttys) */
+void devfs_tty_remove_waiter(int tty, int tid);
 /* Check whether an fs_file is a devfs tty device */
 int devfs_is_tty_file(struct fs_file *file);
 

@@ -119,6 +119,7 @@ void print_hex64(unsigned long long num, int uppercase) {
 
 // qemu_debug_printf using stdarg
 void qemu_debug_printf(const char *format, ...) {
+#ifdef QEMU_LOG_ENABLE
     va_list args;
     va_start(args, format);
     const char *p = format;
@@ -252,4 +253,5 @@ void qemu_debug_printf(const char *format, ...) {
         }
     }
     va_end(args);
+#endif
 }

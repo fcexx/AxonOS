@@ -10,6 +10,8 @@ int vbe_is_available(void);
 
 /* Simple framebuffer console primitives used by kprintf delegation */
 void vbefb_putchar(uint8_t ch, uint8_t attr);
+/* Write character at (x,y) without moving cursor (for clearing line segments). */
+void vbefb_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr);
 void vbefb_putn(char ch, int count, uint8_t attr);
 void vbefb_get_cursor(uint32_t *x, uint32_t *y);
 void vbefb_set_cursor(uint32_t x, uint32_t y);

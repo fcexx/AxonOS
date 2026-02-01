@@ -139,7 +139,6 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->context.rflags = 0x202;
         t->state = st;
         t->sleep_until = 0;
-        t->tid = thread_count;
         strncpy(t->name, name, sizeof(t->name));
         /* default credentials (root) */
         t->euid = 0;
@@ -184,7 +183,10 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->exec_trampoline_rax = 0;
         strncpy(t->cwd, "/", sizeof(t->cwd));
         t->cwd[sizeof(t->cwd) - 1] = '\0';
-        threads[thread_count++] = t;
+        /* Use next free slot and tid so we never overwrite an existing thread. */
+        threads[thread_count] = t;
+        t->tid = thread_count;
+        thread_count++;
         return t;
 }
 

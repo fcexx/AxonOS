@@ -196,22 +196,23 @@ void keyboard_process_scancode(uint8_t scancode) {
         if (tu_for_tty && tu_for_tty->attached_tty >= 0) target_tty_for_user = tu_for_tty->attached_tty;
 
         if (kbd_extended_prefix) {
-                /* extended make codes (E0 xx) */
+                /* extended make codes (E0 xx) — always send ANSI sequences to TTY (ISR has no user context) */
                 switch (scancode) {
                         case 0x1D: /* Right Ctrl */ ctrl_pressed = true; break;
                         case 0x38: /* Right Alt (AltGr) */ alt_pressed = true; break;
-                        case 0x48: /* Up */    if (thread_get_current_user()) kbd_push_sequence(target_tty_for_user, "\x1B[A"); else add_to_buffer(KEY_UP); break;
-                        case 0x50: /* Down */  if (thread_get_current_user()) kbd_push_sequence(target_tty_for_user, "\x1B[B"); else add_to_buffer(KEY_DOWN); break;
-                        case 0x4B: /* Left */  if (thread_get_current_user()) kbd_push_sequence(target_tty_for_user, "\x1B[D"); else add_to_buffer(KEY_LEFT); break;
-                        case 0x4D: /* Right */ if (thread_get_current_user()) kbd_push_sequence(target_tty_for_user, "\x1B[C"); else add_to_buffer(KEY_RIGHT); break;
-                        case 0x47: /* Home */  if (thread_get_current_user()) kbd_push_sequence(target_tty_for_user, "\x1B[H"); else add_to_buffer(KEY_HOME); break;
-                        case 0x4F: /* End */   if (thread_get_current_user()) kbd_push_sequence(target_tty_for_user, "\x1B[F"); else add_to_buffer(KEY_END); break;
-                        case 0x49: /* PgUp */  if (thread_get_current_user()) kbd_push_sequence(target_tty_for_user, "\x1B[5~"); else add_to_buffer(KEY_PGUP); break;
-                        case 0x51: /* PgDn */  if (thread_get_current_user()) kbd_push_sequence(target_tty_for_user, "\x1B[6~"); else add_to_buffer(KEY_PGDN); break;
-                        case 0x52: /* Ins */   if (thread_get_current_user()) kbd_push_sequence(target_tty_for_user, "\x1B[2~"); else add_to_buffer(KEY_INSERT); break;
-                        case 0x53: /* Del */   if (thread_get_current_user()) kbd_push_sequence(target_tty_for_user, "\x1B[3~"); else add_to_buffer(KEY_DELETE); break;
+                        case 0x48: /* Up */    kbd_push_sequence(target_tty_for_user, "\x1B[A"); break;
+                        case 0x50: /* Down */  kbd_push_sequence(target_tty_for_user, "\x1B[B"); break;
+                        case 0x4B: /* Left */  kbd_push_sequence(target_tty_for_user, "\x1B[D"); break;
+                        case 0x4D: /* Right */ kbd_push_sequence(target_tty_for_user, "\x1B[C"); break;
+                        case 0x47: /* Home */  kbd_push_sequence(target_tty_for_user, "\x1B[H"); break;
+                        case 0x4F: /* End */   kbd_push_sequence(target_tty_for_user, "\x1B[F"); break;
+                        case 0x49: /* PgUp */  kbd_push_sequence(target_tty_for_user, "\x1B[5~"); break;
+                        case 0x51: /* PgDn */  kbd_push_sequence(target_tty_for_user, "\x1B[6~"); break;
+                        case 0x52: /* Ins */   kbd_push_sequence(target_tty_for_user, "\x1B[2~"); break;
+                        case 0x53: /* Del */   kbd_push_sequence(target_tty_for_user, "\x1B[3~"); break;
                         case 0x1C: /* Keypad Enter */ add_to_buffer('\n'); break;
                         case 0x35: /* Keypad '/' */   add_to_buffer('/'); break;
+                        case 0x01: /* Escape (E0 01 on some kbd) */ devfs_tty_push_input_noblock(target_tty_for_user, 27); break;
                         default: break;
                 }
                 kbd_extended_prefix = false;
@@ -230,89 +231,37 @@ void keyboard_process_scancode(uint8_t scancode) {
                         alt_pressed = true;
                         break;
                 case 0x0E: // Backspace
-                        if (thread_get_current_user()) {
-                                /* Userspace expects DEL (0x7f) for backspace. */
-                                devfs_tty_push_input_noblock(target_tty_for_user, 0x7F);
-                        } else {
-                                add_to_buffer('\b');
-                        }
+                        /* Always send DEL (0x7f) to TTY for userspace; kernel kgetc handles \b */
+                        devfs_tty_push_input_noblock(target_tty_for_user, 0x7F);
                         break;
                 case 0x48: // Up arrow
-                        if (thread_get_current_user()) {
-                                /* send ESC [ A */
-                                kbd_push_sequence(target_tty_for_user, "\x1B[A");
-                        } else {
-                                add_to_buffer(KEY_UP);
-                        }
-                        break;
                 case 0x50: // Down arrow
-                        if (thread_get_current_user()) {
-                                kbd_push_sequence(target_tty_for_user, "\x1B[B");
-                        } else {
-                                add_to_buffer(KEY_DOWN);
-                        }
-                        break;
                 case 0x4B: // Left arrow
-                        if (thread_get_current_user()) {
-                                kbd_push_sequence(target_tty_for_user, "\x1B[D");
-                        } else {
-                                add_to_buffer(KEY_LEFT);
-                        }
-                        break;
                 case 0x4D: // Right arrow
-                        if (thread_get_current_user()) {
-                                kbd_push_sequence(target_tty_for_user, "\x1B[C");
-                        } else {
-                                add_to_buffer(KEY_RIGHT);
-                        }
-                        break;
                 case 0x47: // Home
-                        if (thread_get_current_user()) {
-                                kbd_push_sequence(target_tty_for_user, "\x1B[H");
-                        } else {
-                                add_to_buffer(KEY_HOME);
-                        }
-                        break;
                 case 0x4F: // End
-                        if (thread_get_current_user()) {
-                                kbd_push_sequence(target_tty_for_user, "\x1B[F");
-                        } else {
-                                add_to_buffer(KEY_END);
-                        }
-                        break;
                 case 0x49: // Page Up
-                        if (thread_get_current_user()) {
-                                kbd_push_sequence(target_tty_for_user, "\x1B[5~");
-                        } else {
-                                add_to_buffer(KEY_PGUP);
-                        }
-                        break;
                 case 0x51: // Page Down
-                        if (thread_get_current_user()) {
-                                kbd_push_sequence(target_tty_for_user, "\x1B[6~");
-                        } else {
-                                add_to_buffer(KEY_PGDN);
-                        }
-                        break;
                 case 0x52: // Insert
-                        if (thread_get_current_user()) {
-                                kbd_push_sequence(target_tty_for_user, "\x1B[2~");
-                        } else {
-                                add_to_buffer(KEY_INSERT);
-                        }
-                        break;
                 case 0x53: // Delete
-                        if (thread_get_current_user()) {
-                                kbd_push_sequence(target_tty_for_user, "\x1B[3~");
-                        } else {
-                                add_to_buffer(KEY_DELETE);
-                        }
+                        /* Always send ANSI sequences to TTY (thread_get_current_user() is NULL in ISR) */
+                        if (scancode == 0x48) kbd_push_sequence(target_tty_for_user, "\x1B[A");
+                        else if (scancode == 0x50) kbd_push_sequence(target_tty_for_user, "\x1B[B");
+                        else if (scancode == 0x4B) kbd_push_sequence(target_tty_for_user, "\x1B[D");
+                        else if (scancode == 0x4D) kbd_push_sequence(target_tty_for_user, "\x1B[C");
+                        else if (scancode == 0x47) kbd_push_sequence(target_tty_for_user, "\x1B[H");
+                        else if (scancode == 0x4F) kbd_push_sequence(target_tty_for_user, "\x1B[F");
+                        else if (scancode == 0x49) kbd_push_sequence(target_tty_for_user, "\x1B[5~");
+                        else if (scancode == 0x51) kbd_push_sequence(target_tty_for_user, "\x1B[6~");
+                        else if (scancode == 0x52) kbd_push_sequence(target_tty_for_user, "\x1B[2~");
+                        else kbd_push_sequence(target_tty_for_user, "\x1B[3~");
                         break;
-                case 0x0F: // Tab
-                        add_to_buffer(KEY_TAB);
+                case 0x0F: // Tab — отправляем ASCII '\t' (0x09), чтобы в TTY/sh отображался таб, а не неизвестный символ
+                        add_to_buffer('\t');
                         break;
                 case 0x01: // Escape
-                        add_to_buffer(27); // ASCII ESC
+                case 0x76: // Escape (alternate scancode)
+                        devfs_tty_push_input_noblock(target_tty_for_user, 27);
                         break;
                 case 0x3B: // F1
                 case 0x3C: // F2
@@ -444,6 +393,7 @@ void ps2_keyboard_init() {
 }
 
 // Получить символ (блокирующая функция, как в Unix)
+// ESC (27): возвращаем сразу, без ожиданий. Стрелки: только если [ или O уже в буфере — сливаем ESC [ A в KEY_UP и т.д.
 char kgetc() {
     int tty = devfs_get_active();
     if (tty < 0) tty = 0;
@@ -451,51 +401,28 @@ char kgetc() {
     for (;;) {
         c = devfs_tty_pop_nb(tty);
         if (c >= 0) {
-            /* If ESC, try to detect CSI sequences for arrows and translate to KEY_* */
             if (c == 27) {
-                /* wait briefly for following bytes (non-blocking spin) */
-                int next1 = -1;
-                for (int spin = 0; spin < 100; spin++) {
-                    next1 = devfs_tty_pop_nb(tty);
-                    if (next1 >= 0) break;
-                    asm volatile("pause");
-                }
-                if (next1 < 0) return (char)27;
+                int next1 = devfs_tty_pop_nb(tty);
+                if (next1 < 0) return (char)27;  /* нет следующего байта — сразу ESC */
                 if (next1 == '[' || next1 == 'O') {
-                    int next2 = -1;
-                    for (int spin = 0; spin < 100; spin++) {
-                        next2 = devfs_tty_pop_nb(tty);
-                        if (next2 >= 0) break;
-                        asm volatile("pause");
-                    }
+                    int next2 = devfs_tty_pop_nb(tty);
                     if (next2 < 0) {
-                        /* only ESC [ — return ESC */
-                        /* push back next1? can't — just return ESC */
+                        devfs_tty_unget(tty, next1);
                         return (char)27;
                     }
-                    /* CSI/SS3 finals */
                     if (next2 == 'A') return (char)KEY_UP;
                     if (next2 == 'B') return (char)KEY_DOWN;
                     if (next2 == 'C') return (char)KEY_RIGHT;
                     if (next2 == 'D') return (char)KEY_LEFT;
-                    /* SS3 mapping (ESC O A etc) */
-                    if (next1 == 'O') {
-                        if (next2 == 'A') return (char)KEY_UP;
-                        if (next2 == 'B') return (char)KEY_DOWN;
-                        if (next2 == 'C') return (char)KEY_RIGHT;
-                        if (next2 == 'D') return (char)KEY_LEFT;
-                    }
-                    /* unknown sequence: ignore and continue */
-                    continue;
-                } else {
-                    /* not CSI: return ESC and make the next1 available by pushing into tty buffer */
-                    /* As fallback we can't push back into devfs easily — drop next1 */
+                    devfs_tty_unget(tty, next2);
+                    devfs_tty_unget(tty, next1);
                     return (char)27;
                 }
+                devfs_tty_unget(tty, next1);
+                return (char)27;
             }
             return (char)c;
         }
-        /* no data — sleep until IRQ wakes us */
         asm volatile("sti; hlt" ::: "memory");
     }
 }
@@ -573,13 +500,13 @@ char* kgets(char* buffer, int max_length) {
                                 buffer[i] = buffer[i + 1];
                         }
                         buffer_pos--;
-                } else if (c == (char)KEY_TAB) {
-                        // Простая вставка пробела при Tab в kgets (автодополнение выполняется в sys_read для шелла)
+                } else if (c == '\t') {
+                        // Вставка символа табуляции (VGA/vbefb отрисуют пробелы до следующей таб-стопы)
                         if (buffer_pos < max_length - 1) {
                                 for (int i = buffer_pos; i > cursor_pos; i--) {
                                         buffer[i] = buffer[i - 1];
                                 }
-                                buffer[cursor_pos] = ' ';
+                                buffer[cursor_pos] = '\t';
                                 buffer_pos++;
                                 cursor_pos++;
                         }

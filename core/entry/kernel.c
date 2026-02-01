@@ -30,6 +30,7 @@
 #include <sysfs.h>
 #include <procfs.h>
 #include <initfs.h>
+#include <ramfs.h>
 #include <editor.h>
 #include <fat32.h>
 #include <intel_chipset.h>
@@ -86,7 +87,7 @@ static uintptr_t mb2_modules_max_end(uint32_t multiboot_magic, uint64_t multiboo
     return max_end;
 }
 
-static ssize_t sysfs_show_const(char *buf, size_t size, void *priv) {
+ssize_t sysfs_show_const(char *buf, size_t size, void *priv) {
     if (!buf || size == 0) return 0;
 
     const char *text = (const char*)priv;
@@ -99,7 +100,7 @@ static ssize_t sysfs_show_const(char *buf, size_t size, void *priv) {
     return (ssize_t)len;
 }
 
-static ssize_t sysfs_show_cpu_name_attr(char *buf, size_t size, void *priv) {
+ssize_t sysfs_show_cpu_name_attr(char *buf, size_t size, void *priv) {
     (void)priv;
 
     if (!buf || size == 0) return 0;
@@ -133,7 +134,7 @@ static size_t sysfs_write_int(char *buf, size_t size, int value) {
     return written;
 }
 
-static ssize_t sysfs_show_ram_mb_attr(char *buf, size_t size, void *priv) {
+ssize_t sysfs_show_ram_mb_attr(char *buf, size_t size, void *priv) {
     (void)priv;
     if (!buf || size == 0) return 0;
 
@@ -146,6 +147,17 @@ static ssize_t sysfs_show_ram_mb_attr(char *buf, size_t size, void *priv) {
     if (written < size) buf[written++] = '\n';
 
     return (ssize_t)written;
+}
+
+/* Populate default sysfs tree when userspace mounts sysfs via SYS_mount. */
+void kernel_sysfs_populate_default(void) {
+    sysfs_mkdir("/sys/kernel");
+    sysfs_mkdir("/sys/class");
+    sysfs_mkdir("/sys/bus");
+    static const struct sysfs_attr attr_cpu = { sysfs_show_cpu_name_attr, NULL, NULL };
+    static const struct sysfs_attr attr_ram = { sysfs_show_ram_mb_attr, NULL, NULL };
+    sysfs_create_file("/sys/kernel/cpu_name", &attr_cpu);
+    sysfs_create_file("/sys/kernel/ram_mb", &attr_ram);
 }
 
 void ring0_shell()  { osh_run(); }
@@ -170,6 +182,7 @@ static int boot_try_run_init(void) {
         int rc = kernel_execve_from_path(p, argv0, NULL);
         if (rc == 0) return 0;
         klogprintf("boot: init %s returned rc=%d\n", p, rc);
+
     }
     return -1;
 }
@@ -243,57 +256,11 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 
     mmio_init();
     ramfs_register();
+    /* Create /dev in ramfs before initfs so it is always visible in ls / and before getty runs */
+    ramfs_mkdir("/dev");
     ext2_register();
 
-    if (sysfs_register() == 0) {
-        kprintf("sysfs: registered\n");
-        ramfs_mkdir("/sys");
-        sysfs_mkdir("/sys");
-        sysfs_mkdir("/sys/kernel");
-        sysfs_mkdir("/sys/kernel/cpu");
-        sysfs_mkdir("/sys/class");
-        sysfs_mkdir("/sys/class/input");
-        sysfs_mkdir("/sys/class/tty");
-        sysfs_mkdir("/sys/class/block");
-        sysfs_mkdir("/sys/class/net");
-        sysfs_mkdir("/sys/bus");
-        sysfs_mkdir("/sys/bus/pci");
-        sysfs_mkdir("/sys/bus/pci/devices");
-        sysfs_mkdir("/sys/class");
-        sysfs_mkdir("/sys/class/input");
-        sysfs_mkdir("/sys/class/tty");
-        sysfs_mkdir("/sys/class/block");
-        sysfs_mkdir("/sys/class/net");
-        struct sysfs_attr attr_os_name = { sysfs_show_const, NULL, (void*)OS_NAME };
-        struct sysfs_attr attr_os_version = { sysfs_show_const, NULL, (void*)OS_VERSION };
-        struct sysfs_attr attr_cpu_name = { sysfs_show_cpu_name_attr, NULL, NULL };
-        struct sysfs_attr attr_ram_mb = { sysfs_show_ram_mb_attr, NULL, NULL };
-        sysfs_create_file("/sys/kernel/sysname", &attr_os_name);
-        sysfs_create_file("/sys/kernel/sysver", &attr_os_version);
-        sysfs_create_file("/sys/kernel/cpu/name", &attr_cpu_name);
-        sysfs_create_file("/sys/kernel/ram", &attr_ram_mb);
-        /* create /etc and write initial passwd/group files into ramfs */
-        ramfs_mkdir("/etc");
-        
-        char *buf = NULL; size_t bl = 0;
-        if (user_export_passwd(&buf, &bl) == 0 && buf) {
-            struct fs_file *f = fs_create_file("/etc/passwd");
-            if (f) {
-                fs_write(f, buf, bl, 0);
-                fs_file_free(f);
-            }
-            kfree(buf);
-        }
-        /* simple /etc/group with only root group initially */
-        const char *gline = "root:x:0:root\n";
-        struct fs_file *g = fs_create_file("/etc/group");
-        if (g) {
-            fs_write(g, gline, strlen(gline), 0);
-            fs_file_free(g);
-        }
-    } else {
-        kprintf("sysfs: failed to register\n");
-    }
+    /* sysfs, procfs, devfs mount — only via SYS_mount from userspace (e.g. init) */
 
     klog_init(); // for logging into /var/log/kernel file
     sysinfo_print_e820(multiboot_magic, multiboot_info);
@@ -354,10 +321,13 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     if (r == 0) klogprintf("initfs: unpacked successfully\n");
     else klogprintf("initfs: error: failed, code: %d\n", r);
 
-    /* register devfs (mount done by linuxrc via mount syscall) */
+    /* register devfs and mount at /dev so /dev/tty0, /dev/console etc. exist before init/getty */
     if (devfs_register() == 0) {
         klogprintf("devfs: registering devfs\n");
-        /* initialize stdio fds for current thread (main) without mounting devfs */
+        if (devfs_mount("/dev") == 0) {
+            klogprintf("devfs: mounted at /dev\n");
+        }
+        /* initialize stdio fds for current thread (main) */
         struct fs_file *console = devfs_open_direct("/dev/console");
         if (console) {
             /* allocate fd slots for main thread using helper to manage refcounts */
@@ -382,13 +352,11 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         klogprintf("devfs: failed to register\n");
     }
 
-    /* procfs will be mounted by linuxrc via mount syscall */
-    (void)procfs_register();
+    /* procfs mounted by userspace via SYS_mount */
 
     ps2_keyboard_init();
     rtc_init();
 
-    
     // Prefer linuxrc/init if present; fallback to kernel shell.
     if (boot_try_run_init() != 0) {
         exec_line("PS1=\"osh-2.0# \"");

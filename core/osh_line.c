@@ -59,6 +59,21 @@ static uint32_t measure_colorized_visible(const char* s) {
     return (uint32_t)strlen(s);
 }
 
+/* Видимая колонка после первых pos символов buf (таб = 8 колонок) */
+static uint32_t visible_column(const char* buf, int pos) {
+    uint32_t col = 0;
+    for (int i = 0; i < pos && buf[i]; i++) {
+        if (buf[i] == '\t') {
+            uint32_t n = 8 - (col % 8);
+            if (n == 0) n = 8;
+            col += n;
+        } else {
+            col++;
+        }
+    }
+    return col;
+}
+
 static void redraw_line_xy(uint32_t sx, uint32_t sy, const char* prompt, const char* buf, int len, int cur, const char* sugg, int sugg_len) {
     uint32_t prompt_len = measure_colorized_visible(prompt);
     uint32_t px = sx + prompt_len;
@@ -67,6 +82,7 @@ static void redraw_line_xy(uint32_t sx, uint32_t sy, const char* prompt, const c
     static uint32_t last_sx = 0;
     static uint32_t last_prompt_len = 0;
     static uint32_t last_buf_len = 0;
+    static uint32_t last_visible_len = 0;
     static char last_prompt[OSH_PROMPT_CACHE];
 
     int need_full = 0;
@@ -91,12 +107,13 @@ static void redraw_line_xy(uint32_t sx, uint32_t sy, const char* prompt, const c
         (void)console_write_str_xy(sx, sy, prompt, GRAY_ON_BLACK);
     }
 
+    uint32_t visible_len = visible_column(buf, len);
     if (px < console_max_cols()) {
         console_write_str_xy(px, sy, buf, GRAY_ON_BLACK);
-        if (!need_full && (uint32_t)len < last_buf_len) {
-            uint32_t clear_from = px + (uint32_t)len;
-            uint32_t clear_to = px + last_buf_len;
-            if (clear_to > console_max_cols()) clear_to = console_max_cols();
+        if (!need_full && visible_len < last_visible_len) {
+            uint32_t clear_from = px + visible_len;
+            uint32_t clear_to = px + last_visible_len;
+            if (clear_to > (uint32_t)console_max_cols()) clear_to = (uint32_t)console_max_cols();
             for (uint32_t x = clear_from; x < clear_to; x++) console_putch_xy(x, sy, ' ', GRAY_ON_BLACK);
         }
     }
@@ -104,14 +121,15 @@ static void redraw_line_xy(uint32_t sx, uint32_t sy, const char* prompt, const c
     last_sy = sy;
     last_sx = sx;
     last_buf_len = (uint32_t)len;
+    last_visible_len = visible_len;
     last_prompt_len = prompt_len;
     size_t copy_len = prompt_len;
     if (copy_len >= OSH_PROMPT_CACHE) copy_len = OSH_PROMPT_CACHE - 1;
     if (copy_len > 0) memcpy(last_prompt, prompt, copy_len);
     last_prompt[copy_len] = '\0';
 
-    uint32_t cx = px + (uint32_t)cur;
-    if (cx >= console_max_cols()) cx = console_max_cols() ? console_max_cols() - 1 : 0;
+    uint32_t cx = px + visible_column(buf, cur);
+    if (cx >= (uint32_t)console_max_cols()) cx = (uint32_t)console_max_cols() ? (uint32_t)console_max_cols() - 1 : 0;
     console_set_cursor(cx, sy);
 }
 
@@ -454,7 +472,7 @@ int osh_line_read(const char* prompt, const char* cwd, char* out, int out_size) 
             g_nav_active[t] = 0;
             if (cur>0) { memmove(buf+cur-1, buf+cur, (size_t)(len-cur+1)); cur--; len--; }
         }
-        else if ((unsigned char)c == KEY_TAB) {
+        else if ((unsigned char)c == KEY_TAB || c == '\t') {
             complete_token(cwd, buf, &len, &cur, sugg, (int)sizeof(sugg), &sugg_len);
             if (sugg_len > 0) {
                 uint32_t cx = 0, cy = 0;

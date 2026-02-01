@@ -93,6 +93,15 @@ static void draw_cell_to_backbuffer(uint32_t cx, uint32_t cy) {
 	}
 }
 
+void vbefb_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
+	if (!vbe_is_available() || !textbuf) return;
+	if (x >= cols || y >= rows) return;
+	textbuf[y * cols + x].ch = ch;
+	textbuf[y * cols + x].attr = attr;
+	draw_cell_to_backbuffer(x, y);
+	vbe_flush_region(x * font_w, y * font_h, font_w, font_h);
+}
+
 void vbefb_putchar(uint8_t ch, uint8_t attr) {
 	if (!vbe_is_available()) { return; }
 	// simple ANSI SGR parsing for color sequences: ESC [ ... m
@@ -287,9 +296,15 @@ void vbefb_set_cursor(uint32_t x, uint32_t y) {
 }
 
 void vbefb_clear(uint8_t attr) {
-	if (!vbe_is_available()) return;
-	memset(textbuf, 0, (size_t)(cols * rows * sizeof(cell_t)));
-	//vbe_flush_full();
+	if (!vbe_is_available() || !textbuf) return;
+	for (uint32_t i = 0; i < (uint32_t)(cols * rows); i++) {
+		textbuf[i].ch = ' ';
+		textbuf[i].attr = attr;
+	}
+	for (uint32_t ry = 0; ry < rows; ry++)
+		for (uint32_t rx = 0; rx < cols; rx++)
+			draw_cell_to_backbuffer(rx, ry);
+	vbefb_set_cursor(0, 0);
 }
 
 /* Initialize console state after vbe init; called externally if needed */

@@ -82,25 +82,8 @@ static inline void msr_write_u64(uint32_t msr, uint64_t v) {
 static void debug_dump_kernel_syscall_stack(void) {
     extern uint64_t syscall_kernel_rsp0;
     uint64_t base = (uint64_t)syscall_kernel_rsp0;
-    if (base == 0) {
-        qemu_debug_printf("DBG: no syscall_kernel_rsp0\n");
-        return;
-    }
-    if (base >= (uint64_t)MMIO_IDENTITY_LIMIT) {
-        qemu_debug_printf("DBG: syscall_kernel_rsp0 out of identity map: %p\n", (void*)(uintptr_t)base);
-        return;
-    }
-    qemu_debug_printf("DBG: dump kernel syscall stack at %p:\n", (void*)(uintptr_t)base);
-    /* print 16 qwords starting at base (be conservative) */
-    for (int i = 0; i < 16; i++) {
-        uint64_t *p = (uint64_t*)(uintptr_t)(base + (i * 8));
-        if ((uintptr_t)p + 8 <= (uintptr_t)MMIO_IDENTITY_LIMIT) {
-            uint64_t v = *p;
-            qemu_debug_printf("  [%02d] %p: 0x%016llx\n", i, (void*)p, (unsigned long long)v);
-        } else {
-            qemu_debug_printf("  [%02d] %p: (out of range)\n", i, (void*)p);
-        }
-    }
+    if (base == 0) return;
+    if (base >= (uint64_t)MMIO_IDENTITY_LIMIT) return;
 }
 
 /* Apply per-thread exec trampoline by patching kernel syscall stack saved return RIP
@@ -109,30 +92,33 @@ static int apply_exec_trampoline(thread_t *t) {
     if (!t || !t->exec_trampoline_flag) return -1;
     extern uint64_t syscall_kernel_rsp0;
     if ((uintptr_t)syscall_kernel_rsp0 == 0) return -1;
+    
     uintptr_t base = (uintptr_t)syscall_kernel_rsp0;
     uintptr_t rcx_slot = base + 104; /* saved rcx (user RIP) */
     uintptr_t rax_slot = base + 112; /* saved rax slot */
+
     /* safety: ensure writing within identity map */
     if (rcx_slot + 8 > (uintptr_t)MMIO_IDENTITY_LIMIT) return -1;
     if (rax_slot + 8 > (uintptr_t)MMIO_IDENTITY_LIMIT) return -1;
+
     /* Write the desired return RIP into saved rcx slot so iret will use it */
     *(uint64_t*)(uintptr_t)rcx_slot = (uint64_t)t->exec_trampoline_rip;
+
     /* Set global saved user rsp so assembly builds IRET frame with this RSP */
     syscall_user_rsp_saved = t->exec_trampoline_rsp;
+
     /* Also set saved rax so final popped rax becomes our chosen value */
     *(uint64_t*)(uintptr_t)rax_slot = (uint64_t)t->exec_trampoline_rax;
-    /* Debug: verify write */
-    qemu_debug_printf("apply_exec_trampoline: base=%p rcx_slot=%p wrote_rip=0x%llx rax_slot=%p wrote_rax=0x%llx saved_rsp=%p\n",
-                      (void*)(uintptr_t)base, (void*)(uintptr_t)rcx_slot,
-                      (unsigned long long)(uint64_t)t->exec_trampoline_rip,
-                      (void*)(uintptr_t)rax_slot, (unsigned long long)(uint64_t)t->exec_trampoline_rax,
-                      (void*)(uintptr_t)syscall_user_rsp_saved);
+
     /* memory barrier */
     asm volatile("mfence" ::: "memory");
+
     /* clear flag (we consumed it) */
     t->exec_trampoline_flag = 0;
+
     /* notify assembly entry to preserve patched slots */
     syscall_exec_trampoline_active = 1;
+
     return 0;
 }
 
@@ -220,8 +206,7 @@ static void vfork_restore_parent_stack(thread_t *child) {
         if (end > dst && end <= (uintptr_t)MMIO_IDENTITY_LIMIT) {
             memcpy((void*)dst, child->vfork_parent_stack_backup, (size_t)len64);
         } else {
-            qemu_debug_printf("vfork_restore_parent_stack: bad dst=%p len=%llu\n",
-                              (void*)dst, (unsigned long long)len64);
+            /* bad dst/len */
         }
     }
     /* TEMPORARY DIAGNOSTIC:
@@ -257,8 +242,7 @@ static void vfork_restore_parent_memory(thread_t *child) {
                 user_brk_cur = (uintptr_t)child->vfork_parent_brk_saved;
             }
         } else {
-            qemu_debug_printf("vfork_restore_parent_memory: bad base=%p len=%llu\n",
-                              (void*)base, (unsigned long long)len64);
+            /* bad base/len */
         }
     }
     kfree(child->vfork_parent_mem_backup);
@@ -319,11 +303,6 @@ static inline uint64_t ret_err(int e) {
     /* Log ENOSYS occurrences for the user shell (tid==3) to help musl compatibility debugging. */
     thread_t *t = thread_get_current_user();
     if (!t) t = thread_current();
-    if (e == ENOSYS && t && (t->tid == 3)) {
-        qemu_debug_printf("ret_err: ENOSYS returned for pid=%u syscall=%u\n",
-                (unsigned long long)(t->tid ? t->tid : 1),
-                (unsigned long long)last_syscall_debug);
-    }
     return (uint64_t)(-(int64_t)e);
 }
 
@@ -387,6 +366,42 @@ static thread_t *find_terminated_child(thread_t *t) {
     return NULL;
 }
 
+/* Normalize path by resolving . and .. components. Modifies buf in place. */
+static void normalize_path(char *buf, size_t cap) {
+    if (!buf || cap == 0) return;
+    char tmp[512];
+    const char *comps[64];
+    size_t comp_len[64];
+    int n = 0;
+    const char *p = buf;
+    while (*p && n < (int)(sizeof(comps) / sizeof(comps[0]))) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *start = p;
+        while (*p && *p != '/') p++;
+        size_t len = (size_t)(p - start);
+        if (len == 0) continue;
+        if (len == 1 && start[0] == '.') continue;  /* skip . */
+        if (len == 2 && start[0] == '.' && start[1] == '.') {
+            if (n > 0) n--;  /* pop .. */
+            continue;
+        }
+        comps[n] = start;
+        comp_len[n] = len;
+        n++;
+    }
+    size_t pos = 0;
+    tmp[pos++] = '/';
+    for (int i = 0; i < n && pos < sizeof(tmp) - 1; i++) {
+        if (i > 0) tmp[pos++] = '/';
+        for (size_t j = 0; j < comp_len[i] && pos < sizeof(tmp) - 1; j++)
+            tmp[pos++] = comps[i][j];
+    }
+    tmp[pos] = '\0';
+    strncpy(buf, tmp, cap - 1);
+    buf[cap - 1] = '\0';
+}
+
 static void resolve_user_path(thread_t *cur, const char *path_u, char *out, size_t out_cap) {
     if (!out || out_cap == 0) return;
     out[0] = '\0';
@@ -395,17 +410,45 @@ static void resolve_user_path(thread_t *cur, const char *path_u, char *out, size
         out[out_cap - 1] = '\0';
         return;
     }
+    const char *cwd = (cur && cur->cwd[0]) ? cur->cwd : "/";
     if (path_u[0] == '/') {
         strncpy(out, path_u, out_cap);
         out[out_cap - 1] = '\0';
+        normalize_path(out, out_cap);
         return;
     }
-    const char *cwd = (cur && cur->cwd[0]) ? cur->cwd : "/";
+    /* "." means current directory. */
+    if (strcmp(path_u, ".") == 0) {
+        strncpy(out, cwd, out_cap);
+        out[out_cap - 1] = '\0';
+        return;
+    }
+    /* ".." means parent directory. */
+    if (strcmp(path_u, "..") == 0) {
+        if (strcmp(cwd, "/") == 0) {
+            strncpy(out, "/", out_cap);
+            out[out_cap - 1] = '\0';
+        } else {
+            const char *slash = strrchr(cwd, '/');
+            if (slash && slash > cwd) {
+                size_t len = (size_t)(slash - cwd);
+                if (len >= out_cap) len = out_cap - 1;
+                memcpy(out, cwd, len);
+                out[len] = '\0';
+            } else {
+                strncpy(out, "/", out_cap);
+                out[out_cap - 1] = '\0';
+            }
+        }
+        return;
+    }
+    /* Build full path and normalize (handles ./run, a/./b, a/../b, etc.) */
     if (strcmp(cwd, "/") == 0) {
         snprintf(out, out_cap, "/%s", path_u);
     } else {
         snprintf(out, out_cap, "%s/%s", cwd, path_u);
     }
+    normalize_path(out, out_cap);
 }
 
 static inline int user_range_ok(const void *uaddr, size_t nbytes);
@@ -580,49 +623,6 @@ static int find_valid_saved_ret(uint64_t kernel_rsp, uint64_t *out, int max_qwor
         uintptr_t end = begin + (uintptr_t)PAGE_SIZE_2M;
         if (mark_user_identity_range_2m_sys((uint64_t)begin, (uint64_t)end) == 0) {
             *out = v;
-            qemu_debug_printf("find_valid_saved_ret: picked 0x%llx from stack[%d]=%p\n", (unsigned long long)v, i, (void*)addr);
-            /* dump virt->phys and first bytes for debugging */
-            uint64_t p = virt_to_phys(v);
-            qemu_debug_printf("find_valid_saved_ret: virt_phys=0x%llx\n", (unsigned long long)p);
-            if ((uintptr_t)v + 32 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                unsigned char b[32];
-                for (int j = 0; j < 32; j++) b[j] = *((unsigned char*)(uintptr_t)(v + j));
-                qemu_debug_printf("find_valid_saved_ret: bytes:");
-                for (int j = 0; j < 32; j++) qemu_debug_printf("%02x", (unsigned int)b[j]);
-                qemu_debug_printf("\n");
-            }
-            /* Dump page table entries for VA to inspect flags */
-            {
-                extern uint64_t page_table_l4[];
-                uint64_t *l4 = (uint64_t*)page_table_l4;
-                int l4i = (v >> 39) & 0x1FF;
-                int l3i = (v >> 30) & 0x1FF;
-                int l2i = (v >> 21) & 0x1FF;
-                int l1i = (v >> 12) & 0x1FF;
-                qemu_debug_printf("ptes: l4[%d]=0x%016llx\n", l4i, (unsigned long long)l4[l4i]);
-                if (l4[l4i] & PG_PRESENT) {
-                    uint64_t *l3 = (uint64_t*)(uintptr_t)(l4[l4i] & ~0xFFFULL);
-                    qemu_debug_printf("ptes: l3[%d]=0x%016llx\n", l3i, (unsigned long long)l3[l3i]);
-                    if (l3[l3i] & PG_PRESENT) {
-                        uint64_t l3e = l3[l3i];
-                        if (l3e & PG_PS_2M) {
-                            qemu_debug_printf("ptes: 1GiB/2MiB large at L3\n");
-                        } else {
-                            uint64_t *l2 = (uint64_t*)(uintptr_t)(l3e & ~0xFFFULL);
-                            qemu_debug_printf("ptes: l2[%d]=0x%016llx\n", l2i, (unsigned long long)l2[l2i]);
-                            if (l2[l2i] & PG_PRESENT) {
-                                uint64_t l2e = l2[l2i];
-                                if (l2e & PG_PS_2M) {
-                                    qemu_debug_printf("ptes: 2MiB large at L2\n");
-                                } else {
-                                    uint64_t *l1 = (uint64_t*)(uintptr_t)(l2e & ~0xFFFULL);
-                                    qemu_debug_printf("ptes: l1[%d]=0x%016llx\n", l1i, (unsigned long long)l1[l1i]);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
             return 0;
         }
     }
@@ -737,7 +737,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
 
     /* If return RIP wasn't recorded by entry path, dump kernel syscall stack for diagnosis */
     if (syscall_user_return_rip == 0) {
-        qemu_debug_printf("DBG: syscall_do: syscall_user_return_rip == 0; dumping kernel syscall stack\n");
         debug_dump_kernel_syscall_stack();
     }
 
@@ -781,18 +780,13 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     if (find_valid_saved_ret(syscall_kernel_rsp0, &candidate, 64) == 0) {
                         saved_rcx = candidate;
                     } else {
-                        qemu_debug_printf("DBG: vfork: no valid saved_ret found on kernel stack\n");
                     }
                 }
             }
             uint64_t saved_rsp = p->saved_user_rsp;
 
-            qemu_debug_printf("vfork: pid=%llu saved_ret=0x%llx saved_rsp=0x%llx\n",
-                    (unsigned long long)(p->tid ? p->tid : 1),
-                    (unsigned long long)saved_rcx, (unsigned long long)saved_rsp);
             /* If we still don't have a valid saved_rcx at this point, fail early. */
             if (saved_rcx == 0) {
-                qemu_debug_printf("vfork: refused - no valid saved return RIP\n");
                 return ret_err(EINVAL);
             }
             /* Try to ensure the user pages around saved_rcx are user-accessible to avoid PF
@@ -801,9 +795,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 uintptr_t begin = (uintptr_t)saved_rcx & ~((uintptr_t)PAGE_SIZE_2M - 1);
                 uintptr_t end = begin + (uintptr_t)PAGE_SIZE_2M;
                 if (mark_user_identity_range_2m_sys((uint64_t)begin, (uint64_t)end) == 0) {
-                    qemu_debug_printf("vfork: marked user range [%p - %p] as user-accessible\n", (void*)begin, (void*)end);
                 } else {
-                    qemu_debug_printf("vfork: failed to mark user range [%p - %p]\n", (void*)begin, (void*)end);
                     /* If we cannot make the candidate return site user-accessible, refuse vfork
                        rather than heuristically using an unmapped/privileged address which
                        leads to immediate #PF err=0x5 when the child enters user mode. */
@@ -812,9 +804,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 }
                 /* Also try to broadly ensure common user ranges are user-accessible (helps when writes hit elsewhere). */
                 if (mark_user_identity_range_2m_sys(0x200000, (uint64_t)USER_STACK_TOP) == 0) {
-                    qemu_debug_printf("vfork: ensured broad user range [0x200000 - %p]\n", (void*)(uintptr_t)USER_STACK_TOP);
                 } else {
-                    qemu_debug_printf("vfork: could not ensure broad user range [0x200000 - %p]\n", (void*)(uintptr_t)USER_STACK_TOP);
                 }
             }
             // kprintf("DBG: vfork: syscall_user_return_rip=0x%llx syscall_user_rsp_saved=0x%llx (saved_rcx=0x%llx saved_rsp=0x%llx)\n",
@@ -843,7 +833,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 uintptr_t parent_fs = (uintptr_t)p->user_fs_base;
                 uintptr_t parent_tls_region = (parent_fs >= 0x1000u) ? (parent_fs - 0x1000u) : 0;
                 if ((uintptr_t)saved_rsp == 0 || (uintptr_t)saved_rsp >= (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                    qemu_debug_printf("vfork: invalid saved_rsp=0x%llx -> EINVAL\n", (unsigned long long)saved_rsp);
                     return ret_err(EINVAL);
                 }
                 uintptr_t max_copy = (uintptr_t)USER_STACK_SIZE;
@@ -851,7 +840,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 uintptr_t avail = (uintptr_t)MMIO_IDENTITY_LIMIT - (uintptr_t)saved_rsp;
                 uintptr_t copy_bytes = (avail < max_copy) ? avail : max_copy;
                 if (copy_bytes < 256) {
-                    qemu_debug_printf("vfork: too little stack to copy (%u) -> EINVAL\n", (unsigned)copy_bytes);
                     return ret_err(EINVAL);
                 }
 
@@ -892,7 +880,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 {
                     uintptr_t sb = (child_stack_top - (uintptr_t)USER_STACK_SIZE) & ~0xFFFULL;
                     if (mark_user_identity_range_2m_sys((uint64_t)sb, (uint64_t)child_stack_top) != 0) {
-                        qemu_debug_printf("vfork: failed to mark child stack user range\n");
                         return ret_err(EFAULT);
                     }
                 }
@@ -920,7 +907,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 uintptr_t child_fs = child_tls_region + 0x1000u;
                 uintptr_t child_pthread_fake = child_tls_region + 0x2000u;
                 if (mark_user_identity_range_2m_sys((uint64_t)child_tls_region, (uint64_t)(child_pthread_fake + 0x1000u)) != 0) {
-                    qemu_debug_printf("vfork: failed to mark child TLS range\n");
                     return ret_err(EFAULT);
                 }
                 /* clear/clone minimal TLS layout (3 pages) */
@@ -1025,22 +1011,12 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     /* Read back bytes to verify write succeeded */
                     unsigned char verify[16];
                     memcpy(verify, (void*)(uintptr_t)tramp, sizeof(verify));
-                    qemu_debug_printf("vfork: wrote trampoline at %p bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
-                                      (void*)(uintptr_t)tramp,
-                                      verify[0], verify[1], verify[2], verify[3],
-                                      verify[4], verify[5], verify[6], verify[7],
-                                      verify[8], verify[9], verify[10], verify[11],
-                                      verify[12], verify[13], verify[14], verify[15]);
                     child->user_rip = (uint64_t)tramp;
                 } else {
                     /* fallback: use saved_rcx if tramp can't be used */
                     child->user_rip = saved_rcx;
                 }
                 child->user_stack = (uint64_t)child_rsp;
-                qemu_debug_printf("vfork: child->user_rip=0x%llx child->user_stack=0x%llx (saved_rcx=0x%llx)\n",
-                                  (unsigned long long)child->user_rip,
-                                  (unsigned long long)child->user_stack,
-                                  (unsigned long long)saved_rcx);
                 child->ring = 3;
             }
             child->parent_tid = (int)(p->tid ? p->tid : 1);
@@ -1048,6 +1024,8 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             child->pgid = p->pgid;
             child->euid = p->euid; child->egid = p->egid;
             child->attached_tty = p->attached_tty;
+            strncpy(child->cwd, p->cwd, sizeof(child->cwd) - 1);
+            child->cwd[sizeof(child->cwd) - 1] = '\0';
             /* Preserve parent userspace memory across vfork/exec.
                In our shared-address-space model, exec in the child overwrites
                parent memory, so we must snapshot+restore for correctness. */
@@ -1057,12 +1035,10 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 if (end < base) end = base;
                 uint64_t len64 = (uint64_t)(end - base);
                 if (len64 == 0 || len64 > (uint64_t)(256u * 1024u * 1024u)) {
-                    qemu_debug_printf("vfork: mem backup skipped len=%llu\n", (unsigned long long)len64);
                     return ret_err(ENOMEM);
                 }
                 child->vfork_parent_mem_backup = kmalloc((size_t)len64);
                 if (!child->vfork_parent_mem_backup) {
-                    qemu_debug_printf("vfork: mem backup alloc failed len=%llu\n", (unsigned long long)len64);
                     return ret_err(ENOMEM);
                 }
                 memcpy(child->vfork_parent_mem_backup, (void*)base, (size_t)len64);
@@ -1501,18 +1477,12 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             return ret_err(EMFILE);
         }
-        case 33: { /* access(pathname, mode) */
-            const char *path_u = (const char*)(uintptr_t)a1;
-            int mode = (int)a2;
-            (void)mode;
-            if (!path_u) return ret_err(EFAULT);
-            if ((uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-            char path[256];
-            resolve_user_path(cur, path_u, path, sizeof(path));
-            struct stat st;
-            if (vfs_stat(path, &st) != 0) return ret_err(ENOENT);
-            /* Minimal: if file exists, report accessible (no permissions model yet) */
-            return 0;
+        case SYS_dup2: { /* dup2(oldfd, newfd) — Linux 33; getty/nano need this to dup TTY to stdin/stdout/stderr */
+            int oldfd = (int)a1;
+            int newfd = (int)a2;
+            int r = thread_fd_dup2(oldfd, newfd);
+            if (r < 0) return ret_err(EBADF);
+            return (uint64_t)r;
         }
         case 269: /* faccessat(dirfd, pathname, mode, flags) */
         case 271: /* safe trial: map to faccessat-like check (AT_FDCWD) */
@@ -1555,25 +1525,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 return 0;
             }
             /* Additional diagnostics for syscall 271: dump raw args and nearby memory for easier debugging */
-            qemu_debug_printf("271 args: a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx a5=0x%llx a6=0x%llx\n",
-                              (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3,
-                              (unsigned long long)a4, (unsigned long long)a5, (unsigned long long)a6);
-            unsigned long long addrs[6] = { a1, a2, a3, a4, a5, a6 };
-            for (int i = 0; i < 6; i++) {
-                void *ptr = (void*)(uintptr_t)addrs[i];
-                if (ptr && (uintptr_t)ptr < (uintptr_t)MMIO_IDENTITY_LIMIT && (uintptr_t)ptr > 0x1000) {
-                    unsigned char mem[32];
-                    size_t copied = 0;
-                    if (copy_from_user_raw(mem, ptr, sizeof(mem)) == 0) {
-                        qemu_debug_printf("271 mem[%d] @%p:", i+1, ptr);
-                        for (size_t j = 0; j < sizeof(mem); j++) {
-                            if ((j % 16) == 0) qemu_debug_printf(" ");
-                            qemu_debug_printf("%02x", mem[j]);
-                        }
-                        qemu_debug_printf("\n");
-                    }
-                }
-            }
         }
         case 72: { /* fcntl(fd, cmd, arg) - minimal support */
             int fd = (int)a1;
@@ -1849,9 +1800,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             const char *path_u = (const char*)(uintptr_t)a1;
             const char *const *argv_u = (const char *const*)(uintptr_t)a2;
             const char *const *envp_u = (const char *const*)(uintptr_t)a3;
-            qemu_debug_printf("execve(syscall): pid=%llu path_u=%p argv_u=%p envp_u=%p\n",
-                              (unsigned long long)(cur->tid ? cur->tid : 1),
-                              (void*)(uintptr_t)path_u, (void*)(uintptr_t)argv_u, (void*)(uintptr_t)envp_u);
             if (!path_u) return ret_err(EFAULT);
             if (!user_range_ok(path_u, 1)) return ret_err(EFAULT);
             /* Copy path */
@@ -1865,8 +1813,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             char resolved_path[512];
             resolve_user_path(cur, path, resolved_path, sizeof(resolved_path));
-            qemu_debug_printf("execve(syscall): path='%s' resolved='%s'\n", path, resolved_path);
-
             /* Copy argv array (NULL-terminated) */
             int argc = 0;
             if (argv_u) {
@@ -1881,7 +1827,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     argc++;
                 }
             }
-            qemu_debug_printf("execve(syscall): argc=%d\n", argc);
             const char **kargv = (const char**)kmalloc((size_t)(argc + 1) * sizeof(char*));
             if (!kargv) { kfree(path); return ret_err(ENOMEM); }
             for (int i = 0; i < argc; i++) {
@@ -1904,11 +1849,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 kargv[i] = ks;
             }
             kargv[argc] = NULL;
-            /* brief argv preview for debugging */
-            if (argc > 0) {
-                qemu_debug_printf("execve(syscall): argv0='%s'\n", kargv[0] ? kargv[0] : "(null)");
-            }
-
             /* Copy envp similarly (but allow NULL) */
             int envc = 0;
             const char **kenvp = NULL;
@@ -1997,21 +1937,13 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     if (find_valid_saved_ret(syscall_kernel_rsp0, &candidate, 64) == 0) {
                         saved_rcx = candidate;
                     } else {
-                        qemu_debug_printf("fork: no valid saved_ret found on kernel stack\n");
                     }
                 }
             }
             uint64_t saved_rsp = cur->saved_user_rsp;
 
             /* create kernel thread that will enter user mode at saved_rcx/saved_rsp */
-            qemu_debug_printf("fork: pid=%llu enter saved_ret=0x%llx saved_rsp=0x%llx\n",
-                    (unsigned long long)(cur->tid ? cur->tid : 1),
-                    (unsigned long long)saved_rcx, (unsigned long long)saved_rsp);
-            qemu_debug_printf("fork: pid=%llu saved_ret=0x%llx saved_rsp=0x%llx\n",
-                    (unsigned long long)(cur->tid ? cur->tid : 1),
-                    (unsigned long long)saved_rcx, (unsigned long long)saved_rsp);
             if (saved_rcx == 0) {
-                qemu_debug_printf("fork: refused - no valid saved return RIP\n");
                 return ret_err(EINVAL);
             }
             /* Try to ensure the user pages around saved_rcx are user-accessible to avoid PF
@@ -2020,15 +1952,11 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 uintptr_t begin = (uintptr_t)saved_rcx & ~((uintptr_t)PAGE_SIZE_2M - 1);
                 uintptr_t end = begin + (uintptr_t)PAGE_SIZE_2M;
                 if (mark_user_identity_range_2m_sys((uint64_t)begin, (uint64_t)end) == 0) {
-                    qemu_debug_printf("fork: marked user range [%p - %p] as user-accessible\n", (void*)begin, (void*)end);
                 } else {
-                    qemu_debug_printf("fork: failed to mark user range [%p - %p]\n", (void*)begin, (void*)end);
                 }
                 /* Also try to broadly ensure common user ranges are user-accessible (helps when writes hit elsewhere). */
                 if (mark_user_identity_range_2m_sys(0x200000, (uint64_t)USER_STACK_TOP) == 0) {
-                    qemu_debug_printf("fork: ensured broad user range [0x200000 - %p]\n", (void*)(uintptr_t)USER_STACK_TOP);
                 } else {
-                    qemu_debug_printf("fork: could not ensure broad user range [0x200000 - %p]\n", (void*)(uintptr_t)USER_STACK_TOP);
                 }
             }
             char child_name[32];
@@ -2044,7 +1972,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 uintptr_t parent_fs = (uintptr_t)cur->user_fs_base;
                 uintptr_t parent_tls_region = (parent_fs >= 0x1000u) ? (parent_fs - 0x1000u) : 0;
                 if ((uintptr_t)saved_rsp == 0 || (uintptr_t)saved_rsp >= (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                    qemu_debug_printf("fork: invalid saved_rsp=0x%llx -> EINVAL\n", (unsigned long long)saved_rsp);
                     return ret_err(EINVAL);
                 }
                 uintptr_t max_copy = (uintptr_t)USER_STACK_SIZE;
@@ -2052,7 +1979,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 uintptr_t avail = (uintptr_t)MMIO_IDENTITY_LIMIT - (uintptr_t)saved_rsp;
                 uintptr_t copy_bytes = (avail < max_copy) ? avail : max_copy;
                 if (copy_bytes < 256) {
-                    qemu_debug_printf("fork: too little stack to copy (%u) -> EINVAL\n", (unsigned)copy_bytes);
                     return ret_err(EINVAL);
                 }
 
@@ -2082,7 +2008,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 {
                     uintptr_t sb = (child_stack_top - (uintptr_t)USER_STACK_SIZE) & ~0xFFFULL;
                     if (mark_user_identity_range_2m_sys((uint64_t)sb, (uint64_t)child_stack_top) != 0) {
-                        qemu_debug_printf("fork: failed to mark child stack user range\n");
                         return ret_err(EFAULT);
                     }
                 }
@@ -2107,7 +2032,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 uintptr_t child_fs = child_tls_region + 0x1000u;
                 uintptr_t child_pthread_fake = child_tls_region + 0x2000u;
                 if (mark_user_identity_range_2m_sys((uint64_t)child_tls_region, (uint64_t)(child_pthread_fake + 0x1000u)) != 0) {
-                    qemu_debug_printf("fork: failed to mark child TLS range\n");
                     return ret_err(EFAULT);
                 }
                 memset((void*)child_tls_region, 0, 0x3000u);
@@ -2180,12 +2104,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                         memcpy((void*)(uintptr_t)tramp, stub, off);
                         unsigned char verify[16];
                         memcpy(verify, (void*)(uintptr_t)tramp, sizeof(verify));
-                        qemu_debug_printf("fork: wrote trampoline at %p bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
-                                          (void*)(uintptr_t)tramp,
-                                          verify[0], verify[1], verify[2], verify[3],
-                                          verify[4], verify[5], verify[6], verify[7],
-                                          verify[8], verify[9], verify[10], verify[11],
-                                          verify[12], verify[13], verify[14], verify[15]);
                         child->user_rip = (uint64_t)tramp;
                     } else {
                         child->user_rip = saved_rcx;
@@ -2218,9 +2136,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             /* now allow child to run */
             thread_unblock((int)(child->tid ? child->tid : 1));
             /* child is ready, return child's pid to parent */
-            qemu_debug_printf("fork: parent=%llu child=%llu\n",
-                    (unsigned long long)(cur->tid ? cur->tid : 1),
-                    (unsigned long long)(child->tid ? child->tid : 1));
             return (uint64_t)(child->tid ? child->tid : 1);
         }
         case SYS_wait4: {
@@ -2315,12 +2230,8 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             void *argp = (void*)(uintptr_t)a3;
             /* Map negative fds to fd 0 (controlling/stdin) to be tolerant of libc behavior. */
             if (fd < 0) {
-                qemu_debug_printf("sys_ioctl: pid=%llu got negative fd=%d, mapping to fd 0\n",
-                        (unsigned long long)(cur->tid ? cur->tid : 1), fd);
                 fd = 0;
             }
-            qemu_debug_printf("sys_ioctl: pid=%llu fd=%d req=0x%llx arg=%p\n",
-                    (unsigned long long)(cur->tid ? cur->tid : 1), fd, (unsigned long long)req, argp);
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
             struct fs_file *f = cur->fds[fd];
             if (!f) return ret_err(EBADF);
@@ -2373,29 +2284,15 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (req == TIOCSWINSZ) {
                 if (!argp)  return ret_err(EFAULT); /* accept setting window size silently */
                 /* optionally we could copy_from_user and store winsize, but accept for now */
-                qemu_debug_printf("ioctl: TIOCSWINSZ on fd=%d\n", fd);
                 return 0;
             }
             if (req == TIOCSCTTY) {
-                /* Make ioctl(TIOCSCTTY) attach this thread to the tty as controlling tty.
-                   POSIX: only a session leader may acquire a controlling tty, and a tty may
-                   be a controlling tty for at most one session. */
-                qemu_debug_printf("ioctl: TIOCSCTTY on fd=%d (arg=%p) caller=%llu\n", fd, argp, (unsigned long long)(cur?cur->tid:0));
+                /* Attach this thread to the tty as controlling tty. Allow when tty is free
+                   so getty (launched by init, often not session leader) can acquire the console. */
                 thread_t *curth = thread_current();
                 if (!curth) return 0;
-                /* must be session leader */
-                if (curth->sid != (int)curth->tid) {
-                    qemu_debug_printf("ioctl: TIOCSCTTY denied - caller is not session leader (pid=%llu sid=%d)\n",
-                            (unsigned long long)curth->tid, curth->sid);
-                    return ret_err(EPERM);
-                }
-                /* check whether tty already has controlling session */
                 int cur_sid = devfs_get_tty_controlling_sid(f);
-                if (cur_sid >= 0 && cur_sid != curth->sid) {
-                    qemu_debug_printf("ioctl: TIOCSCTTY denied - tty already has controlling_sid=%d\n", cur_sid);
-                    return ret_err(EPERM);
-                }
-                /* attach and set controlling_sid */
+                if (cur_sid >= 0 && cur_sid != curth->sid) return ret_err(EPERM);
                 devfs_tty_attach_thread(f, curth);
                 devfs_set_tty_controlling_sid(f, curth->sid);
                 return 0;
@@ -2405,9 +2302,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 /* Try to return tty-specific foreground pgrp, fallback to global user_pgrp */
                 int pgrp = devfs_tty_get_fg_pgrp(f);
                 if (pgrp < 0) pgrp = (int)(user_pgrp);
-                qemu_debug_printf("ioctl: TIOCGPGRP on fd=%d -> returning pgrp=%d (caller pid=%llu name=%s)\n",
-                        fd, pgrp, (unsigned long long)(cur->tid ? cur->tid : 1),
-                        cur && cur->name ? cur->name : "(null)");
                 uint32_t pu = (uint32_t)pgrp;
                 if (copy_to_user_safe(argp, &pu, sizeof(pu)) != 0) return ret_err(EFAULT);
                 return 0;
@@ -2416,9 +2310,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 if (!argp) return ret_err(EFAULT);
                 uint32_t p = 0;
                 if (copy_from_user_raw(&p, argp, sizeof(p)) != 0) return ret_err(EFAULT);
-                qemu_debug_printf("ioctl: TIOCSPGRP on fd=%d -> set pgrp=%u (caller pid=%llu name=%s)\n",
-                        fd, p, (unsigned long long)(cur->tid ? cur->tid : 1),
-                        cur && cur->name ? cur->name : "(null)");
                 /* Be permissive: allow any pgrp for now to avoid shells exiting
                    due to strict job-control checks in this minimal tty model. */
                 /* Try to set tty-specific foreground pgrp; fall back to global user_pgrp */
@@ -2453,8 +2344,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
 
             /* For the remaining tty-specific ioctls, require a real tty file. */
             if (!devfs_is_tty_file(f)) {
-                qemu_debug_printf("ioctl: fd=%d not a tty (req=0x%llx)\n",
-                        fd, (unsigned long long)req);
                 return ret_err(ENOTTY);
             }
             if (req == TCSETS || req == TCSETSW || req == TCSETSF) {
@@ -2482,10 +2371,8 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 struct devfs_tty *tty = devfs_get_tty_by_index(tty_idx);
                 if (!tty) return ret_err(ENOTTY);
                 tty->term_lflag = tio.c_lflag;
-                qemu_debug_printf("ioctl: TCSETS on fd=%d set c_lflag=0x%08x (tty=%d)\n", fd, (unsigned)tty->term_lflag, tty_idx);
                 return 0;
             }
-                qemu_debug_printf("ioctl: unknown req=0x%llx on fd=%d\n", (unsigned long long)req, fd);
             return ret_err(EINVAL);
         }
         case SYS_write: {
@@ -2550,8 +2437,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                                 if (memcmp((char*)tmp + i, "askfirst", 8) == 0) { has_askfirst = 1; break; }
                             }
                         }
-                        qemu_debug_printf("read: /etc/inittab size=%u rr=%d preview='%s'\n",
-                                          (unsigned)f->size, (int)rr, preview);
                         {
                             char hex[3 * 32 + 1];
                             size_t hlen = (rr < 32) ? (size_t)rr : 32;
@@ -2564,8 +2449,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                                 hex[w++] = ' ';
                             }
                             hex[w] = '\0';
-                            qemu_debug_printf("read: /etc/inittab hex32='%s' nul=%d lines=%d respawn=%d askfirst=%d\n",
-                                              hex, has_nul, lines, has_respawn, has_askfirst);
                         }
                     }
                 }
@@ -2579,7 +2462,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 return ret_err(EFAULT);
             }
             if (f->path && strcmp(f->path, "/etc/inittab") == 0 && f->pos == 0) {
-                qemu_debug_printf("read: /etc/inittab rr=0 size=%u\n", (unsigned)f->size);
             }
             kfree(tmp);
             return (rr >= 0) ? (uint64_t)rr : ret_err(EINVAL);
@@ -2590,36 +2472,15 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             int in_fd = (int)a2;
             off_t *offp = (off_t*)(uintptr_t)a3;
             size_t count = (size_t)a4;
-            qemu_debug_printf("sendfile: called out=%d in=%d offp=%p count=%llu (caller pid=%llu)\n",
-                              out_fd, in_fd, (void*)(uintptr_t)offp, (unsigned long long)count,
-                              (unsigned long long)(cur->tid ? cur->tid : 1));
             if (out_fd < 0 || out_fd >= THREAD_MAX_FD) {
-                qemu_debug_printf("sendfile: invalid out_fd=%d -> EBADF\n", out_fd);
                 return ret_err(EBADF);
             }
             if (in_fd < 0 || in_fd >= THREAD_MAX_FD) {
-                qemu_debug_printf("sendfile: invalid in_fd=%d -> EBADF\n", in_fd);
                 return ret_err(EBADF);
             }
             struct fs_file *fout = cur->fds[out_fd];
             struct fs_file *fin = cur->fds[in_fd];
             if (!fout || !fin) {
-                qemu_debug_printf("sendfile: missing fd table entry fout=%p fin=%p -> EBADF\n", fout, fin);
-                /* Dump current thread and fd table for diagnosis */
-                thread_t *tc = thread_current();
-                thread_t *tu = thread_get_current_user();
-                qemu_debug_printf("sendfile: thread_current=%p tid=%d thread_get_current_user=%p tid=%d\n",
-                                  tc, tc ? tc->tid : -1, tu, tu ? tu->tid : -1);
-                if (tc) {
-                    for (int i = 0; i < THREAD_MAX_FD; i++) {
-                        qemu_debug_printf("sendfile: fd[%02d]=%p\n", i, tc->fds[i]);
-                    }
-                }
-                if (tu && tu != tc) {
-                    for (int i = 0; i < THREAD_MAX_FD; i++) {
-                        qemu_debug_printf("sendfile: user_fd[%02d]=%p\n", i, tu->fds[i]);
-                    }
-                }
                 return ret_err(EBADF);
             }
             /* Only support regular file -> write and read via fs_read/fs_write */
@@ -2629,7 +2490,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (bufcap == 0) return 0;
             uint8_t *tmp = (uint8_t*)kmalloc(bufcap);
             if (!tmp) {
-                qemu_debug_printf("sendfile: kmalloc(%u) failed -> ENOMEM\n", (unsigned)bufcap);
                 return ret_err(ENOMEM);
             }
             off_t use_pos = -1;
@@ -2643,7 +2503,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     rr = fs_read(fin, tmp, chunk, fin->pos);
                 }
                 if (rr < 0) {
-                    qemu_debug_printf("sendfile: read error rr=%d -> EINVAL\n", (int)rr);
                     kfree(tmp);
                     return ret_err(EINVAL);
                 }
@@ -2651,7 +2510,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 /* write to fout at its current position */
                 ssize_t wr = fs_write(fout, tmp, (size_t)rr, fout->pos);
                 if (wr <= 0) {
-                    qemu_debug_printf("sendfile: write error wr=%d (requested=%u) -> returning\n", (int)wr, (unsigned)rr);
                     kfree(tmp);
                     return (total > 0) ? (uint64_t)total : ret_err(EINVAL);
                 }
@@ -2663,7 +2521,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             kfree(tmp);
             if (offp) *offp = use_pos;
-            qemu_debug_printf("sendfile: completed total=%u (updated off=%lld)\n", (unsigned)total, (long long)use_pos);
             return (uint64_t)total;
         }
         case SYS_poll: {
@@ -2739,13 +2596,37 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (timeout == 0) { kfree(kbuf); return 0; }
             int elapsed = 0;
             int step = 10; /* ms */
+            thread_t *curth_poll = thread_get_current_user();
+            if (!curth_poll) curth_poll = thread_current();
+            int cur_tid = curth_poll ? (int)curth_poll->tid : -1;
+            int tty_waiting[16];
+            int n_tty_waiting;
             if (timeout < 0) {
-                /* block indefinitely, poll */
+                /* block indefinitely: add self as TTY waiter so we wake on keypress */
                 for (;;) {
+                    n_tty_waiting = 0;
+                    if (cur_tid >= 0) {
+                        for (int i = 0; i < nfds && n_tty_waiting < (int)(sizeof(tty_waiting)/sizeof(tty_waiting[0])); i++) {
+                            int fd = *(int*)((uint8_t*)kbuf + i * entry_size + 0);
+                            short events = *(short*)((uint8_t*)kbuf + i * entry_size + 4);
+                            if (fd < 0 || fd >= THREAD_MAX_FD || !(events & POLLIN)) continue;
+                            struct fs_file *f = curth_poll ? curth_poll->fds[fd] : NULL;
+                            if (!f || !devfs_is_tty_file(f)) continue;
+                            int tidx = devfs_get_tty_index_from_file(f);
+                            if (tidx < 0) tidx = devfs_get_active();
+                            if (devfs_tty_add_waiter(tidx, cur_tid) == 0) tty_waiting[n_tty_waiting++] = tidx;
+                        }
+                    }
+                    if (n_tty_waiting > 0) {
+                        thread_block(cur_tid);
+                        for (int w = 0; w < n_tty_waiting; w++) devfs_tty_remove_waiter(tty_waiting[w], cur_tid);
+                        goto auto_check;
+                    }
                     thread_sleep(step);
                     goto auto_check;
                 }
             } else {
+                /* timeout > 0: do not block on TTY waiters (would miss timeout); poll every step */
                 while (elapsed < timeout) {
                     thread_sleep(step);
                     elapsed += step;
@@ -2768,18 +2649,15 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (strcmp(path, "/etc/inittab") == 0) {
                 struct stat st;
                 if (vfs_stat(path, &st) == 0 && st.st_size == 0) {
-                    qemu_debug_printf("open: %s is empty -> ENOENT (force init defaults)\n", path);
                     return ret_err(ENOENT);
                 }
             }
             struct fs_file *f = fs_open(path);
             if (!f) {
-                qemu_debug_printf("open: failed to open '%s' -> ENOENT\n", path);
                 return ret_err(ENOENT);
             }
             int fd = thread_fd_alloc(f);
-            if (fd < 0) { fs_file_free(f); qemu_debug_printf("open: thread_fd_alloc failed for '%s' -> EBADF\n", path); return ret_err(EBADF); }
-            qemu_debug_printf("open: pid=%llu opened '%s' -> fd=%d\n", (unsigned long long)(cur->tid ? cur->tid : 1), path, fd);
+            if (fd < 0) { fs_file_free(f); return ret_err(EBADF); }
             return (uint64_t)(unsigned)fd;
         }
         case SYS_openat: {
@@ -2788,17 +2666,12 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             (void)a1;
             int flags = (int)a3;
             (void)a4;
-            qemu_debug_printf("openat: pid=%llu dirfd=%d path_u=%p path='%s'\n",
-                              (unsigned long long)(cur->tid ? cur->tid : 1), (int)a1, path_u,
-                              path_u ? path_u : "(null)");
             if (!path_u || (uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
             char path[256];
             resolve_user_path(cur, path_u, path, sizeof(path));
-            qemu_debug_printf("openat: resolved path='%s'\n", path);
             if (strcmp(path, "/etc/inittab") == 0) {
                 struct stat st;
                 if (vfs_stat(path, &st) == 0 && st.st_size == 0) {
-                    qemu_debug_printf("openat: %s is empty -> ENOENT (force init defaults)\n", path);
                     return ret_err(ENOENT);
                 }
             }
@@ -2808,19 +2681,16 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 if (flags & O_CREAT_MASK) {
                     f = fs_create_file(path);
                     if (!f) {
-                        qemu_debug_printf("openat: create failed for '%s' -> ENOENT\n", path);
                         return ret_err(ENOENT);
                     }
                 } else {
-                    qemu_debug_printf("openat: failed to open '%s' -> ENOENT\n", path);
                     return ret_err(ENOENT);
                 }
             }
             const int O_TRUNC_MASK = 0x200;
             if (f && (flags & O_TRUNC_MASK)) { f->size = 0; f->pos = 0; }
             int fd = thread_fd_alloc(f);
-            if (fd < 0) { fs_file_free(f); qemu_debug_printf("openat: thread_fd_alloc failed for '%s' -> EBADF\n", path); return ret_err(EBADF); }
-            qemu_debug_printf("openat: pid=%llu opened '%s' -> fd=%d\n", (unsigned long long)(cur->tid ? cur->tid : 1), path, fd);
+            if (fd < 0) { fs_file_free(f); return ret_err(EBADF); }
             return (uint64_t)(unsigned)fd;
         }
         case SYS_close: {
@@ -2843,8 +2713,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (rc_st != 0) return ret_err(ENOENT);
             /* Diagnostic: log stat calls for /init */
             if (strcmp(path, "/init") == 0) {
-                qemu_debug_printf("SYS_stat/lstat: path=%s st_mode=0x%04x st_size=%llu\n",
-                                  path, (unsigned)st.st_mode, (unsigned long long)st.st_size);
             }
             /* build a glibc-like compat struct and copy it to user memory.
                We pack into a kernel-sized temporary buffer to avoid writing beyond
@@ -2908,8 +2776,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (vfs_fstat(f, &st) != 0) return ret_err(EINVAL);
             /* Diagnostic: log fstat results for debugging regular file checks */
             if (f->path && strcmp(f->path, "/init") == 0) {
-                qemu_debug_printf("SYS_fstat: fd=%d path=%s st_mode=0x%04x st_size=%llu\n",
-                                  fd, f->path, (unsigned)st.st_mode, (unsigned long long)st.st_size);
             }
             /* build and copy compat struct like in SYS_stat/SYS_newfstatat */
             {
@@ -2969,11 +2835,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             resolve_user_path(cur, path_u, path, sizeof(path));
             struct stat st;
             if (vfs_stat(path, &st) != 0) return ret_err(ENOENT);
-            /* Diagnostic: log newfstatat for /init */
-            if (strcmp(path, "/init") == 0) {
-                qemu_debug_printf("SYS_newfstatat: path=%s st_mode=0x%04x st_size=%llu\n",
-                                  path, (unsigned)st.st_mode, (unsigned long long)st.st_size);
-            }
+
             /* copy stat with compatibility adjustments */
             {
                 size_t ksz = sizeof(st);
@@ -3017,9 +2879,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             struct fs_file *f = cur->fds[fd];
             if (!f) return ret_err(EBADF);
             if (f->type != FS_TYPE_DIR) return ret_err(EINVAL);
-            qemu_debug_printf("getdents64: pid=%llu fd=%d f=%p f->type=%d path=%s driver_priv=%p pos=%u size=%u\n",
-                              (unsigned long long)(cur->tid ? cur->tid : 1), fd, f, f->type,
-                              f->path ? f->path : "(null)", f->driver_private, (unsigned)f->pos, (unsigned)f->size);
 
             /* Synthesize linux_dirent64 records into a kernel buffer, then copy to userspace.
                This avoids exposing malformed driver records directly to libc. */
@@ -3097,14 +2956,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 in_off += entry_rec;
             }
 
-            /* debug: dump synthesized buffer hex to kernel log to inspect what userspace will receive */
-            qemu_debug_printf("getdents_synth: out_off=%u bytes:\n", (unsigned)out_off);
-            for (size_t zi = 0; zi < out_off; zi++) {
-                qemu_debug_printf("%02x ", (unsigned)outbuf[zi]);
-                if ((zi & 0x0F) == 0x0F) qemu_debug_printf("\n");
-            }
-            qemu_debug_printf("\n");
-
             /* copy synthesized data to user buffer per-record (safer) */
             size_t wrote = 0;
             size_t scan = 0;
@@ -3114,8 +2965,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 if (scan + recl > out_off) break;
                 /* bounds check user destination */
                 if ((uintptr_t)dirp_u + wrote + recl > (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                    qemu_debug_printf("getdents_synth: user buffer overflow prevented wrote=%u recl=%u count=%u\n",
-                                      (unsigned)wrote, (unsigned)recl, (unsigned)count);
                     break;
                 }
                 qemu_debug_printf("getdents_synth: copying record wrote=%u recl=%u\n", (unsigned)wrote, (unsigned)recl);
@@ -3192,12 +3041,12 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 if (sysfs_register() == 0) {
                     ramfs_mkdir(target);
                     rc = sysfs_mount(target);
+                    if (rc == 0)
+                        kernel_sysfs_populate_default();
                 }
             } else if (strcmp(k_type, "devfs") == 0 || strcmp(k_type, "devtmpfs") == 0) {
-                if (devfs_register() == 0) {
-                    ramfs_mkdir(target);
-                    rc = devfs_mount(target);
-                }
+                ramfs_mkdir(target);
+                rc = devfs_mount(target);
             } else {
                 rc = -1;
             }

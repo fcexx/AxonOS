@@ -71,6 +71,19 @@ void console_write_str_xy(uint32_t x, uint32_t y, const char *s, uint8_t attr) {
 				}
 				/* malformed: fallthrough to send single char */
 			}
+			if (s[i] == '\t') {
+				/* Tab: пробелы до следующей таб-стопы (8 колонок) */
+				uint32_t n = 8 - (cx % 8);
+				if (n == 0) n = 8;
+				for (uint32_t k = 0; k < n; k++) {
+					vbefb_set_cursor(cx, cy);
+					vbefb_putchar(' ', attr);
+					cx++;
+					if (cx >= (uint32_t)console_max_cols()) { cx = 0; cy++; }
+				}
+				i++;
+				continue;
+			}
 			/* printable or normal char: set cursor then print */
 			vbefb_set_cursor(cx, cy);
 			vbefb_putchar((uint8_t)s[i], attr);
@@ -118,6 +131,17 @@ void console_write_str_xy(uint32_t x, uint32_t y, const char *s, uint8_t attr) {
 				continue;
 			}
 			char ch = s[i++];
+			if (ch == '\t') {
+				/* Tab: пробелы до следующей таб-стопы (8 колонок); vga_putch_xy не раскрывает \t */
+				uint32_t n = 8 - (cx % 8);
+				if (n == 0) n = 8;
+				for (uint32_t k = 0; k < n; k++) {
+					vga_putch_xy(cx, cy, ' ', cur_attr);
+					cx++;
+					if (cx >= (uint32_t)console_max_cols()) { cx = 0; cy++; }
+				}
+				continue;
+			}
 			vga_putch_xy(cx, cy, (uint8_t)ch, cur_attr);
 			cx++;
 			if (cx >= (uint32_t)console_max_cols()) { cx = 0; cy++; }
