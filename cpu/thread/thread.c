@@ -430,10 +430,23 @@ void thread_block(int pid) {
         for (int i = 0; i < thread_count; ++i) {
                 if (threads[i] && threads[i]->tid == pid && threads[i]->state != THREAD_BLOCKED) {
                         threads[i]->state = THREAD_BLOCKED;
+                        threads[i]->sleep_until = 0; /* no timeout */
                         return;
                 }
         }
         klogprintf("<(0c)>thread_block: thread %d not found or already blocked\n", pid);
+}
+
+void thread_block_with_timeout(int pid, uint32_t timeout_ms) {
+        extern volatile uint64_t timer_ticks;
+        uint32_t now = (uint32_t)timer_ticks;
+        for (int i = 0; i < thread_count; ++i) {
+                if (threads[i] && threads[i]->tid == pid && threads[i]->state != THREAD_BLOCKED) {
+                        threads[i]->state = THREAD_BLOCKED;
+                        threads[i]->sleep_until = now + (timeout_ms ? timeout_ms : 0xFFFFFFFFu);
+                        return;
+                }
+        }
 }
 
 void thread_sleep(uint32_t ms) {
@@ -447,12 +460,17 @@ void thread_sleep(uint32_t ms) {
 }
 
 void thread_schedule() {
-        // Сначала проверяем спящие потоки
+        // Сначала проверяем спящие потоки и блокированные с таймаутом (poll)
         uint32_t now = (uint32_t)timer_ticks;
         for (int i = 0; i < thread_count; ++i) {
                 if (threads[i] && threads[i]->state == THREAD_SLEEPING) {
                         if (now >= threads[i]->sleep_until) {
                                 threads[i]->state = THREAD_READY;
+                        }
+                } else if (threads[i] && threads[i]->state == THREAD_BLOCKED && threads[i]->sleep_until != 0) {
+                        if (now >= threads[i]->sleep_until) {
+                                threads[i]->state = THREAD_READY;
+                                threads[i]->sleep_until = 0;
                         }
                 }
         }
@@ -545,6 +563,7 @@ void thread_unblock(int pid) {
         for (int i = 0; i < thread_count; ++i) {
                 if (threads[i] && threads[i]->tid == pid && threads[i]->state == THREAD_BLOCKED) {
                         threads[i]->state = THREAD_READY;
+                        threads[i]->sleep_until = 0;
                         return;
                 }
         }

@@ -111,6 +111,8 @@ void thread_stop(int pid);
 thread_t* thread_get(int pid);
 int thread_get_pid(const char* name);
 void thread_block(int pid);
+/* Block until unblock OR timeout_ms expires. block_until stored in sleep_until. */
+void thread_block_with_timeout(int pid, uint32_t timeout_ms);
 void thread_unblock(int pid);
 int thread_get_state(int pid);
 int thread_get_count();

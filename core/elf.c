@@ -407,7 +407,10 @@ static void mark_broad_user_ranges_for_exec(void) {
 
 int elf_load_from_path(const char *path, uint64_t *out_entry) {
     struct fs_file *f = fs_open(path);
-    if (!f) return -1;
+    if (!f) {
+        kprintf("execve: open failed: %s\n", path ? path : "(null)");
+        return -1;
+    }
     size_t fsz = f->size;
 
     /* Read only the ELF header first (avoid buffering whole file). */
@@ -987,10 +990,20 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     {
         thread_t *tc = thread_current();
         if (tc && tc->vfork_parent_tid >= 0) {
+            qemu_debug_printf("execve: child %llu has vfork_parent_tid=%d mem_backup=%p\n",
+                (unsigned long long)(tc->tid ? tc->tid : 1),
+                tc->vfork_parent_tid, tc->vfork_parent_mem_backup);
             if (!tc->vfork_parent_mem_backup) {
+                qemu_debug_printf("execve: waking vfork parent %d (no mem backup)\n", tc->vfork_parent_tid);
                 thread_unblock(tc->vfork_parent_tid);
                 tc->vfork_parent_tid = -1;
+            } else {
+                qemu_debug_printf("execve: NOT waking vfork parent %d (mem backup active, will wake on exit)\n",
+                    tc->vfork_parent_tid);
             }
+        } else {
+            qemu_debug_printf("execve: child %llu has no vfork_parent_tid\n",
+                (unsigned long long)(tc ? (tc->tid ? tc->tid : 1) : 0));
         }
     }
 

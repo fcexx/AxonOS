@@ -44,6 +44,8 @@ struct fs_driver_ops {
     void (*release)(struct fs_file *file);
     /* Optional chmod operation: set mode for path */
     int (*chmod)(const char *path, mode_t mode);
+    /* Optional hard link: link(oldpath, newpath). Return 0 on success. */
+    int (*link)(const char *oldpath, const char *newpath);
 };
 
 /* Registered driver object */
@@ -83,6 +85,7 @@ int vfs_stat(const char *path, struct stat *st);
 int vfs_lstat(const char *path, struct stat *st);
 ssize_t vfs_readlink(const char *path, char *buf, size_t bufsiz);
 int fs_chmod(const char *path, mode_t mode);
+int fs_link(const char *oldpath, const char *newpath);
 int fs_mkdir(const char *path);
 
 /* file types */

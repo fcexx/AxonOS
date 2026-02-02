@@ -24,6 +24,7 @@ struct ramfs_node {
     struct ramfs_node *parent;
     struct ramfs_node *children; /* linked list of children */
     struct ramfs_node *next; /* sibling */
+    struct ramfs_node *link_target; /* if set, this is a hard link to that node */
 };
 
 /* forward declarations for functions used before definitions */
@@ -112,6 +113,62 @@ int ramfs_symlink(const char *path, const char *target) {
     if (ct) { n->uid = ct->euid; n->gid = ct->egid; }
     kfree(tmp);
     return 0;
+}
+
+/* Create hard link: newpath will point to same inode as oldpath. */
+int ramfs_link(const char *oldpath, const char *newpath) {
+    if (!oldpath || oldpath[0] != '/' || !newpath || newpath[0] != '/') return -1;
+    /* resolve oldpath (follow symlinks) to get target node */
+    struct ramfs_node *target = ramfs_lookup(oldpath);
+    if (!target) return -2;
+    if (target->is_dir) return -1; /* EPERM: cannot link directory */
+    if (target->link_target) target = target->link_target; /* resolve if oldpath is itself a link */
+
+    /* get parent and basename of newpath */
+    size_t new_len = strlen(newpath);
+    char *tmp = (char*)kmalloc(new_len + 1);
+    if (!tmp) return -5;
+    memcpy(tmp, newpath, new_len + 1);
+    char *slash = strrchr(tmp, '/');
+    const char *parent_path = NULL;
+    char *name = NULL;
+    if (slash == tmp) {
+        parent_path = "/";
+        name = slash + 1;
+    } else if (slash) {
+        *slash = '\0';
+        parent_path = tmp;
+        name = slash + 1;
+    } else {
+        kfree(tmp);
+        return -3;
+    }
+    if (!name || !name[0]) { kfree(tmp); return -3; }
+
+    struct ramfs_node *parent = ramfs_lookup(parent_path);
+    if (!parent) { kfree(tmp); return -2; }
+    if (!parent->is_dir) { kfree(tmp); return -3; }
+    if (ramfs_find_child(parent, name)) { kfree(tmp); return -17; } /* EEXIST=17 */
+
+    /* allocate link node (minimal: name, parent, next, link_target) */
+    struct ramfs_node *link = (struct ramfs_node*)kmalloc(sizeof(*link));
+    if (!link) { kfree(tmp); return -5; }
+    memset(link, 0, sizeof(*link));
+    size_t nlen = strlen(name) + 1;
+    link->name = (char*)kmalloc(nlen);
+    if (!link->name) { kfree(link); kfree(tmp); return -5; }
+    memcpy(link->name, name, nlen);
+    link->link_target = target;
+    link->parent = parent;
+    link->next = parent->children;
+    parent->children = link;
+    target->nlink++;
+    kfree(tmp);
+    return 0;
+}
+
+static struct ramfs_node *ramfs_resolve_link(struct ramfs_node *n) {
+    return (n && n->link_target) ? n->link_target : n;
 }
 
 static void ramfs_free_node_shallow(struct ramfs_node *n) {
@@ -273,10 +330,10 @@ static struct ramfs_node *ramfs_lookup(const char *path) {
             tok = strtok(NULL, "/");
         }
         if (tok == NULL) {
-            /* finished without hitting symlink */
+            /* finished without hitting symlink; resolve hard link if any */
             kfree(tmp);
             kfree(curpath);
-            return cur;
+            return ramfs_resolve_link(cur);
         }
         /* else we restarted due to symlink; continue loop */
         /* loop continues, curpath updated */
@@ -381,6 +438,7 @@ static int ramfs_open(const char *path, struct fs_file **out_file) {
        Returning the symlink node allows lstat/readlink to work. */
     struct ramfs_node *n = ramfs_lookup_nofollow(path);
     if (!n) return -1;
+    n = ramfs_resolve_link(n); /* hard links: use target for data */
     struct fs_file *f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
     if (!f) return -2;
     memset(f,0,sizeof(*f));
@@ -411,6 +469,7 @@ static ssize_t ramfs_read(struct fs_file *file, void *buf, size_t size, size_t o
         struct ext2_dir_entry de;
         uint8_t *out = (uint8_t*)buf;
         for (struct ramfs_node *c = n->children; c; c = c->next) {
+            struct ramfs_node *r = ramfs_resolve_link(c);
             size_t namelen = strlen(c->name);
             /* record length: header (8) + name, padded to 4 bytes for compatibility */
             size_t rec_len = (size_t)(8 + namelen);
@@ -421,10 +480,10 @@ static ssize_t ramfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             uint8_t tmp[512];
             /* initialize buffer to zero to avoid leaking memory beyond name */
             for (size_t zi = 0; zi < sizeof(tmp); zi++) tmp[zi] = 0;
-            de.inode = (uint32_t)(c->ino & 0xFFFFFFFFu);
+            de.inode = (uint32_t)(r->ino & 0xFFFFFFFFu);
             de.rec_len = (uint16_t)rec_len;
             de.name_len = (uint8_t)namelen;
-            de.file_type = c->is_dir ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
+            de.file_type = ((c->mode & S_IFLNK) == S_IFLNK) ? EXT2_FT_SYMLINK : (r->is_dir ? EXT2_FT_DIR : EXT2_FT_REG_FILE);
             memcpy(tmp, &de, 8);
             memcpy(tmp + 8, c->name, namelen);
             size_t entry_off = 0;
@@ -472,12 +531,6 @@ int ramfs_fill_stat(struct fs_file *file, struct stat *st) {
     st->st_atime = n->atime;
     st->st_mtime = n->mtime;
     st->st_ctime = n->ctime;
-    /* Debug: log when /init is queried */
-    if (file->path && strcmp(file->path, "/init") == 0) {
-        /* Use formats supported by qemu_debug_printf: print mode in hex and size as %llu */
-        qemu_debug_printf("ramfs_fill_stat: path=%s node->mode=0x%04x is_dir=%d size=%llu\n",
-                   file->path, (unsigned)n->mode, n->is_dir, (unsigned long long)n->size);
-    }
     return 0;
 }
 
@@ -598,6 +651,8 @@ int ramfs_register(void) {
     ramfs_root = ramfs_alloc_node("", 1);
     if (!ramfs_root) return -1;
     ramfs_root->parent = NULL;
+    /* Create /dev immediately so it is always in root; critical for ls / visibility */
+    (void)ramfs_mkdir("/dev");
     ramfs_driver.ops = &ramfs_ops;
     ramfs_driver.driver_data = (void*)ramfs_root;
     ramfs_ops.name = "ramfs";
@@ -607,6 +662,7 @@ int ramfs_register(void) {
     ramfs_ops.write = ramfs_write;
     ramfs_ops.mkdir = ramfs_mkdir;
     ramfs_ops.chmod = ramfs_chmod;
+    ramfs_ops.link = ramfs_link;
     ramfs_ops.release = ramfs_release;
 
     return fs_register_driver(&ramfs_driver);

@@ -1,6 +1,7 @@
 #include <devfs.h>
 #include <heap.h>
 #include <fs.h>
+#include <ramfs.h>
 #include <vga.h>
 #include <keyboard.h>
 #include <thread.h>
@@ -351,10 +352,37 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
         uint8_t *out = (uint8_t*)buf;
         size_t pos = 0;
         size_t written = 0;
-    /* include ttys + console + any registered block devices */
-    int total_entries = (DEVFS_TTY_COUNT + 1) + dev_block_count;
-    int total_with_special = (DEVFS_TTY_COUNT + 1) + devfs_special_count + dev_block_count + dev_char_count;
-    for (int i = 0; i < total_with_special; i++) {
+        /* Emit "." and ".." first for POSIX/readdir compatibility */
+        static const char *const dot_entries[] = { ".", ".." };
+        for (int di = 0; di < 2; di++) {
+            const char *nm = dot_entries[di];
+            size_t namelen = strlen(nm);
+            size_t rec_len = 8 + namelen;
+            rec_len = (rec_len + 3) & ~3u;
+            if (rec_len < sizeof(struct ext2_dir_entry)) rec_len = sizeof(struct ext2_dir_entry);
+            if (pos + rec_len <= (size_t)offset) { pos += rec_len; continue; }
+            if (written >= size) break;
+            uint8_t tmp[64];
+            for (size_t zi = 0; zi < sizeof(tmp); zi++) tmp[zi] = 0;
+            struct ext2_dir_entry de;
+            memset(&de, 0, sizeof(de));
+            de.inode = 1;
+            de.rec_len = (uint16_t)rec_len;
+            de.name_len = (uint8_t)namelen;
+            de.file_type = EXT2_FT_DIR;
+            memcpy(tmp, &de, 8);
+            memcpy(tmp + 8, nm, namelen);
+            size_t entry_off = ((size_t)offset > pos) ? (size_t)offset - pos : 0;
+            size_t avail = size - written;
+            size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
+            if (tocopy > avail) tocopy = avail;
+            memcpy(out + written, tmp + entry_off, tocopy);
+            written += tocopy;
+            pos += rec_len;
+        }
+        /* include ttys + console + any registered block devices */
+        int total_with_special = (DEVFS_TTY_COUNT + 1) + devfs_special_count + dev_block_count + dev_char_count;
+        for (int i = 0; i < total_with_special; i++) {
             const char *nm;
             char tmpn[64];
             if (i == 0) {
@@ -389,6 +417,7 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                 }
             }
             size_t namelen = strlen(nm);
+            if (namelen == 0) { pos += 8; continue; } /* skip empty names */
             size_t rec_len = 8 + namelen;
             /* pad to 4-byte boundary like ext2 dirent */
             rec_len = (rec_len + 3) & ~3u;
@@ -588,6 +617,7 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
     const char *s = (const char*)buf;
     for (size_t i = 0; i < size; i++) {
         char ch = s[i];
+        int did_output = 0; /* 1 when we printed to VGA/buffer, 0 when consumed by ANSI */
         if (idx == devfs_active) {
             /* write to VGA directly, but respect ANSI escape sequences on the active tty */
             struct devfs_tty *tty = t;
@@ -603,8 +633,8 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                 } else {
                     /* normal character output using current attribute */
                     kputchar((uint8_t)ch, tty->current_attr);
-                    /* keep tty cursor in sync so ESC [ A/B/C/D move correctly */
                     vga_get_cursor(&tty->cursor_x, &tty->cursor_y);
+                    did_output = 1;
                 }
             } else if (tty->ansi_escape_state == 1) {
                 if ((unsigned char)ch == '[') {
@@ -618,6 +648,7 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                     tty->ansi_escape_state = 0;
                     kputchar(0x1B, tty->current_attr);
                     kputchar((uint8_t)ch, tty->current_attr);
+                    did_output = 1;
                 }
             } else if (tty->ansi_escape_state == 3) {
                 /* SS3: single final byte (e.g. A=up, B=down, C=right, D=left) */
@@ -640,6 +671,8 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                 /* CSI parsing: accumulate parameters until final byte */
                 if (ch >= '0' && ch <= '9') {
                     tty->ansi_current_param = tty->ansi_current_param * 10 + (ch - '0');
+                } else if (ch == '?' || ch == '>') {
+                    /* DEC/HP private mode marker - skip, continue parsing */
                 } else if (ch == ';') {
                     if (tty->ansi_param_count < (int)(sizeof(tty->ansi_param)/sizeof(tty->ansi_param[0]))) {
                         tty->ansi_param[tty->ansi_param_count++] = tty->ansi_current_param;
@@ -707,8 +740,8 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                         vga_set_cursor(tty->cursor_x, tty->cursor_y);
                     } else if (final_byte == 'J') {
                         int param = (tty->ansi_param_count > 0) ? tty->ansi_param[0] : 0;
-                        if (param == 2) {
-                            /* Clear entire screen: буфер TTY и физический экран (VGA/vbefb) */
+                        if (param == 2 || param == 3) {
+                            /* 2=clear entire screen; 3=clear entire screen + scrollback (we treat same) */
                             for (uint32_t ry = 0; ry < MAX_ROWS; ry++) {
                                 for (uint32_t rx = 0; rx < MAX_COLS; rx++) {
                                     uint16_t off = (uint16_t)((ry * MAX_COLS + rx) * 2);
@@ -720,10 +753,40 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                             }
                             tty->cursor_x = 0;
                             tty->cursor_y = 0;
-                            kclear();
+                            vga_clear_screen_attr(tty->current_attr);
                             vga_set_cursor(0, 0);
-                        } else {
-                            /* default: clear from cursor to end of screen - simple no-op for now */
+                        } else if (param == 0) {
+                            /* Clear from cursor to end of screen */
+                            uint32_t cy = tty->cursor_y;
+                            for (uint32_t ry = cy; ry < MAX_ROWS; ry++) {
+                                uint32_t x0 = (ry == cy) ? tty->cursor_x : 0;
+                                uint32_t x1 = MAX_COLS - 1;
+                                for (uint32_t rx = x0; rx <= x1; rx++) {
+                                    uint16_t off = (uint16_t)((ry * MAX_COLS + rx) * 2);
+                                    if (tty->screen) {
+                                        tty->screen[off] = ' ';
+                                        tty->screen[off + 1] = tty->current_attr;
+                                    }
+                                }
+                                vga_clear_line_segment((uint32_t)x0, x1, ry, tty->current_attr);
+                            }
+                            vga_set_cursor(tty->cursor_x, tty->cursor_y);
+                        } else if (param == 1) {
+                            /* Clear from start of screen to cursor */
+                            uint32_t cy = tty->cursor_y;
+                            for (uint32_t ry = 0; ry <= cy; ry++) {
+                                uint32_t x0 = 0;
+                                uint32_t x1 = (ry == cy) ? tty->cursor_x : MAX_COLS - 1;
+                                for (uint32_t rx = x0; rx <= x1; rx++) {
+                                    uint16_t off = (uint16_t)((ry * MAX_COLS + rx) * 2);
+                                    if (tty->screen) {
+                                        tty->screen[off] = ' ';
+                                        tty->screen[off + 1] = tty->current_attr;
+                                    }
+                                }
+                                vga_clear_line_segment(x0, x1, ry, tty->current_attr);
+                            }
+                            vga_set_cursor(tty->cursor_x, tty->cursor_y);
                         }
                     } else if (final_byte == 'K') {
                         /* Erase in line: 0=from cursor to EOL, 1=BOL to cursor, 2=whole line.
@@ -793,9 +856,10 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                     if (tty->cursor_x >= MAX_COLS) { tty->cursor_x = 0; tty->cursor_y++; if (tty->cursor_y >= MAX_ROWS) tty->cursor_y = MAX_ROWS - 1; }
                 }
             }
+            did_output = 1; /* non-active: we wrote to buffer */
         }
-            /* write into saved screen buffer */
-            if (t->screen) {
+            /* write into saved screen buffer only when we actually output a char (not consumed by ANSI) */
+            if (did_output && t->screen) {
                 /* very naive: append at bottom-right with no wrapping */
                 uint32_t x = t->cursor_x;
                 uint32_t y = t->cursor_y;
@@ -915,6 +979,8 @@ int devfs_register(void) {
 
 int devfs_mount(const char *path) {
     if (!path) return -1;
+    /* Ensure mount point exists in ramfs so ls / shows "dev" */
+    (void)ramfs_mkdir(path);
     return fs_mount(path, &devfs_driver);
 }
 

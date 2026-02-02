@@ -199,6 +199,9 @@ static int create_file_with_data(const char *path, const void *data, size_t size
 static int unpack_cpio_newc(const void *archive, size_t archive_size) {
     const uint8_t *base = (const uint8_t*)archive;
     size_t offset = 0;
+    /* Ensure /dev exists before unpacking - kernel may have failed to create it (OOM etc).
+       Critical for ls / to show dev and for init's mount -t devtmpfs /dev. */
+    (void)ramfs_mkdir("/dev");
     /* Find reliable start of a CPIO stream. */
     size_t found = find_cpio_start(base, archive_size);
     if (found == (size_t)-1) {

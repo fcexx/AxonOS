@@ -17,6 +17,9 @@
 #include <sysfs.h>
 #include <rtc.h>
 
+/* Linux x86_64 struct stat size; ensures st_mode at correct offset for S_ISREG etc. */
+#define STAT_COPY_SIZE 144
+
 extern void kprintf(const char *fmt, ...);
 
 /* Helper exported from core/elf.c */
@@ -298,6 +301,9 @@ static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, siz
 #define ENAMETOOLONG 36
 #define EAGAIN  11
 #define EINTR   4
+#define EIO     5
+#define EEXIST  17
+#define ENOTDIR 20
 static uint64_t last_syscall_debug = 0;
 static inline uint64_t ret_err(int e) {
     /* Log ENOSYS occurrences for the user shell (tid==3) to help musl compatibility debugging. */
@@ -366,6 +372,18 @@ static thread_t *find_terminated_child(thread_t *t) {
     return NULL;
 }
 
+/* Returns 1 if path contains . or .. components that need normalization. */
+static int path_needs_normalize(const char *p) {
+    if (!p) return 0;
+    if (p[0] == '.' && (p[1] == '\0' || p[1] == '/')) return 1;
+    if (p[0] == '.' && p[1] == '.' && (p[2] == '\0' || p[2] == '/')) return 1;
+    for (; *p; p++) {
+        if (*p == '/' && p[1] == '.' && (p[2] == '\0' || p[2] == '/')) return 1;
+        if (*p == '/' && p[1] == '.' && p[2] == '.' && (p[3] == '\0' || p[3] == '/')) return 1;
+    }
+    return 0;
+}
+
 /* Normalize path by resolving . and .. components. Modifies buf in place. */
 static void normalize_path(char *buf, size_t cap) {
     if (!buf || cap == 0) return;
@@ -414,7 +432,7 @@ static void resolve_user_path(thread_t *cur, const char *path_u, char *out, size
     if (path_u[0] == '/') {
         strncpy(out, path_u, out_cap);
         out[out_cap - 1] = '\0';
-        normalize_path(out, out_cap);
+        if (path_needs_normalize(out)) normalize_path(out, out_cap);
         return;
     }
     /* "." means current directory. */
@@ -448,7 +466,42 @@ static void resolve_user_path(thread_t *cur, const char *path_u, char *out, size
     } else {
         snprintf(out, out_cap, "%s/%s", cwd, path_u);
     }
-    normalize_path(out, out_cap);
+    if (path_needs_normalize(out)) normalize_path(out, out_cap);
+}
+
+/* Resolve path for openat: dirfd base or cwd. Returns 0 on success, negative errno on error. */
+static int resolve_user_path_at(thread_t *cur, int dirfd, const char *path_u, char *out, size_t out_cap) {
+    if (!out || out_cap == 0) return -EFAULT;
+    out[0] = '\0';
+    if (!path_u || !path_u[0]) return -ENOENT;
+    /* Absolute path: dirfd ignored, use standard resolve */
+    if (path_u[0] == '/') {
+        resolve_user_path(cur, path_u, out, out_cap);
+        return 0;
+    }
+    /* AT_FDCWD = -100: use current working directory */
+    enum { AT_FDCWD = -100 };
+    if (dirfd == AT_FDCWD) {
+        resolve_user_path(cur, path_u, out, out_cap);
+        return 0;
+    }
+    /* dirfd: resolve relative to that directory */
+    if (dirfd < 0 || dirfd >= THREAD_MAX_FD) return -EBADF;
+    struct fs_file *f = cur->fds[dirfd];
+    if (!f) return -EBADF;
+    if (f->type != FS_TYPE_DIR) return -ENOTDIR;
+    const char *base = f->path ? f->path : "/";
+    size_t bl = strlen(base);
+    int has_trailing = (bl > 1 && base[bl - 1] == '/');
+    size_t pl = strlen(path_u);
+    if (has_trailing) {
+        snprintf(out, out_cap, "%s%s", base, path_u);
+    } else {
+        snprintf(out, out_cap, "%s/%s", base, path_u);
+    }
+    out[out_cap - 1] = '\0';
+    if (path_needs_normalize(out)) normalize_path(out, out_cap);
+    return 0;
 }
 
 static inline int user_range_ok(const void *uaddr, size_t nbytes);
@@ -1026,6 +1079,10 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             child->attached_tty = p->attached_tty;
             strncpy(child->cwd, p->cwd, sizeof(child->cwd) - 1);
             child->cwd[sizeof(child->cwd) - 1] = '\0';
+            qemu_debug_printf("vfork: parent=%llu child=%llu saved_rcx=0x%llx saved_rsp=0x%llx\n",
+                (unsigned long long)(p->tid ? p->tid : 1),
+                (unsigned long long)(child->tid ? child->tid : 1),
+                (unsigned long long)saved_rcx, (unsigned long long)saved_rsp);
             /* Preserve parent userspace memory across vfork/exec.
                In our shared-address-space model, exec in the child overwrites
                parent memory, so we must snapshot+restore for correctness. */
@@ -1049,6 +1106,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 /* block parent until child exits */
                 p->vfork_parent_tid = -1;
                 p->state = THREAD_BLOCKED;
+                qemu_debug_printf("vfork: parent blocked, child->vfork_parent_tid=%d\n", child->vfork_parent_tid);
             }
             /* duplicate file descriptors (increase refcounts) */
             for (int i = 0; i < THREAD_MAX_FD; i++) {
@@ -1060,13 +1118,19 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             /* If parent was blocked (init backup path), yield to run child now. */
             if (p->state == THREAD_BLOCKED && child->vfork_parent_tid >= 0) {
+                qemu_debug_printf("vfork: unblocking child %llu, calling thread_schedule()\n",
+                    (unsigned long long)(child->tid ? child->tid : 1));
                 thread_unblock((int)(child->tid ? child->tid : 1));
                 thread_schedule();
                 /* parent resumed after child exit; restore syscall frame */
+                qemu_debug_printf("vfork: parent %llu resumed after child exit\n",
+                    (unsigned long long)(p->tid ? p->tid : 1));
                 rebuild_syscall_frame(p);
                 return (uint64_t)(child->tid ? child->tid : 1);
             }
             /* default path: do not block parent; just allow child to run */
+            qemu_debug_printf("vfork: default path, unblocking child %llu\n",
+                (unsigned long long)(child->tid ? child->tid : 1));
             child->vfork_parent_tid = -1;
             thread_unblock((int)(child->tid ? child->tid : 1));
             /* when parent is unblocked and resumes here, return child's pid to parent */
@@ -1165,6 +1229,50 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 return (uint64_t)L; /* no NUL terminator */
             }
             return ret_err(ENOENT);
+        }
+        case SYS_link: {
+            /* link(oldpath, newpath) - create hard link */
+            const char *oldpath_u = (const char*)(uintptr_t)a1;
+            const char *newpath_u = (const char*)(uintptr_t)a2;
+            if (!oldpath_u || !newpath_u) return ret_err(EFAULT);
+            if ((uintptr_t)oldpath_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+            if ((uintptr_t)newpath_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+            char oldpath[256], newpath[256];
+            resolve_user_path(cur, oldpath_u, oldpath, sizeof(oldpath));
+            resolve_user_path(cur, newpath_u, newpath, sizeof(newpath));
+            int r = fs_link(oldpath, newpath);
+            if (r == 0) return 0;
+            return ret_err(r < 0 ? -r : EIO);
+        }
+        case SYS_mkdir: {
+            /* mkdir(path, mode) - syscall 83; init often runs "mkdir -p /dev" before mount */
+            const char *path_u = (const char*)(uintptr_t)a1;
+            mode_t mode = (mode_t)(a2 & 0xFFFFu);
+            if (!path_u) return ret_err(EFAULT);
+            if ((uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+            char path[256];
+            resolve_user_path(cur, path_u, path, sizeof(path));
+            if (path[0] == '\0') return ret_err(EINVAL);
+            int r = fs_mkdir(path);
+            if (r == 0) {
+                (void)fs_chmod(path, (mode & 07777u) | S_IFDIR);
+                return 0;
+            }
+            return ret_err(r < 0 ? -r : EIO);
+        }
+        case SYS_chmod: {
+            /* chmod(path, mode) */
+            const char *path_u = (const char*)(uintptr_t)a1;
+            mode_t mode = (mode_t)(a2 & 0xFFFFu);
+            if (!path_u) return ret_err(EFAULT);
+            if ((uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+            char path[256];
+            resolve_user_path(cur, path_u, path, sizeof(path));
+            struct stat st;
+            if (vfs_stat(path, &st) != 0) return ret_err(ENOENT);
+            int r = fs_chmod(path, mode);
+            if (r == 0) return 0;
+            return ret_err(EPERM);
         }
         case SYS_getrandom: {
             void *bufp = (void*)(uintptr_t)a1;
@@ -2391,6 +2499,49 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             kfree(tmp);
             return (wr >= 0) ? (uint64_t)wr : ret_err(EINVAL);
         }
+        case SYS_readv: {
+            /* readv(fd, const struct iovec *iov, int iovcnt) - scatter read */
+            int fd = (int)a1;
+            const void *iov_u = (const void*)(uintptr_t)a2;
+            int iovcnt = (int)a3;
+            if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
+            if (!iov_u) return ret_err(EFAULT);
+            if (iovcnt <= 0 || iovcnt > 64) return ret_err(EINVAL);
+            struct fs_file *f = cur->fds[fd];
+            if (!f) return ret_err(EBADF);
+
+            struct iovec_k { uint64_t base; uint64_t len; };
+            struct iovec_k iov[64];
+            size_t bytes = (size_t)iovcnt * sizeof(iov[0]);
+            if (copy_from_user_raw(iov, iov_u, bytes) != 0) return ret_err(EFAULT);
+
+            uint64_t total = 0;
+            for (int i = 0; i < iovcnt; i++) {
+                void *base = (void*)(uintptr_t)iov[i].base;
+                size_t len = (size_t)iov[i].len;
+                if (len == 0) continue;
+                if ((uintptr_t)base + len > (uintptr_t)MMIO_IDENTITY_LIMIT) return (total > 0) ? total : ret_err(EFAULT);
+                size_t off = 0;
+                while (off < len) {
+                    size_t chunk = len - off;
+                    if (chunk > 4096) chunk = 4096;
+                    void *tmp = kmalloc(chunk);
+                    if (!tmp) return (total > 0) ? total : ret_err(ENOMEM);
+                    ssize_t rr = fs_read(f, tmp, chunk, f->pos);
+                    if (rr <= 0) {
+                        kfree(tmp);
+                        return (total > 0) ? total : ret_err(EINVAL);
+                    }
+                    memcpy((char*)base + off, tmp, (size_t)rr);
+                    kfree(tmp);
+                    f->pos += (size_t)rr;
+                    total += (uint64_t)rr;
+                    off += (size_t)rr;
+                    if ((size_t)rr < chunk) return total;
+                }
+            }
+            return total;
+        }
         case SYS_read: {
             int fd = (int)a1;
             void *bufp = (void*)(uintptr_t)a2;
@@ -2619,6 +2770,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     }
                     if (n_tty_waiting > 0) {
                         thread_block(cur_tid);
+                        thread_yield(); /* must yield so keyboard ISR can run and unblock */
                         for (int w = 0; w < n_tty_waiting; w++) devfs_tty_remove_waiter(tty_waiting[w], cur_tid);
                         goto auto_check;
                     }
@@ -2626,10 +2778,44 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     goto auto_check;
                 }
             } else {
-                /* timeout > 0: do not block on TTY waiters (would miss timeout); poll every step */
+                /* timeout > 0: use TTY waiters + block_with_timeout to wake on keypress
+                   (Escape) immediately instead of sleeping full timeout */
+                n_tty_waiting = 0;
+                if (cur_tid >= 0) {
+                    for (int i = 0; i < nfds && n_tty_waiting < (int)(sizeof(tty_waiting)/sizeof(tty_waiting[0])); i++) {
+                        int fd = *(int*)((uint8_t*)kbuf + i * entry_size + 0);
+                        short events = *(short*)((uint8_t*)kbuf + i * entry_size + 4);
+                        if (fd < 0 || fd >= THREAD_MAX_FD || !(events & POLLIN)) continue;
+                        struct fs_file *f = curth_poll ? curth_poll->fds[fd] : NULL;
+                        if (!f || !devfs_is_tty_file(f)) continue;
+                        int tidx = devfs_get_tty_index_from_file(f);
+                        if (tidx < 0) tidx = devfs_get_active();
+                        if (devfs_tty_add_waiter(tidx, cur_tid) == 0) tty_waiting[n_tty_waiting++] = tidx;
+                    }
+                }
+                if (n_tty_waiting > 0) {
+                    int remain = timeout - elapsed;
+                    if (remain > 0) {
+                        uint64_t t0 = pit_get_time_ms();
+                        thread_block_with_timeout(cur_tid, (uint32_t)remain);
+                        thread_yield(); /* must yield so keyboard ISR can run and unblock */
+                        elapsed += (int)(pit_get_time_ms() - t0);
+                        if (elapsed >= timeout) {
+                            for (int w = 0; w < n_tty_waiting; w++) devfs_tty_remove_waiter(tty_waiting[w], cur_tid);
+                            if (copy_to_user_safe((void*)ufds, kbuf, bytes) != 0) { kfree(kbuf); return ret_err(EFAULT); }
+                            kfree(kbuf);
+                            return 0; /* timeout expired */
+                        }
+                    }
+                    for (int w = 0; w < n_tty_waiting; w++) devfs_tty_remove_waiter(tty_waiting[w], cur_tid);
+                    goto auto_check;
+                }
+                int step_ms = 2;
                 while (elapsed < timeout) {
-                    thread_sleep(step);
-                    elapsed += step;
+                    uint32_t sleep_ms = (uint32_t)(timeout - elapsed);
+                    if (sleep_ms > (uint32_t)step_ms) sleep_ms = (uint32_t)step_ms;
+                    thread_sleep(sleep_ms);
+                    elapsed += (int)sleep_ms;
                     goto auto_check;
                 }
             }
@@ -2645,7 +2831,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (!path_u || (uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
             char path[256];
             resolve_user_path(cur, path_u, path, sizeof(path));
-            qemu_debug_printf("open: pid=%llu path='%s' resolved='%s'\n", (unsigned long long)(cur->tid ? cur->tid : 1), path_u, path);
             if (strcmp(path, "/etc/inittab") == 0) {
                 struct stat st;
                 if (vfs_stat(path, &st) == 0 && st.st_size == 0) {
@@ -2661,14 +2846,15 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             return (uint64_t)(unsigned)fd;
         }
         case SYS_openat: {
-            /* openat(dirfd, pathname, flags, mode) */
+            /* openat(dirfd, pathname, flags, mode) - dirfd=AT_FDCWD(-100) uses cwd */
+            int dirfd = (int)a1;
             const char *path_u = (const char*)(uintptr_t)a2;
-            (void)a1;
             int flags = (int)a3;
             (void)a4;
             if (!path_u || (uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
             char path[256];
-            resolve_user_path(cur, path_u, path, sizeof(path));
+            int rc = resolve_user_path_at(cur, dirfd, path_u, path, sizeof(path));
+            if (rc != 0) return ret_err(-rc);
             if (strcmp(path, "/etc/inittab") == 0) {
                 struct stat st;
                 if (vfs_stat(path, &st) == 0 && st.st_size == 0) {
@@ -2705,20 +2891,14 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             void *st_u = (void*)(uintptr_t)a2;
             if (!path_u || !st_u) return ret_err(EFAULT);
             if ((uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-            if ((uintptr_t)st_u + sizeof(struct stat) > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+            if ((uintptr_t)st_u + STAT_COPY_SIZE > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
             char path[256];
             resolve_user_path(cur, path_u, path, sizeof(path));
             struct stat st;
             int rc_st = (num == SYS_lstat) ? vfs_lstat(path, &st) : vfs_stat(path, &st);
             if (rc_st != 0) return ret_err(ENOENT);
-            /* Diagnostic: log stat calls for /init */
-            if (strcmp(path, "/init") == 0) {
-            }
-            /* build a glibc-like compat struct and copy it to user memory.
-               We pack into a kernel-sized temporary buffer to avoid writing beyond
-               the bounds previously validated (sizeof(struct stat)). */
+            /* build Linux x86_64 ABI struct stat and copy full layout so vi/busybox S_ISREG works */
             {
-                /* compat struct approximating x86_64 glibc struct stat layout */
                 struct compat_stat {
                     uint64_t st_dev;
                     uint64_t st_ino;
@@ -2755,12 +2935,10 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 cs.st_ctime_sec = (int64_t)st.st_ctime;
 
                 uint8_t tmp[256];
-                memset(tmp, 0, sizeof(tmp));
-                /* Copy into a kernel-sized buffer matching sizeof(struct stat) so userland reads expected bytes. */
-                size_t copy_sz = sizeof(struct stat) <= sizeof(tmp) ? sizeof(struct stat) : sizeof(tmp);
-                size_t cs_sz = sizeof(cs) < copy_sz ? sizeof(cs) : copy_sz;
-                memcpy(tmp, &cs, cs_sz);
-                if (copy_to_user_safe(st_u, tmp, copy_sz) != 0) return ret_err(EFAULT);
+                if (sizeof(cs) > sizeof(tmp)) return ret_err(EINVAL);
+                memcpy(tmp, &cs, sizeof(cs));
+                memset(tmp + sizeof(cs), 0, STAT_COPY_SIZE - sizeof(cs));
+                if (copy_to_user_safe(st_u, tmp, STAT_COPY_SIZE) != 0) return ret_err(EFAULT);
             }
             return 0;
         }
@@ -2769,15 +2947,12 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             void *st_u = (void*)(uintptr_t)a2;
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
             if (!st_u) return ret_err(EFAULT);
-            if ((uintptr_t)st_u + sizeof(struct stat) > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+            if ((uintptr_t)st_u + STAT_COPY_SIZE > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
             struct fs_file *f = cur->fds[fd];
             if (!f) return ret_err(EBADF);
             struct stat st;
             if (vfs_fstat(f, &st) != 0) return ret_err(EINVAL);
-            /* Diagnostic: log fstat results for debugging regular file checks */
-            if (f->path && strcmp(f->path, "/init") == 0) {
-            }
-            /* build and copy compat struct like in SYS_stat/SYS_newfstatat */
+            /* build Linux x86_64 ABI struct stat so vi/busybox S_ISREG(st.st_mode) works */
             {
                 struct compat_stat {
                     uint64_t st_dev;
@@ -2815,39 +2990,77 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 cs.st_ctime_sec = (int64_t)st.st_ctime;
 
                 uint8_t tmp[256];
-                memset(tmp, 0, sizeof(tmp));
-                size_t copy_sz = sizeof(struct stat) <= sizeof(tmp) ? sizeof(struct stat) : sizeof(tmp);
-                size_t cs_sz = sizeof(cs) < copy_sz ? sizeof(cs) : copy_sz;
-                memcpy(tmp, &cs, cs_sz);
-                if (copy_to_user_safe(st_u, tmp, copy_sz) != 0) return ret_err(EFAULT);
+                if (sizeof(cs) > sizeof(tmp)) return ret_err(EINVAL);
+                memcpy(tmp, &cs, sizeof(cs));
+                memset(tmp + sizeof(cs), 0, STAT_COPY_SIZE - sizeof(cs));
+                if (copy_to_user_safe(st_u, tmp, STAT_COPY_SIZE) != 0) return ret_err(EFAULT);
             }
             return 0;
         }
         case SYS_newfstatat: {
-            /* newfstatat(dirfd, pathname, statbuf, flags) */
+            /* newfstatat(dirfd, pathname, statbuf, flags) - use same Linux ABI layout as stat/fstat */
+            int dirfd = (int)a1;
             const char *path_u = (const char*)(uintptr_t)a2;
             void *st_u = (void*)(uintptr_t)a3;
-            (void)a1; (void)a4;
-            if (!path_u || !st_u) return ret_err(EFAULT);
-            if ((uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-            if ((uintptr_t)st_u + sizeof(struct stat) > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-            char path[256];
-            resolve_user_path(cur, path_u, path, sizeof(path));
+            int flags = (int)a4;
+            if (!st_u) return ret_err(EFAULT);
+            if ((uintptr_t)st_u + STAT_COPY_SIZE > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
             struct stat st;
-            if (vfs_stat(path, &st) != 0) return ret_err(ENOENT);
+            /* AT_EMPTY_PATH (0x1000): path ignored, stat the file given by dirfd (vi uses this) */
+            if ((flags & 0x1000) != 0 && path_u && path_u[0] == '\0') {
+                if (dirfd < 0 || dirfd >= THREAD_MAX_FD) return ret_err(EBADF);
+                struct fs_file *f = cur->fds[dirfd];
+                if (!f) return ret_err(EBADF);
+                if (vfs_fstat(f, &st) != 0) return ret_err(EINVAL);
+            } else {
+                if (!path_u) return ret_err(EFAULT);
+                if ((uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+                char path[256];
+                resolve_user_path(cur, path_u, path, sizeof(path));
+                if (vfs_stat(path, &st) != 0) return ret_err(ENOENT);
+            }
 
-            /* copy stat with compatibility adjustments */
             {
-                size_t ksz = sizeof(st);
+                struct compat_stat {
+                    uint64_t st_dev;
+                    uint64_t st_ino;
+                    uint64_t st_nlink;
+                    uint32_t st_mode;
+                    uint32_t st_uid;
+                    uint32_t st_gid;
+                    uint32_t __pad0;
+                    uint64_t st_rdev;
+                    int64_t  st_size;
+                    int64_t  st_blksize;
+                    int64_t  st_blocks;
+                    int64_t  st_atime_sec;
+                    int64_t  st_atime_nsec;
+                    int64_t  st_mtime_sec;
+                    int64_t  st_mtime_nsec;
+                    int64_t  st_ctime_sec;
+                    int64_t  st_ctime_nsec;
+                    int64_t  __unused[3];
+                } cs;
+                memset(&cs, 0, sizeof(cs));
+                cs.st_dev = 0;
+                cs.st_ino = (uint64_t)st.st_ino;
+                cs.st_nlink = (uint64_t)st.st_nlink;
+                cs.st_mode = (uint32_t)st.st_mode;
+                cs.st_uid = (uint32_t)st.st_uid;
+                cs.st_gid = (uint32_t)st.st_gid;
+                cs.st_rdev = 0;
+                cs.st_size = (int64_t)st.st_size;
+                cs.st_blksize = 0;
+                cs.st_blocks = 0;
+                cs.st_atime_sec = (int64_t)st.st_atime;
+                cs.st_mtime_sec = (int64_t)st.st_mtime;
+                cs.st_ctime_sec = (int64_t)st.st_ctime;
+
                 uint8_t tmp[256];
-                if (ksz > sizeof(tmp)) ksz = sizeof(tmp);
-                memset(tmp, 0, sizeof(tmp));
-                memcpy(tmp, &st, ksz);
-                size_t off_mode_alt = offsetof(struct stat, st_size);
-                if (off_mode_alt + sizeof(st.st_mode) <= ksz) {
-                    memcpy(tmp + off_mode_alt, &st.st_mode, sizeof(st.st_mode));
-                }
-                if (copy_to_user_safe(st_u, tmp, sizeof(st)) != 0) return ret_err(EFAULT);
+                if (sizeof(cs) > sizeof(tmp)) return ret_err(EINVAL);
+                memcpy(tmp, &cs, sizeof(cs));
+                memset(tmp + sizeof(cs), 0, STAT_COPY_SIZE - sizeof(cs));
+                if (copy_to_user_safe(st_u, tmp, STAT_COPY_SIZE) != 0) return ret_err(EFAULT);
             }
             return 0;
         }
@@ -2967,7 +3180,6 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 if ((uintptr_t)dirp_u + wrote + recl > (uintptr_t)MMIO_IDENTITY_LIMIT) {
                     break;
                 }
-                qemu_debug_printf("getdents_synth: copying record wrote=%u recl=%u\n", (unsigned)wrote, (unsigned)recl);
                 int rc = copy_to_user_safe((uint8_t*)dirp_u + wrote, outbuf + scan, recl);
                 if (rc != 0) {
                     kfree(outbuf);
@@ -3044,7 +3256,8 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     if (rc == 0)
                         kernel_sysfs_populate_default();
                 }
-            } else if (strcmp(k_type, "devfs") == 0 || strcmp(k_type, "devtmpfs") == 0) {
+            } else if (strcmp(k_type, "devfs") == 0 || strcmp(k_type, "devtmpfs") == 0 || strcmp(k_type, "tmpfs") == 0) {
+                /* tmpfs as mount type for /dev: treat same as devtmpfs (init inittab fallback) */
                 ramfs_mkdir(target);
                 rc = devfs_mount(target);
             } else {
@@ -3141,10 +3354,15 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 }
                 /* wake vfork parent if any (restore parent's stack snapshot first) */
                 if (cur->vfork_parent_tid >= 0) {
+                    qemu_debug_printf("sys_exit: waking vfork parent %d from child %llu\n",
+                        cur->vfork_parent_tid, (unsigned long long)(cur->tid ? cur->tid : 1));
                     vfork_restore_parent_memory(cur);
                     vfork_restore_parent_stack(cur);
                     thread_unblock(cur->vfork_parent_tid);
                     cur->vfork_parent_tid = -1;
+                } else {
+                    qemu_debug_printf("sys_exit: child %llu has no vfork_parent_tid (was %d)\n",
+                        (unsigned long long)(cur->tid ? cur->tid : 1), cur->vfork_parent_tid);
                 }
                 /* wake arbitrary waiter if present */
                 if (cur->waiter_tid >= 0) {
@@ -3181,10 +3399,15 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     if (pt) thread_set_pending_signal(pt, SIGCHLD);
                 }
                 if (cur->vfork_parent_tid >= 0) {
+                    qemu_debug_printf("sys_exit_group: waking vfork parent %d from child %llu\n",
+                        cur->vfork_parent_tid, (unsigned long long)(cur->tid ? cur->tid : 1));
                     vfork_restore_parent_memory(cur);
                     vfork_restore_parent_stack(cur);
                     thread_unblock(cur->vfork_parent_tid);
                     cur->vfork_parent_tid = -1;
+                } else {
+                    qemu_debug_printf("sys_exit_group: child %llu has no vfork_parent_tid (was %d)\n",
+                        (unsigned long long)(cur->tid ? cur->tid : 1), cur->vfork_parent_tid);
                 }
                 if (cur->waiter_tid >= 0) thread_unblock(cur->waiter_tid);
                 cur->state = THREAD_TERMINATED;

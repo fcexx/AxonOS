@@ -282,6 +282,10 @@ void	scroll_line()
 
 void	kclear()
 {
+	if (vbe_is_available()) {
+		vbefb_clear(WHITE_ON_BLACK);
+		return;
+	}
 	uint16_t	offset = 0;
 	while (offset < (MAX_ROWS * MAX_COLS * 2))
 	{

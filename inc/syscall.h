@@ -5,6 +5,7 @@
 
 /* Minimal syscall numbers (Linux-compatible where convenient) */
 #define SYS_read    0
+#define SYS_readv   19
 #define SYS_write   1
 #define SYS_open    2
 #define SYS_close   3
@@ -62,6 +63,9 @@
 #define SYS_clock_nanosleep 230
 #define SYS_gettimeofday 169
 #define SYS_access 21
+#define SYS_link   86
+#define SYS_mkdir  83
+#define SYS_chmod  90
 
 /* initialize syscall subsystem (register handler) */
 void syscall_init(void);

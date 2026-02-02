@@ -407,11 +407,20 @@ struct fs_file *fs_create_file(const char *path) {
 
 struct fs_file *fs_open(const char *path) {
     if (!path) return NULL;
-    
-    /* разрешаем симлинки перед открытием */
+
+    /* Fast path: most paths have no symlinks. Try direct open first. */
+    struct fs_file *f = fs_open_no_resolve(path);
+    if (f) {
+        struct stat st;
+        if (vfs_fstat(f, &st) == 0 && (st.st_mode & S_IFLNK) != S_IFLNK) {
+            return f;  /* regular file or dir, no resolution needed */
+        }
+        fs_file_free(f);  /* symlink or error, need full resolve */
+    }
+
     char *resolved_path = fs_resolve_symlinks(path);
     if (!resolved_path) return NULL;
-    
+
     struct fs_file *result = NULL;
     struct fs_driver *mount_drv = fs_match_mount(resolved_path);
     if (mount_drv && mount_drv->ops && mount_drv->ops->open) {
@@ -422,7 +431,7 @@ struct fs_file *fs_open(const char *path) {
             result = file;
         }
     }
-    
+
     if (!result) {
         for (int i = 0; i < g_drivers_count; i++) {
             struct fs_driver *drv = g_drivers[i];
@@ -434,16 +443,11 @@ struct fs_file *fs_open(const char *path) {
                 result = file;
                 break;
             }
-            if (r < 0 && r != -1) {
-                /* real error, stop */
-                break;
-            }
+            if (r < 0 && r != -1) break;
         }
     }
-    
-    /* освобождаем разрешенный путь (всегда выделяется новый буфер) */
+
     kfree(resolved_path);
-    
     return result;
 }
 
@@ -508,12 +512,28 @@ int fs_chmod(const char *path, mode_t mode) {
     return -1;
 }
 
+int fs_link(const char *oldpath, const char *newpath) {
+    if (!oldpath || !newpath) return -1;
+    struct fs_driver *mount_drv = fs_match_mount(oldpath);
+    if (mount_drv && mount_drv->ops && mount_drv->ops->link) {
+        int r = mount_drv->ops->link(oldpath, newpath);
+        if (r == 0) return 0;
+        if (r < 0) return r;
+    }
+    for (int i = 0; i < g_drivers_count; i++) {
+        struct fs_driver *drv = g_drivers[i];
+        if (!drv || !drv->ops || !drv->ops->link) continue;
+        int r = drv->ops->link(oldpath, newpath);
+        if (r == 0) return 0;
+        if (r < 0 && r != -1) return r;
+    }
+    return -1;
+}
+
 ssize_t fs_readdir_next(struct fs_file *file, void *buf, size_t size) {
     if (!file) return -1;
     ssize_t r = fs_read(file, buf, size, file->pos);
     if (r > 0) file->pos += r;
-    qemu_debug_printf("fs_readdir_next: path=%s pos=%llu returned=%d\n",
-                      file->path ? file->path : "(null)", (unsigned long long)file->pos, (int)r);
     return r;
 }
 
@@ -527,25 +547,31 @@ int vfs_fstat(struct fs_file *file, struct stat *st) {
         if (!fs_file_matches_driver(drv, file)) continue;
         const char *name = drv->ops ? drv->ops->name : NULL;
         if (name && strcmp(name, "sysfs") == 0) {
-            if (sysfs_fill_stat(file, st) == 0) return 0;
+            if (sysfs_fill_stat(file, st) == 0) goto fix_mode;
         } else if (name && strcmp(name, "ramfs") == 0) {
-            if (ramfs_fill_stat(file, st) == 0) return 0;
+            if (ramfs_fill_stat(file, st) == 0) goto fix_mode;
         } else if (name && strcmp(name, "procfs") == 0) {
-            if (procfs_fill_stat(file, st) == 0) return 0;
+            if (procfs_fill_stat(file, st) == 0) goto fix_mode;
         }
         break;
     }
     /* fallback: fill from fs_file fields */
     st->st_mode = (file->type == FS_TYPE_DIR) ? (S_IFDIR | 0755) : (S_IFREG | 0644);
+    goto done;
+fix_mode:
+    /* Add type bits only when driver left them zero. Do not overwrite existing type
+       so boot init path is not changed (avoids rc=-1 when exec fails for script/interp). */
+    {
+        unsigned int have_type = (st->st_mode & 0170000u);
+        if (have_type == 0) {
+            unsigned int want_type = (file->type == FS_TYPE_DIR) ? S_IFDIR : S_IFREG;
+            st->st_mode = (st->st_mode & 07777u) | want_type;
+        }
+    }
+    return 0;
+done:
     st->st_size = (off_t)file->size;
     st->st_nlink = 1;
-    /* Debug: if this is /init, log what mode we return to userspace to help diagnose
-       why userland considers it non-regular. */
-    if (file->path && strcmp(file->path, "/init") == 0) {
-        /* vfs_fstat diagnostic: print mode in hex (qemu_debug_printf supports %x and %llu) */
-        qemu_debug_printf("vfs_fstat: path=%s file->type=%d st_mode=0x%04x st_size=%llu\n",
-                   file->path, file->type, (unsigned)st->st_mode, (unsigned long long)st->st_size);
-    }
     return 0;
 }
 
