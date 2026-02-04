@@ -15,11 +15,6 @@ thread_t* threads[MAX_THREADS];
 int thread_count = 0;
 static thread_t* current = NULL;
 static thread_t* current_user = NULL; // регистрируемый юзер-процесс
-<<<<<<< HEAD
-int init = 0;
-static thread_t main_thread;
-
-=======
 static thread_t* idle_thread = NULL;  /* always-runnable idle task */
 static int idle_tid = -1;
 int init = 0;
@@ -61,7 +56,6 @@ static void idle_task_entry(void) {
                 asm volatile("sti; hlt" ::: "memory");
         }
 }
->>>>>>> fcexx
 
 void thread_init() {
         memset(&main_thread, 0, sizeof(main_thread));
@@ -92,8 +86,6 @@ void thread_init() {
         main_thread.exec_trampoline_rsp = 0;
         main_thread.exec_trampoline_rax = 0;
         init = 1;
-<<<<<<< HEAD
-=======
 
         /* Create an always-READY idle task (tid != 0) so the scheduler always has
            a safe thread to switch to when all other threads are blocked. */
@@ -103,7 +95,6 @@ void thread_init() {
         } else {
                 idle_tid = -1;
         }
->>>>>>> fcexx
 }
 
 // для старта потока
@@ -133,21 +124,12 @@ static void thread_trampoline(void) {
         }
 }
 
-<<<<<<< HEAD
-thread_t* thread_create(void (*entry)(void), const char* name) {
-=======
 static thread_t* thread_create_with_state(void (*entry)(void), const char* name, thread_state_t st) {
->>>>>>> fcexx
         if (thread_count >= MAX_THREADS) return NULL;
         thread_t* t = (thread_t*)kmalloc(sizeof(thread_t));
         if (!t) return NULL;
         memset(t, 0, sizeof(thread_t));
-<<<<<<< HEAD
-        //for (int i=0;i<THREAD_MAX_FD;i++) t->fds[i]=NULL;
-        t->kernel_stack = (uint64_t)kmalloc(8192 + 16) + 8192;
-=======
         t->kernel_stack = (uint64_t)kmalloc(KERNEL_STACK_SIZE + 16) + KERNEL_STACK_SIZE;
->>>>>>> fcexx
         uint64_t* stack = (uint64_t*)t->kernel_stack;
         // Ensure 16-byte alignment for the stack pointer before ret
         uint64_t sp = ((uint64_t)&stack[-1]) & ~0xFULL;
@@ -155,22 +137,14 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->context.rsp = sp;
         t->context.r12 = (uint64_t)entry; // entry передаётся через r12
         t->context.rflags = 0x202;
-<<<<<<< HEAD
-        t->state = THREAD_READY;
-        t->sleep_until = 0;
-        t->tid = thread_count;
-=======
         t->state = st;
         t->sleep_until = 0;
->>>>>>> fcexx
         strncpy(t->name, name, sizeof(t->name));
         /* default credentials (root) */
         t->euid = 0;
         t->egid = 0;
         t->attached_tty = -1;
         t->vfork_parent_tid = -1;
-<<<<<<< HEAD
-=======
         t->vfork_parent_saved_rsp = 0;
         t->vfork_parent_stack_backup = NULL;
         t->vfork_parent_stack_backup_len = 0;
@@ -181,13 +155,10 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->user_brk_base = 0;
         t->user_brk_cur = 0;
         t->user_mmap_next = 0;
->>>>>>> fcexx
         t->rseq_ptr = NULL;
         t->parent_tid = -1;
         t->saved_user_rip = 0;
         t->saved_user_rsp = 0;
-<<<<<<< HEAD
-=======
         t->saved_user_rbx = 0;
         t->saved_user_rbp = 0;
         t->saved_user_r12 = 0;
@@ -204,7 +175,6 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->saved_user_rcx = 0;
         t->saved_syscall_frame = NULL;
         t->pending_signals = 0;
->>>>>>> fcexx
         t->waiter_tid = -1;
         t->exit_status = 0;
         t->exec_trampoline_flag = 0;
@@ -213,12 +183,6 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->exec_trampoline_rax = 0;
         strncpy(t->cwd, "/", sizeof(t->cwd));
         t->cwd[sizeof(t->cwd) - 1] = '\0';
-<<<<<<< HEAD
-        threads[thread_count++] = t;
-        return t;
-}
-
-=======
         /* Use next free slot and tid so we never overwrite an existing thread. */
         threads[thread_count] = t;
         t->tid = thread_count;
@@ -234,7 +198,6 @@ thread_t* thread_create_blocked(void (*entry)(void), const char* name) {
         return thread_create_with_state(entry, name, THREAD_BLOCKED);
 }
 
->>>>>>> fcexx
 thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char* name){
         if (thread_count >= MAX_THREADS) return NULL;
         // Sanity checks: reject clearly invalid user contexts (entry==0 or tiny stack)
@@ -261,10 +224,6 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         if (current) {
                 t->euid = current->euid;
                 t->egid = current->egid;
-<<<<<<< HEAD
-                /* copy fd table */
-                for (int i = 0; i < THREAD_MAX_FD; i++) t->fds[i] = current->fds[i];
-=======
                 t->umask = current->umask;
                 /* copy fd table and bump refcount so close in parent doesn't free shared files (e.g. pipe) */
                 for (int i = 0; i < THREAD_MAX_FD; i++) {
@@ -274,17 +233,12 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
                         else t->fds[i]->refcount++;
                     }
                 }
->>>>>>> fcexx
                 t->attached_tty = current->attached_tty >= 0 ? current->attached_tty : devfs_get_active();
                 strncpy(t->cwd, current->cwd[0] ? current->cwd : "/", sizeof(t->cwd));
                 t->cwd[sizeof(t->cwd) - 1] = '\0';
         } else { t->euid = 0; t->egid = 0; t->attached_tty = devfs_get_active(); }
         if (!t->cwd[0]) { strncpy(t->cwd, "/", sizeof(t->cwd)); t->cwd[sizeof(t->cwd)-1] = '\0'; }
         t->vfork_parent_tid = -1;
-<<<<<<< HEAD
-        t->rseq_ptr = NULL;
-        t->parent_tid = -1;
-=======
         t->vfork_parent_saved_rsp = 0;
         t->vfork_parent_stack_backup = NULL;
         t->vfork_parent_stack_backup_len = 0;
@@ -315,7 +269,6 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         t->saved_user_rcx = 0;
         t->saved_syscall_frame = NULL;
         t->pending_signals = 0;
->>>>>>> fcexx
         t->waiter_tid = -1;
         t->exit_status = 0;
         t->exec_trampoline_flag = 0;
@@ -327,13 +280,10 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         return t;
 }
 
-<<<<<<< HEAD
-=======
 int thread_get_init_user_tid(void) {
         return init_user_tid;
 }
 
->>>>>>> fcexx
 // Entry for kernel-created user threads: set up per-thread kernel stack as TSS, mark as current_user
 // then enter user mode at saved rip/rsp. This function is used as the entry point passed to thread_create().
 void user_thread_entry(void) {
@@ -487,22 +437,13 @@ void thread_block(int pid) {
         for (int i = 0; i < thread_count; ++i) {
                 if (threads[i] && threads[i]->tid == pid && threads[i]->state != THREAD_BLOCKED) {
                         threads[i]->state = THREAD_BLOCKED;
-<<<<<<< HEAD
-=======
                         threads[i]->sleep_until = 0; /* no timeout */
->>>>>>> fcexx
                         return;
                 }
         }
         klogprintf("<(0c)>thread_block: thread %d not found or already blocked\n", pid);
 }
 
-<<<<<<< HEAD
-void thread_sleep(uint32_t ms) {
-        if (ms == 0) return;
-        
-        current->sleep_until = pit_ticks + ms;
-=======
 void thread_block_with_timeout(int pid, uint32_t timeout_ms) {
         extern volatile uint64_t timer_ticks;
         uint32_t now = (uint32_t)timer_ticks;
@@ -521,31 +462,11 @@ void thread_sleep(uint32_t ms) {
         /* Use common timer ticks so sleep works even when PIT is disabled (APIC timer). */
         uint32_t now = (uint32_t)timer_ticks;
         current->sleep_until = (uint32_t)(now + ms);
->>>>>>> fcexx
         current->state = THREAD_SLEEPING;
         thread_yield();
 }
 
 void thread_schedule() {
-<<<<<<< HEAD
-        // Сначала проверяем спящие потоки
-        for (int i = 0; i < thread_count; ++i) {
-                if (threads[i] && threads[i]->state == THREAD_SLEEPING) {
-                        if (pit_ticks >= threads[i]->sleep_until) {
-                                threads[i]->state = THREAD_READY;
-                        }
-                }
-        }
-        
-        int next = (current->tid + 1) % thread_count;
-        for (int i = 0; i < thread_count; ++i) {
-                int idx = (next + i) % thread_count;
-                if (threads[idx] && threads[idx]->state == THREAD_READY && threads[idx]->state != THREAD_TERMINATED) {
-                        thread_t* prev = current;
-                        current = threads[idx];
-                        current->state = THREAD_RUNNING;
-                        if (prev->state != THREAD_SLEEPING && prev->state != THREAD_TERMINATED) {
-=======
         // Сначала проверяем спящие потоки и блокированные с таймаутом (poll)
         uint32_t now = (uint32_t)timer_ticks;
         for (int i = 0; i < thread_count; ++i) {
@@ -613,17 +534,12 @@ void thread_schedule() {
                         /* Only a RUNNING thread becomes READY when we switch away.
                            If it was already BLOCKED/SLEEPING/TERMINATED, preserve that state. */
                         if (prev->state == THREAD_RUNNING) {
->>>>>>> fcexx
                                 prev->state = THREAD_READY;
                         }
                         //qemu_debug_printf("thread_schedule: switching from tid=%d to tid=%d\n", prev->tid, current->tid);
                         //qemu_debug_printf("thread_schedule: prev.ctx.rflags=0x%x new.ctx.rflags=0x%x\n", (unsigned int)prev->context.rflags, (unsigned int)current->context.rflags);
                         context_switch(&prev->context, &current->context);
                         return;
-<<<<<<< HEAD
-                }
-        }
-=======
         }
         /* No READY threads found.
            Previous behavior forced execution of main_thread even if it was BLOCKED,
@@ -646,7 +562,6 @@ void thread_schedule() {
                 return;
         }
         /* Fallback to tid0 context (best-effort). */
->>>>>>> fcexx
         current = &main_thread;
         current->state = THREAD_RUNNING;
 }
@@ -655,17 +570,12 @@ void thread_unblock(int pid) {
         for (int i = 0; i < thread_count; ++i) {
                 if (threads[i] && threads[i]->tid == pid && threads[i]->state == THREAD_BLOCKED) {
                         threads[i]->state = THREAD_READY;
-<<<<<<< HEAD
-=======
                         threads[i]->sleep_until = 0;
->>>>>>> fcexx
                         return;
                 }
         }
 }
 
-<<<<<<< HEAD
-=======
 /* SIGINT (Ctrl+C): terminate all threads in the foreground process group. */
 void thread_send_sigint_to_pgrp(int pgrp) {
         if (pgrp < 0) return;
@@ -681,7 +591,6 @@ void thread_send_sigint_to_pgrp(int pgrp) {
         }
 }
 
->>>>>>> fcexx
 // get thread info by pid
 thread_t* thread_get(int pid) {
         for (int i = 0; i < thread_count; ++i) {

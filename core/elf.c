@@ -13,10 +13,7 @@
 #include <heap.h>
 #include <mmio.h>
 #include <thread.h>
-<<<<<<< HEAD
-=======
 #include <devfs.h>
->>>>>>> fcexx
 #include <gdt.h>
 #include <paging.h>
 #include <elf.h>
@@ -28,8 +25,6 @@ extern uint8_t _end[]; /* kernel end symbol from linker */
    support isn't available. */
 static const uint64_t ELF_ET_DYN_BASE = 0x00400000ULL; /* 4MiB */
 
-<<<<<<< HEAD
-=======
 /* In AxonOS, user programs currently run as kernel threads in a shared identity-mapped
    address space. That means user stacks and TLS must not overlap between threads,
    otherwise vfork/exec will clobber the parent's stack/TLS and trigger user-mode #GP
@@ -68,7 +63,6 @@ static inline uintptr_t user_tls_base_for_stack_top(uintptr_t stack_top) {
     return (uintptr_t)stack_top - (uintptr_t)USER_STACK_SIZE - (uintptr_t)USER_TLS_SIZE;
 }
 
->>>>>>> fcexx
 static inline uint64_t msr_read_u64_local(uint32_t msr) {
     uint32_t lo = 0, hi = 0;
     asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
@@ -241,13 +235,6 @@ static int elf_validate_header(const Elf64_Ehdr *eh, size_t len) {
     return 1;
 }
 
-<<<<<<< HEAD
-int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
-    if (!buf || len < sizeof(Elf64_Ehdr)) return -1;
-    const Elf64_Ehdr *eh = (const Elf64_Ehdr*)buf;
-    if (!elf_validate_header(eh, len)) return -1;
-    if (eh->e_phoff == 0 || eh->e_phnum == 0) return -1;
-=======
 /* User images are loaded into the low identity-mapped region by copying to p_vaddr.
    To avoid corrupting the kernel heap (which is also identity-mapped), keep user
    segments strictly below the heap base. */
@@ -313,7 +300,6 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
     const Elf64_Ehdr *eh = (const Elf64_Ehdr*)buf;
     if (!elf_validate_header(eh, len)) return -2;
     if (eh->e_phoff == 0 || eh->e_phnum == 0) return -3;
->>>>>>> fcexx
 
     /* For ET_DYN (PIE) load at a fixed base within identity-mapped region. */
     uint64_t load_base = 0;
@@ -323,72 +309,41 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
     uintptr_t kernel_start = (uintptr_t)0x100000; /* from linker.ld */
     uintptr_t kernel_end = (uintptr_t)_end;
 
-<<<<<<< HEAD
-    /* iterate program headers */
-    const Elf64_Phdr *ph = (const Elf64_Phdr*)((const char*)buf + eh->e_phoff);
-    for (int i = 0; i < eh->e_phnum; i++) {
-        if ((const char*)ph + sizeof(Elf64_Phdr) > (const char*)buf + len) return -1;
-=======
     uint64_t brk_end = 0;
     /* iterate program headers */
     const Elf64_Phdr *ph = (const Elf64_Phdr*)((const char*)buf + eh->e_phoff);
     for (int i = 0; i < eh->e_phnum; i++) {
         if ((const char*)ph + sizeof(Elf64_Phdr) > (const char*)buf + len) return -4;
->>>>>>> fcexx
         if (ph->p_type != 1) { ph++; continue; } /* PT_LOAD */
 
         /* Check bounds */
         uint64_t vstart = ph->p_vaddr + load_base;
         uint64_t vend = ph->p_vaddr + load_base + ph->p_memsz;
-<<<<<<< HEAD
-        if (vend < vstart) return -1;
-        /* Hard limit for user image virtual range.
-           We currently load user binaries into the low identity-mapped region by copying to p_vaddr.
-           Keep them below the heap floor (64MiB) to prevent corrupting kernel heap. */
-        const uint64_t USER_IMAGE_LIMIT = 64ULL * 1024ULL * 1024ULL;
-=======
         if (vend < vstart) return -5;
         /* Hard limit for user image virtual range.
            We currently load user binaries into the low identity-mapped region by copying to p_vaddr.
            Keep them below the heap floor (64MiB) to prevent corrupting kernel heap. */
         const uint64_t USER_IMAGE_LIMIT = user_image_limit_bytes();
->>>>>>> fcexx
         if (vend > USER_IMAGE_LIMIT) {
             kprintf("elf: user image too high (segment 0x%llx..0x%llx, limit 0x%llx)\n",
                     (unsigned long long)vstart, (unsigned long long)vend,
                     (unsigned long long)USER_IMAGE_LIMIT);
-<<<<<<< HEAD
-            return -4;
-=======
             return -6;
->>>>>>> fcexx
         }
         if (vstart < kernel_end && vend > kernel_start) {
             kprintf("elf: segment overlaps kernel (vaddr 0x%llx..0x%llx kernel 0x%llx..0x%llx)\n",
                 (unsigned long long)vstart, (unsigned long long)vend,
                 (unsigned long long)kernel_start, (unsigned long long)kernel_end);
-<<<<<<< HEAD
-            return -2;
-=======
             return -7;
->>>>>>> fcexx
         }
         if (vstart + ph->p_filesz > MMIO_IDENTITY_LIMIT) {
             /* avoid writing above identity-mapped region for now */
             kprintf("elf: segment outside identity-mapped range, unsupported vaddr=0x%llx\n", (unsigned long long)vstart);
-<<<<<<< HEAD
-            return -3;
-        }
-
-        /* Copy file data into target vaddr (assumes identity mapping) */
-        if (ph->p_offset + ph->p_filesz > len) return -1;
-=======
             return -8;
         }
 
         /* Copy file data into target vaddr (assumes identity mapping) */
         if (ph->p_offset + ph->p_filesz > len) return -12;
->>>>>>> fcexx
         void *dst = (void*)(uintptr_t)(ph->p_vaddr + load_base);
         const void *src = (const char*)buf + ph->p_offset;
         /* copy filesz bytes */
@@ -398,67 +353,6 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
             memset((char*)dst + ph->p_filesz, 0, (size_t)(ph->p_memsz - ph->p_filesz));
         }
 
-<<<<<<< HEAD
-        /* Ensure pages are user-accessible: set PG_US on existing page-table entries
-           (handles large 1GiB/2MiB mappings created at bootstrap). We don't attempt
-           to split large pages; instead mark the existing mapping as user-accessible. */
-        extern uint64_t page_table_l4[];
-        uint64_t va_begin = ph->p_vaddr & ~(PAGE_SIZE_2M - 1);
-        uint64_t va_end = (ph->p_vaddr + ph->p_memsz + PAGE_SIZE_2M - 1) & ~(PAGE_SIZE_2M - 1);
-        for (uint64_t va = va_begin; va < va_end; va += PAGE_SIZE_2M) {
-            uint64_t l4i = (va >> 39) & 0x1FF;
-            uint64_t l3i = (va >> 30) & 0x1FF;
-            uint64_t l2i = (va >> 21) & 0x1FF;
-            uint64_t l1i = (va >> 12) & 0x1FF;
-            uint64_t *l4 = (uint64_t*)page_table_l4;
-            if (!(l4[l4i] & PG_PRESENT)) {
-                kprintf("elf: no L4 entry for va=0x%llx\n", (unsigned long long)va);
-                return -1;
-            }
-            /* Make sure the PML4 entry itself permits user access (parent entries must not block) */
-            l4[l4i] |= PG_US | PG_RW;
-            l4[l4i] &= ~PG_NX;
-            invlpg((void*)(uintptr_t)va);
-
-            uint64_t *l3 = (uint64_t*)(uintptr_t)(l4[l4i] & ~0xFFFULL);
-            if (!(l3[l3i] & PG_PRESENT)) {
-                kprintf("elf: no L3 entry for va=0x%llx\n", (unsigned long long)va);
-                return -1;
-            }
-            /* PDPT entry must also allow user access, иначе будет #PF err=0x5 при fetch/чтении из ring3. */
-            l3[l3i] |= PG_US | PG_RW;
-            l3[l3i] &= ~PG_NX;
-            uint64_t l3e = l3[l3i];
-            if (l3e & PG_PS_2M) {
-                /* 1GiB mapping at L3: set US and clear NX on L3 entry */
-                l3[l3i] |= PG_US;
-                l3[l3i] &= ~PG_NX;
-                invlpg((void*)(uintptr_t)va);
-                continue;
-            }
-            uint64_t *l2 = (uint64_t*)(uintptr_t)(l3e & ~0xFFFULL);
-            if (!(l2[l2i] & PG_PRESENT)) {
-                kprintf("elf: no L2 entry for va=0x%llx\n", (unsigned long long)va);
-                return -1;
-            }
-            uint64_t l2e = l2[l2i];
-            if (l2e & PG_PS_2M) {
-                /* 2MiB mapping at L2: set US and clear NX on L2 entry */
-                l2[l2i] |= PG_US | PG_RW;
-                l2[l2i] &= ~PG_NX;
-                invlpg((void*)(uintptr_t)va);
-                continue;
-            }
-            uint64_t *l1 = (uint64_t*)(uintptr_t)(l2e & ~0xFFFULL);
-            /* set US and clear NX on L1 entry covering this 4KiB range */
-            l1[l1i] |= PG_US | PG_RW;
-            l1[l1i] &= ~PG_NX;
-            invlpg((void*)(uintptr_t)va);
-        }
-        ph++;
-    }
-
-=======
         /* Ensure pages are user-accessible (include load_base for ET_DYN). */
         uint64_t ua_begin = (ph->p_vaddr + load_base);
         uint64_t ua_end = (ph->p_vaddr + load_base + ph->p_memsz);
@@ -468,7 +362,6 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
     }
 
     if (brk_end) syscall_set_user_brk((uintptr_t)brk_end);
->>>>>>> fcexx
     if (out_entry) *out_entry = eh->e_entry + load_base;
     return 0;
 }
@@ -515,19 +408,6 @@ static void mark_broad_user_ranges_for_exec(void) {
 
 int elf_load_from_path(const char *path, uint64_t *out_entry) {
     struct fs_file *f = fs_open(path);
-<<<<<<< HEAD
-    if (!f) return -1;
-    size_t sz = f->size;
-    if (sz == 0 || sz > 16*1024*1024) { fs_file_free(f); return -1; } /* limit 16MB */
-    void *buf = kmalloc(sz);
-    if (!buf) { fs_file_free(f); return -1; }
-    ssize_t r = fs_read(f, buf, sz, 0);
-    fs_file_free(f);
-    if (r <= 0 || (size_t)r != sz) { kfree(buf); return -1; }
-    int rc = elf_load_from_memory(buf, sz, out_entry);
-    kfree(buf);
-    return rc;
-=======
     if (!f) {
         kprintf("execve: open failed: %s\n", path ? path : "(null)");
         return -1;
@@ -648,77 +528,11 @@ int elf_load_from_path(const char *path, uint64_t *out_entry) {
     kfree(phdrs);
     fs_file_free(f);
     return 0;
->>>>>>> fcexx
 }
 
 /* Kernel execve: load ELF and prepare user stack then transfer to user mode.
    Simple implementation: expects identity mapping for all segments and stack
    under USER_STACK_TOP (<4GiB). Returns negative on error; on success does not return. */
-<<<<<<< HEAD
-int kernel_execve_from_path(const char *path, const char *const argv[], const char *const envp[]) {
-    if (!path) return -1;
-    /* Resolve symlinks (follow up to 16 levels) */
-    char *curpath = (char*)kmalloc(strlen(path) + 1);
-    if (!curpath) return -1;
-    strcpy(curpath, path);
-    for (int depth = 0; depth < 16; depth++) {
-        struct stat st;
-        if (vfs_stat(curpath, &st) != 0) break;
-        if ((st.st_mode & S_IFLNK) == S_IFLNK) {
-            /* read link target */
-            struct fs_file *lf = fs_open(curpath);
-            if (!lf) break;
-            size_t tsize = (size_t)lf->size;
-            if (tsize == 0) { fs_file_free(lf); break; }
-            size_t cap = tsize + 1;
-            char *tbuf = (char*)kmalloc(cap);
-            if (!tbuf) { fs_file_free(lf); break; }
-            ssize_t rr = fs_read(lf, tbuf, tsize, 0);
-            fs_file_free(lf);
-            if (rr <= 0) { kfree(tbuf); break; }
-            tbuf[rr] = '\\0';
-            /* build new absolute path */
-            char *newpath = NULL;
-            if (tbuf[0] == '/') {
-                newpath = (char*)kmalloc(strlen(tbuf) + 1);
-                if (newpath) strcpy(newpath, tbuf);
-            } else {
-                /* relative: parent dir of curpath + '/' + tbuf */
-                const char *slash = strrchr(curpath, '/');
-                size_t plen = slash ? (size_t)(slash - curpath) : 0;
-                if (plen == 0) plen = 1; /* root */
-                size_t nlen = plen + 1 + strlen(tbuf) + 1;
-                newpath = (char*)kmalloc(nlen);
-                if (newpath) {
-                    if (plen == 1) {
-                        /* parent is root */
-                        newpath[0] = '/'; newpath[1] = '\\0';
-                    } else {
-                        strncpy(newpath, curpath, plen);
-                        newpath[plen] = '\\0';
-                    }
-                    /* ensure trailing slash */
-                    size_t curl = strlen(newpath);
-                    if (newpath[curl-1] != '/') strncat(newpath, "/", nlen - curl - 1);
-                    strncat(newpath, tbuf, nlen - strlen(newpath) - 1);
-                }
-            }
-            kfree(tbuf);
-            if (!newpath) break;
-            kfree(curpath);
-            curpath = newpath;
-            /* continue resolving */
-            continue;
-        }
-        break;
-    }
-    uint64_t entry = 0;
-    int r = elf_load_from_path(curpath, &entry);
-    if (curpath) kfree(curpath);
-    if (r != 0) {
-        kprintf("execve: elf_load_from_path failed for %s (rc=%d)\n", path, r);
-        return -1;
-=======
 static int is_space_char(char c) {
     return (c == ' ' || c == '\t' || c == '\r' || c == '\n');
 }
@@ -838,7 +652,6 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     if (r != 0) {
         /* Not an ELF. Try shebang scripts (e.g. /linuxrc). */
         return try_exec_shebang(curpath, path, argv, envp);
->>>>>>> fcexx
     }
     /* NOTE:
        We currently execute user programs in the *same* address space (same CR3),
@@ -906,8 +719,6 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         }
     }
 
-<<<<<<< HEAD
-=======
     /* Determine which tid we are preparing the stack/TLS for.
        If called from ring0 (osh/kernel), we must base the per-thread stack/TLS layout
        on the tid of the NEW user thread we are about to run, not on the caller's tid0.
@@ -926,7 +737,6 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         planned_tid = (uint64_t)planned_ut->tid;
     }
 
->>>>>>> fcexx
     /* Build argv strings and pointers in kernel, then copy into user stack area.
        We must ensure the final RSP passed to user mode is 16-byte aligned to avoid
        misaligned iret frame / ABI issues. Compute aligned base accordingly. */
@@ -955,20 +765,12 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     const size_t random_bytes = 16;
     size_t total = ptrs_bytes + strings_size + random_bytes + 32;
     if (total > USER_STACK_SIZE - 128) {
-<<<<<<< HEAD
-        kprintf("execve: required stack size too large %u\n", (unsigned)total);
-=======
         kprintf("required stack size too large %u\n", (unsigned)total);
->>>>>>> fcexx
         return -1;
     }
 
     /* Align stack_top downward to 16 bytes */
-<<<<<<< HEAD
-    uintptr_t stack_top = (uintptr_t)USER_STACK_TOP;
-=======
     uintptr_t stack_top = user_stack_top_for_tid(planned_tid);
->>>>>>> fcexx
     stack_top &= ~((uintptr_t)0xFULL);
 
     /* provisional base then align final_stack (base-8) to 16 */
@@ -1023,40 +825,14 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     /* Ensure the entire user stack mapping is user-accessible (PG_US).
        Without this, the first user push/read will trigger #PF err=0x5. */
     {
-<<<<<<< HEAD
-        uintptr_t stack_base = ((uintptr_t)USER_STACK_TOP - USER_STACK_SIZE) & ~0xFFFULL;
-        uintptr_t stack_end = (uintptr_t)USER_STACK_TOP;
-        if (mark_user_identity_range_2m((uint64_t)stack_base, (uint64_t)stack_end) != 0) {
-            kprintf("execve: failed to mark user stack range user-accessible\n");
-=======
         uintptr_t stack_base = (stack_top - USER_STACK_SIZE) & ~0xFFFULL;
         uintptr_t stack_end = stack_top;
         if (mark_user_identity_range_2m((uint64_t)stack_base, (uint64_t)stack_end) != 0) {
             kprintf("Failed to mark user stack range user-accessible\n");
->>>>>>> fcexx
             return -1;
         }
     }
 
-<<<<<<< HEAD
-    /* Seed an initial TLS base + stack canary guard before entering userspace.
-       Some libcs may execute stack-protected code before they set up TLS. If FS base is 0,
-       GCC's stack protector reads canary from fs:0x28, which is physical address 0x28 under
-       identity mapping and may change -> false "*** stack smashing detected ***".
-       We ensure FS points to a stable, user-accessible TLS page with a guard at +0x28. */
-    enum { MSR_FS_BASE_LOCAL = 0xC0000100u };
-    const uintptr_t user_tls_base = (uintptr_t)USER_TLS_BASE; /* reserved TLS region (see inc/exec.h) */
-    {
-        if (user_tls_base + 0x1000u >= (uintptr_t)MMIO_IDENTITY_LIMIT) {
-            kprintf("execve: tls base outside identity map\n");
-            return -1;
-        }
-        if (mark_user_identity_range_2m((uint64_t)user_tls_base, (uint64_t)(user_tls_base + 0x1000u)) != 0) {
-            kprintf("execve: failed to mark TLS range user-accessible\n");
-            return -1;
-        }
-        memset((void*)user_tls_base, 0, 0x1000u);
-=======
     /* Seed a minimal TLS/TCB layout before entering userspace.
        Why: busybox in your initfs is **glibc static**, and glibc expects some TLS/TCB
        fields to exist immediately. In particular, early code may call pthread_getspecific(),
@@ -1087,33 +863,11 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         }
         /* Clear the first 3 pages we use */
         memset((void*)tls_region_base, 0, 0x3000u);
->>>>>>> fcexx
         uint64_t guard = 0;
         if (random_addr + 16 <= (uintptr_t)MMIO_IDENTITY_LIMIT) guard = *(uint64_t*)(uintptr_t)random_addr;
         else guard = 0x8b13f00d2a11c0deULL;
         /* glibc uses a "terminator canary": least-significant byte is 0 */
         guard &= ~0xFFULL;
-<<<<<<< HEAD
-        *(volatile uint64_t*)(uintptr_t)(user_tls_base + 0x28u) = guard;
-        msr_write_u64_local(MSR_FS_BASE_LOCAL, (uint64_t)user_tls_base);
-    }
-
-
-    /* register user thread info for debugger/listing purposes and allocate kernel stack */
-    thread_t *ut = thread_register_user(entry, final_stack, path);
-    if (ut) {
-        ut->user_fs_base = (uint64_t)user_tls_base;
-        /* allocate kernel stack for the user thread so hardware can switch to a valid RSP0 */
-        void *kst = kmalloc(8192 + 16);
-        if (kst) {
-            ut->kernel_stack = (uint64_t)kst + 8192 + 16;
-            tss_set_rsp0(ut->kernel_stack);
-        } else {
-            /* keep going (less safe), but avoid noisy warnings */
-        }
-    } else {
-        /* keep going without a registered user thread */
-=======
         *(volatile uint64_t*)(uintptr_t)(fs_base + 0x28u) = guard;
 
         /* pthread_getspecific() expects *(%fs:-0x78) to be a valid pointer. */
@@ -1204,7 +958,6 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         /* schedule immediately; when caller resumes, the program has terminated */
         thread_schedule();
         return 0;
->>>>>>> fcexx
     }
 
     /* Debug: print argv/env passed to execve for user debugging (qemu debug) */
@@ -1241,14 +994,6 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     /* wrap read in a benign check */
     first = entry_b[0];
 
-<<<<<<< HEAD
-    /* If this thread was created via vfork, wake parent now (child is about to exec). */
-    {
-        thread_t *tc = thread_current();
-        if (tc && tc->vfork_parent_tid >= 0) {
-            thread_unblock(tc->vfork_parent_tid);
-            tc->vfork_parent_tid = -1;
-=======
     /* If this thread was created via vfork, we normally wake parent on exec.
        However, in a shared address space we keep the parent blocked when a full
        memory snapshot is active, and only restore/unblock on child exit. */
@@ -1269,7 +1014,6 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         } else {
             qemu_debug_printf("execve: child %llu has no vfork_parent_tid\n",
                 (unsigned long long)(tc ? (tc->tid ? tc->tid : 1) : 0));
->>>>>>> fcexx
         }
     }
 
@@ -1295,11 +1039,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     /* Mark 0..ELF_ET_DYN_BASE (0..4MiB) as user-accessible for diagnostic */
     (void)mark_user_identity_range_2m(0, ELF_ET_DYN_BASE);
 
-<<<<<<< HEAD
-    /* Transfer to user mode (does not return) */
-=======
     /* Transfer to user mode (does not return on success). */
->>>>>>> fcexx
     enter_user_mode(entry, final_stack);
     return 0; /* not reached */
 }

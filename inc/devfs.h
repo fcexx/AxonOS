@@ -9,10 +9,6 @@
 #ifndef DEVFS_TTY_COUNT
 #define DEVFS_TTY_COUNT 6
 #endif
-<<<<<<< HEAD
-
-=======
->>>>>>> fcexx
 struct devfs_tty {
     int id;
     uint8_t *screen; /* saved VGA buffer (raw bytes 2 per cell) */
@@ -51,23 +47,17 @@ struct devfs_tty {
     int controlling_sid;
     /* POSIX termios local flags (c_lflag) for this tty */
     uint32_t term_lflag;
-<<<<<<< HEAD
-=======
     /* echo: skip escape sequences (0=normal, 1=after ESC, 2=after ESC [ or ESC O) */
     uint8_t echo_escape_state;
     /* single-byte pushback for readers (e.g. kgetc escape handling); -1 = none */
     int unget_char;
->>>>>>> fcexx
 };
 
 int devfs_register(void);
 int devfs_unregister(void);
 int devfs_mount(const char *path);
-<<<<<<< HEAD
-=======
 /* Open a devfs node directly without requiring a VFS mount. */
 struct fs_file *devfs_open_direct(const char *path);
->>>>>>> fcexx
 /* Create a character device node at given path and associate with driver_private.
    driver_private is stored and later returned in fs_file->driver_private on open. */
 int devfs_create_char_node(const char *path, void *driver_private);
@@ -89,10 +79,6 @@ int devfs_get_active(void);
 void devfs_tty_push_input_noblock(int tty, char c);
 /* Non-blocking pop: returns -1 if none, or char (0-255) */
 int devfs_tty_pop_nb(int tty);
-<<<<<<< HEAD
-/* Return number of available chars in input buffer */
-int devfs_tty_available(int tty);
-=======
 /* Push one byte back; will be returned by next pop. Returns 0 on success, -1 if already pushed. */
 int devfs_tty_unget(int tty, int c);
 /* Return number of available chars in input buffer */
@@ -101,7 +87,6 @@ int devfs_tty_available(int tty);
 int devfs_tty_add_waiter(int tty, int tid);
 /* Remove thread from waiters (call when poll wakes so we are not woken again by other ttys) */
 void devfs_tty_remove_waiter(int tty, int tid);
->>>>>>> fcexx
 /* Check whether an fs_file is a devfs tty device */
 int devfs_is_tty_file(struct fs_file *file);
 

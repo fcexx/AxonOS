@@ -18,10 +18,7 @@ volatile uint64_t timer_ticks = 0;
 // PIT handler - called on IRQ 0
 void pit_handler(cpu_registers_t* regs) {
         pit_ticks++;
-<<<<<<< HEAD
-=======
         timer_ticks++;
->>>>>>> fcexx
 
         if (!init) return;
         /* То же правило, что и для APIC: не планируем из IRQ, пришедшего из ring3. */

@@ -52,8 +52,6 @@ static void dump(const char* what, const char* who, cpu_registers_t* regs, uint6
         klogprintf("RSI: 0x%llx\n", (unsigned long long)regs->rsi);
         klogprintf("RDX: 0x%llx\n", (unsigned long long)regs->rdx);
         klogprintf("RCX: 0x%llx\n", (unsigned long long)regs->rcx);
-<<<<<<< HEAD
-=======
 
         /* Mirror the most important fault info to serial (qemu -serial stdio),
            otherwise user-mode faults printed to VGA are not visible in terminal logs. */
@@ -71,7 +69,6 @@ static void dump(const char* what, const char* who, cpu_registers_t* regs, uint6
                           (unsigned long long)regs->rdx,
                           (unsigned long long)regs->rcx,
                           (unsigned long long)regs->rax);
->>>>>>> fcexx
 }
 
 static inline uint64_t rdmsr_u64(uint32_t msr) {
@@ -236,14 +233,11 @@ static void page_fault_handler(cpu_registers_t* regs) {
         uint64_t fsbase = ((uint64_t)fsbase_hi << 32) | fsbase_lo;
         klogprintf("page fault MSR_FS_BASE=0x%016llx\n", (unsigned long long)fsbase);
         klogprintf("page fault details: CR2=0x%llx err=0x%llx user=%d\n", (unsigned long long)cr2, (unsigned long long)regs->error_code, user);
-<<<<<<< HEAD
-=======
         qemu_debug_printf("page fault: MSR_FS_BASE=0x%016llx CR2=0x%llx err=0x%llx user=%d\n",
                           (unsigned long long)fsbase,
                           (unsigned long long)cr2,
                           (unsigned long long)regs->error_code,
                           user ? 1 : 0);
->>>>>>> fcexx
         /* Additional diagnostics to help pinpoint cause in user mode */
         if (user) {
             /* dump instruction bytes at RIP */
@@ -252,17 +246,12 @@ static void page_fault_handler(cpu_registers_t* regs) {
                 klogprintf("code @ RIP: ");
                 for (int i = 0; i < 32; i++) kprintf("%02x ", (unsigned)code[i]);
                 kprintf("\n");
-<<<<<<< HEAD
-            } else {
-                klogprintf("code @ RIP: (outside identity map)\n");
-=======
                 qemu_debug_printf("code @ RIP:");
                 for (int i = 0; i < 16; i++) qemu_debug_printf(" %02x", (unsigned)code[i]);
                 qemu_debug_printf("\n");
             } else {
                 klogprintf("code @ RIP: (outside identity map)\n");
                 qemu_debug_printf("code @ RIP: (outside identity map)\n");
->>>>>>> fcexx
             }
             /* dump stack words */
             if ((uintptr_t)regs->rsp < (uintptr_t)MMIO_IDENTITY_LIMIT) {
@@ -334,8 +323,6 @@ static void gp_fault_handler(cpu_registers_t* regs){
     // General Protection Fault в пользовательском процессе рассматривается как фатальная ошибка процесса.
     if ((regs->cs & 3) == 3) {
         klogprintf("\nGPF (user-mode) trap.\n");
-<<<<<<< HEAD
-=======
         /* Identify which kernel thread/user-thread this happened in */
         {
             extern thread_t* thread_current(void);
@@ -355,7 +342,6 @@ static void gp_fault_handler(cpu_registers_t* regs){
                        (unsigned long long)(uc ? uc->user_fs_base : 0ULL),
                        uc ? (int)uc->state : -1);
         }
->>>>>>> fcexx
         klogprintf("RIP: 0x%016llx\n", (unsigned long long)regs->rip);
         klogprintf("RSP: 0x%016llx\n", (unsigned long long)regs->rsp);
         klogprintf("RBP: 0x%016llx\n", (unsigned long long)regs->rbp);

@@ -111,7 +111,6 @@ void vbefb_putchar(uint8_t ch, uint8_t attr) {
 		// sequence ends with 'm'
 		if (ch == 'm') {
 			esc_buf[esc_len] = '\0';
-<<<<<<< HEAD
 			// expect leading '[' possibly present
 			char *s = esc_buf;
 			uint8_t fg = current_attr & 0x0F;
@@ -133,7 +132,6 @@ void vbefb_putchar(uint8_t ch, uint8_t attr) {
 				}
 				if (*s == ';') s++;
 			}
->>>>>>> fcexx
 			current_attr = (uint8_t)((bg << 4) | (fg & 0x0F));
 			esc_mode = 0;
 			return;

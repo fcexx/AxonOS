@@ -141,11 +141,8 @@ void thread_sleep(uint32_t ms);
 
 // access thread by index (0..thread_get_count()-1)
 thread_t* thread_get_by_index(int idx);
-<<<<<<< HEAD
-=======
 int thread_get_init_user_tid(void);
 void thread_mark_init_user(thread_t* t);
->>>>>>> fcexx
 
 // register user thread (process) for display in list
 thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char* name);
