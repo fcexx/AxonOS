@@ -90,7 +90,7 @@ disk:
 archive:
 	wget -P build apm.axont.ru/Packages/initfs.tar.xz
 	tar -xf build/initfs.tar.xz -C iso/boot/
-	rm buils/initfs.tar.xz
+	rm build/initfs.tar.xz
 
 clean:
 	@rm -rf $(BUILD_DIR)
