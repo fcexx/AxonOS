@@ -39,5 +39,8 @@ uint64_t pit_get_frequency();
 // global variables
 extern volatile uint64_t pit_ticks;
 extern volatile uint32_t pit_frequency;
+/* Common timer tick counter (monotonic). This continues to tick even when PIT is disabled
+   (e.g., when APIC timer is used), so subsystems should prefer this over pit_ticks. */
+extern volatile uint64_t timer_ticks;
 
 #endif // PIT_H

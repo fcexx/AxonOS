@@ -44,6 +44,10 @@ struct fs_driver_ops {
     void (*release)(struct fs_file *file);
     /* Optional chmod operation: set mode for path */
     int (*chmod)(const char *path, mode_t mode);
+    /* Optional hard link: link(oldpath, newpath). Return 0 on success. */
+    int (*link)(const char *oldpath, const char *newpath);
+    /* Optional rename: rename(oldpath, newpath). Return 0 on success. */
+    int (*rename)(const char *oldpath, const char *newpath);
 };
 
 /* Registered driver object */
@@ -80,12 +84,20 @@ ssize_t fs_readdir_next(struct fs_file *file, void *buf, size_t size);
 /* POSIX-like stat helpers */
 int vfs_fstat(struct fs_file *file, struct stat *st);
 int vfs_stat(const char *path, struct stat *st);
+int vfs_lstat(const char *path, struct stat *st);
+ssize_t vfs_readlink(const char *path, char *buf, size_t bufsiz);
 int fs_chmod(const char *path, mode_t mode);
+int fs_link(const char *oldpath, const char *newpath);
+int fs_rename(const char *oldpath, const char *newpath);
 int fs_mkdir(const char *path);
 
 /* file types */
 #define FS_TYPE_UNKNOWN 0
 #define FS_TYPE_REG     1
 #define FS_TYPE_DIR     2
+#define FS_TYPE_PIPE    3
+
+/* Called by thread_fd_close when closing a pipe end; f->type == FS_TYPE_PIPE. */
+void pipe_release_end(struct fs_file *f);
 
 #endif /* INC_FS_H */

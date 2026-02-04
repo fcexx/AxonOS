@@ -11,6 +11,8 @@ int ramfs_mkdir(const char *path);
 int ramfs_remove(const char *path);
 /* create a symbolic link at 'path' pointing to 'target' */
 int ramfs_symlink(const char *path, const char *target);
+/* create a hard link: newpath points to same inode as oldpath */
+int ramfs_link(const char *oldpath, const char *newpath);
 
 #ifdef __cplusplus
 extern "C" {

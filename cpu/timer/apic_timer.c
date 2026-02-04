@@ -5,6 +5,8 @@
 #include <thread.h>
 #include <stdio.h>
 #include <string.h>
+/* common ticks */
+extern volatile uint64_t timer_ticks;
 
 volatile uint64_t apic_timer_ticks = 0;
 apic_timer_state_t apic_timer_state = {0};
@@ -177,16 +179,10 @@ uint64_t apic_timer_get_uptime_seconds(void) {
 void apic_timer_handler(cpu_registers_t* regs) {
     apic_timer_ticks++;
     apic_timer_state.ticks = apic_timer_ticks;
-    /* Важно: пока user-процессы не интегрированы в scheduler как полноценные потоки,
-       нельзя вызывать планировщик из прерывания, пришедшего из ring3 — это ломает
-       return-контекст (iret/sysret) и приводит к прыжкам в мусорный RIP. */
-    if (init) {
-        if (regs && ((regs->cs & 3) == 3)) {
-            apic_eoi();
-            return;
-        }
-        thread_yield();
-    }
+    timer_ticks++;
+    /* Never call the scheduler from an interrupt handler.
+       Switching context while running on an IRQ stack frame corrupts return context.
+       This became a hard hang once we introduced an always-READY idle thread. */
     if (apic_timer_ticks % 5) vbe_flush_full();
     vbefb_update_cursor();
     apic_eoi();

@@ -8,6 +8,11 @@
 typedef ssize_t (*sysfs_show_t)(char *buf, size_t size, void *priv);
 typedef ssize_t (*sysfs_store_t)(const char *buf, size_t size, void *priv);
 
+/* Show callbacks for sysfs attributes (implemented in kernel.c) */
+ssize_t sysfs_show_const(char *buf, size_t size, void *priv);
+ssize_t sysfs_show_cpu_name_attr(char *buf, size_t size, void *priv);
+ssize_t sysfs_show_ram_mb_attr(char *buf, size_t size, void *priv);
+
 struct sysfs_attr {
     sysfs_show_t show;
     sysfs_store_t store;

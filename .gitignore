@@ -8,3 +8,4 @@ iso/boot/axonos.elf
 *.elf
 *.bin
 *.o
+iso/boot/initfs.cpio

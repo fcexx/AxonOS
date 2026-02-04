@@ -18,7 +18,10 @@
 #include <paging.h>
 #include <sysinfo.h>
 #include <thread.h>
+<<<<<<< HEAD
 #include <axosh.h>
+=======
+>>>>>>> fcexx
 #include <apic.h>
 #include <apic_timer.h>
 #include <stat.h>
@@ -30,7 +33,11 @@
 #include <sysfs.h>
 #include <procfs.h>
 #include <initfs.h>
+<<<<<<< HEAD
 #include <editor.h>
+=======
+#include <ramfs.h>
+>>>>>>> fcexx
 #include <fat32.h>
 #include <intel_chipset.h>
 #include <disk.h>
@@ -61,7 +68,13 @@ static uintptr_t mb2_modules_max_end(uint32_t multiboot_magic, uint64_t multiboo
     uint8_t *p = (uint8_t*)(uintptr_t)multiboot_info;
     uint32_t total_size = *(uint32_t*)p;
 
+<<<<<<< HEAD
     if (total_size < 16 || total_size > (64u * 1024u * 1024u)) return 0;
+=======
+    /* Allow larger multiboot info blocks (some bootloaders/VMs may pass large
+       tag regions when modules are large). Increase cap to 256 MiB. */
+    if (total_size < 16 || total_size > (256u * 1024u * 1024u)) return 0;
+>>>>>>> fcexx
 
     uint32_t off = 8;
     uintptr_t max_end = 0;
@@ -84,7 +97,11 @@ static uintptr_t mb2_modules_max_end(uint32_t multiboot_magic, uint64_t multiboo
     return max_end;
 }
 
+<<<<<<< HEAD
 static ssize_t sysfs_show_const(char *buf, size_t size, void *priv) {
+=======
+ssize_t sysfs_show_const(char *buf, size_t size, void *priv) {
+>>>>>>> fcexx
     if (!buf || size == 0) return 0;
 
     const char *text = (const char*)priv;
@@ -97,7 +114,11 @@ static ssize_t sysfs_show_const(char *buf, size_t size, void *priv) {
     return (ssize_t)len;
 }
 
+<<<<<<< HEAD
 static ssize_t sysfs_show_cpu_name_attr(char *buf, size_t size, void *priv) {
+=======
+ssize_t sysfs_show_cpu_name_attr(char *buf, size_t size, void *priv) {
+>>>>>>> fcexx
     (void)priv;
 
     if (!buf || size == 0) return 0;
@@ -131,7 +152,11 @@ static size_t sysfs_write_int(char *buf, size_t size, int value) {
     return written;
 }
 
+<<<<<<< HEAD
 static ssize_t sysfs_show_ram_mb_attr(char *buf, size_t size, void *priv) {
+=======
+ssize_t sysfs_show_ram_mb_attr(char *buf, size_t size, void *priv) {
+>>>>>>> fcexx
     (void)priv;
     if (!buf || size == 0) return 0;
 
@@ -146,9 +171,49 @@ static ssize_t sysfs_show_ram_mb_attr(char *buf, size_t size, void *priv) {
     return (ssize_t)written;
 }
 
+<<<<<<< HEAD
 void ring0_shell()  { osh_run(); }
 
 void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
+=======
+/* Populate default sysfs tree when userspace mounts sysfs via SYS_mount. */
+void kernel_sysfs_populate_default(void) {
+    sysfs_mkdir("/sys/kernel");
+    sysfs_mkdir("/sys/class");
+    sysfs_mkdir("/sys/bus");
+    static const struct sysfs_attr attr_cpu = { sysfs_show_cpu_name_attr, NULL, NULL };
+    static const struct sysfs_attr attr_ram = { sysfs_show_ram_mb_attr, NULL, NULL };
+    sysfs_create_file("/sys/kernel/cpu_name", &attr_cpu);
+    sysfs_create_file("/sys/kernel/ram_mb", &attr_ram);
+}
+
+static int boot_try_run_init(void) {
+    /* initramfs-style init selection:
+       prefer /linuxrc when present, then fall back to /init and classic paths. */
+    static const char *candidates[] = {
+        "/sbin/init",
+        "/bin/init",
+        NULL
+    };
+    for (int i = 0; candidates[i]; i++) {
+        const char *p = candidates[i];
+        struct stat st;
+        if (vfs_stat(p, &st) != 0) continue;
+        /* Accept regular files and symlinks (symlinks already resolved by exec). */
+        if (!((st.st_mode & S_IFREG) == S_IFREG || (st.st_mode & S_IFLNK) == S_IFLNK)) continue;
+        const char *argv0[2] = { p, NULL };
+        klogprintf("boot: starting init candidate %s\n", p);
+        int rc = kernel_execve_from_path(p, argv0, NULL);
+        if (rc == 0) return 0;
+        klogprintf("boot: init %s returned rc=%d\n", p, rc);
+
+    }
+    return -1;
+}
+
+void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
+    qemu_debug_printf("Kernel started\n");
+>>>>>>> fcexx
     kclear();
     enable_cursor();
     sysinfo_init(multiboot_magic, multiboot_info);
@@ -173,6 +238,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 
     gdt_init();
 
+<<<<<<< HEAD
     /* allocate IST1 stack for Double Fault handler to avoid triple-faults */
     void *df_stack = kmalloc(8192 + 16);
     if (df_stack) {
@@ -183,6 +249,23 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         kprintf("Failed to allocate DF IST stack (warning)\n");
     }
     int vbe_init;
+=======
+    /* allocate IST1 stack for Double Fault handler to avoid triple-faults.
+       Use a larger (16KiB) stack and ensure 16-byte alignment of the top. */
+    {
+        const size_t DF_STACK_SIZE = 16 * 1024;
+        void *df_stack = kmalloc(DF_STACK_SIZE + 16);
+        if (df_stack) {
+            uintptr_t top = (uintptr_t)df_stack + DF_STACK_SIZE + 16;
+            uintptr_t df_top = align_up_uintptr(top, 16);
+            tss_set_ist(1, (uint64_t)df_top);
+            kprintf("Set kernel DF IST1 stack at %p.\n", (void*)(uintptr_t)df_top);
+        } else {
+            kprintf("Failed to allocate DF IST stack (warning)\n");
+        }
+    }
+    int vbe_init = 0;
+>>>>>>> fcexx
     /* Initialize VBE framebuffer console after heap is available */
     if (multiboot_info != 0) {
         if (vbe_init_from_multiboot(multiboot_magic, multiboot_info)) {
@@ -211,6 +294,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 
     mmio_init();
     ramfs_register();
+<<<<<<< HEAD
     ext2_register();
 
     if (sysfs_register() == 0) {
@@ -268,6 +352,16 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     klog_init(); // for logging into /var/log/kernel file
     sysinfo_print_e820(multiboot_magic, multiboot_info);
     if (vbe_init = 1) klogprintf("Set VBE framebuffer mode: %ux%u@%u.\n", vbe_get_width(), vbe_get_height(), vbe_get_bpp());
+=======
+    /* Create /dev in ramfs before initfs so it is always visible in ls / and before getty runs */
+    ext2_register();
+
+    /* sysfs, procfs, devfs mount — only via SYS_mount from userspace (e.g. init) */
+
+    klog_init(); // for logging into /var/log/kernel file
+    sysinfo_print_e820(multiboot_magic, multiboot_info);
+    if (vbe_is_available() == 1) klogprintf("Set VBE framebuffer mode: %ux%u@%u.\n", vbe_get_width(), vbe_get_height(), vbe_get_bpp());
+>>>>>>> fcexx
     else klogprintf("Set VGA default 80x25 mode.\n");
     
     apic_init();
@@ -324,6 +418,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     if (r == 0) klogprintf("initfs: unpacked successfully\n");
     else klogprintf("initfs: error: failed, code: %d\n", r);
 
+<<<<<<< HEAD
     /* register and mount devfs at /dev */
     if (devfs_register() == 0) {
         klogprintf("devfs: registering devfs\n");
@@ -332,6 +427,18 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 
         /* initialize stdio fds for current thread (main) */
         struct fs_file *console = fs_open("/dev/console");
+=======
+    ramfs_mkdir("/dev");
+
+    /* register devfs and mount at /dev so /dev/tty0, /dev/console etc. exist before init/getty */
+    if (devfs_register() == 0) {
+        klogprintf("devfs: registering devfs\n");
+        if (devfs_mount("/dev") == 0) {
+            klogprintf("devfs: mounted at /dev\n");
+        }
+        /* initialize stdio fds for current thread (main) */
+        struct fs_file *console = devfs_open_direct("/dev/console");
+>>>>>>> fcexx
         if (console) {
             /* allocate fd slots for main thread using helper to manage refcounts */
             int fd0 = thread_fd_alloc(console);
@@ -355,6 +462,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         klogprintf("devfs: failed to register\n");
     }
 
+<<<<<<< HEAD
     /* register and mount procfs at /proc */
     if (procfs_register() == 0) {
         klogprintf("procfs: mounting procfs in /proc\n");
@@ -373,5 +481,19 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     
     for(;;) {
         asm volatile("hlt");
+=======
+    /* procfs mounted by userspace via SYS_mount */
+
+    ps2_keyboard_init();
+    rtc_init();
+    if (vbe_is_available()) kprintf("VBE is avaliable!1!\n");
+    // Prefer linuxrc/init if present; fallback to kernel shell.
+    if (boot_try_run_init() != 0) {
+        kprintf("fatal: nothing to run.");
+    }
+    
+    for(;;) {
+        asm volatile("sti; hlt" ::: "memory");
+>>>>>>> fcexx
     }
 }

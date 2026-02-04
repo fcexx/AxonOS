@@ -93,6 +93,15 @@ static void draw_cell_to_backbuffer(uint32_t cx, uint32_t cy) {
 	}
 }
 
+void vbefb_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
+	if (!vbe_is_available() || !textbuf) return;
+	if (x >= cols || y >= rows) return;
+	textbuf[y * cols + x].ch = ch;
+	textbuf[y * cols + x].attr = attr;
+	draw_cell_to_backbuffer(x, y);
+	vbe_flush_region(x * font_w, y * font_h, font_w, font_h);
+}
+
 void vbefb_putchar(uint8_t ch, uint8_t attr) {
 	if (!vbe_is_available()) { return; }
 	// simple ANSI SGR parsing for color sequences: ESC [ ... m
@@ -102,28 +111,31 @@ void vbefb_putchar(uint8_t ch, uint8_t attr) {
 		// sequence ends with 'm'
 		if (ch == 'm') {
 			esc_buf[esc_len] = '\0';
+<<<<<<< HEAD
 			// expect leading '[' possibly present
 			char *s = esc_buf;
-			if (*s == '[') s++;
-			int last = 0;
-			int bright = 0;
 			uint8_t fg = current_attr & 0x0F;
 			uint8_t bg = (current_attr >> 4) & 0x0F;
-			while (*s) {
+			while (*s && *s != 'm') {
 				int val = 0;
-				int neg = 0;
 				if (*s == ';') { s++; continue; }
 				while (*s >= '0' && *s <= '9') { val = val * 10 + (*s - '0'); s++; }
-				if (val == 0) { fg = 7; bg = 0; bright = 0; }
-				else if (val == 1) { bright = 1; }
-				else if (val >= 30 && val <= 37) { fg = (uint8_t)(val - 30); }
-				else if (val >= 40 && val <= 47) { bg = (uint8_t)(val - 40); }
+				if (val == 0) { fg = 7; bg = 0; }
+				else if (val == 1) { fg |= 0x08; } /* bold -> bright fg */
+				else if (val >= 30 && val <= 37) {
+					fg = (uint8_t)((fg & 0x08) | (val - 30));
+				} else if (val >= 40 && val <= 47) {
+					bg = (uint8_t)(val - 40);
+				} else if (val >= 90 && val <= 97) {
+					fg = (uint8_t)(val - 90 + 8); /* bright fg */
+				} else if (val >= 100 && val <= 107) {
+					bg = (uint8_t)(val - 100 + 8); /* bright bg */
+				}
 				if (*s == ';') s++;
 			}
-			if (bright) fg |= 0x08;
+>>>>>>> fcexx
 			current_attr = (uint8_t)((bg << 4) | (fg & 0x0F));
 			esc_mode = 0;
-			esc_len = 0;
 			return;
 		}
 		// still in escape; drop characters
@@ -287,9 +299,15 @@ void vbefb_set_cursor(uint32_t x, uint32_t y) {
 }
 
 void vbefb_clear(uint8_t attr) {
-	if (!vbe_is_available()) return;
-	memset(textbuf, 0, (size_t)(cols * rows * sizeof(cell_t)));
-	//vbe_flush_full();
+	if (!vbe_is_available() || !textbuf) return;
+	for (uint32_t i = 0; i < (uint32_t)(cols * rows); i++) {
+		textbuf[i].ch = ' ';
+		textbuf[i].attr = attr;
+	}
+	for (uint32_t ry = 0; ry < rows; ry++)
+		for (uint32_t rx = 0; rx < cols; rx++)
+			draw_cell_to_backbuffer(rx, ry);
+	vbefb_set_cursor(0, 0);
 }
 
 /* Initialize console state after vbe init; called externally if needed */

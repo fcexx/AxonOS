@@ -16,4 +16,7 @@ size_t heap_total_bytes(void);
 size_t heap_used_bytes(void);
 size_t heap_peak_bytes(void);
 
+/* Base virtual/physical address where the kernel heap starts (identity mapped). */
+uintptr_t heap_base_addr(void);
+
 

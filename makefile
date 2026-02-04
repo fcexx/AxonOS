@@ -17,7 +17,7 @@ MULTIBOOT_BIN := $(BUILD_DIR)/multiboot.bin
 ISO_IMAGE := $(BUILD_DIR)/axonos.iso
 
 CC := gcc -m64
-CFLAGS := -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=kernel -Iinc -w
+CFLAGS := -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=kernel -Iinc -w -DQEMU_LOG_ENABLE
 
 CSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -type f -name '*.c' -print | sed 's|^\./||')
 COBJS := $(patsubst %.c,$(BUILD_DIR)/%.c.o,$(CSRCS))
@@ -57,7 +57,7 @@ $(BUILD_DIR)/%.S.o: %.S
 
 $(KERNEL_ELF): $(MULTIBOOT_OBJ) $(OTHER_ASM_OBJS) $(SOBJS) $(COBJS)
 	@mkdir -p $(BUILD_DIR)
-	@ld -m elf_x86_64 -T linker.ld --allow-multiple-definition -o $@ $^
+	@ld -m elf_x86_64 -T linker.ld -o $@ $^
 
 $(KERNEL_BIN): $(KERNEL_ELF)
 	@objcopy -O binary $< $@
@@ -78,7 +78,7 @@ iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg
 	}
 
 run: iso
-	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 512M -serial stdio -boot d -hda ../disk.img
+	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 700M -serial stdio -boot d -hda ../disk.img
 
 debug: iso
 	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 512M -serial stdio -hda ../disk.img -boot d -s -S & gdb -ex "target remote localhost:1234" $(KERNEL_ELF)

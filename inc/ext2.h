@@ -66,6 +66,7 @@ struct ext2_dir_entry {
 #define EXT2_FT_UNKNOWN  0
 #define EXT2_FT_REG_FILE 1
 #define EXT2_FT_DIR      2
+#define EXT2_FT_SYMLINK  7
 
 /* Magic */
 #define EXT2_SUPER_MAGIC 0xEF53

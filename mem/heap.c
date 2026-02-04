@@ -50,7 +50,7 @@ static int heap_range_in_range(const void *p, size_t n) {
     uintptr_t hi = (uintptr_t)heap_base + heap_capacity;
     /* check [a, a+n) fits in [lo, hi) without overflow */
     if (a < lo) return 0;
-    if (a > hi) return 0;
+    if (a >= hi) return 0;
     if (n > (size_t)(hi - a)) return 0;
     return 1;
 }
@@ -62,8 +62,8 @@ void heap_init(uintptr_t heap_start, size_t heap_size) {
         heap_start = base;
     }
     if (heap_size == 0) {
-        // Default size: 16 MiB
-        heap_size = 16ULL * 1024 * 1024;
+        // Default size: 512 MiB (increase to support very large initfs/modules)
+        heap_size = 512ULL * 1024 * 1024;
     }
 
     heap_base = (uint8_t*)heap_start;
@@ -113,6 +113,10 @@ static void coalesce(heap_block_header_t* blk) {
     blk->magic = HEAP_MAGIC_FREE;
     blk->req_size = 0;
 }
+
+/* forward declarations for diagnostic helpers used by krealloc */
+static size_t heap_largest_free_block(void);
+static size_t heap_total_free_bytes(void);
 
 void* kmalloc(size_t size) {
     if (!head || size == 0) return 0;
@@ -224,27 +228,51 @@ void* krealloc(void* ptr, size_t new_size) {
 #endif
         return ptr;
     }
-    // try to grow in place if next is free and large enough
-    if (blk->next && blk->next->free && old_size + sizeof(heap_block_header_t) + blk->next->size >= new_size) {
-        blk->size += sizeof(heap_block_header_t) + blk->next->size;
-        blk->next = blk->next->next;
-        if (blk->next) blk->next->prev = blk;
-        split_block(blk, new_size);
-        size_t diff = new_size - old_size;
-        heap_used_now += diff;
-        if (heap_used_now > heap_peak) heap_peak = heap_used_now;
+    /* try to grow in place by absorbing one or more consecutive next free blocks */
+    if (blk->next && blk->next->free) {
+        heap_block_header_t *scan = blk->next;
+        size_t accumulated = old_size;
+        /* accumulate sizes of consecutive free blocks (including their headers) */
+        while (scan && scan->free) {
+            /* defensive check: ensure header looks like a free block */
+            if (scan->magic != HEAP_MAGIC_FREE) break;
+            accumulated += sizeof(heap_block_header_t) + scan->size;
+            if (accumulated >= new_size) break;
+            scan = scan->next;
+        }
+        if (accumulated >= new_size) {
+            /* 'scan' now points to the first non-absorbed block (may be NULL) */
+            heap_block_header_t *after = scan;
+            /* set blk to cover the entire accumulated region */
+            blk->size = accumulated;
+            blk->next = after;
+            if (after) after->prev = blk;
+            split_block(blk, new_size);
+            size_t diff = new_size - old_size;
+            heap_used_now += diff;
+            if (heap_used_now > heap_peak) heap_peak = heap_used_now;
 #if HEAP_GUARD
-        blk->req_size = new_req;
-        uint8_t *p = (uint8_t*)blk + sizeof(heap_block_header_t);
-        uint64_t v = (uint64_t)HEAP_CANARY_QWORD;
-        memcpy(p + new_req, &v, sizeof(v));
+            blk->req_size = new_req;
+            uint8_t *p = (uint8_t*)blk + sizeof(heap_block_header_t);
+            uint64_t v = (uint64_t)HEAP_CANARY_QWORD;
+            memcpy(p + new_req, &v, sizeof(v));
 #else
-        blk->req_size = new_req;
+            blk->req_size = new_req;
 #endif
-        return ptr;
+            return ptr;
+        }
     }
     void* n = kmalloc(new_req);
-    if (!n) return 0;
+    if (!n) {
+        /* diagnose fragmentation / OOM to aid debugging */
+        size_t largest = heap_largest_free_block();
+        size_t total_free = heap_total_free_bytes();
+        kprintf("heap: krealloc kmalloc failed old_size=%llu new_req=%llu heap_used=%llu heap_total=%llu largest_free=%llu total_free=%llu\n",
+                (unsigned long long)old_size, (unsigned long long)new_req,
+                (unsigned long long)heap_used_now, (unsigned long long)heap_capacity,
+                (unsigned long long)largest, (unsigned long long)total_free);
+        return 0;
+    }
     size_t to_copy = old_req < new_req ? old_req : new_req;
     memcpy(n, ptr, to_copy);
     kfree(ptr);
@@ -261,5 +289,29 @@ void* kcalloc(size_t num, size_t size) {
 size_t heap_total_bytes(void) { return heap_capacity; }
 size_t heap_used_bytes(void)  { return heap_used_now; }
 size_t heap_peak_bytes(void)  { return heap_peak; }
+
+uintptr_t heap_base_addr(void) { return (uintptr_t)heap_base; }
+
+/* Return largest single free payload size currently available (doesn't include header). */
+static size_t heap_largest_free_block(void) {
+    size_t max = 0;
+    heap_block_header_t *cur = head;
+    while (cur) {
+        if (cur->free && cur->size > max) max = cur->size;
+        cur = cur->next;
+    }
+    return max;
+}
+
+/* Sum of all free payload bytes (for diagnostics). */
+static size_t heap_total_free_bytes(void) {
+    size_t total = 0;
+    heap_block_header_t *cur = head;
+    while (cur) {
+        if (cur->free) total += cur->size;
+        cur = cur->next;
+    }
+    return total;
+}
 
 

@@ -24,6 +24,7 @@ struct ramfs_node {
     struct ramfs_node *parent;
     struct ramfs_node *children; /* linked list of children */
     struct ramfs_node *next; /* sibling */
+    struct ramfs_node *link_target; /* if set, this is a hard link to that node */
 };
 
 /* forward declarations for functions used before definitions */
@@ -114,6 +115,62 @@ int ramfs_symlink(const char *path, const char *target) {
     return 0;
 }
 
+/* Create hard link: newpath will point to same inode as oldpath. */
+int ramfs_link(const char *oldpath, const char *newpath) {
+    if (!oldpath || oldpath[0] != '/' || !newpath || newpath[0] != '/') return -1;
+    /* resolve oldpath (follow symlinks) to get target node */
+    struct ramfs_node *target = ramfs_lookup(oldpath);
+    if (!target) return -2;
+    if (target->is_dir) return -1; /* EPERM: cannot link directory */
+    if (target->link_target) target = target->link_target; /* resolve if oldpath is itself a link */
+
+    /* get parent and basename of newpath */
+    size_t new_len = strlen(newpath);
+    char *tmp = (char*)kmalloc(new_len + 1);
+    if (!tmp) return -5;
+    memcpy(tmp, newpath, new_len + 1);
+    char *slash = strrchr(tmp, '/');
+    const char *parent_path = NULL;
+    char *name = NULL;
+    if (slash == tmp) {
+        parent_path = "/";
+        name = slash + 1;
+    } else if (slash) {
+        *slash = '\0';
+        parent_path = tmp;
+        name = slash + 1;
+    } else {
+        kfree(tmp);
+        return -3;
+    }
+    if (!name || !name[0]) { kfree(tmp); return -3; }
+
+    struct ramfs_node *parent = ramfs_lookup(parent_path);
+    if (!parent) { kfree(tmp); return -2; }
+    if (!parent->is_dir) { kfree(tmp); return -3; }
+    if (ramfs_find_child(parent, name)) { kfree(tmp); return -17; } /* EEXIST=17 */
+
+    /* allocate link node (minimal: name, parent, next, link_target) */
+    struct ramfs_node *link = (struct ramfs_node*)kmalloc(sizeof(*link));
+    if (!link) { kfree(tmp); return -5; }
+    memset(link, 0, sizeof(*link));
+    size_t nlen = strlen(name) + 1;
+    link->name = (char*)kmalloc(nlen);
+    if (!link->name) { kfree(link); kfree(tmp); return -5; }
+    memcpy(link->name, name, nlen);
+    link->link_target = target;
+    link->parent = parent;
+    link->next = parent->children;
+    parent->children = link;
+    target->nlink++;
+    kfree(tmp);
+    return 0;
+}
+
+static struct ramfs_node *ramfs_resolve_link(struct ramfs_node *n) {
+    return (n && n->link_target) ? n->link_target : n;
+}
+
 static void ramfs_free_node_shallow(struct ramfs_node *n) {
     if (!n) return;
     if (n->name) kfree(n->name);
@@ -129,6 +186,79 @@ static struct ramfs_node *ramfs_find_child(struct ramfs_node *parent, const char
         c = c->next;
     }
     return NULL;
+}
+
+/* Build absolute path to a node into buf. Returns 0 on success.
+   If node is root, returns "/". */
+static int ramfs_build_path(struct ramfs_node *node, char *buf, size_t bufsz) {
+    if (!buf || bufsz == 0) return -1;
+    if (!node) { buf[0] = '\0'; return -1; }
+    if (node == ramfs_root) {
+        if (bufsz < 2) { buf[0] = '\0'; return -1; }
+        buf[0] = '/'; buf[1] = '\0';
+        return 0;
+    }
+
+    /* collect components from node up to (but excluding) root */
+    const char *parts[64];
+    int count = 0;
+    struct ramfs_node *cur = node;
+    while (cur && cur != ramfs_root && count < (int)(sizeof(parts)/sizeof(parts[0]))) {
+        parts[count++] = cur->name ? cur->name : "";
+        cur = cur->parent;
+    }
+    if (!cur) { buf[0] = '\0'; return -1; }
+
+    /* write in reverse */
+    size_t pos = 0;
+    if (pos + 1 >= bufsz) { buf[0] = '\0'; return -1; }
+    buf[pos++] = '/';
+    for (int i = count - 1; i >= 0; i--) {
+        const char *p = parts[i];
+        size_t l = p ? strlen(p) : 0;
+        if (l == 0) continue;
+        if (pos + l + 1 >= bufsz) { buf[0] = '\0'; return -1; }
+        memcpy(buf + pos, p, l);
+        pos += l;
+        if (i != 0) buf[pos++] = '/';
+    }
+    buf[pos] = '\0';
+    /* ensure it is absolute */
+    if (buf[0] != '/') return -1;
+    return 0;
+}
+
+/* Lookup node by absolute path WITHOUT following symlinks.
+   If a symlink appears in the middle of the path, we treat it as non-directory and fail. */
+static struct ramfs_node *ramfs_lookup_nofollow(const char *path) {
+    if (!path) return NULL;
+    if (strcmp(path, "/") == 0) return ramfs_root;
+    if (path[0] != '/') return NULL;
+
+    size_t plen = strlen(path);
+    char *tmp = (char*)kmalloc(plen + 1);
+    if (!tmp) return NULL;
+    memcpy(tmp, path + 1, plen); /* skip leading '/' */
+    tmp[plen] = '\0';
+
+    struct ramfs_node *cur = ramfs_root;
+    char *tok = strtok(tmp, "/");
+    while (tok && cur) {
+        struct ramfs_node *child = ramfs_find_child(cur, tok);
+        if (!child) { kfree(tmp); return NULL; }
+        /* If this is a symlink and there are more components, fail (nofollow). */
+        if ((child->mode & S_IFLNK) == S_IFLNK) {
+            char *peek = strtok(NULL, "/");
+            if (peek) { kfree(tmp); return NULL; }
+            /* it was the last component */
+            kfree(tmp);
+            return child;
+        }
+        cur = child;
+        tok = strtok(NULL, "/");
+    }
+    kfree(tmp);
+    return cur;
 }
 
 static struct ramfs_node *ramfs_lookup(const char *path) {
@@ -173,16 +303,14 @@ static struct ramfs_node *ramfs_lookup(const char *path) {
                     /* relative to parent directory of symlink */
                     /* build parent path */
                     char parentbuf[512];
-                    /* compute parent path of current node */
-                    struct ramfs_node *p = child->parent;
-                    size_t plenp = 0;
                     parentbuf[0] = '\0';
-                    if (p && p != ramfs_root) {
-                        /* reconstruct path by walking up - simple approach: ignore, treat as '/' */
-                        strcpy(parentbuf, "/");
-                    } else {
+                    /* compute absolute directory path of the symlink's parent */
+                    if (ramfs_build_path(child->parent ? child->parent : ramfs_root, parentbuf, sizeof(parentbuf)) != 0) {
                         strcpy(parentbuf, "/");
                     }
+                    /* join parent path + relative target */
+                    size_t plen = strlen(parentbuf);
+                    if (plen > 1 && parentbuf[plen - 1] == '/') parentbuf[plen - 1] = '\0';
                     snprintf(newpath, newlen, "%s/%s", parentbuf, child->data);
                 }
                 if (rest) {
@@ -202,10 +330,10 @@ static struct ramfs_node *ramfs_lookup(const char *path) {
             tok = strtok(NULL, "/");
         }
         if (tok == NULL) {
-            /* finished without hitting symlink */
+            /* finished without hitting symlink; resolve hard link if any */
             kfree(tmp);
             kfree(curpath);
-            return cur;
+            return ramfs_resolve_link(cur);
         }
         /* else we restarted due to symlink; continue loop */
         /* loop continues, curpath updated */
@@ -305,8 +433,12 @@ static int ramfs_create(const char *path, struct fs_file **out_file) {
 }
 
 static int ramfs_open(const char *path, struct fs_file **out_file) {
-    struct ramfs_node *n = ramfs_lookup(path);
+    /* IMPORTANT: do NOT follow symlinks here.
+       VFS (`fs_open`) is responsible for resolving symlinks in paths.
+       Returning the symlink node allows lstat/readlink to work. */
+    struct ramfs_node *n = ramfs_lookup_nofollow(path);
     if (!n) return -1;
+    n = ramfs_resolve_link(n); /* hard links: use target for data */
     struct fs_file *f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
     if (!f) return -2;
     memset(f,0,sizeof(*f));
@@ -336,7 +468,35 @@ static ssize_t ramfs_read(struct fs_file *file, void *buf, size_t size, size_t o
         size_t written = 0;
         struct ext2_dir_entry de;
         uint8_t *out = (uint8_t*)buf;
+        /* When listing root, always emit "dev" first so ls / always shows /dev (mount point). */
+        if (n == ramfs_root) {
+            const char *dev_name = "dev";
+            size_t namelen = 3;
+            size_t rec_len = (size_t)(8 + namelen);
+            rec_len = (rec_len + 3) & ~3u;
+            if (rec_len < sizeof(struct ext2_dir_entry)) rec_len = sizeof(struct ext2_dir_entry);
+            if (pos + rec_len > (size_t)offset && written < size) {
+                uint8_t tmp[64];
+                for (size_t zi = 0; zi < sizeof(tmp); zi++) tmp[zi] = 0;
+                de.inode = 1;
+                de.rec_len = (uint16_t)rec_len;
+                de.name_len = (uint8_t)namelen;
+                de.file_type = EXT2_FT_DIR;
+                memcpy(tmp, &de, 8);
+                memcpy(tmp + 8, dev_name, namelen);
+                size_t entry_off = ((size_t)offset > pos) ? (size_t)offset - pos : 0;
+                size_t avail = size - written;
+                size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
+                if (tocopy > avail) tocopy = avail;
+                memcpy(out + written, tmp + entry_off, tocopy);
+                written += tocopy;
+            }
+            pos += rec_len;
+        }
         for (struct ramfs_node *c = n->children; c; c = c->next) {
+            /* When listing root, skip "dev" here so we don't duplicate (already emitted above) */
+            if (n == ramfs_root && c->name && strcmp(c->name, "dev") == 0) continue;
+            struct ramfs_node *r = ramfs_resolve_link(c);
             size_t namelen = strlen(c->name);
             /* record length: header (8) + name, padded to 4 bytes for compatibility */
             size_t rec_len = (size_t)(8 + namelen);
@@ -347,10 +507,10 @@ static ssize_t ramfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             uint8_t tmp[512];
             /* initialize buffer to zero to avoid leaking memory beyond name */
             for (size_t zi = 0; zi < sizeof(tmp); zi++) tmp[zi] = 0;
-            de.inode = (uint32_t)(c->ino & 0xFFFFFFFFu);
+            de.inode = (uint32_t)(r->ino & 0xFFFFFFFFu);
             de.rec_len = (uint16_t)rec_len;
             de.name_len = (uint8_t)namelen;
-            de.file_type = c->is_dir ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
+            de.file_type = ((c->mode & S_IFLNK) == S_IFLNK) ? EXT2_FT_SYMLINK : (r->is_dir ? EXT2_FT_DIR : EXT2_FT_REG_FILE);
             memcpy(tmp, &de, 8);
             memcpy(tmp + 8, c->name, namelen);
             size_t entry_off = 0;
@@ -398,12 +558,6 @@ int ramfs_fill_stat(struct fs_file *file, struct stat *st) {
     st->st_atime = n->atime;
     st->st_mtime = n->mtime;
     st->st_ctime = n->ctime;
-    /* Debug: log when /init is queried */
-    if (file->path && strcmp(file->path, "/init") == 0) {
-        /* Use formats supported by qemu_debug_printf: print mode in hex and size as %llu */
-        qemu_debug_printf("ramfs_fill_stat: path=%s node->mode=0x%04x is_dir=%d size=%llu\n",
-                   file->path, (unsigned)n->mode, n->is_dir, (unsigned long long)n->size);
-    }
     return 0;
 }
 
@@ -419,14 +573,33 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
     } else {
         /* kernel context: allow writes */
     }
-    size_t new_size = offset + size;
-    if (new_size > n->size) {
-        char *d = (char*)krealloc(n->data, new_size);
-        if (!d) return -1;
-        n->data = d;
-        n->size = new_size;
+    /* Grow and copy in chunks to avoid one-shot large reallocs where possible.
+       This may allow progress when large contiguous allocations fail. */
+    const size_t CHUNK = 64 * 1024; /* 64 KiB */
+    size_t write_pos = offset;
+    size_t src_pos = 0;
+    size_t remaining = size;
+    while (remaining > 0) {
+        size_t chunk = remaining > CHUNK ? CHUNK : remaining;
+        size_t needed_end = write_pos + chunk;
+        if (needed_end > n->size) {
+            char *d = (char*)krealloc(n->data, needed_end);
+            if (!d) {
+                /* log diagnostic info to help root cause allocation failure */
+                klogprintf("ramfs: write: krealloc failed path=%s offset=%u write_size=%u needed_end=%u heap_used=%llu heap_total=%llu\n",
+                           file && file->path ? file->path : "(null)",
+                           (unsigned)offset, (unsigned)size, (unsigned)needed_end,
+                           (unsigned long long)heap_used_bytes(), (unsigned long long)heap_total_bytes());
+                return -1;
+            }
+            n->data = d;
+            n->size = needed_end;
+        }
+        memcpy(n->data + write_pos, (const char*)buf + src_pos, chunk);
+        write_pos += chunk;
+        src_pos += chunk;
+        remaining -= chunk;
     }
-    memcpy(n->data + offset, buf, size);
     return (ssize_t)size;
 }
 
@@ -468,6 +641,61 @@ int ramfs_mkdir(const char *path) {
     return 0;
 }
 
+/* Unlink node from its parent's children list without freeing the node. */
+static void ramfs_unlink_from_parent(struct ramfs_node *n) {
+    if (!n || !n->parent) return;
+    struct ramfs_node **pp = &n->parent->children;
+    while (*pp) {
+        if (*pp == n) { *pp = n->next; n->next = NULL; break; }
+        pp = &(*pp)->next;
+    }
+}
+
+/* rename(oldpath, newpath) - move/overwrite. Same fs only. */
+int ramfs_rename(const char *oldpath, const char *newpath) {
+    if (!oldpath || oldpath[0] != '/' || !newpath || newpath[0] != '/') return -1;
+    if (strcmp(oldpath, newpath) == 0) return 0;
+    struct ramfs_node *old_node = ramfs_lookup(oldpath);
+    if (!old_node) return -2; /* ENOENT */
+    if (old_node->link_target) old_node = old_node->link_target; /* resolve symlink target for move */
+
+    /* parse newpath into parent + basename */
+    size_t new_len = strlen(newpath);
+    char *tmp = (char *)kmalloc(new_len + 1);
+    if (!tmp) return -5;
+    memcpy(tmp, newpath, new_len + 1);
+    char *slash = strrchr(tmp, '/');
+    const char *new_parent_path = NULL;
+    char *new_name = NULL;
+    if (slash == tmp) { new_parent_path = "/"; new_name = slash + 1; }
+    else if (slash) { *slash = '\0'; new_parent_path = tmp; new_name = slash + 1; }
+    else { kfree(tmp); return -3; }
+    if (!new_name || !new_name[0]) { kfree(tmp); return -3; }
+
+    struct ramfs_node *new_parent = ramfs_lookup(new_parent_path);
+    if (!new_parent) { kfree(tmp); return -2; }
+    if (!new_parent->is_dir) { kfree(tmp); return -3; }
+
+    struct ramfs_node *existing = ramfs_find_child(new_parent, new_name);
+    if (existing && existing != old_node) {
+        /* overwrite: remove existing (root only in ramfs_remove) */
+        int rr = ramfs_remove(newpath);
+        if (rr != 0) { kfree(tmp); return rr; }
+    }
+
+    ramfs_unlink_from_parent(old_node);
+    if (old_node->name) kfree(old_node->name);
+    size_t nlen = strlen(new_name) + 1;
+    old_node->name = (char *)kmalloc(nlen);
+    if (!old_node->name) { kfree(tmp); return -5; }
+    memcpy(old_node->name, new_name, nlen);
+    old_node->parent = new_parent;
+    old_node->next = new_parent->children;
+    new_parent->children = old_node;
+    kfree(tmp);
+    return 0;
+}
+
 int ramfs_remove(const char *path) {
     if (!path) return -1;
     if (strcmp(path, "/") == 0) return -2;
@@ -478,12 +706,7 @@ int ramfs_remove(const char *path) {
     if (!n) return -3;
     struct ramfs_node *p = n->parent;
     if (!p) return -4;
-    /* unlink from parent's children */
-    struct ramfs_node **pp = &p->children;
-    while (*pp) {
-        if (*pp == n) { *pp = n->next; break; }
-        pp = &(*pp)->next;
-    }
+    ramfs_unlink_from_parent(n);
     /* free recursively */
     /* simple recursive free */
     struct ramfs_node *stack[64]; int sp = 0;
@@ -505,6 +728,8 @@ int ramfs_register(void) {
     ramfs_root = ramfs_alloc_node("", 1);
     if (!ramfs_root) return -1;
     ramfs_root->parent = NULL;
+    /* Create /dev immediately so it is always in root; critical for ls / visibility */
+    (void)ramfs_mkdir("/dev");
     ramfs_driver.ops = &ramfs_ops;
     ramfs_driver.driver_data = (void*)ramfs_root;
     ramfs_ops.name = "ramfs";
@@ -514,6 +739,8 @@ int ramfs_register(void) {
     ramfs_ops.write = ramfs_write;
     ramfs_ops.mkdir = ramfs_mkdir;
     ramfs_ops.chmod = ramfs_chmod;
+    ramfs_ops.link = ramfs_link;
+    ramfs_ops.rename = ramfs_rename;
     ramfs_ops.release = ramfs_release;
 
     return fs_register_driver(&ramfs_driver);
