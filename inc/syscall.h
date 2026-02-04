@@ -43,7 +43,10 @@
 #define SYS_gettid  186
 #define SYS_mmap    9
 #define SYS_munmap  11
+#define SYS_madvise 28
 #define SYS_brk     12
+#define SYS_pipe    22
+#define SYS_pipe2   293
 #define SYS_poll    7
 #define SYS_mprotect 10
 #define SYS_arch_prctl 158
@@ -52,6 +55,7 @@
 #define SYS_vfork   58
 #define SYS_fork    57
 #define SYS_clone   56
+#define SYS_clone3  435
 #define SYS_wait4   61
 #define SYS_exit_group 231
 #define SYS_openat  257
@@ -61,11 +65,21 @@
 #define SYS_mount   165
 #define SYS_rt_sigtimedwait 128
 #define SYS_clock_nanosleep 230
+#define SYS_select  23
+#define SYS_socket  41
+#define SYS_getrlimit 97
+#define SYS_sysinfo  99
+#define SYS_sched_getaffinity 204
+#define SYS_nanosleep 35
 #define SYS_gettimeofday 169
 #define SYS_access 21
 #define SYS_link   86
 #define SYS_mkdir  83
+#define SYS_rename 82
+#define SYS_umask  95
 #define SYS_chmod  90
+#define SYS_chown  92
+#define SYS_utimensat 280
 
 /* initialize syscall subsystem (register handler) */
 void syscall_init(void);

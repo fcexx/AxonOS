@@ -172,6 +172,8 @@ static struct fs_file *fs_open_no_resolve(const char *path) {
             if (!file->fs_private) file->fs_private = (void*)mount_drv;
             return file;
         }
+        /* Path is under a mount; do not fall through to ramfs/etc. so /dev returns devfs, not empty ramfs dir */
+        return NULL;
     }
     for (int i = 0; i < g_drivers_count; i++) {
         struct fs_driver *drv = g_drivers[i];
@@ -429,6 +431,10 @@ struct fs_file *fs_open(const char *path) {
         if (rr == 0 && file) {
             if (!file->fs_private) file->fs_private = (void*)mount_drv;
             result = file;
+        } else {
+            /* Path is under a mount; do not fall through so /dev returns devfs, not empty ramfs */
+            kfree(resolved_path);
+            return NULL;
         }
     }
 
@@ -482,6 +488,9 @@ void fs_file_free(struct fs_file *file) {
     /* reference-counted: decrement and only free when zero */
     if (file->refcount > 1) { file->refcount--; return; }
     /* file->refcount <= 1 -> release resources */
+    if (file->type == FS_TYPE_PIPE) {
+        pipe_release_end(file);
+    }
     for (int i = 0; i < g_drivers_count; i++) {
         struct fs_driver *drv = g_drivers[i];
         if (!drv || !drv->ops) continue;
@@ -524,6 +533,25 @@ int fs_link(const char *oldpath, const char *newpath) {
         struct fs_driver *drv = g_drivers[i];
         if (!drv || !drv->ops || !drv->ops->link) continue;
         int r = drv->ops->link(oldpath, newpath);
+        if (r == 0) return 0;
+        if (r < 0 && r != -1) return r;
+    }
+    return -1;
+}
+
+int fs_rename(const char *oldpath, const char *newpath) {
+    if (!oldpath || !newpath) return -1;
+    if (strcmp(oldpath, newpath) == 0) return 0;
+    struct fs_driver *mount_drv = fs_match_mount(oldpath);
+    if (mount_drv && mount_drv->ops && mount_drv->ops->rename) {
+        int r = mount_drv->ops->rename(oldpath, newpath);
+        if (r == 0) return 0;
+        if (r < 0) return r;
+    }
+    for (int i = 0; i < g_drivers_count; i++) {
+        struct fs_driver *drv = g_drivers[i];
+        if (!drv || !drv->ops || !drv->ops->rename) continue;
+        int r = drv->ops->rename(oldpath, newpath);
         if (r == 0) return 0;
         if (r < 0 && r != -1) return r;
     }

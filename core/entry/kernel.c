@@ -18,7 +18,6 @@
 #include <paging.h>
 #include <sysinfo.h>
 #include <thread.h>
-#include <axosh.h>
 #include <apic.h>
 #include <apic_timer.h>
 #include <stat.h>
@@ -31,7 +30,6 @@
 #include <procfs.h>
 #include <initfs.h>
 #include <ramfs.h>
-#include <editor.h>
 #include <fat32.h>
 #include <intel_chipset.h>
 #include <disk.h>
@@ -160,13 +158,10 @@ void kernel_sysfs_populate_default(void) {
     sysfs_create_file("/sys/kernel/ram_mb", &attr_ram);
 }
 
-void ring0_shell()  { osh_run(); }
-
 static int boot_try_run_init(void) {
     /* initramfs-style init selection:
        prefer /linuxrc when present, then fall back to /init and classic paths. */
     static const char *candidates[] = {
-        "/init",
         "/sbin/init",
         "/bin/init",
         NULL
@@ -257,14 +252,13 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     mmio_init();
     ramfs_register();
     /* Create /dev in ramfs before initfs so it is always visible in ls / and before getty runs */
-    ramfs_mkdir("/dev");
     ext2_register();
 
     /* sysfs, procfs, devfs mount — only via SYS_mount from userspace (e.g. init) */
 
     klog_init(); // for logging into /var/log/kernel file
     sysinfo_print_e820(multiboot_magic, multiboot_info);
-    if (vbe_init == 1) klogprintf("Set VBE framebuffer mode: %ux%u@%u.\n", vbe_get_width(), vbe_get_height(), vbe_get_bpp());
+    if (vbe_is_available() == 1) klogprintf("Set VBE framebuffer mode: %ux%u@%u.\n", vbe_get_width(), vbe_get_height(), vbe_get_bpp());
     else klogprintf("Set VGA default 80x25 mode.\n");
     
     apic_init();
@@ -321,6 +315,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     if (r == 0) klogprintf("initfs: unpacked successfully\n");
     else klogprintf("initfs: error: failed, code: %d\n", r);
 
+    ramfs_mkdir("/dev");
+
     /* register devfs and mount at /dev so /dev/tty0, /dev/console etc. exist before init/getty */
     if (devfs_register() == 0) {
         klogprintf("devfs: registering devfs\n");
@@ -356,11 +352,10 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 
     ps2_keyboard_init();
     rtc_init();
-
+    if (vbe_is_available()) kprintf("VBE is avaliable!1!\n");
     // Prefer linuxrc/init if present; fallback to kernel shell.
     if (boot_try_run_init() != 0) {
-        exec_line("PS1=\"osh-2.0# \"");
-        exec_line("osh");
+        kprintf("fatal: nothing to run.");
     }
     
     for(;;) {

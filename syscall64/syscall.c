@@ -16,6 +16,7 @@
 #include <procfs.h>
 #include <sysfs.h>
 #include <rtc.h>
+#include <spinlock.h>
 
 /* Linux x86_64 struct stat size; ensures st_mode at correct offset for S_ISREG etc. */
 #define STAT_COPY_SIZE 144
@@ -55,14 +56,9 @@ uint64_t syscall_exit_to_shell_flag = 0;
 uint64_t syscall_exec_trampoline_active = 0;
 /* per-thread saved values copied from syscall_entry64 globals at syscall start */
 
-
-
-extern void ring0_shell(void);
-
 __attribute__((noreturn)) void syscall_return_to_shell(void) {
     syscall_exit_to_shell_flag = 0;
     thread_set_current_user(NULL);
-    ring0_shell();
     for (;;) { asm volatile("sti; hlt" ::: "memory"); }
 }
 
@@ -301,9 +297,107 @@ static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, siz
 #define ENAMETOOLONG 36
 #define EAGAIN  11
 #define EINTR   4
+#define EPIPE   32
 #define EIO     5
 #define EEXIST  17
 #define ENOTDIR 20
+
+/* Pipe: kernel buffer + two fd ends. driver_private = pipe_t*, fs_private = 0 read / 1 write */
+#define PIPE_BUF_SIZE 4096
+typedef struct pipe {
+    uint8_t *buf;
+    size_t size;
+    size_t head;   /* write position */
+    size_t tail;   /* read position */
+    int refcount;  /* 2 when both ends open */
+    int reader_waiter_tid;
+    int writer_waiter_tid;
+    spinlock_t lock;
+} pipe_t;
+
+static ssize_t pipe_read_bytes(pipe_t *p, void *buf, size_t cnt, thread_t *cur);
+static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t *cur);
+
+void pipe_release_end(struct fs_file *f) {
+    if (!f || f->type != FS_TYPE_PIPE || !f->driver_private) return;
+    pipe_t *p = (pipe_t *)f->driver_private;
+    unsigned long fl = 0;
+    acquire_irqsave(&p->lock, &fl);
+    p->refcount--;
+    int ref = p->refcount;
+    /* Wake waiter on the other end so they see EOF or EPIPE */
+    if (p->reader_waiter_tid >= 0) { thread_unblock(p->reader_waiter_tid); p->reader_waiter_tid = -1; }
+    if (p->writer_waiter_tid >= 0) { thread_unblock(p->writer_waiter_tid); p->writer_waiter_tid = -1; }
+    release_irqrestore(&p->lock, fl);
+    if (ref == 0) {
+        kfree(p->buf);
+        kfree(p);
+    }
+}
+
+static ssize_t pipe_read_bytes(pipe_t *p, void *buf, size_t cnt, thread_t *cur) {
+    if (!p || !buf || cnt == 0) return -EINVAL;
+    unsigned long fl = 0;
+    for (;;) {
+        acquire_irqsave(&p->lock, &fl);
+        size_t used = (p->head >= p->tail) ? (p->head - p->tail) : (p->size - p->tail + p->head);
+        if (used > 0) {
+            size_t n = used < cnt ? used : cnt;
+            size_t tail = p->tail;
+            release_irqrestore(&p->lock, fl);
+            size_t first = (tail + n <= p->size) ? n : (p->size - tail);
+            memcpy(buf, p->buf + tail, first);
+            if (first < n) memcpy((char*)buf + first, p->buf, n - first);
+            acquire_irqsave(&p->lock, &fl);
+            p->tail = (tail + n) % p->size;
+            if (p->writer_waiter_tid >= 0) { thread_unblock(p->writer_waiter_tid); p->writer_waiter_tid = -1; }
+            release_irqrestore(&p->lock, fl);
+            return (ssize_t)n;
+        }
+        if (p->refcount < 2) { release_irqrestore(&p->lock, fl); return 0; } /* EOF */
+        p->reader_waiter_tid = (int)(cur && cur->tid ? cur->tid : 0);
+        release_irqrestore(&p->lock, fl);
+        if (p->reader_waiter_tid >= 0) {
+            thread_block(p->reader_waiter_tid);
+            thread_yield();
+        }
+    }
+}
+
+static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t *cur) {
+    if (!p || !buf || cnt == 0) return -EINVAL;
+    unsigned long fl = 0;
+    size_t written = 0;
+    const char *src = (const char *)buf;
+    while (written < cnt) {
+        acquire_irqsave(&p->lock, &fl);
+        size_t used = (p->head >= p->tail) ? (p->head - p->tail) : (p->size - p->tail + p->head);
+        size_t free = (p->size - 1) > used ? (p->size - 1 - used) : 0;
+        if (free > 0) {
+            size_t n = (cnt - written) < free ? (cnt - written) : free;
+            size_t head = p->head;
+            release_irqrestore(&p->lock, fl);
+            for (size_t i = 0; i < n; i++) {
+                p->buf[(head + i) % p->size] = src[written + i];
+            }
+            acquire_irqsave(&p->lock, &fl);
+            p->head = (head + n) % p->size;
+            written += n;
+            if (p->reader_waiter_tid >= 0) { thread_unblock(p->reader_waiter_tid); p->reader_waiter_tid = -1; }
+            release_irqrestore(&p->lock, fl);
+            continue;
+        }
+        if (p->refcount < 2) { release_irqrestore(&p->lock, fl); return written > 0 ? (ssize_t)written : -EPIPE; }
+        p->writer_waiter_tid = (int)(cur && cur->tid ? cur->tid : 0);
+        release_irqrestore(&p->lock, fl);
+        if (p->writer_waiter_tid >= 0) {
+            thread_block(p->writer_waiter_tid);
+            thread_yield();
+        }
+    }
+    return (ssize_t)written;
+}
+
 static uint64_t last_syscall_debug = 0;
 static inline uint64_t ret_err(int e) {
     /* Log ENOSYS occurrences for the user shell (tid==3) to help musl compatibility debugging. */
@@ -802,6 +896,97 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             /* Minimal compatibility: treat clone() without complex flags as fork(). */
             return syscall_do(SYS_fork, 0, 0, 0, 0, 0, 0);
         }
+        case SYS_clone3: {
+            /* clone3(cl_args, size) - glibc pthreads passes user stack; must use it or advise_stack_range assert fails */
+            const void *cl_args_u = (const void*)(uintptr_t)a1;
+            size_t cl_size = (size_t)a2;
+            if (!cl_args_u || cl_size < 64 || (uintptr_t)cl_args_u + 64 > (uintptr_t)MMIO_IDENTITY_LIMIT)
+                return ret_err(EFAULT);
+            uint64_t cl_buf[8];
+            if (copy_from_user_raw(cl_buf, cl_args_u, 64) != 0) return ret_err(EFAULT);
+            uint64_t flags = cl_buf[0];
+            uint64_t child_tid_ptr = cl_buf[2];
+            uint64_t parent_tid_ptr = cl_buf[3];
+            uint64_t stack = cl_buf[5];
+            uint64_t stack_size = cl_buf[6];
+            uint64_t tls = cl_buf[7];
+            uint64_t saved_rcx = cur->saved_user_rip;
+            if (saved_rcx == 0) {
+                extern uint64_t syscall_kernel_rsp0;
+                if ((uintptr_t)syscall_kernel_rsp0 != 0) {
+                    uint64_t candidate = 0;
+                    if (find_valid_saved_ret(syscall_kernel_rsp0, &candidate, 64) == 0) saved_rcx = candidate;
+                }
+            }
+            if (saved_rcx == 0) return ret_err(EINVAL);
+            if (stack != 0 && stack_size != 0) {
+                uintptr_t child_rsp = (uintptr_t)(stack + stack_size);
+                child_rsp &= ~0xFULL;
+                if (child_rsp < 0x1000 || child_rsp >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EINVAL);
+                if (mark_user_identity_range_2m_sys((uint64_t)(stack & ~((uintptr_t)PAGE_SIZE_2M - 1)),
+                    (uint64_t)(child_rsp + 4096)) != 0) return ret_err(EFAULT);
+                char child_name[32];
+                snprintf(child_name, sizeof(child_name), "%s.child", cur->name);
+                thread_t *child = thread_create_blocked(user_thread_entry, child_name);
+                if (!child) return ret_err(ENOMEM);
+                /* Use trampoline to restore parent's rdi,rsi,rdx,r8-r11,rbx,rbp,r12-r15 (glibc needs rdx=fn, r8=arg) */
+                uintptr_t tramp = (uintptr_t)USER_VFORK_TRAMP;
+                mark_user_identity_range_2m_sys((uint64_t)(tramp & ~((uintptr_t)(PAGE_SIZE_2M - 1))),
+                    (uint64_t)((tramp & ~((uintptr_t)(PAGE_SIZE_2M - 1))) + PAGE_SIZE_2M));
+                if ((uintptr_t)tramp + 128 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                    unsigned char stub[160];
+                    int off = 0;
+                    stub[off++] = 0x48; stub[off++] = 0xBF; memcpy(&stub[off], &cur->saved_user_rdi, 8); off += 8;
+                    stub[off++] = 0x48; stub[off++] = 0xBE; memcpy(&stub[off], &cur->saved_user_rsi, 8); off += 8;
+                    stub[off++] = 0x48; stub[off++] = 0xBA; memcpy(&stub[off], &cur->saved_user_rdx, 8); off += 8;
+                    stub[off++] = 0x49; stub[off++] = 0xB8; memcpy(&stub[off], &cur->saved_user_r8, 8); off += 8;
+                    stub[off++] = 0x49; stub[off++] = 0xB9; memcpy(&stub[off], &cur->saved_user_r9, 8); off += 8;
+                    stub[off++] = 0x49; stub[off++] = 0xBA; memcpy(&stub[off], &cur->saved_user_r10, 8); off += 8;
+                    stub[off++] = 0x48; stub[off++] = 0xB9; { uint64_t rc = saved_rcx; memcpy(&stub[off], &rc, 8); off += 8; }
+                    stub[off++] = 0x49; stub[off++] = 0xBB; memcpy(&stub[off], &cur->saved_user_r11, 8); off += 8;
+                    stub[off++] = 0x48; stub[off++] = 0xBB; memcpy(&stub[off], &cur->saved_user_rbx, 8); off += 8;
+                    stub[off++] = 0x48; stub[off++] = 0xBD; memcpy(&stub[off], &cur->saved_user_rbp, 8); off += 8;
+                    stub[off++] = 0x49; stub[off++] = 0xBC; memcpy(&stub[off], &cur->saved_user_r12, 8); off += 8;
+                    stub[off++] = 0x49; stub[off++] = 0xBD; memcpy(&stub[off], &cur->saved_user_r13, 8); off += 8;
+                    stub[off++] = 0x49; stub[off++] = 0xBE; memcpy(&stub[off], &cur->saved_user_r14, 8); off += 8;
+                    stub[off++] = 0x49; stub[off++] = 0xBF; memcpy(&stub[off], &cur->saved_user_r15, 8); off += 8;
+                    stub[off++] = 0x48; stub[off++] = 0x31; stub[off++] = 0xC0; /* xor eax,eax - child returns 0 */
+                    stub[off++] = 0x48; stub[off++] = 0xBC; { uint64_t rs = (uint64_t)child_rsp; memcpy(&stub[off], &rs, 8); off += 8; }
+                    stub[off++] = 0xFF; stub[off++] = 0xE1; /* jmp rcx */
+                    for (int z = off; z < (int)sizeof(stub); z++) stub[z] = 0x90;
+                    memcpy((void*)tramp, stub, off);
+                    child->user_rip = (uint64_t)tramp;
+                } else {
+                    child->user_rip = saved_rcx;
+                }
+                child->user_stack = (uint64_t)child_rsp;
+                child->ring = 3;
+                child->user_fs_base = (flags & 0x00080000u) ? tls : cur->user_fs_base;
+                child->euid = cur->euid;
+                child->egid = cur->egid;
+                child->umask = cur->umask;
+                child->attached_tty = cur->attached_tty;
+                child->parent_tid = (int)(cur->tid ? cur->tid : 1);
+                child->sid = cur->sid;
+                child->pgid = cur->pgid;
+                strncpy(child->cwd, cur->cwd, sizeof(child->cwd)-1);
+                child->cwd[sizeof(child->cwd)-1] = '\0';
+                for (int i = 0; i < THREAD_MAX_FD; i++) {
+                    child->fds[i] = cur->fds[i];
+                    if (child->fds[i]) {
+                        if (child->fds[i]->refcount <= 0) child->fds[i]->refcount = 1;
+                        else child->fds[i]->refcount++;
+                    }
+                }
+                if (child_tid_ptr && child_tid_ptr < (uint64_t)MMIO_IDENTITY_LIMIT - 4)
+                    copy_to_user_safe((void*)(uintptr_t)child_tid_ptr, &child->tid, 4);
+                if (parent_tid_ptr && parent_tid_ptr < (uint64_t)MMIO_IDENTITY_LIMIT - 4)
+                    copy_to_user_safe((void*)(uintptr_t)parent_tid_ptr, &child->tid, 4);
+                thread_unblock((int)(child->tid ? child->tid : 1));
+                return (uint64_t)(child->tid ? child->tid : 1);
+            }
+            return syscall_do(SYS_fork, 0, 0, 0, 0, 0, 0);
+        }
         case SYS_set_tid_address: {
             /* set_tid_address(int *tidptr): used by glibc to set clear_child_tid. */
             uint64_t tidptr = a1;
@@ -1085,12 +1270,22 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 (unsigned long long)saved_rcx, (unsigned long long)saved_rsp);
             /* Preserve parent userspace memory across vfork/exec.
                In our shared-address-space model, exec in the child overwrites
-               parent memory, so we must snapshot+restore for correctness. */
+               parent memory, so we must snapshot+restore for correctness.
+               Optimization: backup only the used region (heap + mmap) instead of
+               the full 0x200000..USER_TLS_BASE (~122 MiB). Typical vfork+exec
+               (sh, busybox) uses only a few MiB. */
             {
                 const uintptr_t base = (uintptr_t)0x00200000u;
                 uintptr_t end = (uintptr_t)USER_TLS_BASE;
                 if (end < base) end = base;
-                uint64_t len64 = (uint64_t)(end - base);
+                /* Backup only up to the end of used memory */
+                uintptr_t used_end = (uintptr_t)p->user_brk_cur;
+                if (p->user_mmap_next > used_end) used_end = p->user_mmap_next;
+                /* Minimum: cover program load + small heap (busybox ~2MB at 0x400000) */
+                const uintptr_t min_backup = base + (8u * 1024u * 1024u);
+                if (used_end < min_backup || used_end == 0) used_end = min_backup;
+                if (used_end > end) used_end = end;
+                uint64_t len64 = (uint64_t)(used_end - base);
                 if (len64 == 0 || len64 > (uint64_t)(256u * 1024u * 1024u)) {
                     return ret_err(ENOMEM);
                 }
@@ -1098,7 +1293,18 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 if (!child->vfork_parent_mem_backup) {
                     return ret_err(ENOMEM);
                 }
-                memcpy(child->vfork_parent_mem_backup, (void*)base, (size_t)len64);
+                /* Small backup: single copy. Large: chunk with yields to avoid freeze. */
+                const size_t chunk = 512u * 1024u;
+                if ((size_t)len64 <= chunk) {
+                    memcpy(child->vfork_parent_mem_backup, (void*)base, (size_t)len64);
+                } else {
+                    for (size_t off = 0; off < (size_t)len64; off += chunk) {
+                        size_t n = chunk;
+                        if (off + n > (size_t)len64) n = (size_t)len64 - off;
+                        memcpy((char*)child->vfork_parent_mem_backup + off, (void*)(base + off), n);
+                        if (off + n < (size_t)len64) thread_yield();
+                    }
+                }
                 child->vfork_parent_mem_backup_len = len64;
                 child->vfork_parent_mem_backup_base = (uint64_t)base;
                 child->vfork_parent_brk_saved = (uint64_t)p->user_brk_cur;
@@ -1244,6 +1450,50 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (r == 0) return 0;
             return ret_err(r < 0 ? -r : EIO);
         }
+        case SYS_rename: {
+            /* rename(oldpath, newpath) - syscall 82; rpm needs this for move */
+            const char *oldpath_u = (const char*)(uintptr_t)a1;
+            const char *newpath_u = (const char*)(uintptr_t)a2;
+            if (!oldpath_u || !newpath_u) return ret_err(EFAULT);
+            if ((uintptr_t)oldpath_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+            if ((uintptr_t)newpath_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+            char oldpath[256], newpath[256];
+            resolve_user_path(cur, oldpath_u, oldpath, sizeof(oldpath));
+            resolve_user_path(cur, newpath_u, newpath, sizeof(newpath));
+            /* If newpath is a directory, target is newpath/basename(oldpath) (POSIX) */
+            {
+                struct stat st;
+                if (vfs_stat(newpath, &st) == 0 && (st.st_mode & S_IFDIR)) {
+                    const char *base = strrchr(oldpath, '/');
+                    base = base ? base + 1 : oldpath;
+                    size_t nlen = strlen(newpath);
+                    size_t blen = strlen(base);
+                    if (nlen + 1 + blen + 1 <= sizeof(newpath)) {
+                        if (nlen > 0 && newpath[nlen - 1] != '/') {
+                            newpath[nlen] = '/';
+                            newpath[nlen + 1] = '\0';
+                            nlen++;
+                        }
+                        memcpy(newpath + nlen, base, blen + 1);
+                    }
+                }
+            }
+            int r = fs_rename(oldpath, newpath);
+            if (r == 0) return 0;
+            /* Map fs driver internal codes to Linux errno (ramfs uses -1,-2,-3,-5) */
+            if (r == -2) return ret_err(ENOENT);
+            if (r == -3) return ret_err(ENOTDIR);
+            if (r == -5) return ret_err(ENOMEM);
+            if (r == -17) return ret_err(EEXIST);
+            return ret_err(r < 0 ? -r : EIO);
+        }
+        case SYS_umask: {
+            /* umask(mask) - syscall 95; returns previous mask, sets new mask */
+            unsigned int mask = (unsigned int)(a1 & 07777u);
+            unsigned int prev = cur->umask;
+            cur->umask = mask;
+            return (uint64_t)prev;
+        }
         case SYS_mkdir: {
             /* mkdir(path, mode) - syscall 83; init often runs "mkdir -p /dev" before mount */
             const char *path_u = (const char*)(uintptr_t)a1;
@@ -1253,6 +1503,8 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             char path[256];
             resolve_user_path(cur, path_u, path, sizeof(path));
             if (path[0] == '\0') return ret_err(EINVAL);
+            /* root "/" always exists; rpm may do mkdir -p / and fail with EPERM otherwise */
+            if (path[0] == '/' && path[1] == '\0') return 0;
             int r = fs_mkdir(path);
             if (r == 0) {
                 (void)fs_chmod(path, (mode & 07777u) | S_IFDIR);
@@ -1273,6 +1525,16 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             int r = fs_chmod(path, mode);
             if (r == 0) return 0;
             return ret_err(EPERM);
+        }
+        case SYS_chown: {
+            /* chown(path, uid, gid) - syscall 92; rpm may set ownership; stub success */
+            (void)a1; (void)a2; (void)a3;
+            return 0;
+        }
+        case SYS_utimensat: {
+            /* utimensat(dirfd, path, times, flags) - syscall 280; rpm may set mtime; stub success */
+            (void)a1; (void)a2; (void)a3; (void)a4;
+            return 0;
         }
         case SYS_getrandom: {
             void *bufp = (void*)(uintptr_t)a1;
@@ -1545,6 +1807,99 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 return 0;
             }
             return ret_err(ESRCH);
+        }
+        case SYS_select: { /* select(nfds, readfds, writefds, exceptfds, timeout) - minimal stub */
+            int nfds = (int)a1;
+            (void)a2; (void)a3; (void)a4;
+            void *timeout_u = (void*)(uintptr_t)a5;
+            if (nfds < 0) return ret_err(EINVAL);
+            if (timeout_u && (uintptr_t)timeout_u < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                struct timeval_k { int64_t tv_sec; int64_t tv_usec; } tv;
+                if (copy_from_user_raw(&tv, timeout_u, sizeof(tv)) == 0 && (tv.tv_sec > 0 || tv.tv_usec > 0)) {
+                    uint64_t ms = (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)(tv.tv_usec / 1000ULL);
+                    if (ms == 0 && tv.tv_usec > 0) ms = 1;
+                    if (ms > 0) thread_sleep((uint32_t)(ms > 0xFFFFFFFFULL ? 0xFFFFFFFFU : (uint32_t)ms));
+                }
+            }
+            /* No fd readiness; return 0 (timeout / no events) */
+            return 0;
+        }
+        case SYS_nanosleep: { /* nanosleep(req, rem) - Linux 35 */
+            const void *req_u = (const void*)(uintptr_t)a1;
+            void *rem_u = (void*)(uintptr_t)a2;
+            (void)rem_u;
+            if (!req_u) return ret_err(EFAULT);
+            struct timespec_k { int64_t tv_sec; int64_t tv_nsec; } ts;
+            if (copy_from_user_raw(&ts, req_u, sizeof(ts)) != 0) return ret_err(EFAULT);
+            if (ts.tv_sec < 0 || ts.tv_nsec < 0) return ret_err(EINVAL);
+            uint64_t ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
+            if (ms == 0 && ts.tv_nsec > 0) ms = 1;
+            if (ms > 0) thread_sleep((uint32_t)(ms > 0xFFFFFFFFULL ? 0xFFFFFFFFU : (uint32_t)ms));
+            return 0;
+        }
+        case SYS_socket: { /* socket(domain, type, protocol) - no network stack */
+            (void)a1; (void)a2; (void)a3;
+            return ret_err(ENOSYS);
+        }
+        case SYS_sysinfo: { /* sysinfo(struct sysinfo *) - syscall 99; glibc allocatestack needs sane freeram */
+            void *info_u = (void*)(uintptr_t)a1;
+            if (!info_u || (uintptr_t)info_u + 112 > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+            /* Linux struct sysinfo x86_64: uptime(0), loads[3](8), totalram(32), freeram(40), sharedram(48),
+               bufferram(56), totalswap(64), freeswap(72), procs(80), pad(82), totalhigh(84), freehigh(92),
+               mem_unit(100). glibc advise_stack_range: freesize from freeram*mem_unit; must be >= stack size. */
+            uint8_t buf[128];
+            memset(buf, 0, sizeof(buf));
+            int64_t uptime_sec = (int64_t)(pit_get_time_ms() / 1000);
+            memcpy(buf + 0, &uptime_sec, 8);
+            /* loads[3] at 8,16,24 = 0 */
+            uint64_t totalram = 128 * 1024 * 1024;  /* 128MB */
+            uint64_t freeram = 64 * 1024 * 1024;   /* 64MB - enough for stack allocation */
+            memcpy(buf + 32, &totalram, 8);
+            memcpy(buf + 40, &freeram, 8);
+            /* sharedram, bufferram at 48,56 = 0 */
+            /* totalswap, freeswap at 64,72 = 0 */
+            uint16_t procs = (uint16_t)thread_get_count();
+            memcpy(buf + 80, &procs, 2);
+            /* totalhigh, freehigh at 84,92 = 0 */
+            uint32_t mem_unit = 1;
+            memcpy(buf + 100, &mem_unit, 4);
+            if (copy_to_user_safe(info_u, buf, 112) != 0) return ret_err(EFAULT);
+            return 0;
+        }
+        case SYS_getrlimit: { /* getrlimit(resource, rlim) */
+            int resource = (int)a1;
+            void *rlim_u = (void*)(uintptr_t)a2;
+            if (!rlim_u || (uintptr_t)rlim_u + 16 > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+            /* struct rlimit { rlim_t rlim_cur; rlim_t rlim_max; }; rlim_t = 64-bit */
+            uint64_t cur_val = 0xFFFFFFFFFFFFFFFFULL, max_val = 0xFFFFFFFFFFFFFFFFULL;
+            switch (resource) {
+                case 3: /* RLIMIT_STACK */ cur_val = 8 * 1024 * 1024; max_val = cur_val; break;
+                case 4: /* RLIMIT_CORE */ cur_val = 0; max_val = 0xFFFFFFFFFFFFFFFFULL; break;
+                case 6: /* RLIMIT_NPROC */ cur_val = 4096; max_val = 4096; break;
+                case 7: /* RLIMIT_NOFILE */ cur_val = (uint64_t)THREAD_MAX_FD; max_val = cur_val; break;
+                case 9: /* RLIMIT_AS */ cur_val = max_val = 0xFFFFFFFFFFFFFFFFULL; break;
+                default: cur_val = max_val = 0xFFFFFFFFFFFFFFFFULL; break;
+            }
+            if (copy_to_user_safe(rlim_u, &cur_val, sizeof(cur_val)) != 0) return ret_err(EFAULT);
+            if (copy_to_user_safe((char*)rlim_u + 8, &max_val, sizeof(max_val)) != 0) return ret_err(EFAULT);
+            return 0;
+        }
+        case SYS_sched_getaffinity: { /* sched_getaffinity(pid, len, user_mask) */
+            int pid = (int)a1;
+            size_t len = (size_t)a2;
+            void *mask_u = (void*)(uintptr_t)a3;
+            uint64_t self = (uint64_t)(cur->tid ? cur->tid : 1);
+            if (pid != 0 && (uint64_t)pid != self) return ret_err(ESRCH);
+            if (!mask_u || len < 8 || (uintptr_t)mask_u + len > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+            /* Single CPU: set bit 0 */
+            uint64_t mask = 1;
+            size_t copy = len < 8 ? len : 8;
+            if (copy_to_user_safe(mask_u, &mask, copy) != 0) return ret_err(EFAULT);
+            for (size_t i = 8; i < len; i++) {
+                char zero = 0;
+                if (copy_to_user_safe((char*)mask_u + i, &zero, 1) != 0) return ret_err(EFAULT);
+            }
+            return 0;
         }
         case 62: { /* kill(pid, sig) */
             int pid = (int)a1;
@@ -2490,6 +2845,16 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
             struct fs_file *f = cur->fds[fd];
             if (!f) return ret_err(EBADF);
+            if (f->type == FS_TYPE_PIPE && f->fs_private == (void *)1) {
+                pipe_t *p = (pipe_t *)f->driver_private;
+                if (!p) return ret_err(EBADF);
+                size_t copied = 0;
+                void *tmp = copy_from_user_safe(bufp, cnt, PIPE_BUF_SIZE, &copied);
+                if (!tmp) return ret_err(EFAULT);
+                ssize_t wr = pipe_write_bytes(p, tmp, copied, cur);
+                kfree(tmp);
+                return (wr >= 0) ? (uint64_t)wr : ret_err((int)-wr);
+            }
             size_t copied = 0;
             void *tmp = copy_from_user_safe(bufp, cnt, 4096, &copied);
             if (!tmp) return ret_err(EFAULT);
@@ -2549,6 +2914,18 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
             struct fs_file *f = cur->fds[fd];
             if (!f) return ret_err(EBADF);
+            if (f->type == FS_TYPE_PIPE && !f->fs_private) {
+                pipe_t *p = (pipe_t *)f->driver_private;
+                if (!p) return ret_err(EBADF);
+                size_t to_read = cnt < (size_t)PIPE_BUF_SIZE ? cnt : (size_t)PIPE_BUF_SIZE;
+                void *tmp = kmalloc(to_read);
+                if (!tmp) return ret_err(ENOMEM);
+                ssize_t rr = pipe_read_bytes(p, tmp, to_read, cur);
+                if (rr > 0 && (uintptr_t)bufp + (size_t)rr <= (uintptr_t)MMIO_IDENTITY_LIMIT)
+                    memcpy(bufp, tmp, (size_t)rr);
+                kfree(tmp);
+                return (rr >= 0) ? (uint64_t)rr : ret_err((int)-rr);
+            }
             size_t to_read = cnt < 4096 ? cnt : 4096;
             void *tmp = kmalloc(to_read);
             if (!tmp) return ret_err(ENOMEM);
@@ -2879,6 +3256,46 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (fd < 0) { fs_file_free(f); return ret_err(EBADF); }
             return (uint64_t)(unsigned)fd;
         }
+        case SYS_pipe:
+        case SYS_pipe2: {
+            /* pipe(int pipefd[2]); pipe2(int pipefd[2], int flags). flags (e.g. O_CLOEXEC) ignored for now. */
+            void *pipefd_u = (void*)(uintptr_t)a1;
+            (void)a2; /* flags for pipe2 */
+            if (!pipefd_u || (uintptr_t)pipefd_u + 8 > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+            pipe_t *p = (pipe_t *)kmalloc(sizeof(pipe_t));
+            if (!p) return ret_err(ENOMEM);
+            p->buf = (uint8_t *)kmalloc(PIPE_BUF_SIZE);
+            if (!p->buf) { kfree(p); return ret_err(ENOMEM); }
+            p->size = PIPE_BUF_SIZE;
+            p->head = p->tail = 0;
+            p->refcount = 2;
+            p->reader_waiter_tid = p->writer_waiter_tid = -1;
+            p->lock.lock = 0;
+
+            struct fs_file *r = (struct fs_file *)kmalloc(sizeof(struct fs_file));
+            struct fs_file *w = (struct fs_file *)kmalloc(sizeof(struct fs_file));
+            if (!r || !w) { kfree(p->buf); kfree(p); if (r) kfree(r); if (w) kfree(w); return ret_err(ENOMEM); }
+            memset(r, 0, sizeof(*r)); memset(w, 0, sizeof(*w));
+            r->type = w->type = FS_TYPE_PIPE;
+            r->driver_private = w->driver_private = p;
+            r->fs_private = NULL; w->fs_private = (void *)1; /* 0=read end, 1=write end */
+            r->refcount = w->refcount = 1;
+
+            int fd0 = thread_fd_alloc(r);
+            int fd1 = thread_fd_alloc(w);
+            if (fd0 < 0 || fd1 < 0) {
+                if (fd0 >= 0) thread_fd_close(fd0);
+                if (fd1 >= 0) thread_fd_close(fd1);
+                return ret_err(EMFILE);
+            }
+            int fds[2] = { fd0, fd1 };
+            if (copy_to_user_safe(pipefd_u, fds, 8) != 0) {
+                thread_fd_close(fd0);
+                thread_fd_close(fd1);
+                return ret_err(EFAULT);
+            }
+            return 0;
+        }
         case SYS_close: {
             int fd = (int)a1;
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
@@ -3111,7 +3528,8 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 size_t rem = (size_t)rr - in_off;
                 size_t entry_rec = (size_t)de->rec_len;
                 if (entry_rec == 0) break;
-                if (entry_rec > rem) entry_rec = rem;
+                /* Do not parse a partial entry at buffer end — would corrupt next name */
+                if (entry_rec > rem) break;
                 size_t max_name = (entry_rec > 8) ? entry_rec - 8 : 0;
                 size_t name_len_use = (size_t)de->name_len;
                 if (name_len_use > max_name) name_len_use = max_name;
@@ -3168,6 +3586,10 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 out_off += reclen;
                 in_off += entry_rec;
             }
+
+            /* Rewind directory position so next getdents64 re-reads the partial entry */
+            if (in_off < (size_t)rr)
+                f->pos -= (rr - (off_t)in_off);
 
             /* copy synthesized data to user buffer per-record (safer) */
             size_t wrote = 0;
@@ -3299,43 +3721,63 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             return (uint64_t)(*p_cur);
         }
         case SYS_mmap: {
-            /* mmap(addr,len,prot,flags,fd,off) - only anonymous/private supported */
-            (void)a1; /* addr hint ignored */
+            /* mmap(addr,len,prot,flags,fd,off) - anonymous and file-backed MAP_PRIVATE */
+            (void)a1;
             size_t len = (size_t)a2;
             int prot = (int)a3;
             int flags = (int)a4;
             (void)prot;
-            (void)a5; (void)a6;
             if (len == 0) return ret_err(EINVAL);
             len = (size_t)align_up_u((uintptr_t)len, 4096);
             enum { MAP_FIXED = 0x10, MAP_ANONYMOUS = 0x20, MAP_PRIVATE = 0x02,
                    MAP_STACK = 0x20000, MAP_GROWSDOWN = 0x0100, MAP_NORESERVE = 0x4000 };
             if (flags & MAP_FIXED) return ret_err(EINVAL);
-            if (!(flags & MAP_ANONYMOUS) || !(flags & MAP_PRIVATE)) return ret_err(ENOSYS);
-            /* tolerate additional common flags used by bash/glibc */
-            flags &= ~(MAP_ANONYMOUS | MAP_PRIVATE | MAP_STACK | MAP_GROWSDOWN | MAP_NORESERVE);
-            if (flags != 0) return ret_err(ENOSYS);
+            if (!(flags & MAP_PRIVATE)) return ret_err(ENOSYS);
             thread_t *tcur = thread_get_current_user();
             if (!tcur) tcur = thread_current();
             uintptr_t *p_mmap_next = tcur ? &tcur->user_mmap_next : &user_mmap_next;
-            if (*p_mmap_next == 0) *p_mmap_next = 32u * 1024u * 1024u; /* 32MiB */
+            if (*p_mmap_next == 0) *p_mmap_next = 32u * 1024u * 1024u;
             uintptr_t addr = align_up_u(*p_mmap_next, 4096);
-            /* Do not allow mappings to collide with this thread's TLS/stack region. */
             uintptr_t top_limit = (uintptr_t)USER_TLS_BASE;
             if (tcur) {
                 uintptr_t tls_base = user_tls_base_for_tid_local(tcur->tid);
-                if (tls_base > 0x200000 && tls_base < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                if (tls_base > 0x200000 && tls_base < (uintptr_t)MMIO_IDENTITY_LIMIT)
                     top_limit = tls_base;
-                }
             }
             if (addr + len >= top_limit) return ret_err(ENOMEM);
             if (mark_user_identity_range_2m_sys((uint64_t)addr, (uint64_t)(addr + len)) != 0) return ret_err(EFAULT);
-            memset((void*)addr, 0, len);
+
+            if (flags & MAP_ANONYMOUS) {
+                flags &= ~(MAP_ANONYMOUS | MAP_PRIVATE | MAP_STACK | MAP_GROWSDOWN | MAP_NORESERVE);
+                if (flags != 0) return ret_err(ENOSYS);
+                memset((void*)addr, 0, len);
+            } else {
+                /* File-backed MAP_PRIVATE (e.g. BusyBox rpm mmaps .rpm file) */
+                int fd = (int)(int64_t)a5;
+                off_t file_off = (off_t)(int64_t)a6;
+                if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
+                struct fs_file *f = cur->fds[fd];
+                if (!f) return ret_err(EBADF);
+                if (f->type != FS_TYPE_REG) return ret_err(EBADF);
+                memset((void*)addr, 0, len);
+                size_t file_avail = 0;
+                if ((size_t)file_off < f->size) file_avail = f->size - (size_t)file_off;
+                size_t to_read = len < file_avail ? len : file_avail;
+                if (to_read > 0) {
+                    ssize_t nr = fs_read(f, (void*)addr, to_read, (size_t)file_off);
+                    (void)nr; /* partial read leaves rest zeroed */
+                }
+            }
             *p_mmap_next = addr + len;
             return (uint64_t)addr;
         }
         case SYS_munmap:
             return 0;
+        case SYS_madvise: {
+            /* madvise(addr, length, advice) - syscall 28; glibc/apm uses MADV_DONTNEED etc.; stub success */
+            (void)a1; (void)a2; (void)a3;
+            return 0;
+        }
         case SYS_mprotect:
             return 0;
         case SYS_exit: {
@@ -3367,6 +3809,16 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 /* wake arbitrary waiter if present */
                 if (cur->waiter_tid >= 0) {
                     thread_unblock(cur->waiter_tid);
+                }
+                /* glibc pthread_join waits on clear_child_tid; write 0 and FUTEX_WAKE so parent wakes */
+                if (cur->clear_child_tid != 0 && cur->clear_child_tid < (uint64_t)MMIO_IDENTITY_LIMIT - 4) {
+                    uint32_t zero = 0;
+                    copy_to_user_safe((void*)(uintptr_t)cur->clear_child_tid, &zero, 4);
+                    {
+                        extern int futex_syscall(uintptr_t uaddr, int op, int val, const void *timeout, uintptr_t uaddr2, int val3);
+                        futex_syscall((uintptr_t)cur->clear_child_tid, 1 | 128, 1, NULL, 0, 0);
+                    }
+                    cur->clear_child_tid = 0;
                 }
             }
             /* mark terminated */
@@ -3410,6 +3862,13 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                         (unsigned long long)(cur->tid ? cur->tid : 1), cur->vfork_parent_tid);
                 }
                 if (cur->waiter_tid >= 0) thread_unblock(cur->waiter_tid);
+                if (cur->clear_child_tid != 0 && cur->clear_child_tid < (uint64_t)MMIO_IDENTITY_LIMIT - 4) {
+                    uint32_t zero = 0;
+                    copy_to_user_safe((void*)(uintptr_t)cur->clear_child_tid, &zero, 4);
+                    { extern int futex_syscall(uintptr_t uaddr, int op, int val, const void *timeout, uintptr_t uaddr2, int val3);
+                      futex_syscall((uintptr_t)cur->clear_child_tid, 1 | 128, 1, NULL, 0, 0); }
+                    cur->clear_child_tid = 0;
+                }
                 cur->state = THREAD_TERMINATED;
             }
             thread_t *kcur = thread_current();

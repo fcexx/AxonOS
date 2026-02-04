@@ -224,8 +224,15 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         if (current) {
                 t->euid = current->euid;
                 t->egid = current->egid;
-                /* copy fd table */
-                for (int i = 0; i < THREAD_MAX_FD; i++) t->fds[i] = current->fds[i];
+                t->umask = current->umask;
+                /* copy fd table and bump refcount so close in parent doesn't free shared files (e.g. pipe) */
+                for (int i = 0; i < THREAD_MAX_FD; i++) {
+                    t->fds[i] = current->fds[i];
+                    if (t->fds[i]) {
+                        if (t->fds[i]->refcount <= 0) t->fds[i]->refcount = 1;
+                        else t->fds[i]->refcount++;
+                    }
+                }
                 t->attached_tty = current->attached_tty >= 0 ? current->attached_tty : devfs_get_active();
                 strncpy(t->cwd, current->cwd[0] ? current->cwd : "/", sizeof(t->cwd));
                 t->cwd[sizeof(t->cwd) - 1] = '\0';
@@ -565,6 +572,21 @@ void thread_unblock(int pid) {
                         threads[i]->state = THREAD_READY;
                         threads[i]->sleep_until = 0;
                         return;
+                }
+        }
+}
+
+/* SIGINT (Ctrl+C): terminate all threads in the foreground process group. */
+void thread_send_sigint_to_pgrp(int pgrp) {
+        if (pgrp < 0) return;
+        for (int i = 0; i < thread_count; ++i) {
+                thread_t *t = threads[i];
+                if (!t) continue;
+                if (t->pgid != pgrp) continue;
+                if (t->state != THREAD_TERMINATED) {
+                        t->exit_status = (130 & 0xFF) << 8; /* 128 + 2 (SIGINT) */
+                        t->state = THREAD_TERMINATED;
+                        if (t->waiter_tid >= 0) thread_unblock(t->waiter_tid);
                 }
         }
 }

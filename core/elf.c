@@ -13,6 +13,7 @@
 #include <heap.h>
 #include <mmio.h>
 #include <thread.h>
+#include <devfs.h>
 #include <gdt.h>
 #include <paging.h>
 #include <elf.h>
@@ -908,6 +909,10 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         /* update display name */
         strncpy(cur_user->name, path, sizeof(cur_user->name) - 1);
         cur_user->name[sizeof(cur_user->name) - 1] = '\0';
+        /* Set foreground so Ctrl+C terminates this process when waiting */
+        if (cur_user->attached_tty >= 0) {
+            devfs_set_tty_fg_pgrp(cur_user->attached_tty, cur_user->pgid >= 0 ? cur_user->pgid : (int)cur_user->tid);
+        }
         /* ensure TSS RSP0 points to this thread's kernel stack */
         if (cur_user->kernel_stack) {
             tss_set_rsp0(cur_user->kernel_stack);
@@ -929,6 +934,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         if (caller) {
             ut->euid = caller->euid;
             ut->egid = caller->egid;
+            ut->umask = caller->umask;
             ut->attached_tty = caller->attached_tty;
             strncpy(ut->cwd, caller->cwd[0] ? caller->cwd : "/", sizeof(ut->cwd));
             ut->cwd[sizeof(ut->cwd) - 1] = '\0';
@@ -942,6 +948,10 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
             /* block caller until user program exits */
             ut->waiter_tid = (int)caller->tid;
             caller->state = THREAD_BLOCKED;
+        }
+        /* Set foreground process group so Ctrl+C terminates this program when waiting */
+        if (ut->attached_tty >= 0) {
+            devfs_set_tty_fg_pgrp(ut->attached_tty, ut->pgid >= 0 ? ut->pgid : (int)ut->tid);
         }
         /* Now make the new user thread runnable. */
         thread_unblock((int)ut->tid);

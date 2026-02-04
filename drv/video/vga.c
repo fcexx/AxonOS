@@ -50,6 +50,16 @@ void vga_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
 	vga_lock_release();
 }
 
+uint8_t vga_get_cell_attr(uint32_t x, uint32_t y) {
+	if (vbe_is_available()) return GRAY_ON_BLACK;
+	if (x >= MAX_COLS || y >= MAX_ROWS) return GRAY_ON_BLACK;
+	uint16_t off = (uint16_t)((y * MAX_COLS + x) * 2 + 1);
+	vga_lock_acquire();
+	uint8_t attr = ((uint8_t *)VIDEO_ADDRESS)[off];
+	vga_lock_release();
+	return attr;
+}
+
 void vga_clear_line_segment(uint32_t x0, uint32_t x1, uint32_t y, uint8_t attr) {
 	if (y >= MAX_ROWS) return;
 	if (x0 > x1) return;
@@ -194,10 +204,16 @@ void kputchar(uint8_t character, uint8_t attribute_byte)
 	}
 	else if (character == '\b')
 	{
-		/* Move left by one cell and clear it */
-		if (offset >= 2) {
+		/* Move left one cell, clear it; do not wrap from column 0 to previous line.
+		 * Use the cell's current attribute so the erased cell doesn't change color (TTY). */
+		uint16_t col = (uint16_t)((offset / 2) % MAX_COLS);
+		if (col > 0) {
 			offset -= 2;
-			write_nolock(' ', attribute_byte, offset);
+			{
+				uint8_t *vga = (uint8_t *)VIDEO_ADDRESS;
+				uint8_t attr = vga[offset + 1]; /* preserve existing cell attribute */
+				write_nolock(' ', attr, offset);
+			}
 			set_cursor_nolock(offset);
 		}
 	}
@@ -632,13 +648,13 @@ PRINT_NUMBER_BASE10:
 }
 
 void vga_set_cursor(uint32_t x, uint32_t y) {
-	if (vbe_is_available()) { vbefb_set_cursor(x,y); return; }
+	vbefb_set_cursor(x,y);
 	set_cursor_x(x);
 	set_cursor_y(y);
 }
 
 void vga_get_cursor(uint32_t* x, uint32_t* y) {
-	if (vbe_is_available()) { vbefb_get_cursor(x,y); return; }
+	vbefb_get_cursor(x,y);
 	uint16_t pos = get_cursor();
 	if (x) *x = (pos % (MAX_COLS * 2)) / 2;
 	if (y) *y = pos / (MAX_COLS * 2);

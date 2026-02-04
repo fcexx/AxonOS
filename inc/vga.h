@@ -44,6 +44,8 @@ int sprintf(char* out, const char* fmt, ...);
 
 /* Fast direct VGA helpers (write directly to video memory) */
 void vga_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr);
+/* Return attribute byte at cell (x,y); only valid when VGA, not VBE. */
+uint8_t vga_get_cell_attr(uint32_t x, uint32_t y);
 /* Clear segment [x0..x1] on line y with spaces; does not move cursor. */
 void vga_clear_line_segment(uint32_t x0, uint32_t x1, uint32_t y, uint8_t attr);
 void vga_clear_screen_attr(uint8_t attr);

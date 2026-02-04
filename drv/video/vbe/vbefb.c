@@ -111,25 +111,28 @@ void vbefb_putchar(uint8_t ch, uint8_t attr) {
 		// sequence ends with 'm'
 		if (ch == 'm') {
 			esc_buf[esc_len] = '\0';
-			// expect leading '[' possibly present
+			/* Parse CSI SGR: ESC [ ... m — same semantics as VGA console */
 			char *s = esc_buf;
 			if (*s == '[') s++;
-			int last = 0;
-			int bright = 0;
 			uint8_t fg = current_attr & 0x0F;
 			uint8_t bg = (current_attr >> 4) & 0x0F;
-			while (*s) {
+			while (*s && *s != 'm') {
 				int val = 0;
-				int neg = 0;
 				if (*s == ';') { s++; continue; }
 				while (*s >= '0' && *s <= '9') { val = val * 10 + (*s - '0'); s++; }
-				if (val == 0) { fg = 7; bg = 0; bright = 0; }
-				else if (val == 1) { bright = 1; }
-				else if (val >= 30 && val <= 37) { fg = (uint8_t)(val - 30); }
-				else if (val >= 40 && val <= 47) { bg = (uint8_t)(val - 40); }
+				if (val == 0) { fg = 7; bg = 0; }
+				else if (val == 1) { fg |= 0x08; } /* bold -> bright fg */
+				else if (val >= 30 && val <= 37) {
+					fg = (uint8_t)((fg & 0x08) | (val - 30));
+				} else if (val >= 40 && val <= 47) {
+					bg = (uint8_t)(val - 40);
+				} else if (val >= 90 && val <= 97) {
+					fg = (uint8_t)(val - 90 + 8); /* bright fg */
+				} else if (val >= 100 && val <= 107) {
+					bg = (uint8_t)(val - 100 + 8); /* bright bg */
+				}
 				if (*s == ';') s++;
 			}
-			if (bright) fg |= 0x08;
 			current_attr = (uint8_t)((bg << 4) | (fg & 0x0F));
 			esc_mode = 0;
 			esc_len = 0;

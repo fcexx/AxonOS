@@ -37,6 +37,8 @@ typedef struct thread {
         /* POSIX credentials */
         uid_t euid;
         gid_t egid;
+        /* file mode creation mask (umask) for mkdir/open */
+        unsigned int umask;
         /* attached tty index or -1 */
         int attached_tty;
         /* vfork parent PID: if >=0 then this thread was created by vfork and parent is blocked;
@@ -114,6 +116,8 @@ void thread_block(int pid);
 /* Block until unblock OR timeout_ms expires. block_until stored in sleep_until. */
 void thread_block_with_timeout(int pid, uint32_t timeout_ms);
 void thread_unblock(int pid);
+/* Send SIGINT to foreground process group (Ctrl+C → terminate blocking program) */
+void thread_send_sigint_to_pgrp(int pgrp);
 int thread_get_state(int pid);
 int thread_get_count();
 void thread_sleep(uint32_t ms);

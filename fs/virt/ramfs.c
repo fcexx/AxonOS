@@ -468,7 +468,34 @@ static ssize_t ramfs_read(struct fs_file *file, void *buf, size_t size, size_t o
         size_t written = 0;
         struct ext2_dir_entry de;
         uint8_t *out = (uint8_t*)buf;
+        /* When listing root, always emit "dev" first so ls / always shows /dev (mount point). */
+        if (n == ramfs_root) {
+            const char *dev_name = "dev";
+            size_t namelen = 3;
+            size_t rec_len = (size_t)(8 + namelen);
+            rec_len = (rec_len + 3) & ~3u;
+            if (rec_len < sizeof(struct ext2_dir_entry)) rec_len = sizeof(struct ext2_dir_entry);
+            if (pos + rec_len > (size_t)offset && written < size) {
+                uint8_t tmp[64];
+                for (size_t zi = 0; zi < sizeof(tmp); zi++) tmp[zi] = 0;
+                de.inode = 1;
+                de.rec_len = (uint16_t)rec_len;
+                de.name_len = (uint8_t)namelen;
+                de.file_type = EXT2_FT_DIR;
+                memcpy(tmp, &de, 8);
+                memcpy(tmp + 8, dev_name, namelen);
+                size_t entry_off = ((size_t)offset > pos) ? (size_t)offset - pos : 0;
+                size_t avail = size - written;
+                size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
+                if (tocopy > avail) tocopy = avail;
+                memcpy(out + written, tmp + entry_off, tocopy);
+                written += tocopy;
+            }
+            pos += rec_len;
+        }
         for (struct ramfs_node *c = n->children; c; c = c->next) {
+            /* When listing root, skip "dev" here so we don't duplicate (already emitted above) */
+            if (n == ramfs_root && c->name && strcmp(c->name, "dev") == 0) continue;
             struct ramfs_node *r = ramfs_resolve_link(c);
             size_t namelen = strlen(c->name);
             /* record length: header (8) + name, padded to 4 bytes for compatibility */
@@ -614,6 +641,61 @@ int ramfs_mkdir(const char *path) {
     return 0;
 }
 
+/* Unlink node from its parent's children list without freeing the node. */
+static void ramfs_unlink_from_parent(struct ramfs_node *n) {
+    if (!n || !n->parent) return;
+    struct ramfs_node **pp = &n->parent->children;
+    while (*pp) {
+        if (*pp == n) { *pp = n->next; n->next = NULL; break; }
+        pp = &(*pp)->next;
+    }
+}
+
+/* rename(oldpath, newpath) - move/overwrite. Same fs only. */
+int ramfs_rename(const char *oldpath, const char *newpath) {
+    if (!oldpath || oldpath[0] != '/' || !newpath || newpath[0] != '/') return -1;
+    if (strcmp(oldpath, newpath) == 0) return 0;
+    struct ramfs_node *old_node = ramfs_lookup(oldpath);
+    if (!old_node) return -2; /* ENOENT */
+    if (old_node->link_target) old_node = old_node->link_target; /* resolve symlink target for move */
+
+    /* parse newpath into parent + basename */
+    size_t new_len = strlen(newpath);
+    char *tmp = (char *)kmalloc(new_len + 1);
+    if (!tmp) return -5;
+    memcpy(tmp, newpath, new_len + 1);
+    char *slash = strrchr(tmp, '/');
+    const char *new_parent_path = NULL;
+    char *new_name = NULL;
+    if (slash == tmp) { new_parent_path = "/"; new_name = slash + 1; }
+    else if (slash) { *slash = '\0'; new_parent_path = tmp; new_name = slash + 1; }
+    else { kfree(tmp); return -3; }
+    if (!new_name || !new_name[0]) { kfree(tmp); return -3; }
+
+    struct ramfs_node *new_parent = ramfs_lookup(new_parent_path);
+    if (!new_parent) { kfree(tmp); return -2; }
+    if (!new_parent->is_dir) { kfree(tmp); return -3; }
+
+    struct ramfs_node *existing = ramfs_find_child(new_parent, new_name);
+    if (existing && existing != old_node) {
+        /* overwrite: remove existing (root only in ramfs_remove) */
+        int rr = ramfs_remove(newpath);
+        if (rr != 0) { kfree(tmp); return rr; }
+    }
+
+    ramfs_unlink_from_parent(old_node);
+    if (old_node->name) kfree(old_node->name);
+    size_t nlen = strlen(new_name) + 1;
+    old_node->name = (char *)kmalloc(nlen);
+    if (!old_node->name) { kfree(tmp); return -5; }
+    memcpy(old_node->name, new_name, nlen);
+    old_node->parent = new_parent;
+    old_node->next = new_parent->children;
+    new_parent->children = old_node;
+    kfree(tmp);
+    return 0;
+}
+
 int ramfs_remove(const char *path) {
     if (!path) return -1;
     if (strcmp(path, "/") == 0) return -2;
@@ -624,12 +706,7 @@ int ramfs_remove(const char *path) {
     if (!n) return -3;
     struct ramfs_node *p = n->parent;
     if (!p) return -4;
-    /* unlink from parent's children */
-    struct ramfs_node **pp = &p->children;
-    while (*pp) {
-        if (*pp == n) { *pp = n->next; break; }
-        pp = &(*pp)->next;
-    }
+    ramfs_unlink_from_parent(n);
     /* free recursively */
     /* simple recursive free */
     struct ramfs_node *stack[64]; int sp = 0;
@@ -663,6 +740,7 @@ int ramfs_register(void) {
     ramfs_ops.mkdir = ramfs_mkdir;
     ramfs_ops.chmod = ramfs_chmod;
     ramfs_ops.link = ramfs_link;
+    ramfs_ops.rename = ramfs_rename;
     ramfs_ops.release = ramfs_release;
 
     return fs_register_driver(&ramfs_driver);

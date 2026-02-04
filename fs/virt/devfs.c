@@ -3,6 +3,7 @@
 #include <fs.h>
 #include <ramfs.h>
 #include <vga.h>
+#include <vbe.h>
 #include <keyboard.h>
 #include <thread.h>
 #include <string.h>
@@ -980,7 +981,7 @@ int devfs_register(void) {
 int devfs_mount(const char *path) {
     if (!path) return -1;
     /* Ensure mount point exists in ramfs so ls / shows "dev" */
-    (void)ramfs_mkdir(path);
+    (void)fs_mkdir(path);
     return fs_mount(path, &devfs_driver);
 }
 
@@ -1031,10 +1032,22 @@ static int devfs_tty_try_erase(struct devfs_tty *t, int tty) {
     /* Remove last buffered character. */
     t->in_tail = last_idx;
     t->in_count--;
-    /* Echo erase sequence if enabled and active tty. */
+    /* Echo erase: move cursor left and clear cell. VGA: do it directly so cursor always moves. */
     if ((t->term_lflag & 0x00000008u) /* ECHO */ && tty == devfs_get_active()) {
-        /* Single backspace is enough; VGA/VBE handlers clear the cell. */
-        kputchar('\b', t->current_attr);
+        if (!vbe_is_available()) {
+            uint32_t cx = 0, cy = 0;
+            vga_get_cursor(&cx, &cy);
+            if (cx > 0) {
+                uint8_t attr = vga_get_cell_attr(cx - 1, cy);
+                vga_putch_xy(cx - 1, cy, ' ', attr);
+                vga_set_cursor(cx - 2, cy);
+                t->cursor_x = cx - 2;
+                t->cursor_y = cy;
+            }
+        } else {
+            kputchar('\b', t->current_attr);
+            vga_get_cursor(&t->cursor_x, &t->cursor_y);
+        }
     }
     return 1;
 }
@@ -1045,10 +1058,9 @@ void devfs_tty_push_input(int tty, char c) {
     struct devfs_tty *t = &dev_ttys[tty];
     unsigned long flags = 0;
     acquire_irqsave(&t->in_lock, &flags);
-    /* Handle backspace locally in canonical mode. */
+    /* Canonical mode: handle backspace in TTY (for busybox sh) */
     if ((t->term_lflag & 0x00000002u) /* ICANON */ && (c == '\b' || (unsigned char)c == 0x7F)) {
         (void)devfs_tty_try_erase(t, tty);
-        /* wake waiters and return */
         for (int i = 0; i < t->waiters_count; i++) {
             int tid = t->waiters[i];
             if (tid >= 0) thread_unblock(tid);
@@ -1085,10 +1097,9 @@ void devfs_tty_push_input_noblock(int tty, char c) {
         t->waiters_count = 0;
         return;
     }
-    /* Handle backspace locally in canonical mode. */
+    /* Canonical mode: handle backspace in TTY (for busybox sh etc. that read via read()) */
     if ((t->term_lflag & 0x00000002u) /* ICANON */ && (c == '\b' || (unsigned char)c == 0x7F)) {
         (void)devfs_tty_try_erase(t, tty);
-        /* wake waiters (don't unblock in ISR) */
         for (int i = 0; i < t->waiters_count; i++) {
             int tid = t->waiters[i];
             if (tid >= 0) thread_unblock(tid);
@@ -1096,6 +1107,10 @@ void devfs_tty_push_input_noblock(int tty, char c) {
         t->waiters_count = 0;
         release(&t->in_lock);
         return;
+    }
+    /* Ctrl+C (0x03): send SIGINT to foreground process group to terminate blocking program */
+    if ((unsigned char)c == 0x03 && t->fg_pgrp >= 0) {
+        thread_send_sigint_to_pgrp(t->fg_pgrp);
     }
     if (t->in_count < (int)sizeof(t->inbuf)) {
         t->inbuf[t->in_tail] = c;
@@ -1130,6 +1145,8 @@ void devfs_tty_push_input_noblock(int tty, char c) {
                     else if (u == 'B' && cy + 1 < (uint32_t)MAX_ROWS) cy++;
                     else if (u == 'C' && cx + 1 < (uint32_t)MAX_COLS) cx++;
                     else if (u == 'D' && cx > 0) cx--;
+                    t->cursor_x = cx;
+                    t->cursor_y = cy;
                     vga_set_cursor(cx, cy);
                 }
             } else {
@@ -1146,6 +1163,7 @@ void devfs_tty_push_input_noblock(int tty, char c) {
             } else if (c == '\n' || c == '\r') {
                 kputchar(u, t->current_attr);
             }
+            vga_get_cursor(&t->cursor_x, &t->cursor_y);
         }
     }
     release(&t->in_lock);
