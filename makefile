@@ -77,7 +77,7 @@ iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg
 		@echo "grub-mkrescue failed: try installing grub-pc-bin or xorriso" >&2; exit 1; \
 	}
 
-run: iso
+run: archive iso
 	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 700M -serial stdio -boot d -hda ../disk.img
 
 debug: iso
@@ -86,6 +86,10 @@ debug: iso
 disk:
 	@dd if=/dev/zero of=../disk.img bs=1M count=10
 	@mkfs.fat -F 32 ../disk.img
+
+archive:
+	wget -P build apm.axont.ru/Packages/initfs.tar.xz
+	tar -xf build/initfs.tar.xz -C iso/boot/
 
 clean:
 	@rm -rf $(BUILD_DIR)
