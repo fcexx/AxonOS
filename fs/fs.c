@@ -25,18 +25,20 @@ static struct mount_entry g_mounts[MAX_FS_MOUNTS];
 static int g_mount_count = 0;
 
 static struct fs_driver *fs_match_mount(const char *path) {
+    if (!path) return NULL;
+    size_t path_len = strlen(path);
     struct fs_driver *best = NULL;
     size_t best_len = 0;
     for (int i = 0; i < g_mount_count; i++) {
         struct mount_entry *m = &g_mounts[i];
         if (!m->driver) continue;
-        if (strncmp(path, m->path, m->path_len) == 0) {
-            if (path[m->path_len] == '\0' || path[m->path_len] == '/') {
-                if (m->path_len > best_len) {
-                    best = m->driver;
-                    best_len = m->path_len;
-                }
-            }
+        /* path must be at least as long as mount path so path[m->path_len] is valid */
+        if (path_len < m->path_len) continue;
+        if (strncmp(path, m->path, m->path_len) != 0) continue;
+        if (path[m->path_len] != '\0' && path[m->path_len] != '/') continue;
+        if (m->path_len > best_len) {
+            best = m->driver;
+            best_len = m->path_len;
         }
     }
     return best;
@@ -74,18 +76,18 @@ int fs_get_mount_path(const struct fs_driver *drv, char *out, size_t outlen) {
    Writes prefix into out (null-terminated). Returns 0 on success, -1 if none. */
 int fs_get_matching_mount_prefix(const char *path, char *out, size_t outlen) {
     if (!path || !out || outlen == 0) return -1;
+    size_t path_len = strlen(path);
     size_t best_len = 0;
     const char *best = NULL;
     for (int i = 0; i < g_mount_count; i++) {
         struct mount_entry *m = &g_mounts[i];
         if (!m->driver) continue;
-        if (strncmp(path, m->path, m->path_len) == 0) {
-            if (path[m->path_len] == '\0' || path[m->path_len] == '/') {
-                if (m->path_len > best_len) {
-                    best_len = m->path_len;
-                    best = m->path;
-                }
-            }
+        if (path_len < m->path_len) continue;
+        if (strncmp(path, m->path, m->path_len) != 0) continue;
+        if (path[m->path_len] != '\0' && path[m->path_len] != '/') continue;
+        if (m->path_len > best_len) {
+            best_len = m->path_len;
+            best = m->path;
         }
     }
     if (!best) return -1;
@@ -181,6 +183,16 @@ static struct fs_file *fs_open_no_resolve(const char *path) {
         struct fs_file *file = NULL;
         int r = drv->ops->open(path, &file);
         if (r == 0 && file) {
+            /* Path might be a mount point (e.g. /dev): use mounted fs so ls /dev sees devfs list, not ramfs */
+            struct fs_driver *m = fs_match_mount(path);
+            if (m && m->ops && m->ops->open) {
+                struct fs_file *mount_file = NULL;
+                if (m->ops->open(path, &mount_file) == 0 && mount_file) {
+                    if (!mount_file->fs_private) mount_file->fs_private = (void*)m;
+                    fs_file_free(file);
+                    return mount_file;
+                }
+            }
             if (!file->fs_private) file->fs_private = (void*)drv;
             return file;
         }

@@ -980,8 +980,6 @@ int devfs_register(void) {
 
 int devfs_mount(const char *path) {
     if (!path) return -1;
-    /* Ensure mount point exists in ramfs so ls / shows "dev" */
-    (void)fs_mkdir(path);
     return fs_mount(path, &devfs_driver);
 }
 
@@ -1090,6 +1088,15 @@ void devfs_tty_push_input_noblock(int tty, char c) {
     if (tty < 0 || tty >= DEVFS_TTY_COUNT) return;
     struct devfs_tty *t = &dev_ttys[tty];
     if (!try_acquire(&t->in_lock)) {
+        /* Ctrl+C: still send SIGINT so foreground process terminates even if lock busy */
+        if ((unsigned char)c == 0x03) {
+            int pgrp = devfs_tty_get_fg_pgrp(tty);
+            if (pgrp >= 0) {
+                thread_send_sigint_to_pgrp(pgrp);
+                thread_schedule();
+            }
+            return;
+        }
         for (int i = 0; i < t->waiters_count; i++) {
             int tid = t->waiters[i];
             if (tid >= 0) thread_unblock(tid);
@@ -1108,9 +1115,29 @@ void devfs_tty_push_input_noblock(int tty, char c) {
         release(&t->in_lock);
         return;
     }
-    /* Ctrl+C (0x03): send SIGINT to foreground process group to terminate blocking program */
-    if ((unsigned char)c == 0x03 && t->fg_pgrp >= 0) {
-        thread_send_sigint_to_pgrp(t->fg_pgrp);
+    /* Ctrl+C (0x03): terminate whoever is reading from this TTY (foreground) and wake their parent (shell in wait4) */
+    if ((unsigned char)c == 0x03) {
+        /* Kill all threads blocked in read() on this TTY and unblock their waiter (e.g. shell in wait4) */
+        for (int i = 0; i < t->waiters_count; i++) {
+            int tid = t->waiters[i];
+            if (tid < 0) continue;
+            thread_t *th = thread_get(tid);
+            if (!th || th->state == THREAD_TERMINATED) continue;
+            th->exit_status = (130 & 0xFF) << 8; /* 128 + SIGINT */
+            th->state = THREAD_TERMINATED;
+            if (th->waiter_tid >= 0) thread_unblock(th->waiter_tid);
+        }
+        t->waiters_count = 0;
+        /* Also send SIGINT by pgrp in case fg_pgrp was set (covers any other threads in the group) */
+        if (t->fg_pgrp >= 0) thread_send_sigint_to_pgrp(t->fg_pgrp);
+        if (tty == devfs_get_active() && (t->term_lflag & 0x00000008u)) {
+            kputchar('^', t->current_attr);
+            kputchar('C', t->current_attr);
+            kputchar('\n', t->current_attr);
+        }
+        release(&t->in_lock);
+        thread_schedule();
+        return;
     }
     if (t->in_count < (int)sizeof(t->inbuf)) {
         t->inbuf[t->in_tail] = c;

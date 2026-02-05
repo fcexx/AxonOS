@@ -3,6 +3,7 @@
 
 build/*.o
 build/*.asm.o
+build/*
 iso/boot/axonos.elf
 *.iso
 *.elf

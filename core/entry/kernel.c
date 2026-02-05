@@ -315,8 +315,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     if (r == 0) klogprintf("initfs: unpacked successfully\n");
     else klogprintf("initfs: error: failed, code: %d\n", r);
 
-    ramfs_mkdir("/dev");
-
     /* register devfs and mount at /dev so /dev/tty0, /dev/console etc. exist before init/getty */
     if (devfs_register() == 0) {
         klogprintf("devfs: registering devfs\n");
@@ -348,11 +346,12 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         klogprintf("devfs: failed to register\n");
     }
 
-    /* procfs mounted by userspace via SYS_mount */
-
     ps2_keyboard_init();
     rtc_init();
-    if (vbe_is_available()) kprintf("VBE is avaliable!1!\n");
+    
+    ramfs_mkdir("/dev");
+
+
     // Prefer linuxrc/init if present; fallback to kernel shell.
     if (boot_try_run_init() != 0) {
         kprintf("fatal: nothing to run.");

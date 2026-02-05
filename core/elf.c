@@ -909,9 +909,11 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         /* update display name */
         strncpy(cur_user->name, path, sizeof(cur_user->name) - 1);
         cur_user->name[sizeof(cur_user->name) - 1] = '\0';
+        /* New program runs in its own process group so Ctrl+C (SIGINT) only kills it, not the shell */
+        cur_user->pgid = (int)(cur_user->tid ? cur_user->tid : 1);
         /* Set foreground so Ctrl+C terminates this process when waiting */
         if (cur_user->attached_tty >= 0) {
-            devfs_set_tty_fg_pgrp(cur_user->attached_tty, cur_user->pgid >= 0 ? cur_user->pgid : (int)cur_user->tid);
+            devfs_set_tty_fg_pgrp(cur_user->attached_tty, cur_user->pgid);
         }
         /* ensure TSS RSP0 points to this thread's kernel stack */
         if (cur_user->kernel_stack) {
@@ -949,9 +951,10 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
             ut->waiter_tid = (int)caller->tid;
             caller->state = THREAD_BLOCKED;
         }
-        /* Set foreground process group so Ctrl+C terminates this program when waiting */
+        /* New program in its own process group so Ctrl+C only kills it */
+        ut->pgid = (int)(ut->tid ? ut->tid : 1);
         if (ut->attached_tty >= 0) {
-            devfs_set_tty_fg_pgrp(ut->attached_tty, ut->pgid >= 0 ? ut->pgid : (int)ut->tid);
+            devfs_set_tty_fg_pgrp(ut->attached_tty, ut->pgid);
         }
         /* Now make the new user thread runnable. */
         thread_unblock((int)ut->tid);

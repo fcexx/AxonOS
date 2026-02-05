@@ -468,7 +468,35 @@ static ssize_t ramfs_read(struct fs_file *file, void *buf, size_t size, size_t o
         size_t written = 0;
         struct ext2_dir_entry de;
         uint8_t *out = (uint8_t*)buf;
-        /* When listing root, always emit "dev" first so ls / always shows /dev (mount point). */
+        /* Emit "." and ".." first for POSIX/readdir compatibility (ls and getdents expect them) */
+        {
+            static const char *const dot_entries[] = { ".", ".." };
+            for (int di = 0; di < 2; di++) {
+                const char *nm = dot_entries[di];
+                size_t namelen = strlen(nm);
+                size_t rec_len = (size_t)(8 + namelen);
+                rec_len = (rec_len + 3) & ~3u;
+                if (rec_len < sizeof(struct ext2_dir_entry)) rec_len = sizeof(struct ext2_dir_entry);
+                if (pos + rec_len <= (size_t)offset) { pos += rec_len; continue; }
+                if (written >= size) break;
+                uint8_t tmp[64];
+                for (size_t zi = 0; zi < sizeof(tmp); zi++) tmp[zi] = 0;
+                de.inode = 1;
+                de.rec_len = (uint16_t)rec_len;
+                de.name_len = (uint8_t)namelen;
+                de.file_type = EXT2_FT_DIR;
+                memcpy(tmp, &de, 8);
+                memcpy(tmp + 8, nm, namelen);
+                size_t entry_off = ((size_t)offset > pos) ? (size_t)offset - pos : 0;
+                size_t avail = size - written;
+                size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
+                if (tocopy > avail) tocopy = avail;
+                memcpy(out + written, tmp + entry_off, tocopy);
+                written += tocopy;
+                pos += rec_len;
+            }
+        }
+        /* When listing root, always emit "dev" so ls / shows /dev (mount point). */
         if (n == ramfs_root) {
             const char *dev_name = "dev";
             size_t namelen = 3;

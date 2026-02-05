@@ -78,7 +78,7 @@ iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg
 	}
 
 run: iso
-	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 700M -serial stdio -boot d -hda ../disk.img
+	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 700M -serial stdio -boot d -hda ../disk.img -device rtl8139,netdev=net0 -netdev user,id=net0
 
 debug: iso
 	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 512M -serial stdio -hda ../disk.img -boot d -s -S & gdb -ex "target remote localhost:1234" $(KERNEL_ELF)
