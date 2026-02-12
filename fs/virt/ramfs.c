@@ -496,34 +496,7 @@ static ssize_t ramfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                 pos += rec_len;
             }
         }
-        /* When listing root, always emit "dev" so ls / shows /dev (mount point). */
-        if (n == ramfs_root) {
-            const char *dev_name = "dev";
-            size_t namelen = 3;
-            size_t rec_len = (size_t)(8 + namelen);
-            rec_len = (rec_len + 3) & ~3u;
-            if (rec_len < sizeof(struct ext2_dir_entry)) rec_len = sizeof(struct ext2_dir_entry);
-            if (pos + rec_len > (size_t)offset && written < size) {
-                uint8_t tmp[64];
-                for (size_t zi = 0; zi < sizeof(tmp); zi++) tmp[zi] = 0;
-                de.inode = 1;
-                de.rec_len = (uint16_t)rec_len;
-                de.name_len = (uint8_t)namelen;
-                de.file_type = EXT2_FT_DIR;
-                memcpy(tmp, &de, 8);
-                memcpy(tmp + 8, dev_name, namelen);
-                size_t entry_off = ((size_t)offset > pos) ? (size_t)offset - pos : 0;
-                size_t avail = size - written;
-                size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
-                if (tocopy > avail) tocopy = avail;
-                memcpy(out + written, tmp + entry_off, tocopy);
-                written += tocopy;
-            }
-            pos += rec_len;
-        }
         for (struct ramfs_node *c = n->children; c; c = c->next) {
-            /* When listing root, skip "dev" here so we don't duplicate (already emitted above) */
-            if (n == ramfs_root && c->name && strcmp(c->name, "dev") == 0) continue;
             struct ramfs_node *r = ramfs_resolve_link(c);
             size_t namelen = strlen(c->name);
             /* record length: header (8) + name, padded to 4 bytes for compatibility */
@@ -549,6 +522,46 @@ static ssize_t ramfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             memcpy(out + written, tmp + entry_off, tocopy);
             written += tocopy;
             pos += rec_len;
+        }
+
+        /* Also expose direct child mountpoints (e.g. "/dev" under "/") even when
+           there is no ramfs node for them. This fixes cases where mountpoints
+           are accessible via path lookup but invisible via `ls`/getdents. */
+        if (file->path && file->path[0] == '/') {
+            char mnames[8][64];
+            int mc = fs_get_mount_children(file->path, mnames, 8);
+            for (int mi = 0; mi < mc; mi++) {
+                const char *nm = mnames[mi];
+                if (!nm || !nm[0]) continue;
+                if (strcmp(nm, ".") == 0 || strcmp(nm, "..") == 0) continue;
+                /* do not duplicate existing ramfs entries */
+                if (ramfs_find_child(n, nm)) continue;
+
+                size_t namelen = strlen(nm);
+                size_t rec_len = (size_t)(8 + namelen);
+                rec_len = (rec_len + 3) & ~3u;
+                if (rec_len < sizeof(struct ext2_dir_entry)) rec_len = sizeof(struct ext2_dir_entry);
+                if (pos + rec_len <= (size_t)offset) { pos += rec_len; continue; }
+                if (written >= size) break;
+
+                uint8_t tmp[128];
+                for (size_t zi = 0; zi < sizeof(tmp); zi++) tmp[zi] = 0;
+                de.inode = 1;
+                de.rec_len = (uint16_t)rec_len;
+                de.name_len = (uint8_t)namelen;
+                de.file_type = EXT2_FT_DIR;
+                memcpy(tmp, &de, 8);
+                memcpy(tmp + 8, nm, namelen);
+
+                size_t entry_off = 0;
+                if (offset > (ssize_t)pos) entry_off = (size_t)offset - pos;
+                size_t avail = size - written;
+                size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
+                if (tocopy > avail) tocopy = avail;
+                memcpy(out + written, tmp + entry_off, tocopy);
+                written += tocopy;
+                pos += rec_len;
+            }
         }
         return (ssize_t)written;
     } else {

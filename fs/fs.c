@@ -5,6 +5,7 @@
 #include <stat.h>
 #include <heap.h>
 #include <vga.h>
+#include <ext2.h>
 /* driver-specific stat helpers */
 #include <sysfs.h>
 #include <ramfs.h>
@@ -23,6 +24,102 @@ struct mount_entry {
 
 static struct mount_entry g_mounts[MAX_FS_MOUNTS];
 static int g_mount_count = 0;
+
+int fs_get_mount_children(const char *dir_path, char names[][64], int max_count) {
+    if (!dir_path || !names || max_count <= 0) return 0;
+
+    /* normalize dir_path into a small fixed buffer */
+    char dir[64];
+    size_t dlen = strlen(dir_path);
+    if (dlen == 0) return 0;
+    if (dlen >= sizeof(dir)) dlen = sizeof(dir) - 1;
+    memcpy(dir, dir_path, dlen);
+    dir[dlen] = '\0';
+    /* strip trailing slashes (except root) */
+    while (dlen > 1 && dir[dlen - 1] == '/') {
+        dir[dlen - 1] = '\0';
+        dlen--;
+    }
+    if (dlen == 0) { dir[0] = '/'; dir[1] = '\0'; dlen = 1; }
+
+    int out = 0;
+    for (int i = 0; i < g_mount_count && out < max_count; i++) {
+        if (!g_mounts[i].driver) continue;
+        if (g_mounts[i].path[0] != '/') continue;
+
+        /* normalize mount path (strip trailing slashes) */
+        char mp[64];
+        size_t mlen = g_mounts[i].path_len;
+        if (mlen == 0) continue;
+        if (mlen >= sizeof(mp)) mlen = sizeof(mp) - 1;
+        memcpy(mp, g_mounts[i].path, mlen);
+        mp[mlen] = '\0';
+        while (mlen > 1 && mp[mlen - 1] == '/') {
+            mp[mlen - 1] = '\0';
+            mlen--;
+        }
+        if (strcmp(mp, "/") == 0) continue;
+
+        const char *slash = strrchr(mp, '/');
+        if (!slash) continue;
+
+        char parent[64];
+        const char *child = slash + 1;
+        if (!child[0]) continue;
+        if (strchr(child, '/')) continue; /* must be direct child */
+
+        if (slash == mp) {
+            parent[0] = '/';
+            parent[1] = '\0';
+        } else {
+            size_t plen = (size_t)(slash - mp);
+            if (plen >= sizeof(parent)) plen = sizeof(parent) - 1;
+            memcpy(parent, mp, plen);
+            parent[plen] = '\0';
+        }
+
+        if (strcmp(parent, dir) != 0) continue;
+
+        /* de-dup */
+        int dup = 0;
+        for (int j = 0; j < out; j++) {
+            if (strncmp(names[j], child, 64) == 0) { dup = 1; break; }
+        }
+        if (dup) continue;
+
+        strncpy(names[out], child, 63);
+        names[out][63] = '\0';
+        out++;
+    }
+    return out;
+}
+
+/* Ensure that the mountpoint path exists in the ramfs namespace so tools that
+ * list directories (e.g. `ls /`) can see mountpoints like `/dev` even if the
+ * underlying filesystem doesn't contain an on-disk entry for them. */
+static void fs_ensure_ramfs_mountpoint_dir(const char *path) {
+    if (!path || path[0] != '/') return;
+    char tmp[64];
+    size_t len = strlen(path);
+    if (len == 0) return;
+    if (len >= sizeof(tmp)) len = sizeof(tmp) - 1;
+    memcpy(tmp, path, len);
+    tmp[len] = '\0';
+    /* drop trailing slashes (except for "/") */
+    while (len > 1 && tmp[len - 1] == '/') {
+        tmp[len - 1] = '\0';
+        len--;
+    }
+    /* create intermediate prefixes: /a, /a/b, ... */
+    for (size_t i = 1; i < len; i++) {
+        if (tmp[i] == '/') {
+            tmp[i] = '\0';
+            (void)ramfs_mkdir(tmp);
+            tmp[i] = '/';
+        }
+    }
+    (void)ramfs_mkdir(tmp);
+}
 
 static struct fs_driver *fs_match_mount(const char *path) {
     if (!path) return NULL;
@@ -120,6 +217,8 @@ int fs_mount(const char *path, struct fs_driver *drv) {
     if (g_mount_count >= MAX_FS_MOUNTS) return -1;
     size_t len = strlen(path);
     if (len == 0 || len >= sizeof(g_mounts[0].path)) return -1;
+    /* Make mountpoint visible in ramfs directory listings. */
+    fs_ensure_ramfs_mountpoint_dir(path);
     strcpy(g_mounts[g_mount_count].path, path);
     g_mounts[g_mount_count].path_len = len;
     g_mounts[g_mount_count].driver = drv;
@@ -573,8 +672,28 @@ int fs_rename(const char *oldpath, const char *newpath) {
 ssize_t fs_readdir_next(struct fs_file *file, void *buf, size_t size) {
     if (!file) return -1;
     ssize_t r = fs_read(file, buf, size, file->pos);
-    if (r > 0) file->pos += r;
-    return r;
+    if (r <= 0) return r;
+
+    /* Directory reads must advance by whole dirent records, otherwise the next
+       call can start in the middle of an entry and userspace `getdents*` parsing
+       will fail (this is what makes mountpoints like /dev appear "missing"). */
+    size_t rr = (size_t)r;
+    size_t off = 0;
+    while (off + sizeof(struct ext2_dir_entry) <= rr) {
+        struct ext2_dir_entry *de = (struct ext2_dir_entry*)((uint8_t*)buf + off);
+        if (de->rec_len < (uint16_t)sizeof(struct ext2_dir_entry)) break;
+        size_t rec = (size_t)de->rec_len;
+        if (rec == 0) break;
+        if (off + rec > rr) break; /* partial record at end */
+        off += rec;
+    }
+    if (off == 0) {
+        /* Fallback: avoid stalling on unexpected formats. */
+        file->pos += (off_t)rr;
+        return r;
+    }
+    file->pos += (off_t)off;
+    return (ssize_t)off;
 }
 
 int vfs_fstat(struct fs_file *file, struct stat *st) {

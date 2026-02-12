@@ -3546,7 +3546,10 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 const char *nm = namebuf_local;
                 size_t nlen = copy_n;
 
-                /* Determine inode/type by stat'ing the full path if possible */
+                /* Determine inode/type by stat'ing the full path if possible.
+                   IMPORTANT: some virtual filesystems don't provide st_ino (0).
+                   Userspace tools often treat d_ino==0 as "absent" and skip it,
+                   which makes mountpoints like /dev invisible. */
                 uint64_t out_ino = (uint64_t)de->inode;
                 uint8_t out_type = (uint8_t)de->file_type;
                 if (f->path && nlen > 0) {
@@ -3561,7 +3564,9 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                         if (ef) {
                             struct stat st;
                             if (vfs_fstat(ef, &st) == 0) {
-                                out_ino = (uint64_t)st.st_ino;
+                                if ((uint64_t)st.st_ino != 0) {
+                                    out_ino = (uint64_t)st.st_ino;
+                                }
                                 if ((st.st_mode & S_IFDIR) == S_IFDIR) out_type = EXT2_FT_DIR;
                                 else out_type = EXT2_FT_REG_FILE;
                             }
