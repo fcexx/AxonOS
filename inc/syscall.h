@@ -46,6 +46,7 @@
 #define SYS_madvise 28
 #define SYS_brk     12
 #define SYS_pipe    22
+#define SYS_dup3    292
 #define SYS_pipe2   293
 #define SYS_poll    7
 #define SYS_mprotect 10
@@ -63,6 +64,7 @@
 #define SYS_tgkill  234
 #define SYS_sendfile 40
 #define SYS_mount   165
+#define SYS_umount2 166
 #define SYS_rt_sigtimedwait 128
 #define SYS_clock_nanosleep 230
 #define SYS_select  23
@@ -80,6 +82,9 @@
 #define SYS_chmod  90
 #define SYS_chown  92
 #define SYS_utimensat 280
+/* Linux x86_64: preadv/pwritev */
+#define SYS_preadv 295
+#define SYS_pwritev 296
 
 /* initialize syscall subsystem (register handler) */
 void syscall_init(void);

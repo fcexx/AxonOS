@@ -12,6 +12,7 @@
 #include <ext2.h>
 #include <keyboard.h>
 #include <disk.h>
+#include <stat.h>
 
 #define DEVFS_TTY_COUNT 6
 
@@ -930,6 +931,61 @@ static void devfs_release(struct fs_file *file) {
     }
     if (file->path) kfree((void*)file->path);
     kfree(file);
+}
+
+int devfs_block_count(void) {
+    return dev_block_count;
+}
+
+int devfs_block_get(int index, char *out_name, size_t out_cap, int *out_device_id, uint32_t *out_sectors) {
+    if (index < 0 || index >= dev_block_count) return -1;
+    if (!out_name || out_cap == 0) return -1;
+    const char *path = dev_blocks[index].path;
+    const char *last = path ? strrchr(path, '/') : NULL;
+    const char *nm = last ? (last + 1) : (path ? path : "");
+    strncpy(out_name, nm, out_cap - 1);
+    out_name[out_cap - 1] = '\0';
+    if (out_device_id) *out_device_id = dev_blocks[index].device_id;
+    if (out_sectors) *out_sectors = dev_blocks[index].sectors;
+    return 0;
+}
+
+int devfs_fill_stat(struct fs_file *file, struct stat *st) {
+    if (!file || !st) return -1;
+    memset(st, 0, sizeof(*st));
+
+    const char *p = file->path ? file->path : "";
+    /* directory /dev */
+    if (strcmp(p, "/dev") == 0 || strcmp(p, "/dev/") == 0 || file->type == FS_TYPE_DIR) {
+        st->st_ino = 2;
+        st->st_mode = (mode_t)(S_IFDIR | 0755);
+        st->st_nlink = 2;
+        st->st_uid = 0;
+        st->st_gid = 0;
+        st->st_size = 0;
+        return 0;
+    }
+
+    /* block device node? */
+    int did = devfs_get_device_id(p);
+    if (did >= 0) {
+        st->st_ino = (ino_t)(1000u + (unsigned)did);
+        st->st_mode = (mode_t)(S_IFBLK | 0600);
+        st->st_nlink = 1;
+        st->st_uid = 0;
+        st->st_gid = 0;
+        st->st_size = (off_t)file->size;
+        return 0;
+    }
+
+    /* tty and special devices behave like character devices */
+    st->st_ino = 2000;
+    st->st_mode = (mode_t)(S_IFCHR | 0666);
+    st->st_nlink = 1;
+    st->st_uid = 0;
+    st->st_gid = 0;
+    st->st_size = 0;
+    return 0;
 }
 
 int devfs_register(void) {

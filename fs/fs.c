@@ -10,6 +10,7 @@
 #include <sysfs.h>
 #include <ramfs.h>
 #include <procfs.h>
+#include <devfs.h>
 
 #define MAX_FS_DRIVERS 8
 #define MAX_FS_MOUNTS 8
@@ -711,6 +712,8 @@ int vfs_fstat(struct fs_file *file, struct stat *st) {
             if (ramfs_fill_stat(file, st) == 0) goto fix_mode;
         } else if (name && strcmp(name, "procfs") == 0) {
             if (procfs_fill_stat(file, st) == 0) goto fix_mode;
+        } else if (name && strcmp(name, "devfs") == 0) {
+            if (devfs_fill_stat(file, st) == 0) goto fix_mode;
         }
         break;
     }

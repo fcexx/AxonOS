@@ -17,6 +17,7 @@
 #include <sysfs.h>
 #include <rtc.h>
 #include <spinlock.h>
+#include <fat32.h>
 
 /* Linux x86_64 struct stat size; ensures st_mode at correct offset for S_ISREG etc. */
 #define STAT_COPY_SIZE 144
@@ -1713,6 +1714,64 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             return total;
         }
+        case SYS_pwritev: {
+            /* pwritev(fd, const struct iovec *iov, int iovcnt, off_t offset) — Linux x86_64 296 */
+            int fd = (int)a1;
+            const void *iov_u = (const void*)(uintptr_t)a2;
+            int iovcnt = (int)a3;
+            int64_t off_in = (int64_t)a4;
+            if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
+            if (!iov_u) return ret_err(EFAULT);
+            if (iovcnt <= 0 || iovcnt > 64) return ret_err(EINVAL);
+            if (off_in < 0) return ret_err(EINVAL);
+            struct fs_file *f = cur->fds[fd];
+            if (!f) return ret_err(EBADF);
+
+            struct iovec_k { uint64_t base; uint64_t len; };
+            struct iovec_k iov[64];
+            size_t bytes = (size_t)iovcnt * sizeof(iov[0]);
+            if (copy_from_user_raw(iov, iov_u, bytes) != 0) return ret_err(EFAULT);
+
+            uint64_t total = 0;
+            size_t cur_off = (size_t)off_in;
+            for (int i = 0; i < iovcnt; i++) {
+                const void *base = (const void*)(uintptr_t)iov[i].base;
+                size_t len = (size_t)iov[i].len;
+                if (len == 0) continue;
+                if ((uintptr_t)base + len > (uintptr_t)MMIO_IDENTITY_LIMIT) return (total > 0) ? total : ret_err(EFAULT);
+                /* Clamp per-chunk to avoid huge kmalloc; write in pieces. */
+                size_t off = 0;
+                while (off < len) {
+                    size_t chunk = len - off;
+                    if (chunk > 4096) chunk = 4096;
+                    size_t copied = 0;
+                    void *tmp = copy_from_user_safe((const uint8_t*)base + off, chunk, 4096, &copied);
+                    if (!tmp) return (total > 0) ? total : ret_err(EFAULT);
+                    ssize_t wr = fs_write(f, tmp, copied, cur_off);
+                    kfree(tmp);
+                    if (wr <= 0) return (total > 0) ? total : ret_err(EINVAL);
+                    cur_off += (size_t)wr;
+                    total += (uint64_t)wr;
+                    off += (size_t)wr;
+                    if ((size_t)wr < copied) break;
+                }
+            }
+            return total;
+        }
+        case SYS_dup3: {
+            /* dup3(oldfd, newfd, flags) — Linux x86_64 292.
+               Many tools (including busybox applets) use dup3() internally. */
+            int oldfd = (int)a1;
+            int newfd = (int)a2;
+            int flags = (int)a3;
+            /* Only allow O_CLOEXEC (ignored) or 0. */
+            const int O_CLOEXEC = 02000000;
+            if (flags & ~O_CLOEXEC) return ret_err(EINVAL);
+            if (oldfd == newfd) return ret_err(EINVAL);
+            int r = thread_fd_dup2(oldfd, newfd);
+            if (r < 0) return ret_err(EBADF);
+            return (uint64_t)r;
+        }
         case SYS_getpid:
             if (is_init_user(cur)) return 1;
             return (uint64_t)(cur->tid ? cur->tid : 1);
@@ -2907,6 +2966,52 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             return total;
         }
+        case SYS_preadv: {
+            /* preadv(fd, const struct iovec *iov, int iovcnt, off_t offset) — Linux x86_64 295 */
+            int fd = (int)a1;
+            const void *iov_u = (const void*)(uintptr_t)a2;
+            int iovcnt = (int)a3;
+            int64_t off_in = (int64_t)a4;
+            if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
+            if (!iov_u) return ret_err(EFAULT);
+            if (iovcnt <= 0 || iovcnt > 64) return ret_err(EINVAL);
+            if (off_in < 0) return ret_err(EINVAL);
+            struct fs_file *f = cur->fds[fd];
+            if (!f) return ret_err(EBADF);
+
+            struct iovec_k { uint64_t base; uint64_t len; };
+            struct iovec_k iov[64];
+            size_t bytes = (size_t)iovcnt * sizeof(iov[0]);
+            if (copy_from_user_raw(iov, iov_u, bytes) != 0) return ret_err(EFAULT);
+
+            uint64_t total = 0;
+            size_t cur_off = (size_t)off_in;
+            for (int i = 0; i < iovcnt; i++) {
+                void *base = (void*)(uintptr_t)iov[i].base;
+                size_t len = (size_t)iov[i].len;
+                if (len == 0) continue;
+                if ((uintptr_t)base + len > (uintptr_t)MMIO_IDENTITY_LIMIT) return (total > 0) ? total : ret_err(EFAULT);
+                size_t pos = 0;
+                while (pos < len) {
+                    size_t chunk = len - pos;
+                    if (chunk > 4096) chunk = 4096;
+                    void *tmp = kmalloc(chunk);
+                    if (!tmp) return (total > 0) ? total : ret_err(ENOMEM);
+                    ssize_t rr = fs_read(f, tmp, chunk, cur_off);
+                    if (rr <= 0) {
+                        kfree(tmp);
+                        return total; /* EOF or error -> return what we have */
+                    }
+                    memcpy((char*)base + pos, tmp, (size_t)rr);
+                    kfree(tmp);
+                    cur_off += (size_t)rr;
+                    total += (uint64_t)rr;
+                    pos += (size_t)rr;
+                    if ((size_t)rr < chunk) return total;
+                }
+            }
+            return total;
+        }
         case SYS_read: {
             int fd = (int)a1;
             void *bufp = (void*)(uintptr_t)a2;
@@ -3660,7 +3765,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             const char *src_u = (const char*)(uintptr_t)a1;
             const char *tgt_u = (const char*)(uintptr_t)a2;
             const char *type_u = (const char*)(uintptr_t)a3;
-            (void)src_u; (void)a4; (void)a5;
+            (void)a4; (void)a5;
             if (!tgt_u || !type_u) return ret_err(EINVAL);
             char *k_type = copy_user_cstr(type_u, 64);
             if (!k_type) return ret_err(EFAULT);
@@ -3687,12 +3792,61 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 /* tmpfs as mount type for /dev: treat same as devtmpfs (init inittab fallback) */
                 ramfs_mkdir(target);
                 rc = devfs_mount(target);
+            } else if (strcmp(k_type, "fat32") == 0 || strcmp(k_type, "vfat") == 0 || strcmp(k_type, "msdos") == 0 || strcmp(k_type, "auto") == 0) {
+                if (!src_u) { kfree(k_type); return ret_err(EINVAL); }
+                char *k_src_raw = copy_user_cstr(src_u, 256);
+                if (!k_src_raw) { kfree(k_type); return ret_err(EFAULT); }
+                char source[256];
+                resolve_user_path(cur, k_src_raw, source, sizeof(source));
+                kfree(k_src_raw);
+                if (source[0] == '\0') { kfree(k_type); return ret_err(EINVAL); }
+
+                int dev_id = devfs_get_device_id(source);
+                if (dev_id < 0) { kfree(k_type); return ret_err(ENOENT); }
+
+                /* Ensure FAT32 state is initialized for this device. */
+                if (fat32_probe_and_mount(dev_id) != 0) { kfree(k_type); return ret_err(EINVAL); }
+                struct fs_driver *drv = fat32_get_driver();
+                if (!drv) { kfree(k_type); return ret_err(ENOSYS); }
+
+                ramfs_mkdir(target);
+                rc = fs_mount(target, drv);
             } else {
                 rc = -1;
             }
 
             kfree(k_type);
             return (rc == 0) ? 0 : ret_err(ENOSYS);
+        }
+        case SYS_umount2:
+        case 52: { /* umount2 on some ABIs / compat */
+            /* umount2(target, flags) */
+            const char *tgt_u = (const char*)(uintptr_t)a1;
+            int flags = (int)a2;
+            /* Support only the common case flags==0; ignore MNT_DETACH etc for now. */
+            if (flags != 0) return ret_err(ENOSYS);
+            if (!tgt_u) return ret_err(EINVAL);
+            char *k_tgt_raw = copy_user_cstr(tgt_u, 256);
+            if (!k_tgt_raw) return ret_err(EFAULT);
+            char target[256];
+            resolve_user_path(cur, k_tgt_raw, target, sizeof(target));
+            kfree(k_tgt_raw);
+            if (target[0] == '\0') return ret_err(EINVAL);
+            /* normalize: strip trailing slashes except root */
+            size_t n = strlen(target);
+            while (n > 1 && target[n - 1] == '/') target[--n] = '\0';
+
+            struct fs_driver *drv = fs_get_mount_driver(target);
+            int rc = fs_unmount(target);
+            if (rc != 0) return ret_err(EINVAL);
+
+            /* driver-specific cleanup */
+            if (drv && drv->ops && drv->ops->name) {
+                if (strcmp(drv->ops->name, "fat32") == 0) {
+                    fat32_unmount_cleanup();
+                }
+            }
+            return 0;
         }
         case SYS_brk: {
             /* Simple brk: bump within a safe range in identity-mapped low memory. */
@@ -3735,9 +3889,12 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (len == 0) return ret_err(EINVAL);
             len = (size_t)align_up_u((uintptr_t)len, 4096);
             enum { MAP_FIXED = 0x10, MAP_ANONYMOUS = 0x20, MAP_PRIVATE = 0x02,
+                   MAP_SHARED = 0x01,
                    MAP_STACK = 0x20000, MAP_GROWSDOWN = 0x0100, MAP_NORESERVE = 0x4000 };
             if (flags & MAP_FIXED) return ret_err(EINVAL);
-            if (!(flags & MAP_PRIVATE)) return ret_err(ENOSYS);
+            /* Many userspace tools (including xxd) use MAP_SHARED for read-only mmaps.
+               We don't implement true shared mappings; treat MAP_SHARED like MAP_PRIVATE. */
+            if (!(flags & (MAP_PRIVATE | MAP_SHARED))) return ret_err(ENOSYS);
             thread_t *tcur = thread_get_current_user();
             if (!tcur) tcur = thread_current();
             uintptr_t *p_mmap_next = tcur ? &tcur->user_mmap_next : &user_mmap_next;
@@ -3753,7 +3910,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (mark_user_identity_range_2m_sys((uint64_t)addr, (uint64_t)(addr + len)) != 0) return ret_err(EFAULT);
 
             if (flags & MAP_ANONYMOUS) {
-                flags &= ~(MAP_ANONYMOUS | MAP_PRIVATE | MAP_STACK | MAP_GROWSDOWN | MAP_NORESERVE);
+                flags &= ~(MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED | MAP_STACK | MAP_GROWSDOWN | MAP_NORESERVE);
                 if (flags != 0) return ret_err(ENOSYS);
                 memset((void*)addr, 0, len);
             } else {

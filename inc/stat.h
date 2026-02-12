@@ -32,5 +32,13 @@ struct stat {
 #define S_IFLNK 0120000
 #endif
 
+/* Device special files (needed for /dev block/char nodes) */
+#ifndef S_IFCHR
+#define S_IFCHR 0020000
+#endif
+#ifndef S_IFBLK
+#define S_IFBLK 0060000
+#endif
+
 
 

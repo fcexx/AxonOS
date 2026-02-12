@@ -74,6 +74,34 @@ static ssize_t procfs_show_uptime(char *buf, size_t size, void *priv) {
 	return (ssize_t)w;
 }
 
+static ssize_t procfs_show_partitions(char *buf, size_t size, void *priv) {
+	(void)priv;
+	if (!buf || size == 0) return 0;
+	/* Linux-like /proc/partitions format (minimal). */
+	size_t w = 0;
+	w += (size_t)snprintf(buf + w, (w < size) ? (size - w) : 0, "major minor  #blocks  name\n");
+	int n = devfs_block_count();
+	for (int i = 0; i < n; i++) {
+		char name[64];
+		int did = -1;
+		uint32_t sectors = 0;
+		if (devfs_block_get(i, name, sizeof(name), &did, &sectors) != 0) continue;
+		/* Prefer Linux-style sdX names to avoid duplicates (we also create hdN). */
+		if (!(name[0] == 's' && name[1] == 'd')) continue;
+		/* blocks in 1K units like Linux: sectors * 512 / 1024 == sectors/2 */
+		uint32_t blocks = sectors / 2;
+		/* fake major/minor; enough for userland tools that just parse size+name */
+		int major = 8;
+		int minor = did >= 0 ? did * 16 : i * 16;
+		int written = snprintf(buf + w, (w < size) ? (size - w) : 0,
+							   "%5d %5d %8u %s\n", major, minor, (unsigned)blocks, name);
+		if (written < 0) break;
+		w += (size_t)written;
+		if (w >= size) { w = size; break; }
+	}
+	return (ssize_t)w;
+}
+
 /* CPU info */
 static ssize_t procfs_show_cpuinfo(char *buf, size_t size, void *priv) {
 	(void)priv;
@@ -220,6 +248,16 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 				kfree(h); kfree(pp); kfree(f); return -1;
 			}
 		}
+		/* top-level file: /proc/partitions */
+		if (first_len == 10 && strncmp(p, "partitions", 10) == 0) {
+			h->kind = 7;
+			h->file_id = 12;
+			f->type = FS_TYPE_REG;
+			f->size = 4096; /* approximate */
+			f->driver_private = h;
+			*out_file = f;
+			return 0;
+		}
 		/* if path is exactly /proc/<something> and something is not a pid -> special files like /proc/meminfo or directories like sys/bus */
 		if (!slash) {
 			/* Could be pid dir or top-level file like meminfo/uptime */
@@ -346,7 +384,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
         size_t pos = 0;
         size_t written = 0;
         uint8_t *out = (uint8_t*)buf;
-        const char *top[] = { "meminfo", "cpuinfo", "uptime", "sys", "bus", "tty" };
+        const char *top[] = { "meminfo", "cpuinfo", "uptime", "partitions", "sys", "bus", "tty" };
         for (size_t ti = 0; ti < sizeof(top)/sizeof(top[0]); ti++) {
             const char *name = top[ti];
             size_t namelen = strlen(name);
@@ -596,6 +634,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 		ssize_t full = 0;
 		if (h->file_id == 10) full = procfs_show_meminfo(tmpbuf, cap, NULL);
 		else if (h->file_id == 11) full = procfs_show_uptime(tmpbuf, cap, NULL);
+		else if (h->file_id == 12) full = procfs_show_partitions(tmpbuf, cap, NULL);
 		if (full < 0) { kfree(tmpbuf); return -1; }
 		size_t len = (size_t)full;
 		if ((size_t)offset >= len) { kfree(tmpbuf); return 0; }
