@@ -2769,6 +2769,11 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 TIOCSPGRP = 0x5410,
                 TIOCGWINSZ= 0x5413,
                 TIOCSWINSZ= 0x5414,
+                /* Linux block ioctls commonly used by mkfs/mount utilities */
+                BLKGETSIZE   = 0x1260,       /* get device size in 512-byte sectors (unsigned long*) */
+                BLKSSZGET    = 0x1268,       /* get logical sector size (int*) */
+                BLKBSZGET    = 0x80081270,   /* get block size (int*) */
+                BLKGETSIZE64 = 0x80081272,   /* get device size in bytes (uint64_t*) */
             };
 
             /* no ioctl tracing in release builds */
@@ -2788,6 +2793,29 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 speed_t c_ispeed;
                 speed_t c_ospeed;
             };
+
+            /* Block-device ioctls for /dev/sdX,/dev/hdX (needed by mkfs.vfat and friends). */
+            if (req == BLKSSZGET || req == BLKBSZGET || req == BLKGETSIZE || req == BLKGETSIZE64) {
+                if (!argp) return ret_err(EFAULT);
+                if (!f->path || devfs_get_device_id(f->path) < 0) return ret_err(ENOTTY);
+                uint64_t bytes = (uint64_t)f->size;
+                if (req == BLKSSZGET || req == BLKBSZGET) {
+                    int v = 512;
+                    if (copy_to_user_safe(argp, &v, sizeof(v)) != 0) return ret_err(EFAULT);
+                    return 0;
+                }
+                if (req == BLKGETSIZE64) {
+                    uint64_t v = bytes;
+                    if (copy_to_user_safe(argp, &v, sizeof(v)) != 0) return ret_err(EFAULT);
+                    return 0;
+                }
+                /* BLKGETSIZE -> number of 512-byte sectors (unsigned long on x86_64) */
+                {
+                    uint64_t sectors = bytes / 512u;
+                    if (copy_to_user_safe(argp, &sectors, sizeof(sectors)) != 0) return ret_err(EFAULT);
+                    return 0;
+                }
+            }
 
             /* Important: libc frequently probes terminal state on stdout/stderr very early
                (e.g. ld.lld does ioctl(TCGETS) on fd=2). Do NOT require tty classification

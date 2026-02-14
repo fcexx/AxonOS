@@ -32,8 +32,31 @@ static int mmio_inited = 0;
 void *mmio_map_phys(uint64_t pa, size_t len) {
 	if (len == 0) return NULL;
 
-	/* fast path: fully below 4GiB -> identity */
+	/* For MMIO below 4GiB, keep identity VA==PA but REMAP the affected 2MiB pages
+	   as uncached (PCD|PWT). VMware in particular can return garbage if MMIO is
+	   accessed through cached mappings. */
 	if (pa + (uint64_t)len <= MMIO_IDENTITY_LIMIT) {
+		uint64_t pa_page = pa & ~(PAGE_SIZE_2M - 1);
+		size_t offset_in_page = (size_t)(pa - pa_page);
+		size_t total = offset_in_page + len;
+		size_t pages_needed = (total + PAGE_SIZE_2M - 1) / PAGE_SIZE_2M;
+#if MMIO_CACHE_ENABLED
+		const uint64_t flags = PG_PRESENT | PG_RW;
+#else
+		const uint64_t flags = PG_PRESENT | PG_RW | PG_PCD | PG_PWT;
+#endif
+		for (size_t p = 0; p < pages_needed; p++) {
+			uint64_t page = pa_page + (uint64_t)p * PAGE_SIZE_2M;
+			/* identity VA==PA */
+			int r = map_page_2m(page, page, flags);
+			if (r != 0) {
+				klogprintf("MMIO: identity remap failed pa=0x%llx (page=0x%llx) r=%d\n",
+				           (unsigned long long)pa,
+				           (unsigned long long)page,
+				           r);
+				return (void*)(uintptr_t)pa; /* fallback: still return identity */
+			}
+		}
 		return (void*)(uintptr_t)pa;
 	}
 

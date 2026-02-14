@@ -24,6 +24,7 @@
 #include <heap.h>
 #include <vga.h>
 #include <ramfs.h>
+#include <pci.h>
 
 #include <fat32.h>
 
@@ -69,6 +70,13 @@ typedef struct {
 /* up to 4 devices indexed by registration id after registration */
 static ata_device_t ata_devices[4];
 static int ata_device_count = 0;
+
+typedef struct {
+	uint16_t io_base;
+	uint16_t ctrl_base;
+} ata_channel_t;
+
+#define ATA_MAX_CHANNELS 16
 
 /* helper: short io delay (read altstatus 4 times) */
 static void ata_io_delay(uint16_t ctrl) {
@@ -317,51 +325,116 @@ static void ata_register_device(uint16_t io_base, uint16_t ctrl_base, int is_sla
 	uint32_t size_mb = sectors / 2048; /* sectors * 512 / (1024*1024) */
 	/* create /dev node: /dev/hdN */
 	char devpath[32];
-	/* create traditional /dev/hdN and Linux-style /dev/sdX */
+	/* create traditional /dev/hdN and Linux-style /dev/sdX by global disk id */
 	snprintf(devpath, sizeof(devpath), "/dev/hd%d", id);
 	devfs_create_block_node(devpath, id, sectors);
-	/* map 0->a,1->b... */
-	char devpath2[32];
 	if (id >= 0 && id < 26) {
+		char devpath2[32];
 		snprintf(devpath2, sizeof(devpath2), "/dev/sd%c", 'a' + id);
 		devfs_create_block_node(devpath2, id, sectors);
 	}
-	/* Attempt to auto-mount FAT32 devices under /mnt (Linux-like behavior) */
-	/* Probe device for FAT32 and mount at /mnt/sdX if successful */
-	if (fat32_probe_and_mount(id) == 0) {
-		char mntpath[32];
-		if (id >= 0 && id < 26) snprintf(mntpath, sizeof(mntpath), "/mnt/sd%c", 'a' + id);
-		else snprintf(mntpath, sizeof(mntpath), "/mnt/disk%d", id);
-		ramfs_mkdir("/mnt");
-		ramfs_mkdir(mntpath);
-		struct fs_driver *drv = fat32_get_driver();
-		if (drv) {
-			if (fs_mount(mntpath, drv) == 0) {
-				klogprintf("fat32: Auto-mounted device %d at %s\n", id, mntpath);
-			} else {
-				klogprintf("fat32: Auto-mount failed for device %d at %s\n", id, mntpath);
-			}
-		}
-	}
+	/* Do not auto-probe/auto-mount FAT32 here.
+	   Manual mount(2) should control which block device is attached as vfat. */
 	klogprintf("ATA: Found pio disk: \"%s\" model: \"%s\" size: %u mb\n", ata_devices[id].model, ata_devices[id].model, size_mb);
 }
 
-void ata_dma_init(void) {
-	/* Prefer AHCI-based discovery if available so SATA/ATAPI drivers can be attached later */
-	int ahci_count = ahci_probe_and_register();
-	if (ahci_count > 0) {
-		klogprintf("ahci: devices: %d, skipping legacy ATA probe\n", ahci_count);
-		return;
+static int ata_channel_seen(const ata_channel_t *channels, int count, uint16_t io_base, uint16_t ctrl_base) {
+	for (int i = 0; i < count; i++) {
+		if (channels[i].io_base == io_base && channels[i].ctrl_base == ctrl_base) return 1;
 	}
-	/* perform software reset on legacy channels to mimic cold-boot behavior
-	   which helps virtual machines (VMware) that do not reset ATA on soft reboot */
-	{
-		uint16_t bases_reset[2] = { ATA_PRIMARY_IO, ATA_SECONDARY_IO };
-		uint16_t ctrls_reset[2] = { ATA_PRIMARY_CTRL, ATA_SECONDARY_CTRL };
-		for (int ch = 0; ch < 2; ch++) {
-			/* issue SRST on channel */
-			ata_software_reset(bases_reset[ch], ctrls_reset[ch]);
+	return 0;
+}
+
+static void ata_channel_add_unique(ata_channel_t *channels, int *count, uint16_t io_base, uint16_t ctrl_base) {
+	if (!channels || !count) return;
+	if (*count >= ATA_MAX_CHANNELS) return;
+	if (io_base == 0 || ctrl_base == 0) return;
+	if (ata_channel_seen(channels, *count, io_base, ctrl_base)) return;
+	channels[*count].io_base = io_base;
+	channels[*count].ctrl_base = ctrl_base;
+	(*count)++;
+}
+
+static int ata_collect_pci_channels(ata_channel_t *channels, int max_channels) {
+	if (!channels || max_channels <= 0) return 0;
+	int count = 0;
+
+	pci_device_t *devs = pci_get_devices();
+	int dev_count = pci_get_device_count();
+
+	for (int i = 0; i < dev_count; i++) {
+		pci_device_t *pdev = &devs[i];
+		if (pdev->class_code != 0x01 || pdev->subclass != 0x01) continue; /* IDE */
+
+		if (pdev->vendor_id == 0x8086 &&
+		    (pdev->device_id == 0x2920 || pdev->device_id == 0x2921 || pdev->device_id == 0x2926)) {
+			klogprintf("ata: intel ICH9 storage controller detected (device=%04x)\n", pdev->device_id);
 		}
+
+		/* Enable IO + bus master before touching PCI IDE BARs. */
+		uint32_t cmd = pci_config_read_dword(pdev->bus, pdev->device, pdev->function, 0x04);
+		cmd |= (1u << 0) | (1u << 2); /* IO | BUS MASTER */
+		pci_config_write_dword(pdev->bus, pdev->device, pdev->function, 0x04, cmd);
+
+		/* Default compatibility ranges. */
+		uint16_t p_io = ATA_PRIMARY_IO;
+		uint16_t p_ctrl = ATA_PRIMARY_CTRL;
+		uint16_t s_io = ATA_SECONDARY_IO;
+		uint16_t s_ctrl = ATA_SECONDARY_CTRL;
+
+		int p_native = (pdev->prog_if & 0x01) != 0; /* primary native mode */
+		int s_native = (pdev->prog_if & 0x04) != 0; /* secondary native mode */
+
+		/* In native mode PCI BAR0..BAR3 define channel ranges.
+		   BAR1/BAR3 are control blocks; control register is BAR + 2. */
+		if (p_native) {
+			if ((pdev->bar[0] & 0x1u) && pdev->bar[0] != 0) p_io = (uint16_t)(pdev->bar[0] & ~0x3u);
+			if ((pdev->bar[1] & 0x1u) && pdev->bar[1] != 0) p_ctrl = (uint16_t)((pdev->bar[1] & ~0x3u) + 2u);
+		}
+		if (s_native) {
+			if ((pdev->bar[2] & 0x1u) && pdev->bar[2] != 0) s_io = (uint16_t)(pdev->bar[2] & ~0x3u);
+			if ((pdev->bar[3] & 0x1u) && pdev->bar[3] != 0) s_ctrl = (uint16_t)((pdev->bar[3] & ~0x3u) + 2u);
+		}
+
+		klogprintf("ata: pci ide %02x:%02x.%x vendor=%04x device=%04x prog_if=%02x p=%s io=0x%x ctrl=0x%x s=%s io=0x%x ctrl=0x%x\n",
+		           pdev->bus, pdev->device, pdev->function,
+		           pdev->vendor_id, pdev->device_id, pdev->prog_if,
+		           p_native ? "native" : "compat", p_io, p_ctrl,
+		           s_native ? "native" : "compat", s_io, s_ctrl);
+
+		ata_channel_add_unique(channels, &count, p_io, p_ctrl);
+		ata_channel_add_unique(channels, &count, s_io, s_ctrl);
+		if (count >= max_channels) break;
+	}
+
+	/* Log common Intel SATA RAID IDs that need a real AHCI/RAID path. */
+	for (int i = 0; i < dev_count; i++) {
+		pci_device_t *pdev = &devs[i];
+		if (pdev->class_code == 0x01 && pdev->subclass == 0x04 && pdev->vendor_id == 0x8086) {
+			klogprintf("ata: intel storage in RAID mode found %02x:%02x.%x device=%04x (IDE/AHCI path won't bind)\n",
+			           pdev->bus, pdev->device, pdev->function, pdev->device_id);
+		}
+	}
+
+	return count;
+}
+
+void ata_dma_init(void) {
+	/* Probe PCI IDE channels first (includes Intel ICHx in IDE/native mode). */
+	ata_channel_t channels[ATA_MAX_CHANNELS];
+	memset(channels, 0, sizeof(channels));
+	int channel_count = ata_collect_pci_channels(channels, ATA_MAX_CHANNELS);
+
+	/* Fallback to legacy ports if no PCI IDE controller was exposed. */
+	if (channel_count == 0) {
+		ata_channel_add_unique(channels, &channel_count, ATA_PRIMARY_IO, ATA_PRIMARY_CTRL);
+		ata_channel_add_unique(channels, &channel_count, ATA_SECONDARY_IO, ATA_SECONDARY_CTRL);
+		klogprintf("ata: no pci ide controller, fallback legacy channels\n");
+	}
+
+	/* Reset discovered channels to mimic cold-boot behavior. */
+	for (int ch = 0; ch < channel_count; ch++) {
+		ata_software_reset(channels[ch].io_base, channels[ch].ctrl_base);
 	}
 	/* register IRQ handlers for primary (14) and secondary (15) ATA IRQs
 	   before probing so any interrupts generated during IDENTIFY are handled. */
@@ -375,13 +448,11 @@ void ata_dma_init(void) {
 	idt_set_handler(32 + 15, (void (*)(cpu_registers_t*))ata_irq_dispatch_wrapper);
 	pic_unmask_irq(15);
 
-	/* probe standard channels */
-	uint16_t bases[2] = { ATA_PRIMARY_IO, ATA_SECONDARY_IO };
-	uint16_t ctrls[2] = { ATA_PRIMARY_CTRL, ATA_SECONDARY_CTRL };
-	for (int ch = 0; ch < 2; ch++) {
+	/* Probe all discovered channels. */
+	for (int ch = 0; ch < channel_count; ch++) {
 		for (int sl = 0; sl < 2; sl++) {
 			uint16_t identbuf[256];
-			if (ata_identify(bases[ch], ctrls[ch], sl, identbuf) == 0) {
+			if (ata_identify(channels[ch].io_base, channels[ch].ctrl_base, sl, identbuf) == 0) {
 				char model[41] = {0};
 				ata_model_from_ident(identbuf, model, sizeof(model));
 				/* compute total sectors:
@@ -403,7 +474,7 @@ void ata_dma_init(void) {
 					/* fallback to LBA28 words 60..61 */
 					sectors = (uint32_t)identbuf[60] | ((uint32_t)identbuf[61] << 16);
 				}
-				ata_register_device(bases[ch], ctrls[ch], sl, model, sectors);
+				ata_register_device(channels[ch].io_base, channels[ch].ctrl_base, sl, model, sectors);
 			} else {
 				/* no device or identify failed; just continue */
 			}
@@ -412,9 +483,16 @@ void ata_dma_init(void) {
 
 	if (ata_device_count == 0) {
 		klogprintf("ata: No devices detected.\n");
-		return;
+	} else {
+		klogprintf("ata: devices: %d\n", ata_device_count);
 	}
-	klogprintf("ata: devices: %d\n", ata_device_count);
+
+	/* Then probe AHCI SATA. */
+	int ahci_count = ahci_probe_and_register();
+	if (ahci_count > 0) {
+		klogprintf("ahci: devices: %d (after legacy ATA)\n", ahci_count);
+	}
+
 }
 
 /* IRQ handler: clear status on devices to acknowledge IRQ.

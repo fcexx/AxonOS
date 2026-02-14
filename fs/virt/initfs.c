@@ -180,8 +180,18 @@ static void ensure_parent_dirs(const char *path) {
 static int create_file_with_data(const char *path, const void *data, size_t size) {
     struct fs_file *f = fs_create_file(path);
     if (!f) {
-        klogprintf("initfs: create_file_with_data: fs_create_file returned NULL for %s\n", path);
-        return -1;
+        /* Common in busybox/initramfs trees: duplicates / overwrites. If the path already
+           exists, treat it as success to avoid spam and partial extracts. */
+        struct stat st;
+        if (vfs_stat(path, &st) == 0) {
+            return 0;
+        }
+        klogprintf("initfs: create_file_with_data: fs_create_file returned NULL for %s (heap_used=%llu heap_total=%llu heap_peak=%llu)\n",
+                   path,
+                   (unsigned long long)heap_used_bytes(),
+                   (unsigned long long)heap_total_bytes(),
+                   (unsigned long long)heap_peak_bytes());
+        return -12;
     }
     /* Ensure the created handle is recognized as a regular file by VFS/drivers.
        Some drivers may return ambiguous types; force FS_TYPE_REG for initfs-created files. */
@@ -189,8 +199,11 @@ static int create_file_with_data(const char *path, const void *data, size_t size
     ssize_t written = fs_write(f, data, size, 0);
     fs_file_free(f);
     if (written < 0 || (size_t)written != size) {
-        klogprintf("initfs: write failed %s\n", path);
-        return -2;
+        klogprintf("initfs: write failed %s (size=%u written=%d heap_used=%llu heap_total=%llu)\n",
+                   path, (unsigned)size, (int)written,
+                   (unsigned long long)heap_used_bytes(),
+                   (unsigned long long)heap_total_bytes());
+        return -12;
     }
     return 0;
 }
@@ -291,8 +304,13 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
             /* regular file */
             ensure_parent_dirs(target);
             const void *file_data = base + file_data_offset;
-            if (create_file_with_data(target, file_data, filesize) != 0) {
-                klogprintf("initfs: warning: failed to create %s (ingore)\n", target);
+            int cr = create_file_with_data(target, file_data, filesize);
+            if (cr != 0) {
+                if (cr == -12) {
+                    klogprintf("initfs: fatal: OOM while extracting %s\n", target);
+                    return -12;
+                }
+                klogprintf("initfs: warning: failed to create %s (ignore)\n", target);
             } else {
                 /* Apply exact mode bits from archive (includes S_IFREG + perms, esp. +x). */
                 (void)fs_chmod(target, (mode_t)mode);
@@ -307,12 +325,37 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
             if (linkt) {
                 memcpy(linkt, file_data, tlen);
                 linkt[tlen] = '\0';
-                if (ramfs_symlink(target, linkt) < 0) {
-                    klogprintf("initfs: warning: failed to create symlink %s -> %s\n", target, linkt);
+                int sr = ramfs_symlink(target, linkt);
+                if (sr < 0) {
+                    /* ramfs_symlink() return codes:
+                       -4: already exists (EEXIST) -> ignore quietly (busybox trees often include duplicates)
+                       -5/-6: OOM -> fatal
+                       others: warn, but rate-limit to avoid spamming console */
+                    if (sr == -4) {
+                        /* ignore */
+                    } else if (sr == -5 || sr == -6) {
+                        klogprintf("initfs: fatal: OOM while creating symlink %s\n", target);
+                        kfree(linkt);
+                        return -12;
+                    } else {
+                        static int symlink_warn_count = 0;
+                        if (symlink_warn_count < 8) {
+                            klogprintf("initfs: warning: failed to create symlink %s -> %s (rc=%d)\n",
+                                       target, linkt, sr);
+                            symlink_warn_count++;
+                            if (symlink_warn_count == 8) {
+                                klogprintf("initfs: warning: more symlink errors suppressed\n");
+                            }
+                        }
+                    }
                 }
                 kfree(linkt);
             } else {
-                klogprintf("initfs: warning: failed to alloc for symlink %s\n", target);
+                klogprintf("initfs: fatal: OOM alloc for symlink %s (heap_used=%llu heap_total=%llu)\n",
+                           target,
+                           (unsigned long long)heap_used_bytes(),
+                           (unsigned long long)heap_total_bytes());
+                return -12;
             }
         } else {
             /* other types (device, fifo...) - skip for now */

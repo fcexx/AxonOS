@@ -86,12 +86,14 @@ static ssize_t procfs_show_partitions(char *buf, size_t size, void *priv) {
 		int did = -1;
 		uint32_t sectors = 0;
 		if (devfs_block_get(i, name, sizeof(name), &did, &sectors) != 0) continue;
-		/* Prefer Linux-style sdX names to avoid duplicates (we also create hdN). */
-		if (!(name[0] == 's' && name[1] == 'd')) continue;
+		/* Show both SATA-like sdX and legacy IDE-like hdN nodes. */
+		int is_sd = (name[0] == 's' && name[1] == 'd');
+		int is_hd = (name[0] == 'h' && name[1] == 'd');
+		if (!is_sd && !is_hd) continue;
 		/* blocks in 1K units like Linux: sectors * 512 / 1024 == sectors/2 */
 		uint32_t blocks = sectors / 2;
 		/* fake major/minor; enough for userland tools that just parse size+name */
-		int major = 8;
+		int major = is_hd ? 3 : 8;
 		int minor = did >= 0 ? did * 16 : i * 16;
 		int written = snprintf(buf + w, (w < size) ? (size - w) : 0,
 							   "%5d %5d %8u %s\n", major, minor, (unsigned)blocks, name);

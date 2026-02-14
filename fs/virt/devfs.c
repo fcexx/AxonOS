@@ -236,6 +236,9 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                     kfree(tmp);
                     return -1;
                 }
+                /* Security/safety: never expose uninitialized heap bytes to userspace
+                   if a block driver returns success without actually filling the buffer. */
+                memset(tmp, 0, alloc_bytes);
                 if (disk_read_sectors(b->device_id, start_sector + s, tmp, 1) != 0) {
                     kfree(tmp);
                     return -1;
@@ -1471,19 +1474,6 @@ int devfs_create_block_node(const char *path, int device_id, uint32_t sectors) {
     dev_blocks[dev_block_count].device_id = device_id;
     dev_blocks[dev_block_count].sectors = sectors;
     dev_block_count++;
-    /*
-     * Make device visible in ramfs as a simple loop/device node so that
-     * tools that list /dev (or userspace reading ramfs) can see the node
-     * even if devfs is not mounted or is layered. We create a ramfs file
-     * via fs_create_file(), which will try mounted drivers first and then
-     * fall back to registered drivers (ramfs) — the created ramfs node
-     * persists in ramfs tree.
-     */
-    struct fs_file *f = fs_create_file(path);
-    if (f) {
-        /* we don't need to keep the open handle; free it */
-        fs_file_free(f);
-    }
     return 0;
 }
 
@@ -1502,9 +1492,6 @@ int devfs_create_char_node(const char *path, void *driver_private) {
     dev_chars[dev_char_count].path[sizeof(dev_chars[dev_char_count].path)-1] = '\0';
     dev_chars[dev_char_count].driver_private = driver_private;
     dev_char_count++;
-    /* create visible node in ramfs so tools listing /dev see it */
-    struct fs_file *f = fs_create_file(path);
-    if (f) fs_file_free(f);
     return 0;
 }
 

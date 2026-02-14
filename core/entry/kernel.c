@@ -201,9 +201,32 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         // DO NOT TOUCH
         const uintptr_t HEAP_MIN_START = (uintptr_t)(64u * 1024u * 1024u); /* 64 MiB minimal heap start */
         if (heap_start < HEAP_MIN_START) heap_start = HEAP_MIN_START;
-        heap_init(heap_start, 0);
-        kprintf("Loading kernel without compression: heap_start: %p kernel_end: %p mods_end: %p\n",
-                (void*)heap_start, (void*)(uintptr_t)_end, (void*)mods_end);
+        /* Heap size must not exceed installed RAM. The heap implementation is a
+           simple identity-mapped arena; if we size it past RAM we will scribble
+           into non-existent memory and get "random" initfs extraction failures
+           that change with kernel size/timing. */
+        size_t heap_size = 0; /* 0 => heap.c default, but we'll clamp below */
+        int ram_mb = sysinfo_ram_mb();
+        if (ram_mb > 0) {
+            uint64_t ram_bytes = (uint64_t)ram_mb * 1024ULL * 1024ULL;
+            uint64_t start = (uint64_t)heap_start;
+            const uint64_t guard = 16ULL * 1024ULL * 1024ULL; /* leave some slack */
+            if (ram_bytes > start + guard + (32ULL * 1024ULL * 1024ULL)) {
+                uint64_t max = ram_bytes - start - guard;
+                /* keep heap reasonably bounded even on big-RAM machines */
+                const uint64_t cap = 512ULL * 1024ULL * 1024ULL;
+                if (max > cap) max = cap;
+                heap_size = (size_t)max;
+            }
+        }
+        heap_init(heap_start, heap_size);
+        kprintf("Loading kernel without compression: heap_start: %p heap_size=%llu heap_total=%llu heap_base=%p ram_mb=%d kernel_end: %p mods_end: %p\n",
+                (void*)heap_start,
+                (unsigned long long)heap_size,
+                (unsigned long long)heap_total_bytes(),
+                (void*)heap_base_addr(),
+                sysinfo_ram_mb(),
+                (void*)(uintptr_t)_end, (void*)mods_end);
     }
 
     gdt_init();
@@ -271,21 +294,42 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 
     // Enabling interrupts
     asm volatile("sti");
+    /* Recalibrate after STI when PIT ticks are guaranteed to progress. */
+    apic_timer_calibrate();
 
-    // Enabling APIC timer, or PIT
+    /* Enable APIC timer if it behaves sanely; otherwise keep PIT.
+       Real hardware can hang or run at wildly wrong rate with bad APIC calibration. */
     apic_timer_start(100);
-    for (int i = 0; i < 50; i++) {
-        pit_sleep_ms(10);
-        if (apic_timer_ticks > 0) break;
-    }
-    if (apic_timer_ticks > 0) {
-        apic_timer_stop();
-        pit_disable();
-        pic_mask_irq(0);
-        apic_timer_start(1000); // Yeah, APIC is working so we turn on it
-    } else {
-        kprintf("APIC: using PIT\n");
-        apic_timer_stop(); // Nah, we use PIT
+    {
+        uint64_t apic_start = apic_timer_ticks;
+        uint64_t pit_start = pit_get_ticks();
+        while ((pit_get_ticks() - pit_start) < 200) {
+            asm volatile("pause");
+        }
+        uint64_t apic_delta = apic_timer_ticks - apic_start;
+        /* At 100 Hz over ~200 ms we expect around 20 ticks; allow wide tolerance. */
+        int apic_ok = (apic_delta >= 5 && apic_delta <= 80);
+        if (apic_ok) {
+            apic_timer_stop();
+            pit_disable();
+            pic_mask_irq(0);
+            apic_timer_start(1000);
+            /* Confirm APIC is actually ticking at the new rate; otherwise revert to PIT. */
+            uint64_t t0 = apic_timer_ticks;
+            for (int i = 0; i < 1000000; i++) {
+                if (apic_timer_ticks != t0) break;
+                asm volatile("pause");
+            }
+            if (apic_timer_ticks == t0) {
+                kprintf("APIC: no ticks after 1000Hz start, falling back to PIT\n");
+                apic_timer_stop();
+                pic_unmask_irq(0);
+                pit_init();
+            }
+        } else {
+            kprintf("APIC: unstable (%llu ticks/200ms), using PIT\n", (unsigned long long)apic_delta);
+            apic_timer_stop();
+        }
     }
 
     // Calibrate TSC for high resolution timestamps now that APIC timer is running

@@ -2,6 +2,7 @@
 #include <vga.h>
 #include <vbe.h>
 #include <apic.h>
+#include <pit.h>
 #include <thread.h>
 #include <stdio.h>
 #include <string.h>
@@ -32,37 +33,69 @@ static uint8_t find_best_divider(uint32_t target_freq, uint32_t base_freq, uint3
     return 0x3;
 }
 
-// Quick calibration using busy loop
+/* Calibrate APIC timer base frequency against PIT ticks.
+   This is far more stable across machines than CPUID/busy-loop heuristics. */
 static uint32_t quick_calibrate(void) {
-    /* Attempt to read CPU base frequency from CPUID (leaf 0x16).
-       If available, use it as APIC base frequency (good heuristic on modern CPUs).
-       Otherwise fall back to the previous busy-loop measurement. */
-    uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0;
-    asm volatile("cpuid"
-                 : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
-                 : "a"(0x16), "c"(0));
+    const uint32_t divider = 16;
+    const uint32_t sample_ms = 50; /* long enough to average jitter */
+    uint64_t pit_start = pit_get_ticks();
+    uint64_t wait_guard = pit_start + 200; /* avoid infinite wait if PIT broken */
+    uint32_t spin_guard = 0;
+    const uint32_t max_spins = 5000000;
 
-    if (eax != 0) {
-        uint32_t base_mhz = eax;
-        klogprintf("APIC: CPUID reports base CPU frequency %u MHz; using for APIC calibration\n", base_mhz);
-        return base_mhz * 1000000u;
-    }
+    /* One-shot, masked: we only read CURRENT counter and don't need interrupts. */
+    apic_set_lvt_timer(APIC_TIMER_VECTOR, APIC_TIMER_ONESHOT, true);
+    apic_write(LAPIC_TIMER_DIV_REG, 0x3); /* divider=16 */
+    apic_write(LAPIC_TIMER_INIT_REG, 0xFFFFFFFFu);
 
-    /* Fallback: measure APIC ticks using a short busy loop (previous behavior). */
-    apic_set_lvt_timer(APIC_TIMER_VECTOR, APIC_TIMER_ONESHOT, false);
-    apic_write(LAPIC_TIMER_DIV_REG, 0x3); // Divider 16
-    apic_write(LAPIC_TIMER_INIT_REG, 0xFFFFFFFF);
-
-    /* Busy wait for ~10ms — keep loop slightly longer to improve measurability. */
-    for (volatile int i = 0; i < 200000; i++) {
+    while ((pit_get_ticks() - pit_start) < sample_ms) {
+        uint64_t now = pit_get_ticks();
+        if (now > wait_guard) break;
+        if (++spin_guard >= max_spins) break; /* interrupts may be disabled here */
         asm volatile("pause");
     }
 
     uint32_t remaining = apic_read(LAPIC_TIMER_CURRENT_REG);
     uint32_t elapsed = 0xFFFFFFFF - remaining;
     apic_write(LAPIC_TIMER_INIT_REG, 0);
+    apic_set_lvt_timer(APIC_TIMER_VECTOR, APIC_TIMER_ONESHOT, true);
 
-    return elapsed * 100; /* Convert ~10ms sample to Hz */
+    uint64_t pit_delta = pit_get_ticks() - pit_start;
+    if (pit_delta >= 5 && elapsed > 0) {
+        /* base_hz = elapsed * divider / (pit_delta / 1000) */
+        uint64_t base_hz = ((uint64_t)elapsed * (uint64_t)divider * 1000ULL) / pit_delta;
+        if (base_hz >= 1000000ULL && base_hz <= 2000000000ULL) {
+            klogprintf("APIC: calibrated against PIT: elapsed=%u pit_delta=%llu -> base=%u Hz\n",
+                       elapsed, (unsigned long long)pit_delta, (unsigned)base_hz);
+            return (uint32_t)base_hz;
+        }
+    }
+
+    /* If PIT ticks are not advancing yet (e.g. before STI), use bounded busy-loop estimate. */
+    if (pit_delta == 0) {
+        apic_set_lvt_timer(APIC_TIMER_VECTOR, APIC_TIMER_ONESHOT, true);
+        apic_write(LAPIC_TIMER_DIV_REG, 0x3);
+        apic_write(LAPIC_TIMER_INIT_REG, 0xFFFFFFFFu);
+        for (volatile uint32_t i = 0; i < 300000; i++) {
+            asm volatile("pause");
+        }
+        uint32_t rem2 = apic_read(LAPIC_TIMER_CURRENT_REG);
+        uint32_t el2 = 0xFFFFFFFFu - rem2;
+        apic_write(LAPIC_TIMER_INIT_REG, 0);
+        if (el2 > 0) {
+            uint64_t base_hz = (uint64_t)el2 * (uint64_t)divider * 200ULL; /* ~5ms sample */
+            if (base_hz >= 1000000ULL && base_hz <= 2000000000ULL) {
+                klogprintf("APIC: pre-STI calibration fallback: elapsed=%u -> base=%u Hz\n",
+                           el2, (unsigned)base_hz);
+                return (uint32_t)base_hz;
+            }
+        }
+    }
+
+    /* Last resort fallback: conservative default to avoid hangs/wild rates. */
+    klogprintf("APIC: calibration fallback (pit_delta=%llu elapsed=%u), using 100000000 Hz\n",
+               (unsigned long long)pit_delta, elapsed);
+    return 100000000u;
 }
 
 // Simple integer to string conversion
@@ -227,10 +260,10 @@ void apic_timer_start(uint32_t freq_hz) {
     if (count < 10) count = 10;
     if (count > 0xFFFFF) count = 0xFFFFF;
     
-    // Configure timer
+    // Configure timer (program LVT first, then load initial count)
     apic_write(LAPIC_TIMER_DIV_REG, divider);
-    apic_write(LAPIC_TIMER_INIT_REG, count);
     apic_set_lvt_timer(APIC_TIMER_VECTOR, APIC_TIMER_PERIODIC, false);
+    apic_write(LAPIC_TIMER_INIT_REG, count);
     
     // Update state
     apic_timer_state.frequency = freq_hz;

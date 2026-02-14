@@ -97,6 +97,13 @@ static void *dup_page_table(void *old) {
    Returns physical base (frame) or 0 on failure. Works only while current
    page tables are active and mapping exists. */
 uint64_t virt_to_phys(uint64_t va) {
+    /* Kernel and userspace in AxonOS are identity-mapped for the low 4GiB.
+       Many subsystems (AHCI DMA buffers, boot modules, early heap) allocate from
+       this region. Walking page tables here is unnecessary and can fail once we
+       start splitting bootstrap 1GiB mappings into 2MiB tables (virtual/physical
+       pointer confusion). */
+    if (va < 0x100000000ULL) return va;
+
     extern uint64_t page_table_l4[];
     uint64_t *l4 = (uint64_t*)page_table_l4;
     uint64_t l4i = (va >> 39) & 0x1FF;
