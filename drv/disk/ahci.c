@@ -423,15 +423,9 @@ static int ahci_issue_cmd(ahci_port_state_t *st, int slot, uint32_t expect_min_p
 	}
 	/* Check task file error */
 	if (p->tfd & 0x01u) return -1;
-	/* PRDBC is unreliable on some virtual AHCI implementations (VMware often leaves it 0
-	   even for successful transfers). Keep it for diagnostics only; do not fail. */
 	if (expect_min_prdbc > 0) {
 		hba_cmd_header_t *cmd_list = (hba_cmd_header_t*)st->clb_mem;
 		uint32_t prdbc = cmd_list[slot].prdbc;
-		if (prdbc < expect_min_prdbc) {
-			klogprintf("ahci: short transfer port=%d slot=%d prdbc=%u expect=%u IS=0x%08x TFD=0x%08x CI=0x%08x\n",
-			           st->port_no, slot, prdbc, expect_min_prdbc, p->is, p->tfd, p->ci);
-		}
 	}
 	return 0;
 }

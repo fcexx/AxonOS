@@ -340,6 +340,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     pci_dump_devices();
     pci_sysfs_init();
     intel_chipset_init();
+    /* Keep NIC driver non-intrusive until full net stack is wired.
+       This avoids affecting boot stability on machines where NIC init timing is sensitive. */
 
     // Scheduler and I/O scheduler
     thread_init();

@@ -208,6 +208,110 @@ static int create_file_with_data(const char *path, const void *data, size_t size
     return 0;
 }
 
+static size_t initfs_strnlen_local(const char *s, size_t maxn) {
+    size_t n = 0;
+    if (!s) return 0;
+    while (n < maxn && s[n] != '\0') n++;
+    return n;
+}
+
+static const char *initfs_basename(const char *p) {
+    if (!p) return p;
+    const char *b = p;
+    for (const char *c = p; *c; c++) {
+        if (*c == '/') b = c + 1;
+    }
+    return b;
+}
+
+/* Robust module-name matcher:
+   accepts exact "initfs", "initfs.cpio", "/boot/initfs.cpio", and cmdline with args. */
+static int initfs_module_name_matches(const char *cmdline, size_t maxlen, const char *want_name) {
+    if (!cmdline || !want_name || !want_name[0]) return 0;
+    size_t n = initfs_strnlen_local(cmdline, maxlen);
+    if (n == 0) return 0;
+
+    /* Skip leading spaces/tabs. */
+    size_t i = 0;
+    while (i < n && (cmdline[i] == ' ' || cmdline[i] == '\t')) i++;
+    if (i >= n) return 0;
+
+    /* First token only (before whitespace). */
+    size_t start = i;
+    while (i < n && cmdline[i] != ' ' && cmdline[i] != '\t') i++;
+    size_t tok_len = i - start;
+    if (tok_len == 0 || tok_len > 255) return 0;
+
+    char tok[256];
+    memcpy(tok, cmdline + start, tok_len);
+    tok[tok_len] = '\0';
+
+    if (strcmp(tok, want_name) == 0) return 1;
+
+    const char *base = initfs_basename(tok);
+    if (strcmp(base, want_name) == 0) return 1;
+
+    /* Allow common archive suffixes for basename token. */
+    size_t want_len = strlen(want_name);
+    if (strncmp(base, want_name, want_len) == 0) {
+        if (base[want_len] == '\0' || base[want_len] == '.' || base[want_len] == '-') return 1;
+    }
+    return 0;
+}
+
+static int initfs_has_boot_init(void) {
+    struct stat st;
+    if (vfs_stat("/sbin/init", &st) == 0) return 1;
+    if (vfs_stat("/bin/init", &st) == 0) return 1;
+    return 0;
+}
+
+/* Normalize archive path to an absolute canonical-ish form suitable for VFS lookup.
+   Handles common cpio prefixes like "./", repeated '/', and trailing '/'. */
+static void initfs_normalize_target(char *out, size_t out_sz, const char *name) {
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+    if (!name || !name[0]) {
+        if (out_sz >= 2) { out[0] = '/'; out[1] = '\0'; }
+        return;
+    }
+
+    const char *src = name;
+    while (src[0] == '.') {
+        if (src[1] == '/') {
+            src += 2; /* trim leading "./" */
+            continue;
+        }
+        if (src[1] == '\0') { /* "." entry */
+            src += 1;
+            break;
+        }
+        break;
+    }
+
+    size_t w = 0;
+    out[w++] = '/';
+    int last_was_slash = 1;
+    while (*src && w + 1 < out_sz) {
+        char c = *src++;
+        if (c == '/') {
+            if (last_was_slash) continue;
+            out[w++] = '/';
+            last_was_slash = 1;
+            continue;
+        }
+        if (c == '.' && (src[0] == '/' || src[0] == '\0') && last_was_slash) {
+            /* skip "/./" and trailing "/." segments */
+            continue;
+        }
+        out[w++] = c;
+        last_was_slash = 0;
+    }
+
+    if (w > 1 && out[w - 1] == '/') w--;
+    out[w] = '\0';
+}
+
 /* Unpack cpio newc archive at archive (size bytes) into VFS root. */
 static int unpack_cpio_newc(const void *archive, size_t archive_size) {
     const uint8_t *base = (const uint8_t*)archive;
@@ -277,16 +381,15 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
         }
         /* build target path: ensure leading slash */
         char target[512];
-        if (name[0] == '/') {
-            strncpy(target, name, sizeof(target)-1);
-            target[sizeof(target)-1] = '\0';
-        } else {
-            /* make absolute */
-            target[0] = '/';
-            size_t n = strlen(name);
-            if (n > sizeof(target)-2) n = sizeof(target)-2;
-            memcpy(target+1, name, n);
-            target[1+n] = '\0';
+        initfs_normalize_target(target, sizeof(target), name);
+        if (strcmp(target, "/") == 0) {
+            /* Ignore root pseudo-entry like "." */
+            size_t next_root = file_data_offset + filesize;
+            if (next_root <= offset || next_root > archive_size) return -1;
+            next_root = (next_root + 3) & ~3u;
+            if (next_root <= offset) return -1;
+            offset = next_root;
+            continue;
         }
         /* determine mode */
         uint32_t mode = hex_to_uint(h->c_mode, 8);
@@ -392,14 +495,15 @@ int initfs_process_multiboot_module(uint32_t multiboot_magic, uint64_t multiboot
     uint32_t total_size = *(uint32_t*)p;
     /* Deep diagnostic: print header + first tags; this helps when some VMs
        pass different structures / pointers. */
-    /* Allow larger multiboot info blocks (some loaders place large modules).
-       Increase cap to 256 MiB to avoid false-positive 'suspicious' aborts. */
-    if (total_size < 16 || total_size > (256u * 1024u * 1024u)) {
+    /* total_size 0 или слишком большой — отказ. 1..15: возможно загрузчик передал указатель
+       на первый тег (в p+0 тип тега), тогда стандартный цикл не войдёт — ниже пробуем alt layout. */
+    if (total_size == 0 || total_size > (256u * 1024u * 1024u)) {
         klogprintf("initfs: suspicious total_size=%u, aborting mb2 scan\n", (unsigned)total_size);
         return 4;
     }
     uint32_t offset = 8; /* tags start after total_size + reserved */
     uint32_t tag_count = 0;
+    int module_tags_seen = 0;
     while (offset + 8 <= total_size) {
         if (++tag_count > 1024) break;
         uint32_t tag_type = *(uint32_t*)(p + offset);
@@ -409,6 +513,7 @@ int initfs_process_multiboot_module(uint32_t multiboot_magic, uint64_t multiboot
         if ((uint64_t)offset + (uint64_t)tag_size > (uint64_t)total_size) break;
         if (tag_type == 0) break; /* end */
         if (tag_type == 3) { /* module */
+            module_tags_seen++;
             /* Multiboot2 module tag layout is ALWAYS:
                u32 mod_start, u32 mod_end, then NUL-terminated cmdline string.
                (Even for 64-bit kernels, addresses here are 32-bit physical). */
@@ -422,7 +527,18 @@ int initfs_process_multiboot_module(uint32_t multiboot_magic, uint64_t multiboot
                 uint64_t mod_end = (uint64_t)me32;
                 size_t name_field_offset = offset + 16;
                 const char *name = (const char*)(p + name_field_offset);
-            if (strcmp(name, module_name) == 0) {
+                size_t name_max = (size_t)tag_size - 16u;
+                size_t name_len = initfs_strnlen_local(name, name_max);
+                char shown[128];
+                size_t sn = name_len;
+                if (sn >= sizeof(shown)) sn = sizeof(shown) - 1;
+                memcpy(shown, name, sn);
+                shown[sn] = '\0';
+                klogprintf("initfs: mb2 module cmdline=\"%s\" start=0x%llx end=0x%llx size=%u\n",
+                           shown, (unsigned long long)mod_start, (unsigned long long)mod_end,
+                           (unsigned)(mod_end > mod_start ? (mod_end - mod_start) : 0));
+
+            if (initfs_module_name_matches(name, name_max, module_name)) {
                 size_t mod_size = mod_end > mod_start ? (size_t)(mod_end - mod_start) : 0;
                 const void *mod_ptr = (const void*)(uintptr_t)mod_start;
                 klogprintf("initfs: found module '%s' at %p size %u\n", module_name, mod_ptr, (unsigned)mod_size);
@@ -452,26 +568,100 @@ int initfs_process_multiboot_module(uint32_t multiboot_magic, uint64_t multiboot
         uint32_t next = (tag_size + 7) & ~7u;
         offset += next;
     }
-    /* If we didn't find a multiboot module, attempt a tolerant fallback:
-       scan low physical memory for a cpio newc magic ("070701"/"070702")
-       and try to unpack from there.
-
-       NOTE: This can be EXTREMELY slow if done byte-by-byte over hundreds of MiB.
-       Keep the scan bounded and coarse; this fallback is only for broken loaders. */
+    /* В VMware загрузчик может передать указатель на первый тег (в p+0 тип 3), а не на заголовок.
+       Пробуем разбор с offset=0 при любой неудаче — при стандартном layout (p+0=total_size) сразу выйдем. */
     {
-        const uintptr_t scan_start = 0x10000; /* 64KB */
-        const uintptr_t scan_end = 0x02000000; /* 32MB max scan to avoid long boot stalls */
-        const uintptr_t stride = 4;            /* cpio newc headers are 4-byte aligned */
-        for (uintptr_t a = scan_start; a + 6 <= scan_end; a += stride) {
-            const uint8_t *p6 = (const uint8_t*)(uintptr_t)a;
-            if (memcmp(p6, "070701", 6) == 0 || memcmp(p6, "070702", 6) == 0) {
-                size_t remaining = (size_t)(scan_end - a);
-                if (remaining >= sizeof(struct cpio_newc_header) && plausible_cpio_header((const struct cpio_newc_header*)p6, remaining)) {
-                    int r = unpack_cpio_newc(p6, remaining);
+        const uint32_t alt_max = 65536u;
+        uint32_t alt_off = 0;
+        while (alt_off + 8 <= alt_max) {
+            uint32_t tag_type = *(uint32_t*)(p + alt_off);
+            uint32_t tag_size = *(uint32_t*)(p + alt_off + 4);
+            if (tag_size < 8 || tag_size > alt_max) break;
+            if (tag_type == 0) break;
+            if (tag_type == 3 && tag_size >= 16) {
+                const uint8_t *field_ptr = p + alt_off + 8;
+                uint32_t ms32 = *(uint32_t*)(field_ptr);
+                uint32_t me32 = *(uint32_t*)(field_ptr + 4);
+                uint64_t mod_start = (uint64_t)ms32;
+                uint64_t mod_end = (uint64_t)me32;
+                size_t name_max = (size_t)tag_size - 16u;
+                const char *name = (const char*)(p + alt_off + 16);
+                if (initfs_module_name_matches(name, name_max, module_name)) {
+                    size_t mod_size = mod_end > mod_start ? (size_t)(mod_end - mod_start) : 0;
+                    const void *mod_ptr = (const void*)(uintptr_t)mod_start;
+                    klogprintf("initfs: found module '%s' at %p size %u (alt mb2 layout)\n",
+                               module_name, mod_ptr, (unsigned)mod_size);
+                    if (mod_size == 0) return -2;
+                    int r = unpack_cpio_newc(mod_ptr, mod_size);
                     if (r == 0) return 0;
+                    void *buf = kmalloc(mod_size);
+                    if (buf) {
+                        memcpy(buf, mod_ptr, mod_size);
+                        int r2 = unpack_cpio_newc(buf, mod_size);
+                        kfree(buf);
+                        if (r2 == 0) return 0;
+                    }
                 }
+            }
+            alt_off += (tag_size + 7) & ~7u;
+        }
+    }
+
+    /* Fallback: некоторые загрузчики дают битую/обрезанную цепочку тегов (например, end-tag
+       раньше module). В таком случае пробуем "рыхлый" поиск module-tag (type=3) только
+       в небольшом окне около multiboot_info, без глобального сканирования памяти. */
+    {
+        const uint32_t meta_scan = 65536u; /* 64 KiB */
+        for (uint32_t off = 0; off + 16u <= meta_scan; off += 4u) {
+            uint32_t tag_type = *(uint32_t *)(p + off);
+            if (tag_type != 3u) continue;
+            uint32_t tag_size = *(uint32_t *)(p + off + 4u);
+            if (tag_size < 16u || tag_size > 4096u) continue;
+            if (off + tag_size > meta_scan) continue;
+
+            const uint8_t *field_ptr = p + off + 8u;
+            uint32_t ms32 = *(uint32_t *)(field_ptr);
+            uint32_t me32 = *(uint32_t *)(field_ptr + 4u);
+            if (me32 <= ms32) continue;
+
+            uint64_t mod_start = (uint64_t)ms32;
+            uint64_t mod_end = (uint64_t)me32;
+            size_t mod_size = (size_t)(mod_end - mod_start);
+            if (mod_size == 0 || mod_size > (512u * 1024u * 1024u)) continue;
+
+            const char *name = (const char *)(p + off + 16u);
+            size_t name_max = (size_t)tag_size - 16u;
+            if (!initfs_module_name_matches(name, name_max, module_name)) continue;
+
+            const void *mod_ptr = (const void *)(uintptr_t)mod_start;
+            klogprintf("initfs: found module '%s' at %p size %u (loose mb2 tag scan)\n",
+                       module_name ? module_name : "(null)",
+                       mod_ptr, (unsigned)mod_size);
+            int r = unpack_cpio_newc(mod_ptr, mod_size);
+            if (r == 0) return 0;
+            void *buf = kmalloc(mod_size);
+            if (!buf) return r;
+            memcpy(buf, mod_ptr, mod_size);
+            int r2 = unpack_cpio_newc(buf, mod_size);
+            kfree(buf);
+            return r2;
+        }
+    }
+
+    /* Последняя попытка: часть загрузчиков передаёт в multiboot_info адрес initrd напрямую
+       (по указателю сразу cpio magic). Не сканируем память — только один адрес. */
+    if ((memcmp(p, "070701", 6) == 0 || memcmp(p, "070702", 6) == 0)) {
+        const size_t direct_max = 64u * 1024u * 1024u; /* не читать дальше 64 MiB */
+        if (plausible_cpio_header((const struct cpio_newc_header *)p, direct_max)) {
+            int r = unpack_cpio_newc(p, direct_max);
+            if (r == 0 && initfs_has_boot_init()) {
+                klogprintf("initfs: found cpio at multiboot_info (direct initrd)\n");
+                return 0;
             }
         }
     }
+
+    klogprintf("initfs: module '%s' not found in mb2 tags (tags=%u modules=%d)\n",
+               module_name ? module_name : "(null)", (unsigned)tag_count, module_tags_seen);
     return 1; /* module not found */
 }

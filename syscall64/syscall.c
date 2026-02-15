@@ -18,6 +18,7 @@
 #include <rtc.h>
 #include <spinlock.h>
 #include <fat32.h>
+#include <e1000.h>
 
 /* Linux x86_64 struct stat size; ensures st_mode at correct offset for S_ISREG etc. */
 #define STAT_COPY_SIZE 144
@@ -302,6 +303,11 @@ static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, siz
 #define EIO     5
 #define EEXIST  17
 #define ENOTDIR 20
+#define EAFNOSUPPORT 97
+#define EPROTONOSUPPORT 93
+#define ESOCKTNOSUPPORT 94
+#define EOPNOTSUPP 95
+#define ENETDOWN 100
 
 /* Pipe: kernel buffer + two fd ends. driver_private = pipe_t*, fs_private = 0 read / 1 write */
 #define PIPE_BUF_SIZE 4096
@@ -398,6 +404,499 @@ static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t
     }
     return (ssize_t)written;
 }
+
+/* ---------- Minimal IPv4/ICMP raw socket backend (for ping) ---------- */
+#define SYSCALL_FTYPE_SOCKET  0x534F434Bu
+
+#define AF_INET_LOCAL         2
+#define SOCK_DGRAM_LOCAL      2
+#define SOCK_RAW_LOCAL        3
+#define IPPROTO_ICMP_LOCAL    1
+
+#define ETH_TYPE_IPV4         0x0800
+#define ETH_TYPE_ARP          0x0806
+
+#define UDP_PORT_DHCP_SERVER  67
+#define UDP_PORT_DHCP_CLIENT  68
+
+typedef struct __attribute__((packed)) {
+    uint8_t dst[6];
+    uint8_t src[6];
+    uint16_t ethertype;
+} eth_hdr_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t ver_ihl;
+    uint8_t tos;
+    uint16_t total_len;
+    uint16_t id;
+    uint16_t frag_off;
+    uint8_t ttl;
+    uint8_t proto;
+    uint16_t csum;
+    uint32_t src;
+    uint32_t dst;
+} ipv4_hdr_t;
+
+typedef struct __attribute__((packed)) {
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint16_t len;
+    uint16_t csum;
+} udp_hdr_t;
+
+typedef struct __attribute__((packed)) {
+    uint16_t htype;
+    uint16_t ptype;
+    uint8_t hlen;
+    uint8_t plen;
+    uint16_t oper;
+    uint8_t sha[6];
+    uint8_t spa[4];
+    uint8_t tha[6];
+    uint8_t tpa[4];
+} arp_hdr_t;
+
+typedef struct {
+    int type_base;
+    int protocol;
+    uint32_t last_dst_ip_be;
+    uint16_t last_echo_id;
+    uint16_t last_echo_seq;
+    uint16_t next_echo_seq;
+} ksock_net_t;
+
+typedef struct {
+    int inited;
+    int ready;
+    uint8_t mac[6];
+    uint32_t ip_be;
+    uint32_t mask_be;
+    uint32_t gw_be;
+    uint16_t ip_id;
+    uint8_t gw_mac[6];
+    int gw_mac_valid;
+} net_state_t;
+
+static net_state_t g_net;
+
+static inline uint16_t be16(uint16_t v) { return (uint16_t)((v << 8) | (v >> 8)); }
+static inline uint32_t be32(uint32_t v) {
+    return ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) | ((v & 0x00FF0000u) >> 8) | ((v & 0xFF000000u) >> 24);
+}
+
+static uint16_t ip_checksum16(const void *data, size_t len) {
+    const uint8_t *p = (const uint8_t *)data;
+    uint32_t sum = 0;
+    while (len > 1) {
+        sum += (uint32_t)((p[0] << 8) | p[1]);
+        p += 2;
+        len -= 2;
+    }
+    if (len) sum += (uint32_t)(p[0] << 8);
+    while (sum >> 16) sum = (sum & 0xFFFFu) + (sum >> 16);
+    return (uint16_t)(~sum);
+}
+
+static void ip_be_to_bytes(uint32_t ip_be, uint8_t out[4]) {
+    out[0] = (uint8_t)(ip_be >> 24);
+    out[1] = (uint8_t)(ip_be >> 16);
+    out[2] = (uint8_t)(ip_be >> 8);
+    out[3] = (uint8_t)(ip_be);
+}
+
+static int ip_same_subnet(uint32_t a_be, uint32_t b_be, uint32_t mask_be) {
+    return ((a_be & mask_be) == (b_be & mask_be));
+}
+
+static int net_send_eth_ipv4(const uint8_t dst_mac[6], uint32_t dst_ip_be, uint8_t proto, const void *l4, size_t l4_len) {
+    if (!g_net.ready || !dst_mac || !l4 || l4_len > 1500) return -1;
+    size_t frame_len = sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t) + l4_len;
+    uint8_t *frame = (uint8_t *)kmalloc(frame_len);
+    if (!frame) return -1;
+
+    eth_hdr_t *eth = (eth_hdr_t *)frame;
+    memcpy(eth->dst, dst_mac, 6);
+    memcpy(eth->src, g_net.mac, 6);
+    eth->ethertype = be16(ETH_TYPE_IPV4);
+
+    ipv4_hdr_t *ip = (ipv4_hdr_t *)(frame + sizeof(eth_hdr_t));
+    memset(ip, 0, sizeof(*ip));
+    ip->ver_ihl = 0x45;
+    ip->total_len = be16((uint16_t)(sizeof(ipv4_hdr_t) + l4_len));
+    ip->id = be16(++g_net.ip_id);
+    ip->frag_off = be16(0x0000);
+    ip->ttl = 64;
+    ip->proto = proto;
+    ip->src = be32(g_net.ip_be);
+    ip->dst = be32(dst_ip_be);
+    ip->csum = be16(ip_checksum16(ip, sizeof(*ip)));
+
+    memcpy(frame + sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t), l4, l4_len);
+    int r = e1000_send_frame(frame, frame_len);
+    kfree(frame);
+    return (r < 0) ? -1 : 0;
+}
+
+static int net_send_arp_request(uint32_t target_ip_be) {
+    uint8_t frame[64];
+    memset(frame, 0, sizeof(frame));
+    eth_hdr_t *eth = (eth_hdr_t *)frame;
+    memset(eth->dst, 0xFF, 6);
+    memcpy(eth->src, g_net.mac, 6);
+    eth->ethertype = be16(ETH_TYPE_ARP);
+
+    arp_hdr_t *arp = (arp_hdr_t *)(frame + sizeof(eth_hdr_t));
+    arp->htype = be16(1);
+    arp->ptype = be16(ETH_TYPE_IPV4);
+    arp->hlen = 6;
+    arp->plen = 4;
+    arp->oper = be16(1);
+    memcpy(arp->sha, g_net.mac, 6);
+    ip_be_to_bytes(g_net.ip_be, arp->spa);
+    memset(arp->tha, 0, 6);
+    ip_be_to_bytes(target_ip_be, arp->tpa);
+
+    return (e1000_send_frame(frame, sizeof(frame)) < 0) ? -1 : 0;
+}
+
+static int net_try_parse_arp_reply_for_ip(const uint8_t *frame, size_t n, uint32_t ip_be, uint8_t out_mac[6]) {
+    if (!frame || n < sizeof(eth_hdr_t) + sizeof(arp_hdr_t)) return 0;
+    const eth_hdr_t *eth = (const eth_hdr_t *)frame;
+    if (be16(eth->ethertype) != ETH_TYPE_ARP) return 0;
+    const arp_hdr_t *arp = (const arp_hdr_t *)(frame + sizeof(eth_hdr_t));
+    if (be16(arp->oper) != 2) return 0;
+    uint32_t spa = ((uint32_t)arp->spa[0] << 24) | ((uint32_t)arp->spa[1] << 16) | ((uint32_t)arp->spa[2] << 8) | arp->spa[3];
+    if (spa != ip_be) return 0;
+    memcpy(out_mac, arp->sha, 6);
+    return 1;
+}
+
+static int net_resolve_mac(uint32_t ip_be, uint8_t out_mac[6], uint32_t timeout_ms) {
+    if (!out_mac) return -1;
+    /* Drain RX so ARP reply is not behind leftover DHCP/other frames. */
+    { uint8_t drain[256]; while (e1000_recv_frame(drain, sizeof(drain)) > 0) ; }
+    if (net_send_arp_request(ip_be) != 0) return -1;
+    uint8_t frame[2048];
+    uint64_t start = pit_get_time_ms();
+    while ((pit_get_time_ms() - start) < timeout_ms) {
+        int r = e1000_recv_frame(frame, sizeof(frame));
+        if (r > 0 && net_try_parse_arp_reply_for_ip(frame, (size_t)r, ip_be, out_mac)) return 0;
+        thread_yield();
+    }
+    return -1;
+}
+
+/* DHCP option parser: returns pointer to value (inside packet) or NULL. */
+static const uint8_t *dhcp_find_opt(const uint8_t *opts, size_t opts_len, uint8_t code, uint8_t *out_len) {
+    size_t i = 0;
+    while (i < opts_len) {
+        uint8_t c = opts[i++];
+        if (c == 0) continue;
+        if (c == 255) break;
+        if (i >= opts_len) break;
+        uint8_t l = opts[i++];
+        if (i + l > opts_len) break;
+        if (c == code) {
+            if (out_len) *out_len = l;
+            return &opts[i];
+        }
+        i += l;
+    }
+    return NULL;
+}
+
+static int net_send_dhcp(uint8_t msg_type, uint32_t xid, uint32_t req_ip_be, uint32_t server_id_be) {
+    uint8_t pkt[548];
+    memset(pkt, 0, sizeof(pkt));
+    /* BOOTP fixed header */
+    pkt[0] = 1;  /* op: request */
+    pkt[1] = 1;  /* htype ethernet */
+    pkt[2] = 6;  /* hlen */
+    pkt[3] = 0;  /* hops */
+    pkt[4] = (uint8_t)(xid >> 24); pkt[5] = (uint8_t)(xid >> 16); pkt[6] = (uint8_t)(xid >> 8); pkt[7] = (uint8_t)xid;
+    pkt[10] = 0x80; pkt[11] = 0x00; /* flags: broadcast */
+    memcpy(&pkt[28], g_net.mac, 6); /* chaddr */
+    /* magic cookie */
+    pkt[236] = 99; pkt[237] = 130; pkt[238] = 83; pkt[239] = 99;
+    size_t o = 240;
+    pkt[o++] = 53; pkt[o++] = 1; pkt[o++] = msg_type; /* DHCP message type */
+    pkt[o++] = 61; pkt[o++] = 7; pkt[o++] = 1; memcpy(&pkt[o], g_net.mac, 6); o += 6; /* client id */
+    if (msg_type == 1) {
+        /* discover: request common parameters */
+        pkt[o++] = 55; pkt[o++] = 3; pkt[o++] = 1; pkt[o++] = 3; pkt[o++] = 6; /* subnet, router, dns */
+    } else if (msg_type == 3) {
+        pkt[o++] = 50; pkt[o++] = 4; /* requested IP */
+        pkt[o++] = (uint8_t)(req_ip_be >> 24); pkt[o++] = (uint8_t)(req_ip_be >> 16);
+        pkt[o++] = (uint8_t)(req_ip_be >> 8);  pkt[o++] = (uint8_t)(req_ip_be);
+        pkt[o++] = 54; pkt[o++] = 4; /* server identifier */
+        pkt[o++] = (uint8_t)(server_id_be >> 24); pkt[o++] = (uint8_t)(server_id_be >> 16);
+        pkt[o++] = (uint8_t)(server_id_be >> 8);  pkt[o++] = (uint8_t)(server_id_be);
+        pkt[o++] = 55; pkt[o++] = 2; pkt[o++] = 1; pkt[o++] = 3;
+    }
+    pkt[o++] = 255;
+
+    uint8_t dst_mac[6];
+    memset(dst_mac, 0xFF, 6);
+
+    /* Build IPv4+UDP by hand (src 0.0.0.0, dst broadcast, UDP checksum = 0). */
+    size_t ip_len = sizeof(ipv4_hdr_t) + sizeof(udp_hdr_t) + o;
+    size_t frm_len = sizeof(eth_hdr_t) + ip_len;
+    uint8_t *frm = (uint8_t *)kmalloc(frm_len);
+    if (!frm) return -1;
+    eth_hdr_t *eth = (eth_hdr_t *)frm;
+    memcpy(eth->dst, dst_mac, 6);
+    memcpy(eth->src, g_net.mac, 6);
+    eth->ethertype = be16(ETH_TYPE_IPV4);
+
+    ipv4_hdr_t *ip = (ipv4_hdr_t *)(frm + sizeof(eth_hdr_t));
+    memset(ip, 0, sizeof(*ip));
+    ip->ver_ihl = 0x45;
+    ip->total_len = be16((uint16_t)ip_len);
+    ip->id = be16(++g_net.ip_id);
+    ip->ttl = 64;
+    ip->proto = 17; /* UDP */
+    ip->src = 0;
+    ip->dst = 0xFFFFFFFFu;
+    ip->csum = be16(ip_checksum16(ip, sizeof(*ip)));
+
+    udp_hdr_t *udp = (udp_hdr_t *)(frm + sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t));
+    udp->src_port = be16(UDP_PORT_DHCP_CLIENT);
+    udp->dst_port = be16(UDP_PORT_DHCP_SERVER);
+    udp->len = be16((uint16_t)(sizeof(udp_hdr_t) + o));
+    udp->csum = 0;
+    memcpy((uint8_t *)udp + sizeof(udp_hdr_t), pkt, o);
+    int sr = e1000_send_frame(frm, frm_len);
+    kfree(frm);
+    return (sr < 0) ? -1 : 0;
+}
+
+static int net_dhcp_acquire(void) {
+    uint32_t xid = (uint32_t)(pit_get_ticks() ^ 0xA5F0C31Du);
+    uint32_t offered_ip = 0, server_id = 0, netmask = 0, router = 0;
+    if (net_send_dhcp(1, xid, 0, 0) != 0) return -1; /* DISCOVER */
+
+    uint8_t frame[2048];
+    uint64_t start = pit_get_time_ms();
+    while ((pit_get_time_ms() - start) < 3000) {
+        int n = e1000_recv_frame(frame, sizeof(frame));
+        if (n <= 0) { thread_yield(); continue; }
+        if ((size_t)n < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t) + sizeof(udp_hdr_t) + 240) continue;
+        const eth_hdr_t *eth = (const eth_hdr_t *)frame;
+        if (be16(eth->ethertype) != ETH_TYPE_IPV4) continue;
+        const ipv4_hdr_t *ip = (const ipv4_hdr_t *)(frame + sizeof(eth_hdr_t));
+        size_t ihl = (size_t)((ip->ver_ihl & 0x0Fu) * 4u);
+        if (ip->proto != 17 || ihl < sizeof(ipv4_hdr_t)) continue;
+        if ((size_t)n < sizeof(eth_hdr_t) + ihl + sizeof(udp_hdr_t) + 240) continue;
+        const udp_hdr_t *udp = (const udp_hdr_t *)(frame + sizeof(eth_hdr_t) + ihl);
+        if (be16(udp->dst_port) != UDP_PORT_DHCP_CLIENT) continue;
+        const uint8_t *d = (const uint8_t *)udp + sizeof(udp_hdr_t);
+        uint32_t rx_xid = ((uint32_t)d[4] << 24) | ((uint32_t)d[5] << 16) | ((uint32_t)d[6] << 8) | d[7];
+        if (rx_xid != xid) continue;
+        uint32_t yiaddr = ((uint32_t)d[16] << 24) | ((uint32_t)d[17] << 16) | ((uint32_t)d[18] << 8) | d[19];
+        if (!(d[236] == 99 && d[237] == 130 && d[238] == 83 && d[239] == 99)) continue;
+        uint8_t l = 0;
+        const uint8_t *t = dhcp_find_opt(d + 240, (size_t)n - (size_t)((d + 240) - frame), 53, &l);
+        if (!t || l != 1 || t[0] != 2) continue; /* DHCPOFFER */
+        const uint8_t *sid = dhcp_find_opt(d + 240, (size_t)n - (size_t)((d + 240) - frame), 54, &l);
+        if (sid && l == 4) server_id = ((uint32_t)sid[0] << 24) | ((uint32_t)sid[1] << 16) | ((uint32_t)sid[2] << 8) | sid[3];
+        const uint8_t *msk = dhcp_find_opt(d + 240, (size_t)n - (size_t)((d + 240) - frame), 1, &l);
+        if (msk && l == 4) netmask = ((uint32_t)msk[0] << 24) | ((uint32_t)msk[1] << 16) | ((uint32_t)msk[2] << 8) | msk[3];
+        const uint8_t *rtr = dhcp_find_opt(d + 240, (size_t)n - (size_t)((d + 240) - frame), 3, &l);
+        if (rtr && l >= 4) router = ((uint32_t)rtr[0] << 24) | ((uint32_t)rtr[1] << 16) | ((uint32_t)rtr[2] << 8) | rtr[3];
+        offered_ip = yiaddr;
+        break;
+    }
+    if (!offered_ip || !server_id) return -1;
+    if (net_send_dhcp(3, xid, offered_ip, server_id) != 0) return -1; /* REQUEST */
+
+    start = pit_get_time_ms();
+    while ((pit_get_time_ms() - start) < 3000) {
+        int n = e1000_recv_frame(frame, sizeof(frame));
+        if (n <= 0) { thread_yield(); continue; }
+        if ((size_t)n < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t) + sizeof(udp_hdr_t) + 240) continue;
+        const eth_hdr_t *eth = (const eth_hdr_t *)frame;
+        if (be16(eth->ethertype) != ETH_TYPE_IPV4) continue;
+        const ipv4_hdr_t *ip = (const ipv4_hdr_t *)(frame + sizeof(eth_hdr_t));
+        size_t ihl = (size_t)((ip->ver_ihl & 0x0Fu) * 4u);
+        if (ip->proto != 17 || ihl < sizeof(ipv4_hdr_t)) continue;
+        if ((size_t)n < sizeof(eth_hdr_t) + ihl + sizeof(udp_hdr_t) + 240) continue;
+        const udp_hdr_t *udp = (const udp_hdr_t *)(frame + sizeof(eth_hdr_t) + ihl);
+        if (be16(udp->dst_port) != UDP_PORT_DHCP_CLIENT) continue;
+        const uint8_t *d = (const uint8_t *)udp + sizeof(udp_hdr_t);
+        uint32_t rx_xid = ((uint32_t)d[4] << 24) | ((uint32_t)d[5] << 16) | ((uint32_t)d[6] << 8) | d[7];
+        if (rx_xid != xid) continue;
+        if (!(d[236] == 99 && d[237] == 130 && d[238] == 83 && d[239] == 99)) continue;
+        uint8_t l = 0;
+        const uint8_t *t = dhcp_find_opt(d + 240, (size_t)n - (size_t)((d + 240) - frame), 53, &l);
+        if (!t || l != 1 || t[0] != 5) continue; /* DHCPACK */
+        g_net.ip_be = offered_ip;
+        g_net.mask_be = netmask ? netmask : 0xFFFFFF00u;
+        g_net.gw_be = router ? router : server_id;
+        return 0;
+    }
+    return -1;
+}
+
+static int net_stack_init(void) {
+    if (g_net.inited) return g_net.ready ? 0 : -1;
+    memset(&g_net, 0, sizeof(g_net));
+    g_net.inited = 1;
+    g_net.ip_id = 1;
+    if (e1000_init() != 0) {
+        klogprintf("net: e1000 init failed\n");
+        return -1;
+    }
+    if (e1000_get_mac(g_net.mac) != 0) return -1;
+    if (net_dhcp_acquire() != 0) {
+        /* Conservative fallback for QEMU user networking. */
+        g_net.ip_be = 0x0A00020Fu;   /* 10.0.2.15 */
+        g_net.mask_be = 0xFFFFFF00u; /* /24 */
+        g_net.gw_be = 0x0A000202u;   /* 10.0.2.2 */
+        klogprintf("net: DHCP failed, fallback ip=10.0.2.15 gw=10.0.2.2\n");
+    }
+    g_net.ready = 1;
+    klogprintf("net: ready ip=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
+               (unsigned)((g_net.ip_be >> 24) & 0xFF), (unsigned)((g_net.ip_be >> 16) & 0xFF),
+               (unsigned)((g_net.ip_be >> 8) & 0xFF), (unsigned)(g_net.ip_be & 0xFF),
+               (unsigned)((g_net.gw_be >> 24) & 0xFF), (unsigned)((g_net.gw_be >> 16) & 0xFF),
+               (unsigned)((g_net.gw_be >> 8) & 0xFF), (unsigned)(g_net.gw_be & 0xFF));
+    return 0;
+}
+
+static int net_send_icmp_echo(ksock_net_t *s, uint32_t dst_ip_be, const uint8_t *icmp, size_t icmp_len) {
+    if (!s || !icmp || icmp_len == 0) return -1;
+    if (net_stack_init() != 0) return -1;
+    /* 0.0.0.0 and 255.255.255.255: no host replies; send to gateway so user gets a reply. */
+    if (dst_ip_be == 0 || dst_ip_be == 0xFFFFFFFFu) dst_ip_be = g_net.gw_be;
+    uint32_t nh = ip_same_subnet(dst_ip_be, g_net.ip_be, g_net.mask_be) ? dst_ip_be : g_net.gw_be;
+    uint8_t dst_mac[6];
+    if (nh == g_net.gw_be && g_net.gw_mac_valid) memcpy(dst_mac, g_net.gw_mac, 6);
+    else {
+        uint32_t arp_ms = 2000;
+        if (net_resolve_mac(nh, dst_mac, arp_ms) != 0) {
+            /* Повтор ARP для шлюза (VMware иногда отвечает с задержкой). */
+            if (nh == g_net.gw_be) {
+                uint8_t drain[256];
+                while (e1000_recv_frame(drain, sizeof(drain)) > 0) ;
+                if (net_send_arp_request(nh) != 0) return -1;
+                if (net_resolve_mac(nh, dst_mac, arp_ms) != 0) return -1;
+            } else
+                return -1;
+        }
+        if (nh == g_net.gw_be) {
+            memcpy(g_net.gw_mac, dst_mac, 6);
+            g_net.gw_mac_valid = 1;
+        }
+    }
+    s->last_dst_ip_be = dst_ip_be;
+
+    if (s->type_base == SOCK_DGRAM_LOCAL) {
+        /* Linux ping commonly uses SOCK_DGRAM + IPPROTO_ICMP:
+           userspace passes payload only, kernel builds ICMP header. */
+        size_t pkt_len = 8 + icmp_len;
+        uint8_t *pkt = (uint8_t *)kmalloc(pkt_len);
+        if (!pkt) return -1;
+        memset(pkt, 0, pkt_len);
+        pkt[0] = 8; /* Echo Request */
+        pkt[1] = 0; /* code */
+        uint16_t id = (uint16_t)((thread_current() ? thread_current()->tid : 1) & 0xFFFFu);
+        uint16_t seq = ++s->next_echo_seq;
+        pkt[4] = (uint8_t)(id >> 8); pkt[5] = (uint8_t)id;
+        pkt[6] = (uint8_t)(seq >> 8); pkt[7] = (uint8_t)seq;
+        memcpy(pkt + 8, icmp, icmp_len);
+        uint16_t csum = ip_checksum16(pkt, pkt_len);
+        pkt[2] = (uint8_t)(csum >> 8); pkt[3] = (uint8_t)csum;
+        s->last_echo_id = id;
+        s->last_echo_seq = seq;
+        int r = net_send_eth_ipv4(dst_mac, dst_ip_be, IPPROTO_ICMP_LOCAL, pkt, pkt_len);
+        kfree(pkt);
+        return r;
+    }
+
+    /* SOCK_RAW path: userspace provides full ICMP packet including header. */
+    if (icmp_len < 8) return -1;
+    s->last_echo_id = (uint16_t)((icmp[4] << 8) | icmp[5]);
+    s->last_echo_seq = (uint16_t)((icmp[6] << 8) | icmp[7]);
+    return net_send_eth_ipv4(dst_mac, dst_ip_be, IPPROTO_ICMP_LOCAL, icmp, icmp_len);
+}
+
+static int net_try_parse_icmp_reply(const uint8_t *frame, size_t n, ksock_net_t *s, uint8_t *out, size_t out_cap, uint32_t *out_src_ip_be) {
+    if (!frame || n < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t) + 8 || !s || !out) return 0;
+    const eth_hdr_t *eth = (const eth_hdr_t *)frame;
+    if (be16(eth->ethertype) != ETH_TYPE_IPV4) return 0;
+    const ipv4_hdr_t *ip = (const ipv4_hdr_t *)(frame + sizeof(eth_hdr_t));
+    size_t ihl = (size_t)((ip->ver_ihl & 0x0Fu) * 4u);
+    if (ihl < sizeof(ipv4_hdr_t)) return 0;
+    if (ip->proto != IPPROTO_ICMP_LOCAL) return 0;
+    uint16_t tot = be16(ip->total_len);
+    if (tot < ihl + 8) return 0;
+    if (sizeof(eth_hdr_t) + tot > n) return 0;
+    const uint8_t *icmp = frame + sizeof(eth_hdr_t) + ihl;
+    if (icmp[0] != 0 || icmp[1] != 0) return 0; /* echo reply */
+    uint16_t id = (uint16_t)((icmp[4] << 8) | icmp[5]);
+    uint16_t seq = (uint16_t)((icmp[6] << 8) | icmp[7]);
+    if (id != s->last_echo_id || seq != s->last_echo_seq) return 0;
+    size_t copy_len = 0;
+    if (s->type_base == SOCK_DGRAM_LOCAL) {
+        /* For datagram ICMP sockets return only ICMP payload. */
+        size_t icmp_len = (size_t)tot - ihl;
+        if (icmp_len < 8) return 0;
+        size_t payload_len = icmp_len - 8;
+        copy_len = (payload_len > out_cap) ? out_cap : payload_len;
+        if (copy_len > 0) memcpy(out, icmp + 8, copy_len);
+        else { out[0] = 0; copy_len = 1; } /* empty payload: still report success */
+    } else {
+        /* Raw ICMP sockets expect IPv4 header included. */
+        copy_len = (tot > out_cap) ? out_cap : tot;
+        memcpy(out, ip, copy_len);
+    }
+    if (out_src_ip_be) *out_src_ip_be = be32(ip->src);
+    return (int)copy_len;
+}
+
+static int net_recv_icmp_echo_reply(ksock_net_t *s, uint8_t *out, size_t out_cap, uint32_t timeout_ms, uint32_t *out_src_ip_be) {
+    if (!s || !out || out_cap == 0) return -1;
+    if (net_stack_init() != 0) return -1;
+    uint8_t frame[2048];
+    uint64_t start = pit_get_time_ms();
+    while ((pit_get_time_ms() - start) < timeout_ms) {
+        int n = e1000_recv_frame(frame, sizeof(frame));
+        if (n > 0) {
+            int got = net_try_parse_icmp_reply(frame, (size_t)n, s, out, out_cap, out_src_ip_be);
+            if (got > 0) return got;
+            /* Кадр уже потреблён; продолжаем цикл за следующим. */
+        } else {
+            /* Короткий спин: пакет может прийти сразу после проверки, до yield. */
+            int spun = 0;
+            for (; spun < 200; spun++) {
+                n = e1000_recv_frame(frame, sizeof(frame));
+                if (n > 0) {
+                    int got = net_try_parse_icmp_reply(frame, (size_t)n, s, out, out_cap, out_src_ip_be);
+                    if (got > 0) return got;
+                    break; /* кадр потреблён, не подошёл — продолжаем внешний цикл */
+                }
+            }
+            if (spun >= 200) thread_yield();
+        }
+    }
+    return 0; /* timeout */
+}
+
+static struct fs_file *socket_file_get(thread_t *cur, int fd, ksock_net_t **out_sock) {
+    if (!cur || fd < 0 || fd >= THREAD_MAX_FD) return NULL;
+    struct fs_file *f = cur->fds[fd];
+    if (!f || f->type != SYSCALL_FTYPE_SOCKET || !f->driver_private) return NULL;
+    if (out_sock) *out_sock = (ksock_net_t *)f->driver_private;
+    return f;
+}
+
+typedef struct __attribute__((packed)) {
+    uint16_t sin_family;
+    uint16_t sin_port;
+    uint32_t sin_addr;
+    uint8_t sin_zero[8];
+} sockaddr_in_k;
 
 static uint64_t last_syscall_debug = 0;
 static inline uint64_t ret_err(int e) {
@@ -1896,9 +2395,217 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (ms > 0) thread_sleep((uint32_t)(ms > 0xFFFFFFFFULL ? 0xFFFFFFFFU : (uint32_t)ms));
             return 0;
         }
-        case SYS_socket: { /* socket(domain, type, protocol) - no network stack */
+        case 38: { /* setitimer(which, new_value, old_value) - minimal success stub */
             (void)a1; (void)a2; (void)a3;
-            return ret_err(ENOSYS);
+            return 0;
+        }
+        case SYS_socket: { /* socket(domain, type, protocol) */
+            int domain = (int)a1;
+            int type = (int)a2;
+            int protocol = (int)a3;
+            int type_base = type & 0x0F; /* mask SOCK_NONBLOCK/CLOEXEC flags */
+            if (domain != AF_INET_LOCAL) return ret_err(EAFNOSUPPORT);
+            if (!(type_base == SOCK_RAW_LOCAL || type_base == SOCK_DGRAM_LOCAL)) return ret_err(ESOCKTNOSUPPORT);
+            if (!(protocol == 0 || protocol == IPPROTO_ICMP_LOCAL)) return ret_err(EPROTONOSUPPORT);
+            ksock_net_t *s = (ksock_net_t *)kmalloc(sizeof(*s));
+            struct fs_file *f = (struct fs_file *)kmalloc(sizeof(*f));
+            char *p = (char *)kmalloc(24);
+            if (!s || !f || !p) {
+                if (s) kfree(s);
+                if (f) kfree(f);
+                if (p) kfree(p);
+                return ret_err(ENOMEM);
+            }
+            memset(s, 0, sizeof(*s));
+            memset(f, 0, sizeof(*f));
+            snprintf(p, 24, "socket:[icmp]");
+            s->type_base = type_base;
+            s->protocol = (protocol == 0) ? IPPROTO_ICMP_LOCAL : protocol;
+            s->next_echo_seq = 0;
+            f->path = p;
+            f->type = SYSCALL_FTYPE_SOCKET;
+            f->driver_private = s;
+            f->refcount = 1;
+            int fd = thread_fd_alloc(f);
+            if (fd < 0) {
+                kfree(s);
+                kfree((void *)f->path);
+                kfree(f);
+                return ret_err(EMFILE);
+            }
+            return (uint64_t)fd;
+        }
+        case 54: { /* setsockopt */
+            int fd = (int)a1;
+            thread_t *t = thread_get_current_user();
+            if (!t) t = thread_current();
+            ksock_net_t *s = NULL;
+            if (!socket_file_get(t, fd, &s) || !s) return ret_err(EBADF);
+            /* Minimal implementation: accept common ping options. */
+            return 0;
+        }
+        case 55: { /* getsockopt */
+            int fd = (int)a1;
+            void *optval_u = (void *)(uintptr_t)a4;
+            void *optlen_u = (void *)(uintptr_t)a5;
+            thread_t *t = thread_get_current_user();
+            if (!t) t = thread_current();
+            ksock_net_t *s = NULL;
+            if (!socket_file_get(t, fd, &s) || !s) return ret_err(EBADF);
+            if (!optlen_u || !user_range_ok(optlen_u, 4)) return ret_err(EFAULT);
+            uint32_t olen = 0;
+            if (copy_from_user_raw(&olen, optlen_u, 4) != 0) return ret_err(EFAULT);
+            if (optval_u && olen >= 4) {
+                uint32_t zero = 0;
+                if (copy_to_user_safe(optval_u, &zero, 4) != 0) return ret_err(EFAULT);
+                olen = 4;
+            } else {
+                olen = 0;
+            }
+            if (copy_to_user_safe(optlen_u, &olen, 4) != 0) return ret_err(EFAULT);
+            return 0;
+        }
+        case 44: { /* sendto */
+            int fd = (int)a1;
+            const void *buf_u = (const void *)(uintptr_t)a2;
+            size_t len = (size_t)a3;
+            const void *to_u = (const void *)(uintptr_t)a5;
+            size_t tolen = (size_t)a6;
+            thread_t *t = thread_get_current_user();
+            if (!t) t = thread_current();
+            ksock_net_t *s = NULL;
+            if (!socket_file_get(t, fd, &s) || !s) return ret_err(EBADF);
+            if (!buf_u || len == 0 || len > 2048) return ret_err(EINVAL);
+            if (!user_range_ok(buf_u, len)) return ret_err(EFAULT);
+            if (!to_u || tolen < sizeof(sockaddr_in_k) || !user_range_ok(to_u, sizeof(sockaddr_in_k))) return ret_err(EFAULT);
+            sockaddr_in_k to;
+            if (copy_from_user_raw(&to, to_u, sizeof(to)) != 0) return ret_err(EFAULT);
+            if (to.sin_family != AF_INET_LOCAL) return ret_err(EAFNOSUPPORT);
+            uint32_t dst_ip_be = be32(to.sin_addr); /* user sockaddr stores network-order bytes */
+            uint8_t *icmp = (uint8_t *)kmalloc(len);
+            if (!icmp) return ret_err(ENOMEM);
+            if (copy_from_user_raw(icmp, buf_u, len) != 0) { kfree(icmp); return ret_err(EFAULT); }
+            int r = net_send_icmp_echo(s, dst_ip_be, icmp, len);
+            kfree(icmp);
+            if (r != 0) return ret_err(e1000_is_ready() ? EIO : ENETDOWN);
+            return (uint64_t)len;
+        }
+        case 45: { /* recvfrom */
+            int fd = (int)a1;
+            void *buf_u = (void *)(uintptr_t)a2;
+            size_t len = (size_t)a3;
+            void *from_u = (void *)(uintptr_t)a5;
+            void *fromlen_u = (void *)(uintptr_t)a6;
+            thread_t *t = thread_get_current_user();
+            if (!t) t = thread_current();
+            ksock_net_t *s = NULL;
+            if (!socket_file_get(t, fd, &s) || !s) return ret_err(EBADF);
+            if (!buf_u || len == 0 || !user_range_ok(buf_u, len)) return ret_err(EFAULT);
+            uint8_t *tmp = (uint8_t *)kmalloc(len);
+            if (!tmp) return ret_err(ENOMEM);
+            uint32_t src_ip = 0;
+            int n = net_recv_icmp_echo_reply(s, tmp, len, 2500, &src_ip);
+            if (n < 0) { kfree(tmp); return ret_err(EIO); }
+            if (n == 0) { kfree(tmp); return ret_err(EAGAIN); }
+            if (copy_to_user_safe(buf_u, tmp, (size_t)n) != 0) { kfree(tmp); return ret_err(EFAULT); }
+            kfree(tmp);
+            if (from_u && fromlen_u && user_range_ok(fromlen_u, 4)) {
+                uint32_t flen = 0;
+                if (copy_from_user_raw(&flen, fromlen_u, 4) == 0 && flen >= sizeof(sockaddr_in_k) && user_range_ok(from_u, sizeof(sockaddr_in_k))) {
+                    sockaddr_in_k sa;
+                    memset(&sa, 0, sizeof(sa));
+                    sa.sin_family = AF_INET_LOCAL;
+                    sa.sin_addr = be32(src_ip); /* keep sockaddr in network byte order */
+                    (void)copy_to_user_safe(from_u, &sa, sizeof(sa));
+                    uint32_t out_len = sizeof(sa);
+                    (void)copy_to_user_safe(fromlen_u, &out_len, 4);
+                }
+            }
+            return (uint64_t)n;
+        }
+        case 46: { /* sendmsg -> map to sendto for first iov */
+            int fd = (int)a1;
+            const void *msg_u = (const void *)(uintptr_t)a2;
+            if (!msg_u || !user_range_ok(msg_u, 56)) return ret_err(EFAULT);
+            struct msghdr_k {
+                void *msg_name;
+                uint32_t msg_namelen;
+                uint32_t __pad0;
+                void *msg_iov;
+                uint64_t msg_iovlen;
+                void *msg_control;
+                uint64_t msg_controllen;
+                int32_t msg_flags;
+                int32_t __pad1;
+            } m;
+            if (copy_from_user_raw(&m, msg_u, sizeof(m)) != 0) return ret_err(EFAULT);
+            if (!m.msg_iov || m.msg_iovlen < 1 || !user_range_ok(m.msg_iov, 16)) return ret_err(EFAULT);
+            struct iovec_k { void *base; uint64_t len; } iov;
+            if (copy_from_user_raw(&iov, m.msg_iov, sizeof(iov)) != 0) return ret_err(EFAULT);
+            thread_t *t = thread_get_current_user();
+            if (!t) t = thread_current();
+            ksock_net_t *s = NULL;
+            if (!socket_file_get(t, fd, &s) || !s) return ret_err(EBADF);
+            if (!iov.base || iov.len == 0 || iov.len > 2048 || !user_range_ok(iov.base, (size_t)iov.len)) return ret_err(EFAULT);
+            if (!m.msg_name || m.msg_namelen < sizeof(sockaddr_in_k) || !user_range_ok(m.msg_name, sizeof(sockaddr_in_k))) return ret_err(EFAULT);
+            sockaddr_in_k to;
+            if (copy_from_user_raw(&to, m.msg_name, sizeof(to)) != 0) return ret_err(EFAULT);
+            if (to.sin_family != AF_INET_LOCAL) return ret_err(EAFNOSUPPORT);
+            uint32_t dst_ip_be = be32(to.sin_addr);
+            uint8_t *icmp = (uint8_t *)kmalloc((size_t)iov.len);
+            if (!icmp) return ret_err(ENOMEM);
+            if (copy_from_user_raw(icmp, iov.base, (size_t)iov.len) != 0) { kfree(icmp); return ret_err(EFAULT); }
+            int r = net_send_icmp_echo(s, dst_ip_be, icmp, (size_t)iov.len);
+            kfree(icmp);
+            if (r != 0) return ret_err(e1000_is_ready() ? EIO : ENETDOWN);
+            return iov.len;
+        }
+        case 47: { /* recvmsg -> map to recvfrom for first iov */
+            int fd = (int)a1;
+            void *msg_u = (void *)(uintptr_t)a2;
+            if (!msg_u || !user_range_ok(msg_u, 56)) return ret_err(EFAULT);
+            struct msghdr_k {
+                void *msg_name;
+                uint32_t msg_namelen;
+                uint32_t __pad0;
+                void *msg_iov;
+                uint64_t msg_iovlen;
+                void *msg_control;
+                uint64_t msg_controllen;
+                int32_t msg_flags;
+                int32_t __pad1;
+            } m;
+            if (copy_from_user_raw(&m, msg_u, sizeof(m)) != 0) return ret_err(EFAULT);
+            if (!m.msg_iov || m.msg_iovlen < 1 || !user_range_ok(m.msg_iov, 16)) return ret_err(EFAULT);
+            struct iovec_k { void *base; uint64_t len; } iov;
+            if (copy_from_user_raw(&iov, m.msg_iov, sizeof(iov)) != 0) return ret_err(EFAULT);
+            thread_t *t = thread_get_current_user();
+            if (!t) t = thread_current();
+            ksock_net_t *s = NULL;
+            if (!socket_file_get(t, fd, &s) || !s) return ret_err(EBADF);
+            if (!iov.base || iov.len == 0 || !user_range_ok(iov.base, (size_t)iov.len)) return ret_err(EFAULT);
+            uint8_t *tmp = (uint8_t *)kmalloc((size_t)iov.len);
+            if (!tmp) return ret_err(ENOMEM);
+            uint32_t src_ip = 0;
+            int n = net_recv_icmp_echo_reply(s, tmp, (size_t)iov.len, 2500, &src_ip);
+            if (n < 0) { kfree(tmp); return ret_err(EIO); }
+            if (n == 0) { kfree(tmp); return ret_err(EAGAIN); }
+            if (copy_to_user_safe(iov.base, tmp, (size_t)n) != 0) { kfree(tmp); return ret_err(EFAULT); }
+            kfree(tmp);
+            uint32_t fromlen = sizeof(sockaddr_in_k);
+            if (m.msg_name && m.msg_namelen >= sizeof(sockaddr_in_k) && user_range_ok(m.msg_name, sizeof(sockaddr_in_k))) {
+                sockaddr_in_k sa;
+                memset(&sa, 0, sizeof(sa));
+                sa.sin_family = AF_INET_LOCAL;
+                sa.sin_addr = be32(src_ip);
+                (void)copy_to_user_safe(m.msg_name, &sa, sizeof(sa));
+            }
+            /* keep msg_namelen in sync */
+            if (m.msg_name && user_range_ok(msg_u, sizeof(m))) {
+                m.msg_namelen = fromlen;
+                (void)copy_to_user_safe(msg_u, &m, sizeof(m));
+            }
+            return (uint64_t)n;
         }
         case SYS_sysinfo: { /* sysinfo(struct sysinfo *) - syscall 99; glibc allocatestack needs sane freeram */
             void *info_u = (void*)(uintptr_t)a1;
@@ -3432,6 +4139,16 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
         case SYS_close: {
             int fd = (int)a1;
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
+            thread_t *t = thread_get_current_user();
+            if (!t) t = thread_current();
+            if (t) {
+                struct fs_file *f = t->fds[fd];
+                /* Free socket private state only on final close of shared fs_file. */
+                if (f && f->type == SYSCALL_FTYPE_SOCKET && f->driver_private && f->refcount <= 1) {
+                    kfree(f->driver_private);
+                    f->driver_private = NULL;
+                }
+            }
             int r = thread_fd_close(fd);
             return (r == 0) ? 0ULL : ret_err(EBADF);
         }
