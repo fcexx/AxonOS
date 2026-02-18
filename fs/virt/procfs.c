@@ -11,6 +11,7 @@
 #include <rtc.h>
 #include <sysinfo.h>
 #include <axonos.h>
+#include <usb.h>
 
 struct procfs_handle {
 	int kind; /* 1=root, 2=pid_dir, 3=pid_file, 4=symlink, 5=pid_fd_dir, 6=pid_fd_link, 7=plain, 8=proc_sys_dir, 9=proc_sys_file */
@@ -167,6 +168,15 @@ static int procfs_create(const char *path, struct fs_file **out_file) {
 
 static int procfs_open(const char *path, struct fs_file **out_file) {
     if (!path || !out_file) return -1;
+    char npath[512];
+    strncpy(npath, path, sizeof(npath) - 1);
+    npath[sizeof(npath) - 1] = '\0';
+    size_t nlen = strlen(npath);
+    while (nlen > 5 && npath[nlen - 1] == '/') {
+        npath[nlen - 1] = '\0';
+        nlen--;
+    }
+    path = npath;
     if (!(strcmp(path, "/proc") == 0 || strncmp(path, "/proc/", 6) == 0)) return -1;
     int rc = -1;
     struct fs_file *f = NULL;
@@ -216,7 +226,7 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 		/* special subtree: /proc/sys/... */
 		if (first_len == 3 && strncmp(p, "sys", 3) == 0) {
 			if (!slash) {
-				h->kind = 8; f->type = FS_TYPE_DIR; f->size = 0;
+				h->kind = 8; h->file_id = 0; f->type = FS_TYPE_DIR; f->size = 0;
 				f->driver_private = h;
 				*out_file = f;
 				return 0;
@@ -230,14 +240,14 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 				if (qlen == 6 && strncmp(q, "kernel", 6) == 0) {
 					if (!slash2) {
 						/* /proc/sys/kernel */
-						h->kind = 8; f->type = FS_TYPE_DIR; f->size = 0;
+						h->kind = 8; h->file_id = 1; f->type = FS_TYPE_DIR; f->size = 0;
 						f->driver_private = h;
 						*out_file = f;
 						return 0;
 					} else {
 						/* /proc/sys/kernel/<name> */
 						const char *name = slash2 + 1;
-						if (strncmp(name, "hostname", 8) == 0) {
+						if (strcmp(name, "hostname") == 0) {
 							h->kind = 9; h->file_id = 20; f->type = FS_TYPE_REG;
 							/* size = strlen + newline */
 							f->size = strlen(proc_hostname) + 1;
@@ -291,10 +301,22 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 			}
 			if (first_len == 3 && strncmp(p, "sys", 3) == 0) {
 				/* /proc/sys root directory */
-				h->kind = 8; f->type = FS_TYPE_DIR; f->size = 0;
+				h->kind = 8; h->file_id = 0; f->type = FS_TYPE_DIR; f->size = 0;
 				*out_file = f;
 				return 0;
 			}
+            if (first_len == 3 && strncmp(p, "tty", 3) == 0) {
+                /* /proc/tty root directory (minimal) */
+                h->kind = 12; f->type = FS_TYPE_DIR; f->size = 0;
+                *out_file = f;
+                return 0;
+            }
+            if (first_len == 3 && strncmp(p, "bus", 3) == 0) {
+                /* /proc/bus root directory */
+                h->kind = 10; f->type = FS_TYPE_DIR; f->size = 0;
+                *out_file = f;
+                return 0;
+            }
 			if (pid < 0) { kfree(h); kfree(pp); kfree(f); return -1; }
 			/* pid directory */
 			h->kind = 2;
@@ -304,6 +326,41 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 		} else {
 			/* deeper paths: could be /proc/<pid>/cmdline, /proc/<pid>/stat, /proc/<pid>/fd, /proc/<pid>/fd/<n> */
 			const char *rest = slash + 1;
+            /* /proc/bus/... */
+            if (first_len == 3 && strncmp(p, "bus", 3) == 0) {
+                if (strncmp(rest, "usb", 3) == 0 && (rest[3] == '\0' || rest[3] == '/')) {
+                    if (rest[3] == '\0') {
+                        h->kind = 11; f->type = FS_TYPE_DIR; f->size = 0;
+                        f->driver_private = h;
+                        *out_file = f;
+                        return 0;
+                    }
+                    const char *rest2 = rest + 4; /* after usb/ */
+                    if (strncmp(rest2, "devices", 7) == 0) {
+                        h->kind = 7; h->file_id = 30; f->type = FS_TYPE_REG; f->size = 0;
+                        f->driver_private = h;
+                        *out_file = f;
+                        return 0;
+                    }
+                }
+                kfree(h); kfree(pp); kfree(f); return -1;
+            }
+            /* /proc/tty/... */
+            if (first_len == 3 && strncmp(p, "tty", 3) == 0) {
+                if (strcmp(rest, "drivers") == 0) {
+                    h->kind = 7; h->file_id = 31; f->type = FS_TYPE_REG; f->size = 0;
+                    f->driver_private = h;
+                    *out_file = f;
+                    return 0;
+                }
+                if (*rest == '\0') {
+                    h->kind = 12; f->type = FS_TYPE_DIR; f->size = 0;
+                    f->driver_private = h;
+                    *out_file = f;
+                    return 0;
+                }
+                kfree(h); kfree(pp); kfree(f); return -1;
+            }
 			if (pid < 0) { kfree(h); kfree(pp); kfree(f); return -1; }
 			/* check for fd directory */
 			if (strncmp(rest, "fd", 2) == 0 && (rest[2] == '\0' || rest[2] == '/')) {
@@ -404,7 +461,8 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
                 de.rec_len = (uint16_t)rec_len;
                 de.name_len = (uint8_t)namelen;
                 /* sys and bus are directories */
-                de.file_type = (strcmp(name, "sys") == 0 || strcmp(name, "bus") == 0) ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
+                de.file_type = (strcmp(name, "sys") == 0 || strcmp(name, "bus") == 0 || strcmp(name, "tty") == 0)
+                               ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
                 memcpy(tmpent, &de, 8);
                 memcpy(tmpent + 8, name, namelen);
                 size_t avail = size - written;
@@ -519,12 +577,14 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 
 	/* /proc/sys directory listing */
 	if (h->kind == 8) {
-		/* only one namespace 'kernel' for now */
-		const char *names[] = { "kernel" };
+        const char *names_root[] = { "kernel" };
+        const char *names_kernel[] = { "hostname" };
+        const char *const *names = (h->file_id == 1) ? names_kernel : names_root;
+        int ncount = 1;
 		size_t pos = 0;
 		size_t written = 0;
 		uint8_t *out = (uint8_t*)buf;
-		for (int idx = 0; idx < 1; idx++) {
+		for (int idx = 0; idx < ncount; idx++) {
 			size_t namelen = strlen(names[idx]);
             size_t rec_len = 8 + namelen;
             rec_len = (rec_len + 3) & ~3u;
@@ -537,7 +597,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
             de.inode = (uint32_t)(2000 + idx);
             de.rec_len = (uint16_t)rec_len;
             de.name_len = (uint8_t)namelen;
-            de.file_type = EXT2_FT_DIR;
+            de.file_type = (h->file_id == 1) ? EXT2_FT_REG_FILE : EXT2_FT_DIR;
             for (size_t zi = 0; zi < sizeof(tmp); zi++) tmp[zi] = 0;
             memcpy(tmp, &de, 8);
             memcpy(tmp + 8, names[idx], namelen);
@@ -550,6 +610,102 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 		}
 		return (ssize_t)written;
 	}
+
+    /* /proc/tty directory listing */
+    if (h->kind == 12) {
+        const char *names[] = { "drivers" };
+        size_t pos = 0;
+        size_t written = 0;
+        uint8_t *out = (uint8_t*)buf;
+        for (int idx = 0; idx < 1; idx++) {
+            size_t namelen = strlen(names[idx]);
+            size_t rec_len = 8 + namelen;
+            rec_len = (rec_len + 3) & ~3u;
+            if (pos + rec_len <= offset) { pos += rec_len; continue; }
+            if (written >= size) break;
+            size_t entry_off = ((size_t)offset > pos) ? ((size_t)offset - pos) : 0;
+            uint8_t tmp[128];
+            memset(tmp, 0, sizeof(tmp));
+            struct ext2_dir_entry de;
+            de.inode = (uint32_t)(3100 + idx);
+            de.rec_len = (uint16_t)rec_len;
+            de.name_len = (uint8_t)namelen;
+            de.file_type = EXT2_FT_REG_FILE;
+            memcpy(tmp, &de, 8);
+            memcpy(tmp + 8, names[idx], namelen);
+            size_t avail = size - written;
+            size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
+            if (tocopy > avail) tocopy = avail;
+            if (tocopy > 0) memcpy(out + written, tmp + entry_off, tocopy);
+            written += tocopy;
+            pos += rec_len;
+        }
+        return (ssize_t)written;
+    }
+
+    /* /proc/bus directory listing */
+    if (h->kind == 10) {
+        const char *names[] = { "usb" };
+        size_t pos = 0;
+        size_t written = 0;
+        uint8_t *out = (uint8_t*)buf;
+        for (int idx = 0; idx < 1; idx++) {
+            size_t namelen = strlen(names[idx]);
+            size_t rec_len = 8 + namelen;
+            rec_len = (rec_len + 3) & ~3u;
+            if (pos + rec_len <= offset) { pos += rec_len; continue; }
+            if (written >= size) break;
+            size_t entry_off = ((size_t)offset > pos) ? ((size_t)offset - pos) : 0;
+            uint8_t tmp[128];
+            memset(tmp, 0, sizeof(tmp));
+            struct ext2_dir_entry de;
+            de.inode = (uint32_t)(3000 + idx);
+            de.rec_len = (uint16_t)rec_len;
+            de.name_len = (uint8_t)namelen;
+            de.file_type = EXT2_FT_DIR;
+            memcpy(tmp, &de, 8);
+            memcpy(tmp + 8, names[idx], namelen);
+            size_t avail = size - written;
+            size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
+            if (tocopy > avail) tocopy = avail;
+            if (tocopy > 0) memcpy(out + written, tmp + entry_off, tocopy);
+            written += tocopy;
+            pos += rec_len;
+        }
+        return (ssize_t)written;
+    }
+
+    /* /proc/bus/usb directory listing */
+    if (h->kind == 11) {
+        const char *names[] = { "devices" };
+        size_t pos = 0;
+        size_t written = 0;
+        uint8_t *out = (uint8_t*)buf;
+        for (int idx = 0; idx < 1; idx++) {
+            size_t namelen = strlen(names[idx]);
+            size_t rec_len = 8 + namelen;
+            rec_len = (rec_len + 3) & ~3u;
+            if (pos + rec_len <= offset) { pos += rec_len; continue; }
+            if (written >= size) break;
+            size_t entry_off = ((size_t)offset > pos) ? ((size_t)offset - pos) : 0;
+            uint8_t tmp[128];
+            memset(tmp, 0, sizeof(tmp));
+            struct ext2_dir_entry de;
+            de.inode = (uint32_t)(3010 + idx);
+            de.rec_len = (uint16_t)rec_len;
+            de.name_len = (uint8_t)namelen;
+            de.file_type = EXT2_FT_REG_FILE;
+            memcpy(tmp, &de, 8);
+            memcpy(tmp + 8, names[idx], namelen);
+            size_t avail = size - written;
+            size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
+            if (tocopy > avail) tocopy = avail;
+            if (tocopy > 0) memcpy(out + written, tmp + entry_off, tocopy);
+            written += tocopy;
+            pos += rec_len;
+        }
+        return (ssize_t)written;
+    }
 
     /* regular file */
     if (h->kind == 3) {
@@ -637,6 +793,8 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 		if (h->file_id == 10) full = procfs_show_meminfo(tmpbuf, cap, NULL);
 		else if (h->file_id == 11) full = procfs_show_uptime(tmpbuf, cap, NULL);
 		else if (h->file_id == 12) full = procfs_show_partitions(tmpbuf, cap, NULL);
+        else if (h->file_id == 30) full = usb_proc_bus_devices_show(tmpbuf, cap, NULL);
+        else if (h->file_id == 31) full = (ssize_t)snprintf(tmpbuf, cap, "pty_slave            /dev/tty\n");
 		if (full < 0) { kfree(tmpbuf); return -1; }
 		size_t len = (size_t)full;
 		if ((size_t)offset >= len) { kfree(tmpbuf); return 0; }
@@ -682,7 +840,7 @@ int procfs_fill_stat(struct fs_file *file, struct stat *st) {
     if (!file || !st || !file->driver_private) return -1;
     struct procfs_handle *h = (struct procfs_handle*)file->driver_private;
     if (!h) return -1;
-    if (h->kind == 1 || h->kind == 2 || h->kind == 5 || h->kind == 8) {
+    if (h->kind == 1 || h->kind == 2 || h->kind == 5 || h->kind == 8 || h->kind == 10 || h->kind == 11 || h->kind == 12) {
         st->st_ino = 0;
         st->st_mode = S_IFDIR | 0555;
         st->st_nlink = 2;

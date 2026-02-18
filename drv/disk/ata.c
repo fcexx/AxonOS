@@ -154,7 +154,6 @@ static int ata_identify(uint16_t io_base, uint16_t ctrl_base, int is_slave, uint
 			if (keyboard_ctrlc_pending()) { keyboard_consume_ctrlc(); return -1; }
 			status = inb(ATA_REG_STATUS(io_base));
 			if (status & ATA_SR_ERR) {
-				klogprintf("ata: identify failed (ERR) io=0x%x slave=%d\n", io_base, is_slave);
 				return -1;
 			}
 			if (status & ATA_SR_DRQ) break;
@@ -162,7 +161,6 @@ static int ata_identify(uint16_t io_base, uint16_t ctrl_base, int is_slave, uint
 				/* still waiting */
 			}
 			if (++poll > POLL_MAX) {
-				klogprintf("ata: identify timeout io=0x%x slave=%d status=0x%x\n", io_base, is_slave, status);
 				return -1;
 			}
 		}
@@ -293,6 +291,29 @@ static int ata_pio_write(int device_id, uint32_t lba, const void *buf, uint32_t 
 	return 0;
 }
 
+static uint32_t ata_le32(const uint8_t *p) {
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void ata_publish_mbr_partitions(int device_id, char letter, uint32_t disk_sectors) {
+	uint8_t mbr[512];
+	if (disk_read_sectors(device_id, 0, mbr, 1) != 0) return;
+	if (mbr[510] != 0x55 || mbr[511] != 0xAA) return;
+	for (int i = 0; i < 4; i++) {
+		const uint8_t *e = &mbr[446 + i * 16];
+		uint8_t part_type = e[4];
+		uint32_t start_lba = ata_le32(e + 8);
+		uint32_t part_sectors = ata_le32(e + 12);
+		if (part_type == 0 || part_sectors == 0) continue;
+		if (start_lba >= disk_sectors) continue;
+		if (start_lba + part_sectors < start_lba) continue; /* overflow */
+		if (start_lba + part_sectors > disk_sectors) part_sectors = disk_sectors - start_lba;
+		char ppath[32];
+		snprintf(ppath, sizeof(ppath), "/dev/sd%c%d", letter, i + 1);
+		devfs_create_block_node_lba(ppath, device_id, start_lba, part_sectors);
+	}
+}
+
 /* Register discovered device into disk layer and remember mapping */
 static void ata_register_device(uint16_t io_base, uint16_t ctrl_base, int is_slave, const char *model, uint32_t sectors) {
 	disk_ops_t *ops = (disk_ops_t *)kmalloc(sizeof(disk_ops_t));
@@ -330,8 +351,10 @@ static void ata_register_device(uint16_t io_base, uint16_t ctrl_base, int is_sla
 	devfs_create_block_node(devpath, id, sectors);
 	if (id >= 0 && id < 26) {
 		char devpath2[32];
-		snprintf(devpath2, sizeof(devpath2), "/dev/sd%c", 'a' + id);
+		char letter = (char)('a' + id);
+		snprintf(devpath2, sizeof(devpath2), "/dev/sd%c", letter);
 		devfs_create_block_node(devpath2, id, sectors);
+		ata_publish_mbr_partitions(id, letter, sectors);
 	}
 	/* Do not auto-probe/auto-mount FAT32 here.
 	   Manual mount(2) should control which block device is attached as vfat. */

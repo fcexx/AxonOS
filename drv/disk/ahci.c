@@ -690,8 +690,7 @@ static int ahci_register_disk(int controller_idx, int port_no, hba_mem_t *hba, u
 				if (ok == 0 && st->sectors != 0) break;
 				/* dump basic port state for diagnosis */
 				hba_port_t *p = &st->hba->ports[st->port_no];
-				klogprintf("ahci: identify failed port=%d try=%d TFD=0x%08x SERR=0x%08x IS=0x%08x SSTS=0x%08x CMD=0x%08x SIG=0x%08x CI=0x%08x SACT=0x%08x\n",
-				           st->port_no, tries, p->tfd, p->serr, p->is, p->ssts, p->cmd, p->sig, p->ci, p->sact);
+				
 				ahci_port_stop(p);
 				(void)ahci_port_comreset(p);
 				(void)ahci_port_start(p);
@@ -707,11 +706,11 @@ static int ahci_register_disk(int controller_idx, int port_no, hba_mem_t *hba, u
 					for (size_t bi = 0; bi < sizeof(sec0); bi++) {
 						if (sec0[bi] != 0) { all_zero = 0; break; }
 					}
-					klogprintf("ahci: disk id=%d lba0: %02x %02x %02x %02x %02x %02x %02x %02x all_zero=%d\n",
-					           id,
-					           sec0[0], sec0[1], sec0[2], sec0[3],
-					           sec0[4], sec0[5], sec0[6], sec0[7],
-					           all_zero);
+					// klogprintf("ahci: disk id=%d lba0: %02x %02x %02x %02x %02x %02x %02x %02x all_zero=%d\n",
+					//            id,
+					//            sec0[0], sec0[1], sec0[2], sec0[3],
+					//            sec0[4], sec0[5], sec0[6], sec0[7],
+					//            all_zero);
 				} else {
 					klogprintf("ahci: disk id=%d lba0 read failed rc=%d\n", id, rr0);
 				}
@@ -730,8 +729,7 @@ static int ahci_register_disk(int controller_idx, int port_no, hba_mem_t *hba, u
 		   Userspace can mount via SYS_mount (fat32/vfat/auto). */
 	}
 
-	klogprintf("ahci: registered disk id=%d port=%d model=\"%s\" sectors=%u\n",
-	           id, port_no, g_ports[id].model[0] ? g_ports[id].model : "unknown",
+	klogprintf("ahci: registered disk \"%s\" sectors=%u\n", g_ports[id].model[0] ? g_ports[id].model : "unknown",
 	           g_ports[id].sectors);
 	return id;
 }
@@ -826,9 +824,8 @@ int ahci_probe_and_register(void) {
 		if (pi_max > n_ports) n_ports = pi_max;
 		if (n_ports > 32) n_ports = 32;
 
-		klogprintf("ahci: controller %02x:%02x.%x mmio=0x%llx CAP=0x%08x VS=0x%08x GHC=0x%08x PI=0x%08x\n",
-		           pdev->bus, pdev->device, pdev->function,
-		           (unsigned long long)phys, cap0, vs0, ghc0, pi);
+		klogprintf("ahci: found controller at %02x:%02x.%x\n",
+		           pdev->bus, pdev->device, pdev->function);
 
 		for (int port = 0; port < n_ports; port++) {
 			if (!(pi & (1u << port))) continue;

@@ -413,7 +413,7 @@ static void mark_broad_user_ranges_for_exec(void) {
     (void)mark_user_identity_range_2m((uint64_t)begin, (uint64_t)end);
 }
 
-int elf_load_from_path(const char *path, uint64_t *out_entry) {
+int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk_end) {
     struct fs_file *f = fs_open(path);
     if (!f) {
         kprintf("execve: open failed: %s\n", path ? path : "(null)");
@@ -532,6 +532,7 @@ int elf_load_from_path(const char *path, uint64_t *out_entry) {
 
     if (brk_end) syscall_set_user_brk((uintptr_t)brk_end);
     if (out_entry) *out_entry = (uint64_t)eh.e_entry + load_base;
+    if (out_brk_end) *out_brk_end = (uintptr_t)brk_end;
     kfree(phdrs);
     fs_file_free(f);
     return 0;
@@ -651,7 +652,8 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
        *target file* (already resolved) rather than the symlink contents. */
     const char *curpath = path;
     uint64_t entry = 0;
-    int r = elf_load_from_path(curpath, &entry);
+    uintptr_t loaded_brk_end = 0;
+    int r = elf_load_from_path(curpath, &entry, &loaded_brk_end);
     if (r == -2) {
         /* unsupported ELF format (dynamic/PIE without relocations) */
         return -2;
@@ -742,6 +744,14 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         planned_ut = thread_create_blocked(user_thread_entry, path ? path : "user");
         if (!planned_ut) return -1;
         planned_tid = (uint64_t)planned_ut->tid;
+        /* Exec from kernel: current thread is not the one that will run; set brk on planned_ut. */
+        if (loaded_brk_end != 0) {
+            uintptr_t base = loaded_brk_end;
+            if (base < (8u * 1024u * 1024u)) base = 8u * 1024u * 1024u;
+            base = (base + 4095u) & ~(uintptr_t)4095u;
+            planned_ut->user_brk_base = base;
+            planned_ut->user_brk_cur = base;
+        }
     }
 
     /* Build argv strings and pointers in kernel, then copy into user stack area.
@@ -753,24 +763,27 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     /* compute total strings size */
     size_t strings_size = 0;
     for (int i = 0; i < argc; i++) strings_size += strlen(argv[i]) + 1;
-    size_t env_strings_size = 0; /* env not supported for now */
+    int envc = 0;
+    while (envp && envp[envc]) envc++;
+    size_t env_strings_size = 0;
+    for (int i = 0; i < envc; i++) env_strings_size += strlen(envp[i]) + 1;
 
     /* Stack layout (SysV x86_64):
        RSP -> argc
               argv[0..argc-1], NULL
-              envp[0..], NULL (we provide empty envp)
+              envp[0..], NULL
               auxv pairs (a_type,a_val) ending with AT_NULL
        Many libc start routines expect auxv to exist; without AT_NULL they may parse garbage. */
     enum { AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_PAGESZ = 6, AT_ENTRY = 9, AT_RANDOM = 25 };
     const size_t aux_pairs = 7; /* PHDR,PHENT,PHNUM,ENTRY,PAGESZ,RANDOM,NULL */
     const size_t aux_qwords = aux_pairs * 2;
-    /* pointer area: argv pointers + NULL + env NULL + auxv */
-    size_t ptrs = (size_t)(argc + 1 + 1) + aux_qwords;
+    /* pointer area: argv pointers + NULL + env pointers + NULL + auxv */
+    size_t ptrs = (size_t)(argc + 1 + envc + 1) + aux_qwords;
     size_t ptrs_bytes = ptrs * sizeof(uint64_t);
 
-    /* total needed on stack: pointers + strings + AT_RANDOM bytes + small padding */
+    /* total needed on stack: pointers + strings + env strings + AT_RANDOM bytes + small padding */
     const size_t random_bytes = 16;
-    size_t total = ptrs_bytes + strings_size + random_bytes + 32;
+    size_t total = ptrs_bytes + strings_size + env_strings_size + random_bytes + 32;
     if (total > USER_STACK_SIZE - 128) {
         kprintf("required stack size too large %u\n", (unsigned)total);
         return -1;
@@ -790,10 +803,10 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
        then 16 bytes for AT_RANDOM. */
     uintptr_t ptrs_addr = base;
     uintptr_t strings_addr = base + ptrs_bytes;
-    uintptr_t random_addr = strings_addr + strings_size;
+    uintptr_t random_addr = strings_addr + strings_size + env_strings_size;
 
     /* Ensure addresses are within identity-mapped range */
-    if (strings_addr + strings_size > (uintptr_t)MMIO_IDENTITY_LIMIT) {
+    if (strings_addr + strings_size + env_strings_size > (uintptr_t)MMIO_IDENTITY_LIMIT) {
         kprintf("execve: stack region outside identity map\n");
         return -1;
     }
@@ -808,7 +821,13 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         str_dst += l;
     }
     sp64[argc] = 0;     /* argv NULL */
-    sp64[argc + 1] = 0; /* envp NULL */
+    for (int i = 0; i < envc; i++) {
+        size_t l = strlen(envp[i]) + 1;
+        memcpy(str_dst, envp[i], l);
+        sp64[argc + 1 + i] = (uint64_t)(uintptr_t)str_dst;
+        str_dst += l;
+    }
+    sp64[argc + 1 + envc] = 0; /* envp NULL */
 
     /* AT_RANDOM: 16 bytes. Not cryptographically secure; enough for libc bootstrap. */
     {
@@ -817,7 +836,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     }
 
     /* auxv pairs start right after envp NULL */
-    size_t ax = (size_t)argc + 2;
+    size_t ax = (size_t)argc + 2 + (size_t)envc;
     sp64[ax + 0] = (uint64_t)AT_PHDR;   sp64[ax + 1] = aux_phdr;
     sp64[ax + 2] = (uint64_t)AT_PHENT;  sp64[ax + 3] = aux_phent ? aux_phent : (uint64_t)sizeof(Elf64_Phdr);
     sp64[ax + 4] = (uint64_t)AT_PHNUM;  sp64[ax + 5] = aux_phnum;

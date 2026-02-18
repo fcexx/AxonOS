@@ -37,7 +37,8 @@ typedef struct {
    into the segment's p_vaddr (assumes identity mapping for VA < 4GiB). */
 int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry);
 
-/* Convenience: load ELF from filesystem path (reads whole file). */
-int elf_load_from_path(const char *path, uint64_t *out_entry);
+/* Convenience: load ELF from filesystem path (reads whole file).
+   If out_brk_end is non-NULL, stores the program break end (end of last PT_LOAD) there. */
+int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk_end);
 
 

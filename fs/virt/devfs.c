@@ -13,6 +13,7 @@
 #include <keyboard.h>
 #include <disk.h>
 #include <stat.h>
+#include <usb.h>
 
 #define DEVFS_TTY_COUNT 6
 
@@ -28,6 +29,7 @@ static void *devfs_driver_data = NULL;
 struct devfs_block {
     char path[32];
     int device_id;
+    uint32_t start_lba;
     uint32_t sectors;
 };
 static struct devfs_block dev_blocks[16];
@@ -213,6 +215,7 @@ struct fs_file *devfs_open_direct(const char *path) {
 
 static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t offset) {
     if (!file || !buf) return -1;
+    if (usb_is_devfs_file(file)) return usb_devfs_read(file, buf, size, offset);
     /* block device file handling */
     for (int bi = 0; bi < dev_block_count; bi++) {
         if (file->driver_private == &dev_blocks[bi]) {
@@ -239,7 +242,7 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                 /* Security/safety: never expose uninitialized heap bytes to userspace
                    if a block driver returns success without actually filling the buffer. */
                 memset(tmp, 0, alloc_bytes);
-                if (disk_read_sectors(b->device_id, start_sector + s, tmp, 1) != 0) {
+                if (disk_read_sectors(b->device_id, b->start_lba + start_sector + s, tmp, 1) != 0) {
                     kfree(tmp);
                     return -1;
                 }
@@ -404,21 +407,32 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             } else {
                 /* block device entries stored in dev_blocks[] and character devices in dev_chars[] */
                 int bi = i - (DEVFS_TTY_COUNT + 1 + devfs_special_count);
-                if (bi < dev_block_count) {
-                    const char *path = dev_blocks[bi].path;
-                    const char *last = strrchr(path, '/');
-                    if (last) nm = last + 1;
-                    else nm = path;
-                } else {
-                    int ci = bi - dev_block_count;
-                    if (ci >= 0 && ci < dev_char_count) {
-                        const char *path = dev_chars[ci].path;
-                        const char *last = strrchr(path, '/');
-                        if (last) nm = last + 1;
-                        else nm = path;
-                    } else {
-                        nm = "";
+                const char *path = NULL;
+                if (bi < dev_block_count)
+                    path = dev_blocks[bi].path;
+                else if (bi - dev_block_count < dev_char_count)
+                    path = dev_chars[bi - dev_block_count].path;
+                if (path) {
+                    /* Bounded copy so we never read past path[31] or emit garbage from uninitialized bytes */
+                    char safe_path[32];
+                    size_t plen = 0;
+                    while (plen < sizeof(safe_path) - 1 && path[plen] != '\0') plen++;
+                    safe_path[plen] = '\0';
+                    if (plen > 0) memcpy(safe_path, path, plen);
+                    const char *last = strrchr(safe_path, '/');
+                    const char *base = last ? (last + 1) : safe_path;
+                    size_t blen = strlen(base);
+                    if (blen >= sizeof(tmpn)) blen = sizeof(tmpn) - 1;
+                    memcpy(tmpn, base, blen);
+                    tmpn[blen] = '\0';
+                    /* Sanitize: only printable ASCII to avoid ls "?X?..." garbage */
+                    for (size_t k = 0; k < blen; k++) {
+                        unsigned char c = (unsigned char)tmpn[k];
+                        if (c < 32 || c > 126) tmpn[k] = '?';
                     }
+                    nm = tmpn;
+                } else {
+                    nm = "";
                 }
             }
             size_t namelen = strlen(nm);
@@ -526,6 +540,7 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
 static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, size_t offset) {
     (void)offset;
     if (!file || !buf) return -1;
+    if (usb_is_devfs_file(file)) return usb_devfs_write(file, buf, size, offset);
     /* special devices via driver_private marker: handle /dev/null, /dev/zero, /dev/random writes */
     if (file->driver_private) {
         uintptr_t dp = (uintptr_t)file->driver_private;
@@ -575,10 +590,10 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
             void *tmp = kmalloc(alloc_bytes);
             if (!tmp) return -1;
             /* read existing data for RMW */
-            if (disk_read_sectors(b->device_id, start_sector, tmp, nsectors) != 0) { kfree(tmp); return -1; }
+            if (disk_read_sectors(b->device_id, b->start_lba + start_sector, tmp, nsectors) != 0) { kfree(tmp); return -1; }
             size_t off_in_first = offset % 512;
             memcpy((uint8_t*)tmp + off_in_first, buf, size);
-            if (disk_write_sectors(b->device_id, start_sector, tmp, nsectors) != 0) { kfree(tmp); return -1; }
+            if (disk_write_sectors(b->device_id, b->start_lba + start_sector, tmp, nsectors) != 0) { kfree(tmp); return -1; }
             kfree(tmp);
             return (ssize_t)size;
         }
@@ -635,6 +650,11 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                     vga_clear_line_segment(tty->cursor_x, MAX_COLS - 1, tty->cursor_y, tty->current_attr);
                     tty->cursor_x = 0;
                     vga_set_cursor(0, tty->cursor_y);
+                } else if (ch == '\b' || (unsigned char)ch == 0x7F) {
+                    /* backspace / DEL: move cursor left and clear cell (app line editor) */
+                    kputchar('\b', tty->current_attr);
+                    vga_get_cursor(&tty->cursor_x, &tty->cursor_y);
+                    did_output = 1;
                 } else {
                     /* normal character output using current attribute */
                     kputchar((uint8_t)ch, tty->current_attr);
@@ -1089,21 +1109,15 @@ static int devfs_tty_try_erase(struct devfs_tty *t, int tty) {
     /* Remove last buffered character. */
     t->in_tail = last_idx;
     t->in_count--;
-    /* Echo erase: move cursor left and clear cell. VGA: do it directly so cursor always moves. */
+    /* Echo erase: use TTY's cursor (kept in sync on each echo) so visual matches buffer. */
     if ((t->term_lflag & 0x00000008u) /* ECHO */ && tty == devfs_get_active()) {
-        if (!vbe_is_available()) {
-            uint32_t cx = 0, cy = 0;
-            vga_get_cursor(&cx, &cy);
-            if (cx > 0) {
-                uint8_t attr = vga_get_cell_attr(cx - 1, cy);
-                vga_putch_xy(cx - 1, cy, ' ', attr);
-                vga_set_cursor(cx - 2, cy);
-                t->cursor_x = cx - 2;
-                t->cursor_y = cy;
-            }
-        } else {
-            kputchar('\b', t->current_attr);
-            vga_get_cursor(&t->cursor_x, &t->cursor_y);
+        if (t->cursor_x > 0) {
+            uint32_t cx = (uint32_t)t->cursor_x;
+            uint32_t cy = (uint32_t)t->cursor_y;
+            uint8_t attr = vga_get_cell_attr(cx - 1, cy);
+            vga_putch_xy(cx - 1, cy, ' ', attr);
+            t->cursor_x = cx - 1;
+            vga_set_cursor(t->cursor_x, t->cursor_y);
         }
     }
     return 1;
@@ -1115,17 +1129,8 @@ void devfs_tty_push_input(int tty, char c) {
     struct devfs_tty *t = &dev_ttys[tty];
     unsigned long flags = 0;
     acquire_irqsave(&t->in_lock, &flags);
-    /* Canonical mode: handle backspace in TTY (for busybox sh) */
-    if ((t->term_lflag & 0x00000002u) /* ICANON */ && (c == '\b' || (unsigned char)c == 0x7F)) {
-        (void)devfs_tty_try_erase(t, tty);
-        for (int i = 0; i < t->waiters_count; i++) {
-            int tid = t->waiters[i];
-            if (tid >= 0) thread_unblock(tid);
-        }
-        t->waiters_count = 0;
-        release_irqrestore(&t->in_lock, flags);
-        return;
-    }
+    /* Backspace (DEL 0x7F / BS 0x08): never handle in kernel; always pass to application.
+       Otherwise it is handled twice (kernel try_erase + app line editor) and display/buffer get out of sync. */
     if (t->in_count < (int)sizeof(t->inbuf)) {
         t->inbuf[t->in_tail] = c;
         t->in_tail = (t->in_tail + 1) % (int)sizeof(t->inbuf);
@@ -1163,17 +1168,8 @@ void devfs_tty_push_input_noblock(int tty, char c) {
         t->waiters_count = 0;
         return;
     }
-    /* Canonical mode: handle backspace in TTY (for busybox sh etc. that read via read()) */
-    if ((t->term_lflag & 0x00000002u) /* ICANON */ && (c == '\b' || (unsigned char)c == 0x7F)) {
-        (void)devfs_tty_try_erase(t, tty);
-        for (int i = 0; i < t->waiters_count; i++) {
-            int tid = t->waiters[i];
-            if (tid >= 0) thread_unblock(tid);
-        }
-        t->waiters_count = 0;
-        release(&t->in_lock);
-        return;
-    }
+    /* Backspace (DEL 0x7F / BS 0x08): never handle in kernel; always pass to application.
+       Prevents double handling (kernel try_erase + sh line editor) and keeps display in sync. */
     /* Ctrl+C (0x03): terminate whoever is reading from this TTY (foreground) and wake their parent (shell in wait4) */
     if ((unsigned char)c == 0x03) {
         /* Kill all threads blocked in read() on this TTY and unblock their waiter (e.g. shell in wait4) */
@@ -1246,10 +1242,16 @@ void devfs_tty_push_input_noblock(int tty, char c) {
         if (!skip_echo) {
             if (u >= 32 && u < 127) {
                 kputchar(u, t->current_attr);
+                vga_get_cursor(&t->cursor_x, &t->cursor_y);
             } else if (c == '\n' || c == '\r') {
                 kputchar(u, t->current_attr);
+                vga_get_cursor(&t->cursor_x, &t->cursor_y);
+            } else if (u == 0x7F || u == 0x08) {
+                /* Backspace/DEL: visual erase; update TTY cursor ourselves so it stays in sync. */
+                kputchar('\b', t->current_attr);
+                if (t->cursor_x > 0) t->cursor_x--;
+                vga_set_cursor(t->cursor_x, t->cursor_y);
             }
-            vga_get_cursor(&t->cursor_x, &t->cursor_y);
         }
     }
     release(&t->in_lock);
@@ -1465,16 +1467,29 @@ void devfs_clear_controlling_by_sid(int sid) {
     }
 }
 
-/* Create a block device node and register mapping */
-int devfs_create_block_node(const char *path, int device_id, uint32_t sectors) {
+int devfs_create_block_node_lba(const char *path, int device_id, uint32_t start_lba, uint32_t sectors) {
     if (!path) return -1;
+    for (int i = 0; i < dev_block_count; i++) {
+        if (strcmp(dev_blocks[i].path, path) == 0) {
+            dev_blocks[i].device_id = device_id;
+            dev_blocks[i].start_lba = start_lba;
+            dev_blocks[i].sectors = sectors;
+            return 0;
+        }
+    }
     if (dev_block_count >= (int)(sizeof(dev_blocks)/sizeof(dev_blocks[0]))) return -1;
     strncpy(dev_blocks[dev_block_count].path, path, sizeof(dev_blocks[dev_block_count].path)-1);
     dev_blocks[dev_block_count].path[sizeof(dev_blocks[dev_block_count].path)-1] = '\0';
     dev_blocks[dev_block_count].device_id = device_id;
+    dev_blocks[dev_block_count].start_lba = start_lba;
     dev_blocks[dev_block_count].sectors = sectors;
     dev_block_count++;
     return 0;
+}
+
+/* Create a whole-disk block node and register mapping */
+int devfs_create_block_node(const char *path, int device_id, uint32_t sectors) {
+    return devfs_create_block_node_lba(path, device_id, 0, sectors);
 }
 
 /* Create a character device node and register mapping (e.g., /dev/fb0) */

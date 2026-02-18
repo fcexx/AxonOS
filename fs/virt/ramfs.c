@@ -606,12 +606,10 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
     struct ramfs_file_handle *fh = (struct ramfs_file_handle*)file->driver_private;
     struct ramfs_node *n = fh->node;
     if (n->is_dir) return -1;
-    /* allow kernel context writes (ct == NULL), otherwise require root */
+    /* allow kernel context (ct == NULL), root (euid 0), or file owner */
     thread_t* ct = thread_current();
     if (ct) {
-        if (ct->euid != 0) return -1;
-    } else {
-        /* kernel context: allow writes */
+        if (ct->euid != 0 && (unsigned)ct->euid != n->uid) return -1;
     }
     /* Grow and copy in chunks to avoid one-shot large reallocs where possible.
        This may allow progress when large contiguous allocations fail. */
@@ -623,13 +621,16 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
         size_t chunk = remaining > CHUNK ? CHUNK : remaining;
         size_t needed_end = write_pos + chunk;
         if (needed_end > n->size) {
-            char *d = (char*)krealloc(n->data, needed_end);
+            char *d;
+            if (!n->data) {
+                d = (char*)kmalloc(needed_end);
+                if (d) memset(d, 0, needed_end);
+            } else {
+                d = (char*)krealloc(n->data, needed_end);
+            }
             if (!d) {
-                /* log diagnostic info to help root cause allocation failure */
-                klogprintf("ramfs: write: krealloc failed path=%s offset=%u write_size=%u needed_end=%u heap_used=%llu heap_total=%llu\n",
-                           file && file->path ? file->path : "(null)",
-                           (unsigned)offset, (unsigned)size, (unsigned)needed_end,
-                           (unsigned long long)heap_used_bytes(), (unsigned long long)heap_total_bytes());
+                klogprintf("ramfs: write: alloc failed path=%s needed_end=%u\n",
+                           file && file->path ? file->path : "(null)", (unsigned)needed_end);
                 return -1;
             }
             n->data = d;
@@ -640,6 +641,8 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
         src_pos += chunk;
         remaining -= chunk;
     }
+    if (write_pos < n->size) n->size = write_pos; /* truncate when overwriting from start */
+    file->size = (off_t)n->size; /* keep handle in sync for stat/read */
     return (ssize_t)size;
 }
 

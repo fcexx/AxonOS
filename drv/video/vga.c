@@ -648,13 +648,13 @@ PRINT_NUMBER_BASE10:
 }
 
 void vga_set_cursor(uint32_t x, uint32_t y) {
-	vbefb_set_cursor(x,y);
-	set_cursor_x(x);
-	set_cursor_y(y);
+	if (vbe_is_available()) { vbefb_set_cursor(x, y); return; }
+	set_cursor_x((uint16_t)x);
+	set_cursor_y((uint16_t)y);
 }
 
 void vga_get_cursor(uint32_t* x, uint32_t* y) {
-	vbefb_get_cursor(x,y);
+	if (vbe_is_available()) { vbefb_get_cursor(x, y); return; }
 	uint16_t pos = get_cursor();
 	if (x) *x = (pos % (MAX_COLS * 2)) / 2;
 	if (y) *y = pos / (MAX_COLS * 2);

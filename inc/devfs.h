@@ -105,6 +105,8 @@ struct devfs_tty *devfs_get_tty_by_index(int idx);
 /* Create a block device node at given path and associate with disk device_id.
    sectors - total number of 512-byte sectors on device (for size reporting). */
 int devfs_create_block_node(const char *path, int device_id, uint32_t sectors);
+/* Create a block node mapped to [start_lba, start_lba+sectors) on parent device. */
+int devfs_create_block_node_lba(const char *path, int device_id, uint32_t start_lba, uint32_t sectors);
 
 /* Fill a POSIX-like stat struct for a devfs file handle. */
 int devfs_fill_stat(struct fs_file *file, struct stat *st);

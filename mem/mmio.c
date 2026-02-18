@@ -7,10 +7,10 @@
 #include <vga.h>
 
 #define MMIO_IDENTITY_LIMIT ((uint64_t)0x100000000ULL) /* 4GiB */
-/* place MMIO pool at a high virtual address to avoid stomping low memory used
-   by boot modules / initrd scanning. 0x08000000 == 128MiB aligned down to 2MiB. */
+/* Place MMIO pool above user region (user stack at 256 MiB; heap/mmap below).
+   Avoid overlap: use 512 MiB. */
 #define MMIO_POOL_SLOTS 64 /* 64 * 2MiB = 128MiB virtual pool */
-#define MMIO_POOL_BASE_VA ((uintptr_t)0x08000000ULL)
+#define MMIO_POOL_BASE_VA ((uintptr_t)0x20000000ULL) /* 512 MiB */
 
 static uint8_t mmio_slot_used[MMIO_POOL_SLOTS];
 static uint16_t mmio_alloc_count[MMIO_POOL_SLOTS]; /* non-zero only at allocation start */

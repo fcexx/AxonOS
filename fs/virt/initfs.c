@@ -123,8 +123,11 @@ static size_t find_cpio_start(const uint8_t *base, size_t archive_size) {
         }
     }
 
-    /* scan for candidate headers */
-    for (size_t i = 0; i + sizeof(struct cpio_newc_header) <= archive_size; i++) {
+    /* Slow full-byte scan on 100+ MiB archives is too expensive.
+       In practice cpio headers are 4-byte aligned; scan a bounded prefix. */
+    size_t scan_limit = archive_size;
+    if (scan_limit > (2u * 1024u * 1024u)) scan_limit = (2u * 1024u * 1024u);
+    for (size_t i = 0; i + sizeof(struct cpio_newc_header) <= scan_limit; i += 4) {
         if (!(memcmp(base + i, "070701", 6) == 0 || memcmp(base + i, "070702", 6) == 0)) continue;
         const struct cpio_newc_header *h = (const struct cpio_newc_header*)(base + i);
         if (!plausible_cpio_header(h, archive_size - i)) continue;
@@ -333,34 +336,10 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
         /* header.magic is 6 bytes ASCII "070701" (newc) or "070702" (newc with CRC).
            Compare raw bytes from the module to avoid any struct/padding surprises. */
         const uint8_t *magic = base + offset;
-        if (!((memcmp(magic, "070701", 6) == 0) || (memcmp(magic, "070702", 6) == 0))) {
-            /* Quietly skip this partial/non-matching occurrence and search forward
-               for the next complete ASCII magic. This avoids noisy '.07070' debug lines. */
-            size_t next_found = (size_t)-1;
-            for (size_t j = offset + 1; j + 6 <= archive_size; j++) {
-                if (memcmp(base + j, "070701", 6) == 0 || memcmp(base + j, "070702", 6) == 0) { next_found = j; break; }
-            }
-            if (next_found != (size_t)-1) {
-                offset = next_found;
-                continue;
-            }
-            return -1;
-        }
+        if (!((memcmp(magic, "070701", 6) == 0) || (memcmp(magic, "070702", 6) == 0))) return -1;
         /* additional plausibility check to avoid false positives where "070701"
            appears inside file data */
-        if (!plausible_cpio_header(h, archive_size - offset)) {
-            /* header not plausible: search for next magic and continue */
-            //kprintf("initfs: header not plausible at offset %u, searching next\n", (unsigned)offset);
-            size_t next_found = (size_t)-1;
-            for (size_t j = offset + 1; j + 6 <= archive_size; j++) {
-                if (memcmp(base + j, "070701", 6) == 0 || memcmp(base + j, "070702", 6) == 0) { next_found = j; break; }
-            }
-            if (next_found != (size_t)-1) {
-                offset = next_found;
-                continue;
-            }
-            return -1;
-        }
+        if (!plausible_cpio_header(h, archive_size - offset)) return -1;
         uint32_t namesize = hex_to_uint(h->c_namesize, 8);
         uint32_t filesize = hex_to_uint(h->c_filesize, 8);
         size_t header_size = sizeof(struct cpio_newc_header);

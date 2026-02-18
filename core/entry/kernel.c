@@ -38,6 +38,7 @@
 #include <devfs.h>
 #include <user.h>
 #include <serial.h>
+#include <usb.h>
 #include <exec.h>
 #include <klog.h>
 #include <vbe.h>
@@ -156,6 +157,7 @@ void kernel_sysfs_populate_default(void) {
     static const struct sysfs_attr attr_ram = { sysfs_show_ram_mb_attr, NULL, NULL };
     sysfs_create_file("/sys/kernel/cpu_name", &attr_cpu);
     sysfs_create_file("/sys/kernel/ram_mb", &attr_ram);
+    usb_sysfs_populate_default();
 }
 
 static int boot_try_run_init(void) {
@@ -173,8 +175,9 @@ static int boot_try_run_init(void) {
         /* Accept regular files and symlinks (symlinks already resolved by exec). */
         if (!((st.st_mode & S_IFREG) == S_IFREG || (st.st_mode & S_IFLNK) == S_IFLNK)) continue;
         const char *argv0[2] = { p, NULL };
+        static const char *init_env[] = { "PS1=[\\u@\\h \\w]\\$ ", NULL };
         klogprintf("boot: starting init candidate %s\n", p);
-        int rc = kernel_execve_from_path(p, argv0, NULL);
+        int rc = kernel_execve_from_path(p, argv0, init_env);
         if (rc == 0) return 0;
         klogprintf("boot: init %s returned rc=%d\n", p, rc);
 
@@ -340,6 +343,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     pci_dump_devices();
     pci_sysfs_init();
     intel_chipset_init();
+    usb_init();
     /* Keep NIC driver non-intrusive until full net stack is wired.
        This avoids affecting boot stability on machines where NIC init timing is sensitive. */
 
@@ -355,6 +359,11 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     // Registering all disk file systems
     fat32_register();
 
+    if (e1000_init() != 0) {
+        klogprintf("net: e1000 not found\n");
+        return -1;
+    }
+
     
     /* If an initfs module was provided by the bootloader, unpack it into ramfs */
     int r = initfs_process_multiboot_module(multiboot_magic, multiboot_info, "initfs");
@@ -366,6 +375,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         klogprintf("devfs: registering devfs\n");
         if (devfs_mount("/dev") == 0) {
             klogprintf("devfs: mounted at /dev\n");
+            (void)usb_publish_devfs_nodes();
         }
         /* initialize stdio fds for current thread (main) */
         struct fs_file *console = devfs_open_direct("/dev/console");
@@ -392,11 +402,65 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         klogprintf("devfs: failed to register\n");
     }
 
+    /* /etc/passwd and /etc/group so whoami/id show root. Use static buffers to avoid heap overflow. */
+    (void)ramfs_mkdir("/etc");
+    static const char root_passwd_line[] = "root:x:0:0:root:/root:/bin/sh\n";
+    const size_t root_passwd_len = sizeof(root_passwd_line) - 1;
+    struct fs_file *pf = fs_create_file("/etc/passwd");
+    if (!pf) pf = fs_open("/etc/passwd");
+    if (pf) {
+        fs_write(pf, root_passwd_line, root_passwd_len, 0);
+        fs_file_free(pf);
+    }
+    static const char root_group_line[] = "root:x:0:\n";
+    const size_t root_group_len = sizeof(root_group_line) - 1;
+    struct fs_file *gf = fs_create_file("/etc/group");
+    if (!gf) gf = fs_open("/etc/group");
+    if (gf) {
+        fs_write(gf, root_group_line, root_group_len, 0);
+        fs_file_free(gf);
+    }
+    /* adduser expects /etc/shadow to exist and appends entries with O_APPEND. */
+    {
+        static const char root_shadow[] = "root:*:0:0:99999:7:::\n";
+        struct fs_file *sf = fs_create_file("/etc/shadow");
+        if (!sf) sf = fs_open("/etc/shadow");
+        if (sf) {
+            fs_write(sf, root_shadow, sizeof(root_shadow) - 1, 0);
+            fs_file_free(sf);
+        }
+    }
+    (void)ramfs_mkdir("/var");
+    (void)ramfs_mkdir("/var/run");
+    /* Programs (mount, sh) open /etc/localtime; create so open doesn't fail. */
+    {
+        struct fs_file *lt = fs_create_file("/etc/localtime");
+        if (lt) fs_file_free(lt);
+    }
+    /* Remove backup/clone files that some tools create (e.g. passwd+, group+); avoid duplicate entries in ls. */
+    (void)ramfs_remove("/etc/passwd+");
+    (void)ramfs_remove("/etc/group+");
+
+    /* Compatibility: many distros' adduser scripts call /sbin/addgroup explicitly,
+       while initfs may only provide /usr/sbin/addgroup. Create a tiny wrapper if needed. */
+    {
+        struct stat st;
+        if (vfs_stat("/sbin/addgroup", &st) != 0 && vfs_stat("/usr/sbin/addgroup", &st) == 0) {
+            (void)ramfs_mkdir("/sbin");
+            /* Shebang runs with argv [interp, script_path, orig_argv[1], ...]; shift drops script path so $@ = real args for addgroup */
+            static const char addgroup_wrapper[] = "#!/bin/sh\nshift\nexec /usr/sbin/addgroup \"$@\"\n";
+            const size_t L = sizeof(addgroup_wrapper) - 1;
+            struct fs_file *af = fs_create_file("/sbin/addgroup");
+            if (!af) af = fs_open("/sbin/addgroup");
+            if (af) {
+                fs_write(af, addgroup_wrapper, L, 0);
+                fs_file_free(af);
+            }
+        }
+    }
+
     ps2_keyboard_init();
     rtc_init();
-    
-    ramfs_mkdir("/dev");
-
 
     // Prefer linuxrc/init if present; fallback to kernel shell.
     if (boot_try_run_init() != 0) {

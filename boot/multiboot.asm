@@ -89,7 +89,7 @@ _start:
         lgdt        [eax]
 
         jmp 0x08:long_mode_start
-
+пше
         cli
         hlt
 
