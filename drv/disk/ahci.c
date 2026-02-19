@@ -10,6 +10,7 @@
 #include <ahci.h>
 #include <paging.h>
 #include <pit.h>
+#include <scsi.h>
 
 /* AHCI SATA driver (minimal but functional).
    - Discovers AHCI controllers via PCI class/subclass/prog_if.
@@ -718,15 +719,15 @@ static int ahci_register_disk(int controller_idx, int port_no, hba_mem_t *hba, u
 		}
 	}
 
-	/* /dev nodes: /dev/sdX like legacy */
 	if (id >= 0 && id < 26) {
 		char devpath[32];
 		char letter = (char)('a' + id);
 		snprintf(devpath, sizeof(devpath), "/dev/sd%c", letter);
 		uint32_t secs = g_ports[id].sectors ? g_ports[id].sectors : 0xFFFFFFFFu;
 		devfs_create_block_node(devpath, id, secs);
-		/* Auto-mount intentionally disabled here: probing can wedge on some hypervisors.
-		   Userspace can mount via SYS_mount (fat32/vfat/auto). */
+		snprintf(devpath, sizeof(devpath), "/dev/hd%d", id);
+		devfs_create_block_node(devpath, id, secs);
+		(void)scsi_register_disk_as_lun(id, secs, "AHCI   ", g_ports[id].model[0] ? g_ports[id].model : "SATA", "1.0 ");
 	}
 
 	klogprintf("ahci: registered disk \"%s\" sectors=%u\n", g_ports[id].model[0] ? g_ports[id].model : "unknown",

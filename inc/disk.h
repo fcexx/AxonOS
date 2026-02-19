@@ -26,4 +26,3 @@ int disk_count(void);
 int disk_read_sectors(int device_id, uint32_t lba, void *buf, uint32_t sectors);
 int disk_write_sectors(int device_id, uint32_t lba, const void *buf, uint32_t sectors);
 
-

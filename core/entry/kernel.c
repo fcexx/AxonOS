@@ -43,6 +43,8 @@
 #include <klog.h>
 #include <vbe.h>
 void ata_dma_init(void);
+void scsi_init(void);
+int pvscsi_init(void);
 
 static char g_cwd[256] = "/";
 
@@ -158,6 +160,7 @@ void kernel_sysfs_populate_default(void) {
     sysfs_create_file("/sys/kernel/cpu_name", &attr_cpu);
     sysfs_create_file("/sys/kernel/ram_mb", &attr_ram);
     usb_sysfs_populate_default();
+    pci_sysfs_init();  /* /sys/bus/pci/devices для lspci */
 }
 
 static int boot_try_run_init(void) {
@@ -341,7 +344,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 
     pci_init();
     pci_dump_devices();
-    pci_sysfs_init();
     intel_chipset_init();
     usb_init();
     /* Keep NIC driver non-intrusive until full net stack is wired.
@@ -351,8 +353,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     thread_init();
     iothread_init();
 
-    ata_dma_init();
-    
     // POSIX user subsystem
     user_init();
 
@@ -361,7 +361,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 
     if (e1000_init() != 0) {
         klogprintf("net: e1000 not found\n");
-        return -1;
     }
 
     
@@ -375,6 +374,20 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         klogprintf("devfs: registering devfs\n");
         if (devfs_mount("/dev") == 0) {
             klogprintf("devfs: mounted at /dev\n");
+            scsi_init();
+            ata_dma_init();
+            (void)pvscsi_init();
+            {
+                int n = devfs_block_count();
+                klogprintf("List of block devices: %d\n", n);
+                for (int i = 0; i < n; i++) {
+                    char name[64];
+                    int did = -1;
+                    uint32_t secs = 0;
+                    if (devfs_block_get(i, name, sizeof(name), &did, &secs) == 0)
+                        klogprintf("  /dev/%s disk_id=%d sectors=%u\n", name, did, (unsigned)secs);
+                }
+            }
             (void)usb_publish_devfs_nodes();
         }
         /* initialize stdio fds for current thread (main) */

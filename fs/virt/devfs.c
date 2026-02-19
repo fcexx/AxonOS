@@ -31,6 +31,7 @@ struct devfs_block {
     int device_id;
     uint32_t start_lba;
     uint32_t sectors;
+    spinlock_t io_lock; /* сериализация read/write для стабильности */
 };
 static struct devfs_block dev_blocks[16];
 static int dev_block_count = 0;
@@ -216,58 +217,52 @@ struct fs_file *devfs_open_direct(const char *path) {
 static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t offset) {
     if (!file || !buf) return -1;
     if (usb_is_devfs_file(file)) return usb_devfs_read(file, buf, size, offset);
-    /* block device file handling */
+    /* block device file handling: батч-чтение по 64 KB для стабильности при множестве операций */
     for (int bi = 0; bi < dev_block_count; bi++) {
         if (file->driver_private == &dev_blocks[bi]) {
             struct devfs_block *b = (struct devfs_block*)file->driver_private;
-            /* compute sector-aligned read */
+            unsigned long flags = 0;
+            acquire_irqsave(&b->io_lock, &flags);
             uint64_t dev_size_bytes = (uint64_t)b->sectors * 512ULL;
-            if (offset >= dev_size_bytes) return 0;
+            if (offset >= dev_size_bytes) { release_irqrestore(&b->io_lock, flags); return 0; }
             if ((uint64_t)offset + size > dev_size_bytes) size = (size_t)(dev_size_bytes - offset);
             uint32_t start_sector = (uint32_t)(offset / 512);
-            uint32_t end_sector = (uint32_t)((offset + size + 511) / 512);
-            uint32_t nsectors = end_sector - start_sector;
-            uint32_t alloc_bytes = 512; /* read one sector at a time */
-            void *tmp = kmalloc(alloc_bytes);
-            if (!tmp) return -1;
-            size_t copied = 0;
+            uint32_t nsectors = (uint32_t)((offset + size + 511) / 512) - start_sector;
             size_t off_in_first = offset % 512;
-            for (uint32_t s = 0; s < nsectors; s++) {
-                /* allow user to abort via Ctrl-C */
+            size_t copied = 0;
+#define DEVFS_BLOCK_CHUNK_SECTORS 128
+#define DEVFS_BLOCK_CHUNK_BYTES   (DEVFS_BLOCK_CHUNK_SECTORS * 512)
+            void *chunk = kmalloc(DEVFS_BLOCK_CHUNK_BYTES);
+            if (!chunk) { release_irqrestore(&b->io_lock, flags); return -1; }
+            uint32_t s = 0;
+            while (s < nsectors) {
                 if (keyboard_ctrlc_pending()) {
                     keyboard_consume_ctrlc();
-                    kfree(tmp);
+                    kfree(chunk);
+                    release_irqrestore(&b->io_lock, flags);
                     return -1;
                 }
-                /* Security/safety: never expose uninitialized heap bytes to userspace
-                   if a block driver returns success without actually filling the buffer. */
-                memset(tmp, 0, alloc_bytes);
-                if (disk_read_sectors(b->device_id, b->start_lba + start_sector + s, tmp, 1) != 0) {
-                    kfree(tmp);
+                uint32_t chunk_sectors = nsectors - s;
+                if (chunk_sectors > DEVFS_BLOCK_CHUNK_SECTORS) chunk_sectors = DEVFS_BLOCK_CHUNK_SECTORS;
+                memset(chunk, 0, (size_t)chunk_sectors * 512);
+                if (disk_read_sectors(b->device_id, b->start_lba + start_sector + s, chunk, chunk_sectors) != 0) {
+                    kfree(chunk);
+                    release_irqrestore(&b->io_lock, flags);
                     return -1;
                 }
-                /* determine where to copy from this sector */
-                uint8_t *src = (uint8_t*)tmp;
-                uint32_t tocopy = 512;
-                if (s == 0) {
-                    /* first sector - may start at offset within sector */
-                    if (off_in_first >= 512) tocopy = 0;
-                    else {
-                        if (size + off_in_first < 512) tocopy = (uint32_t)size;
-                        else tocopy = 512 - (uint32_t)off_in_first;
-                        memcpy((uint8_t*)buf + copied, src + off_in_first, tocopy);
-                    }
-                } else {
-                    /* subsequent sectors */
-                    uint32_t remaining = (uint32_t)size - (uint32_t)copied;
-                    if (remaining == 0) { break; }
-                    if (remaining < 512) tocopy = remaining;
-                    memcpy((uint8_t*)buf + copied, src, tocopy);
+                uint8_t *src = (uint8_t*)chunk;
+                for (uint32_t i = 0; i < chunk_sectors && copied < size; i++) {
+                    size_t src_off = (s == 0 && i == 0) ? off_in_first : 0;
+                    size_t seg = (size_t)(512 - (uint32_t)src_off);
+                    if (seg > size - copied) seg = size - copied;
+                    memcpy((uint8_t*)buf + copied, src + (size_t)(i * 512) + src_off, seg);
+                    copied += seg;
                 }
-                copied += tocopy;
-                if (copied >= size) break;
+                s += chunk_sectors;
+                if (s < nsectors) thread_yield();
             }
-            kfree(tmp);
+            kfree(chunk);
+            release_irqrestore(&b->io_lock, flags);
             return (ssize_t)copied;
         }
     }
@@ -575,26 +570,54 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
             }
         }
     }
-    /* block device write? */
+    /* block device write: чанками по 64 KB, чтобы не исчерпывать кучу и не зависать */
     for (int bi = 0; bi < dev_block_count; bi++) {
         if (file->driver_private == &dev_blocks[bi]) {
             struct devfs_block *b = (struct devfs_block*)file->driver_private;
-            /* compute sector-aligned write: read-modify-write if unaligned */
+            unsigned long flags = 0;
+            acquire_irqsave(&b->io_lock, &flags);
             uint64_t dev_size_bytes = (uint64_t)b->sectors * 512ULL;
-            if (offset >= dev_size_bytes) return -1;
+            if (offset >= dev_size_bytes) { release_irqrestore(&b->io_lock, flags); return -1; }
             if ((uint64_t)offset + size > dev_size_bytes) size = (size_t)(dev_size_bytes - offset);
             uint32_t start_sector = (uint32_t)(offset / 512);
-            uint32_t end_sector = (uint32_t)((offset + size + 511) / 512);
-            uint32_t nsectors = end_sector - start_sector;
-            uint32_t alloc_bytes = nsectors * 512;
-            void *tmp = kmalloc(alloc_bytes);
-            if (!tmp) return -1;
-            /* read existing data for RMW */
-            if (disk_read_sectors(b->device_id, b->start_lba + start_sector, tmp, nsectors) != 0) { kfree(tmp); return -1; }
+            uint32_t nsectors = (uint32_t)((offset + size + 511) / 512) - start_sector;
             size_t off_in_first = offset % 512;
-            memcpy((uint8_t*)tmp + off_in_first, buf, size);
-            if (disk_write_sectors(b->device_id, b->start_lba + start_sector, tmp, nsectors) != 0) { kfree(tmp); return -1; }
+#define DEVFS_WRITE_CHUNK_SECTORS 128
+#define DEVFS_WRITE_CHUNK_BYTES   (DEVFS_WRITE_CHUNK_SECTORS * 512)
+            void *tmp = kmalloc(DEVFS_WRITE_CHUNK_BYTES);
+            if (!tmp) { release_irqrestore(&b->io_lock, flags); return -1; }
+            size_t written = 0;
+            uint32_t cur_sector = 0;
+            while (cur_sector < nsectors) {
+                if (keyboard_ctrlc_pending()) {
+                    keyboard_consume_ctrlc();
+                    kfree(tmp);
+                    release_irqrestore(&b->io_lock, flags);
+                    return -1;
+                }
+                uint32_t chunk_sectors = nsectors - cur_sector;
+                if (chunk_sectors > DEVFS_WRITE_CHUNK_SECTORS) chunk_sectors = DEVFS_WRITE_CHUNK_SECTORS;
+                if (disk_read_sectors(b->device_id, b->start_lba + start_sector + cur_sector, tmp, chunk_sectors) != 0) {
+                    kfree(tmp);
+                    release_irqrestore(&b->io_lock, flags);
+                    return -1;
+                }
+                size_t merge_off = (cur_sector == 0) ? off_in_first : 0;
+                size_t merge_max = (size_t)chunk_sectors * 512 - merge_off;
+                size_t merge_len = size - written;
+                if (merge_len > merge_max) merge_len = merge_max;
+                memcpy((uint8_t*)tmp + merge_off, (const uint8_t*)buf + written, merge_len);
+                written += merge_len;
+                if (disk_write_sectors(b->device_id, b->start_lba + start_sector + cur_sector, tmp, chunk_sectors) != 0) {
+                    kfree(tmp);
+                    release_irqrestore(&b->io_lock, flags);
+                    return -1;
+                }
+                cur_sector += chunk_sectors;
+                if (cur_sector < nsectors) thread_yield();
+            }
             kfree(tmp);
+            release_irqrestore(&b->io_lock, flags);
             return (ssize_t)size;
         }
     }

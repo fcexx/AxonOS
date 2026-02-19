@@ -29,6 +29,7 @@
 #include <fat32.h>
 
 #include <ahci.h>
+#include <scsi.h>
 
 #define ATA_PRIMARY_IO      0x1F0
 #define ATA_PRIMARY_CTRL    0x3F6
@@ -344,9 +345,7 @@ static void ata_register_device(uint16_t io_base, uint16_t ctrl_base, int is_sla
 	ata_device_count = id + 1;
 	/* concise output per user request */
 	uint32_t size_mb = sectors / 2048; /* sectors * 512 / (1024*1024) */
-	/* create /dev node: /dev/hdN */
 	char devpath[32];
-	/* create traditional /dev/hdN and Linux-style /dev/sdX by global disk id */
 	snprintf(devpath, sizeof(devpath), "/dev/hd%d", id);
 	devfs_create_block_node(devpath, id, sectors);
 	if (id >= 0 && id < 26) {
@@ -359,6 +358,7 @@ static void ata_register_device(uint16_t io_base, uint16_t ctrl_base, int is_sla
 	/* Do not auto-probe/auto-mount FAT32 here.
 	   Manual mount(2) should control which block device is attached as vfat. */
 	klogprintf("ATA: Found pio disk: \"%s\" model: \"%s\" size: %u mb\n", ata_devices[id].model, ata_devices[id].model, size_mb);
+	(void)scsi_register_disk_as_lun(id, sectors, "ATA    ", ata_devices[id].model, "1.0 ");
 }
 
 static int ata_channel_seen(const ata_channel_t *channels, int count, uint16_t io_base, uint16_t ctrl_base) {
