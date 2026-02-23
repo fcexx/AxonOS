@@ -38,6 +38,7 @@
 #define SYS_geteuid 107
 #define SYS_getegid 108
 #define SYS_setsid  112
+#define SYS_syslog  103
 #define SYS_getpgrp 111
 #define SYS_setpgid 109
 #define SYS_gettid  186

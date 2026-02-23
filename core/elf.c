@@ -653,6 +653,57 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     const char *curpath = path;
     uint64_t entry = 0;
     uintptr_t loaded_brk_end = 0;
+
+    /* vfork optimization (shared address space):
+       SYS_vfork itself is kept fast; if a vfork child reaches execve, we must snapshot
+       the parent's userspace memory *here* (before loading overwrites it), and keep the
+       parent blocked until child exit restores it. */
+    {
+        thread_t *tc = thread_get_current_user();
+        if (!tc) tc = thread_current();
+        if (tc && tc->vfork_parent_tid >= 0 && tc->vfork_parent_mem_backup == NULL) {
+            thread_t *pt = thread_get(tc->vfork_parent_tid);
+            /* Snapshot only the used region (heap + mmap cursor), bounded. */
+            const uintptr_t base = (uintptr_t)0x00200000u;
+            uintptr_t end = (uintptr_t)USER_TLS_BASE;
+            if (end < base) end = base;
+            uintptr_t used_end = 0;
+            if (pt) {
+                used_end = (uintptr_t)pt->user_brk_cur;
+                if (pt->user_mmap_next > used_end) used_end = pt->user_mmap_next;
+            } else {
+                used_end = (uintptr_t)tc->user_brk_cur;
+                if (tc->user_mmap_next > used_end) used_end = tc->user_mmap_next;
+            }
+            const uintptr_t min_backup = base + (8u * 1024u * 1024u);
+            if (used_end < min_backup || used_end == 0) used_end = min_backup;
+            if (used_end > end) used_end = end;
+            uint64_t len64 = (uint64_t)(used_end - base);
+            if (len64 == 0 || len64 > (uint64_t)(256u * 1024u * 1024u)) {
+                return -1;
+            }
+            void *buf = kmalloc((size_t)len64);
+            if (!buf) {
+                return -1;
+            }
+            const size_t chunk = 512u * 1024u;
+            if ((size_t)len64 <= chunk) {
+                memcpy(buf, (void*)base, (size_t)len64);
+            } else {
+                for (size_t off = 0; off < (size_t)len64; off += chunk) {
+                    size_t n = chunk;
+                    if (off + n > (size_t)len64) n = (size_t)len64 - off;
+                    memcpy((char*)buf + off, (void*)(base + off), n);
+                    if (off + n < (size_t)len64) thread_yield();
+                }
+            }
+            tc->vfork_parent_mem_backup = buf;
+            tc->vfork_parent_mem_backup_len = len64;
+            tc->vfork_parent_mem_backup_base = (uint64_t)base;
+            tc->vfork_parent_brk_saved = (uint64_t)(pt ? pt->user_brk_cur : tc->user_brk_cur);
+        }
+    }
+
     int r = elf_load_from_path(curpath, &entry, &loaded_brk_end);
     if (r == -2) {
         /* unsupported ELF format (dynamic/PIE without relocations) */
@@ -1023,23 +1074,15 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     /* wrap read in a benign check */
     first = entry_b[0];
 
-    /* If this thread was created via vfork, we normally wake parent on exec.
-       However, in a shared address space we keep the parent blocked when a full
-       memory snapshot is active, and only restore/unblock on child exit. */
+    /* vfork + exec in a shared address space:
+       Do NOT wake the parent here; parent must stay blocked until child exit restores the snapshot. */
     {
         thread_t *tc = thread_current();
         if (tc && tc->vfork_parent_tid >= 0) {
             qemu_debug_printf("execve: child %llu has vfork_parent_tid=%d mem_backup=%p\n",
                 (unsigned long long)(tc->tid ? tc->tid : 1),
                 tc->vfork_parent_tid, tc->vfork_parent_mem_backup);
-            if (!tc->vfork_parent_mem_backup) {
-                qemu_debug_printf("execve: waking vfork parent %d (no mem backup)\n", tc->vfork_parent_tid);
-                thread_unblock(tc->vfork_parent_tid);
-                tc->vfork_parent_tid = -1;
-            } else {
-                qemu_debug_printf("execve: NOT waking vfork parent %d (mem backup active, will wake on exit)\n",
-                    tc->vfork_parent_tid);
-            }
+            qemu_debug_printf("execve: keeping vfork parent %d blocked (shared address space)\n", tc->vfork_parent_tid);
         } else {
             qemu_debug_printf("execve: child %llu has no vfork_parent_tid\n",
                 (unsigned long long)(tc ? (tc->tid ? tc->tid : 1) : 0));
