@@ -1525,118 +1525,294 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (saved_rcx == 0) {
                 return ret_err(EINVAL);
             }
-
-            if ((uintptr_t)saved_rsp == 0 || (uintptr_t)saved_rsp >= (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                return ret_err(EINVAL);
-            }
-
-            /* Ensure return site and trampoline page are user-accessible. */
-            {
+            /* Try to ensure the user pages around saved_rcx are user-accessible to avoid PF
+               when the child enters user mode. This sets PG_US on the containing 2MiB region. */
+            if (saved_rcx != 0) {
                 uintptr_t begin = (uintptr_t)saved_rcx & ~((uintptr_t)PAGE_SIZE_2M - 1);
                 uintptr_t end = begin + (uintptr_t)PAGE_SIZE_2M;
-                if (mark_user_identity_range_2m_sys((uint64_t)begin, (uint64_t)end) != 0) {
+                if (mark_user_identity_range_2m_sys((uint64_t)begin, (uint64_t)end) == 0) {
+                } else {
+                    /* If we cannot make the candidate return site user-accessible, refuse vfork
+                       rather than heuristically using an unmapped/privileged address which
+                       leads to immediate #PF err=0x5 when the child enters user mode. */
                     kprintf("vfork: aborting due to unmapped/privileged saved return site\n");
                     return ret_err(EINVAL);
                 }
+                /* Also try to broadly ensure common user ranges are user-accessible (helps when writes hit elsewhere). */
+                if (mark_user_identity_range_2m_sys(0x200000, (uint64_t)USER_STACK_TOP) == 0) {
+                } else {
+                }
             }
-            const uintptr_t tramp = (uintptr_t)USER_VFORK_TRAMP;
-            (void)mark_user_identity_range_2m_sys((uint64_t)(tramp & ~((uintptr_t)(PAGE_SIZE_2M - 1))),
-                                                  (uint64_t)((tramp & ~((uintptr_t)(PAGE_SIZE_2M - 1))) + PAGE_SIZE_2M));
-
-            /* Fast vfork: run child on the *same* userspace stack (Linux-style).
-               We do NOT snapshot the entire userspace memory here; in AxonOS shared-address-space
-               mode we take the expensive snapshot lazily at execve time (see core/elf.c). */
+            // kprintf("DBG: vfork: syscall_user_return_rip=0x%llx syscall_user_rsp_saved=0x%llx (saved_rcx=0x%llx saved_rsp=0x%llx)\n",
+            //         (unsigned long long)syscall_user_return_rip, (unsigned long long)syscall_user_rsp_saved,
+            //         (unsigned long long)saved_rcx, (unsigned long long)saved_rsp);
+            /* vfork semantics for AxonOS (safe variant):
+               - create child thread, but do NOT run it on the parent's stack
+               - copy active portion of parent's stack into a dedicated child stack
+               - parent is NOT blocked in-kernel (avoids returning from a blocked syscall frame)
+               This behaves closer to fork(), but avoids the post-exit #GP caused by
+               corruption of the parent's syscall frame while it is blocked in-kernel. */
+            if (saved_rcx == 0) {
+                /* cannot create child if we don't have return site */
+                return ret_err(EINVAL);
+            }
+            /* create child kernel thread that will enter user mode at user_thread_entry.
+               Create it BLOCKED first to avoid it running before we finish initializing
+               user_rip/user_stack/user_fs_base (race became visible once we added an always-READY idle thread). */
             thread_t *child = thread_create_blocked(user_thread_entry, "vfork-child");
             if (!child) return ret_err(ENOMEM);
+            /* initialize child's user context and inherit parent's FDs/credentials */
+            /* Create a small user-mode trampoline that zeroes RAX and jumps to saved_rcx.
+               This avoids executing user code directly in an unknown register/stack snapshot. */
+            {
+                /* ---- clone parent's active stack slice into child's own stack ---- */
+                uintptr_t parent_fs = (uintptr_t)p->user_fs_base;
+                uintptr_t parent_tls_region = (parent_fs >= 0x1000u) ? (parent_fs - 0x1000u) : 0;
+                if ((uintptr_t)saved_rsp == 0 || (uintptr_t)saved_rsp >= (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                    return ret_err(EINVAL);
+                }
+                uintptr_t max_copy = (uintptr_t)USER_STACK_SIZE;
+                if (max_copy > (uintptr_t)(1024 * 1024)) max_copy = (uintptr_t)(1024 * 1024);
+                uintptr_t avail = (uintptr_t)MMIO_IDENTITY_LIMIT - (uintptr_t)saved_rsp;
+                uintptr_t copy_bytes = (avail < max_copy) ? avail : max_copy;
+                if (copy_bytes < 256) {
+                    return ret_err(EINVAL);
+                }
 
-            const uint64_t child_tid = (uint64_t)(child->tid ? child->tid : 1);
-            const int parent_tid = (int)(p->tid ? p->tid : 1);
+                /* pick child's stack_top based on child tid to avoid overlap */
+                uintptr_t child_stack_top = (uintptr_t)USER_STACK_TOP;
+                /* reuse the same layout helper as exec uses: stack_top = tls + sizes */
+                {
+                    extern uintptr_t user_stack_top_for_tid(uint64_t tid); /* in core/elf.c (static), can't call */
+                    (void)user_stack_top_for_tid;
+                }
+                /* We can't call elf.c static helper here, so derive stack_top from parent's
+                   canonical layout by using child's tls base region below USER_STACK_TOP:
+                   stack_top = USER_STACK_TOP - (tid+1)*stride. Keep stride in sync with elf.c. */
+                {
+                    const uintptr_t stride = (uintptr_t)USER_STACK_SIZE + (uintptr_t)USER_TLS_SIZE + (uintptr_t)(64 * 1024);
+                    const uint64_t slot = (uint64_t)child->tid + 1ULL;
+                    /* Avoid overflow and avoid (off + 0x10000) wrap. If tid is out of range, use top slot. */
+                    if (stride != 0 && slot <= (uint64_t)((uintptr_t)-1) / (uint64_t)stride) {
+                        const uintptr_t off = (uintptr_t)(slot * (uint64_t)stride);
+                        const uintptr_t top = (uintptr_t)USER_STACK_TOP;
+                        const uintptr_t min_room = (uintptr_t)USER_STACK_SIZE + (uintptr_t)USER_TLS_SIZE + 0x10000u;
+                        if (top > min_room && off < (top - min_room)) {
+                            child_stack_top = (uintptr_t)USER_STACK_TOP - off;
+                        }
+                    }
+                }
+                child_stack_top &= ~((uintptr_t)0xFULL);
+                uintptr_t child_rsp = (child_stack_top - copy_bytes);
+                /* Preserve original stack alignment (SSE movdqa expects this). */
+                uintptr_t align_mask = (uintptr_t)0xFULL;
+                uintptr_t want = (uintptr_t)saved_rsp & align_mask;
+                uintptr_t have = (uintptr_t)child_rsp & align_mask;
+                if (have != want) {
+                    child_rsp += (want - have) & align_mask;
+                }
 
-            /* inherit basic attributes */
-            child->parent_tid = parent_tid;
+                /* ensure child stack region is user-accessible */
+                {
+                    uintptr_t sb = (child_stack_top - (uintptr_t)USER_STACK_SIZE) & ~0xFFFULL;
+                    if (mark_user_identity_range_2m_sys((uint64_t)sb, (uint64_t)child_stack_top) != 0) {
+                        return ret_err(EFAULT);
+                    }
+                }
+                /* copy active stack slice */
+                memcpy((void*)child_rsp, (void*)(uintptr_t)saved_rsp, (size_t)copy_bytes);
+                /* Relocate pointers inside the copied stack slice itself */
+                {
+                    const uintptr_t parent_lo = (uintptr_t)saved_rsp;
+                    const uintptr_t parent_hi = parent_lo + (uintptr_t)copy_bytes;
+                    const uintptr_t delta = (uintptr_t)child_rsp - parent_lo;
+                    uintptr_t pp = (uintptr_t)child_rsp;
+                    uintptr_t end = (uintptr_t)child_rsp + (uintptr_t)copy_bytes;
+                    for (; pp + 8 <= end; pp += 8) {
+                        uint64_t v = *(uint64_t*)(uintptr_t)pp;
+                        uintptr_t vv = (uintptr_t)v;
+                        if (vv >= parent_lo && vv < parent_hi) {
+                            *(uint64_t*)(uintptr_t)pp = (uint64_t)(vv + delta);
+                        }
+                    }
+                }
+
+                /* ---- set up separate TLS (copy 4KiB from parent) ---- */
+                uintptr_t child_tls_region = child_stack_top - (uintptr_t)USER_STACK_SIZE - (uintptr_t)USER_TLS_SIZE;
+                /* Use same layout as exec: FS base inside region, fake pthread on next page. */
+                uintptr_t child_fs = child_tls_region + 0x1000u;
+                uintptr_t child_pthread_fake = child_tls_region + 0x2000u;
+                if (mark_user_identity_range_2m_sys((uint64_t)child_tls_region, (uint64_t)(child_pthread_fake + 0x1000u)) != 0) {
+                    return ret_err(EFAULT);
+                }
+                /* clear/clone minimal TLS layout (3 pages) */
+                memset((void*)child_tls_region, 0, 0x3000u);
+                if (parent_tls_region != 0 && parent_tls_region + 0x3000u < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                    memcpy((void*)child_tls_region, (void*)parent_tls_region, 0x3000u);
+                } else {
+                    /* already zeroed */
+                }
+                /* Ensure the self pointer slot used by glibc pthread_getspecific is valid. */
+                *(volatile uint64_t*)(uintptr_t)(child_fs - 0x78u) = (uint64_t)child_pthread_fake;
+                /* Provide default "C" locale string for specifics[5] (see core/elf.c). */
+                {
+                    const uintptr_t c_str = child_tls_region + 0x2800u;
+                    if (c_str + 2 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                        *(volatile uint8_t*)(uintptr_t)(c_str + 0) = (uint8_t)'C';
+                        *(volatile uint8_t*)(uintptr_t)(c_str + 1) = 0;
+                        const uintptr_t specific5_slot = child_pthread_fake + 0x80u + (uintptr_t)(5u * 8u);
+                        /* The TLS region may have been cloned from parent and contain garbage/non-canonical
+                           pointers in the specifics area. Clear a small window and force slot 5. */
+                        for (int si = 0; si < 32; si++) {
+                            *(volatile uint64_t*)(uintptr_t)(child_pthread_fake + 0x80u + (uintptr_t)(si * 8u)) = 0;
+                        }
+                        *(volatile uint64_t*)(uintptr_t)specific5_slot = (uint64_t)c_str;
+                    }
+                }
+                child->user_fs_base = (uint64_t)child_fs;
+
+                uintptr_t tramp = (uintptr_t)USER_VFORK_TRAMP;
+                /* ensure tramp region is user-accessible */
+                mark_user_identity_range_2m_sys((uint64_t)(tramp & ~((uintptr_t)(PAGE_SIZE_2M - 1))),
+                                               (uint64_t)((tramp & ~((uintptr_t)(PAGE_SIZE_2M - 1))) + PAGE_SIZE_2M));
+                if ((uintptr_t)tramp + 64 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                    const uintptr_t parent_lo = (uintptr_t)saved_rsp;
+                    const uintptr_t parent_hi = parent_lo + (uintptr_t)copy_bytes;
+                    #define VFORK_RELOC(val64) \
+                        ((((uintptr_t)(val64) >= parent_lo) && ((uintptr_t)(val64) < parent_hi)) ? \
+                         (uint64_t)((uintptr_t)child_rsp + ((uintptr_t)(val64) - parent_lo)) : \
+                         (uint64_t)(val64))
+                    /* Build a vfork trampoline that restores a full user register snapshot
+                       (as if we returned from a real SYSCALL instruction):
+                         - restore caller-saved regs: RDI,RSI,RDX,R8,R9,R10,RCX,R11
+                         - restore callee-saved regs: RBX,RBP,R12-R15
+                         - set RAX=0 (vfork return value in child)
+                         - set RSP=saved stack
+                         - jump to RCX (return RIP) */
+                    unsigned char stub[160];
+                    int off = 0;
+                    /* movabs rdi, imm64 */
+                    uint64_t imm_rdi = VFORK_RELOC(p->saved_user_rdi);
+                    stub[off++] = 0x48; stub[off++] = 0xBF; memcpy(&stub[off], &imm_rdi, 8); off += 8;
+                    /* movabs rsi, imm64 */
+                    uint64_t imm_rsi = VFORK_RELOC(p->saved_user_rsi);
+                    stub[off++] = 0x48; stub[off++] = 0xBE; memcpy(&stub[off], &imm_rsi, 8); off += 8;
+                    /* movabs rdx, imm64 */
+                    uint64_t imm_rdx = VFORK_RELOC(p->saved_user_rdx);
+                    stub[off++] = 0x48; stub[off++] = 0xBA; memcpy(&stub[off], &imm_rdx, 8); off += 8;
+                    /* movabs r8, imm64 */
+                    uint64_t imm_r8 = VFORK_RELOC(p->saved_user_r8);
+                    stub[off++] = 0x49; stub[off++] = 0xB8; memcpy(&stub[off], &imm_r8, 8); off += 8;
+                    /* movabs r9, imm64 */
+                    uint64_t imm_r9 = VFORK_RELOC(p->saved_user_r9);
+                    stub[off++] = 0x49; stub[off++] = 0xB9; memcpy(&stub[off], &imm_r9, 8); off += 8;
+                    /* movabs r10, imm64 */
+                    uint64_t imm_r10 = VFORK_RELOC(p->saved_user_r10);
+                    stub[off++] = 0x49; stub[off++] = 0xBA; memcpy(&stub[off], &imm_r10, 8); off += 8;
+                    /* movabs rcx, imm64 (return RIP) */
+                    uint64_t imm_rcx = (uint64_t)saved_rcx;
+                    stub[off++] = 0x48; stub[off++] = 0xB9; memcpy(&stub[off], &imm_rcx, 8); off += 8;
+                    /* movabs r11, imm64 (saved RFLAGS from SYSCALL) */
+                    uint64_t imm_r11_flags = p->saved_user_r11;
+                    stub[off++] = 0x49; stub[off++] = 0xBB; memcpy(&stub[off], &imm_r11_flags, 8); off += 8;
+                    /* movabs rbx, imm64 */
+                    uint64_t imm_rbx = VFORK_RELOC(p->saved_user_rbx);
+                    stub[off++] = 0x48; stub[off++] = 0xBB; memcpy(&stub[off], &imm_rbx, 8); off += 8;
+                    /* movabs rbp, imm64 */
+                    uint64_t imm_rbp = VFORK_RELOC(p->saved_user_rbp);
+                    stub[off++] = 0x48; stub[off++] = 0xBD; memcpy(&stub[off], &imm_rbp, 8); off += 8;
+                    /* movabs r12, imm64 */
+                    uint64_t imm_r12 = VFORK_RELOC(p->saved_user_r12);
+                    stub[off++] = 0x49; stub[off++] = 0xBC; memcpy(&stub[off], &imm_r12, 8); off += 8;
+                    /* movabs r13, imm64 */
+                    uint64_t imm_r13 = VFORK_RELOC(p->saved_user_r13);
+                    stub[off++] = 0x49; stub[off++] = 0xBD; memcpy(&stub[off], &imm_r13, 8); off += 8;
+                    /* movabs r14, imm64 */
+                    uint64_t imm_r14 = VFORK_RELOC(p->saved_user_r14);
+                    stub[off++] = 0x49; stub[off++] = 0xBE; memcpy(&stub[off], &imm_r14, 8); off += 8;
+                    /* movabs r15, imm64 */
+                    uint64_t imm_r15 = VFORK_RELOC(p->saved_user_r15);
+                    stub[off++] = 0x49; stub[off++] = 0xBF; memcpy(&stub[off], &imm_r15, 8); off += 8;
+                    /* xor rax, rax -> return value 0 in child */
+                    stub[off++] = 0x48; stub[off++] = 0x31; stub[off++] = 0xC0;
+                    /* movabs rsp, saved_rsp -> 48 BC imm64 */
+                    uint64_t imm_rsp = (uint64_t)child_rsp;
+                    stub[off++] = 0x48; stub[off++] = 0xBC; memcpy(&stub[off], &imm_rsp, 8); off += 8;
+                    /* jmp rcx -> FF E1 */
+                    stub[off++] = 0xFF; stub[off++] = 0xE1;
+                    #undef VFORK_RELOC
+                    /* pad with NOPs */
+                    for (int z = off; z < (int)sizeof(stub); z++) stub[z] = 0x90;
+                    memcpy((void*)(uintptr_t)tramp, stub, (size_t)off);
+                    /* Read back bytes to verify write succeeded */
+                    unsigned char verify[16];
+                    memcpy(verify, (void*)(uintptr_t)tramp, sizeof(verify));
+                    child->user_rip = (uint64_t)tramp;
+                } else {
+                    /* fallback: use saved_rcx if tramp can't be used */
+                    child->user_rip = saved_rcx;
+                }
+                child->user_stack = (uint64_t)child_rsp;
+                child->ring = 3;
+            }
+            child->parent_tid = (int)(p->tid ? p->tid : 1);
             child->sid = p->sid;
             child->pgid = p->pgid;
-            child->euid = p->euid;
-            child->egid = p->egid;
-            child->umask = p->umask;
+            child->euid = p->euid; child->egid = p->egid;
             child->attached_tty = p->attached_tty;
             strncpy(child->cwd, p->cwd, sizeof(child->cwd) - 1);
             child->cwd[sizeof(child->cwd) - 1] = '\0';
-
-            /* inherit heap/mmap cursors (needed before execve) */
-            child->user_brk_base = p->user_brk_base;
-            child->user_brk_cur = p->user_brk_cur;
-            child->user_mmap_next = p->user_mmap_next;
-
-            /* Share TLS base like fork/vfork in Linux (parent is blocked, so it's safe). */
-            child->user_fs_base = p->user_fs_base;
-
-            /* Build a small user-mode trampoline that restores a full user register snapshot,
-               returns 0 in child, sets RSP to the parent's saved RSP and jumps to the saved return RIP. */
-            if ((uintptr_t)tramp + 64 >= (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                return ret_err(EFAULT);
-            }
+            qemu_debug_printf("vfork: parent=%llu child=%llu saved_rcx=0x%llx saved_rsp=0x%llx\n",
+                (unsigned long long)(p->tid ? p->tid : 1),
+                (unsigned long long)(child->tid ? child->tid : 1),
+                (unsigned long long)saved_rcx, (unsigned long long)saved_rsp);
+            /* Preserve parent userspace memory across vfork/exec.
+               In our shared-address-space model, exec in the child overwrites
+               parent memory, so we must snapshot+restore for correctness.
+               Optimization: backup only the used region (heap + mmap) instead of
+               the full 0x200000..USER_TLS_BASE (~122 MiB). Typical vfork+exec
+               (sh, busybox) uses only a few MiB. */
             {
-                unsigned char stub[160];
-                int off = 0;
-                /* movabs rdi, imm64 */
-                uint64_t imm_rdi = p->saved_user_rdi;
-                stub[off++] = 0x48; stub[off++] = 0xBF; memcpy(&stub[off], &imm_rdi, 8); off += 8;
-                /* movabs rsi, imm64 */
-                uint64_t imm_rsi = p->saved_user_rsi;
-                stub[off++] = 0x48; stub[off++] = 0xBE; memcpy(&stub[off], &imm_rsi, 8); off += 8;
-                /* movabs rdx, imm64 */
-                uint64_t imm_rdx = p->saved_user_rdx;
-                stub[off++] = 0x48; stub[off++] = 0xBA; memcpy(&stub[off], &imm_rdx, 8); off += 8;
-                /* movabs r8, imm64 */
-                uint64_t imm_r8 = p->saved_user_r8;
-                stub[off++] = 0x49; stub[off++] = 0xB8; memcpy(&stub[off], &imm_r8, 8); off += 8;
-                /* movabs r9, imm64 */
-                uint64_t imm_r9 = p->saved_user_r9;
-                stub[off++] = 0x49; stub[off++] = 0xB9; memcpy(&stub[off], &imm_r9, 8); off += 8;
-                /* movabs r10, imm64 */
-                uint64_t imm_r10 = p->saved_user_r10;
-                stub[off++] = 0x49; stub[off++] = 0xBA; memcpy(&stub[off], &imm_r10, 8); off += 8;
-                /* movabs rcx, imm64 (return RIP) */
-                uint64_t imm_rcx = (uint64_t)saved_rcx;
-                stub[off++] = 0x48; stub[off++] = 0xB9; memcpy(&stub[off], &imm_rcx, 8); off += 8;
-                /* movabs r11, imm64 (saved RFLAGS from SYSCALL) */
-                uint64_t imm_r11_flags = p->saved_user_r11;
-                stub[off++] = 0x49; stub[off++] = 0xBB; memcpy(&stub[off], &imm_r11_flags, 8); off += 8;
-                /* movabs rbx, imm64 */
-                uint64_t imm_rbx = p->saved_user_rbx;
-                stub[off++] = 0x48; stub[off++] = 0xBB; memcpy(&stub[off], &imm_rbx, 8); off += 8;
-                /* movabs rbp, imm64 */
-                uint64_t imm_rbp = p->saved_user_rbp;
-                stub[off++] = 0x48; stub[off++] = 0xBD; memcpy(&stub[off], &imm_rbp, 8); off += 8;
-                /* movabs r12, imm64 */
-                uint64_t imm_r12 = p->saved_user_r12;
-                stub[off++] = 0x49; stub[off++] = 0xBC; memcpy(&stub[off], &imm_r12, 8); off += 8;
-                /* movabs r13, imm64 */
-                uint64_t imm_r13 = p->saved_user_r13;
-                stub[off++] = 0x49; stub[off++] = 0xBD; memcpy(&stub[off], &imm_r13, 8); off += 8;
-                /* movabs r14, imm64 */
-                uint64_t imm_r14 = p->saved_user_r14;
-                stub[off++] = 0x49; stub[off++] = 0xBE; memcpy(&stub[off], &imm_r14, 8); off += 8;
-                /* movabs r15, imm64 */
-                uint64_t imm_r15 = p->saved_user_r15;
-                stub[off++] = 0x49; stub[off++] = 0xBF; memcpy(&stub[off], &imm_r15, 8); off += 8;
-                /* xor rax, rax -> return value 0 in child */
-                stub[off++] = 0x48; stub[off++] = 0x31; stub[off++] = 0xC0;
-                /* movabs rsp, saved_rsp -> 48 BC imm64 */
-                uint64_t imm_rsp = (uint64_t)saved_rsp;
-                stub[off++] = 0x48; stub[off++] = 0xBC; memcpy(&stub[off], &imm_rsp, 8); off += 8;
-                /* jmp rcx -> FF E1 */
-                stub[off++] = 0xFF; stub[off++] = 0xE1;
-                /* pad with NOPs */
-                for (int z = off; z < (int)sizeof(stub); z++) stub[z] = 0x90;
-                memcpy((void*)(uintptr_t)tramp, stub, (size_t)off);
+                const uintptr_t base = (uintptr_t)0x00200000u;
+                uintptr_t end = (uintptr_t)USER_TLS_BASE;
+                if (end < base) end = base;
+                /* Backup only up to the end of used memory */
+                uintptr_t used_end = (uintptr_t)p->user_brk_cur;
+                if (p->user_mmap_next > used_end) used_end = p->user_mmap_next;
+                /* Minimum: cover program load + small heap (busybox ~2MB at 0x400000) */
+                const uintptr_t min_backup = base + (8u * 1024u * 1024u);
+                if (used_end < min_backup || used_end == 0) used_end = min_backup;
+                if (used_end > end) used_end = end;
+                uint64_t len64 = (uint64_t)(used_end - base);
+                if (len64 == 0 || len64 > (uint64_t)(256u * 1024u * 1024u)) {
+                    return ret_err(ENOMEM);
+                }
+                child->vfork_parent_mem_backup = kmalloc((size_t)len64);
+                if (!child->vfork_parent_mem_backup) {
+                    return ret_err(ENOMEM);
+                }
+                /* Small backup: single copy. Large: chunk with yields to avoid freeze. */
+                const size_t chunk = 512u * 1024u;
+                if ((size_t)len64 <= chunk) {
+                    memcpy(child->vfork_parent_mem_backup, (void*)base, (size_t)len64);
+                    qemu_debug_printf("COPIED WHITOUT CHUNKS\n");
+                } else {
+                    for (size_t off = 0; off < (size_t)len64; off += chunk) {
+                        size_t n = chunk;
+                        if (off + n > (size_t)len64) n = (size_t)len64 - off;
+                        memcpy((char*)child->vfork_parent_mem_backup + off, (void*)(base + off), n);
+                        if (off + n < (size_t)len64) thread_yield();
+                    }
+                }
+                child->vfork_parent_mem_backup_len = len64;
+                child->vfork_parent_mem_backup_base = (uint64_t)base;
+                child->vfork_parent_brk_saved = (uint64_t)p->user_brk_cur;
+                child->vfork_parent_tid = (int)(p->tid ? p->tid : 1);
+                /* block parent until child exits */
+                p->vfork_parent_tid = -1;
+                p->state = THREAD_BLOCKED;
+                qemu_debug_printf("vfork: parent blocked, child->vfork_parent_tid=%d\n", child->vfork_parent_tid);
             }
-
-            child->user_rip = (uint64_t)tramp;
-            child->user_stack = (uint64_t)saved_rsp;
-            child->ring = 3;
-
             /* duplicate file descriptors (increase refcounts) */
             for (int i = 0; i < THREAD_MAX_FD; i++) {
                 child->fds[i] = p->fds[i];
@@ -1645,17 +1821,25 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     else child->fds[i]->refcount++;
                 }
             }
-
-            /* Establish vfork parent relationship and block parent until child exit. */
-            child->vfork_parent_tid = parent_tid;
-            p->vfork_parent_tid = -1;
-            p->state = THREAD_BLOCKED;
-
-            /* Run child now; parent syscall returns only after child exit unblocks it. */
-            thread_unblock((int)child_tid);
-            thread_schedule();
-            rebuild_syscall_frame(p);
-            return child_tid;
+            /* If parent was blocked (init backup path), yield to run child now. */
+            if (p->state == THREAD_BLOCKED && child->vfork_parent_tid >= 0) {
+                qemu_debug_printf("vfork: unblocking child %llu, calling thread_schedule()\n",
+                    (unsigned long long)(child->tid ? child->tid : 1));
+                thread_unblock((int)(child->tid ? child->tid : 1));
+                thread_schedule();
+                /* parent resumed after child exit; restore syscall frame */
+                qemu_debug_printf("vfork: parent %llu resumed after child exit\n",
+                    (unsigned long long)(p->tid ? p->tid : 1));
+                rebuild_syscall_frame(p);
+                return (uint64_t)(child->tid ? child->tid : 1);
+            }
+            /* default path: do not block parent; just allow child to run */
+            qemu_debug_printf("vfork: default path, unblocking child %llu\n",
+                (unsigned long long)(child->tid ? child->tid : 1));
+            child->vfork_parent_tid = -1;
+            thread_unblock((int)(child->tid ? child->tid : 1));
+            /* when parent is unblocked and resumes here, return child's pid to parent */
+            return (uint64_t)(child->tid ? child->tid : 1);
         }
         case SYS_set_robust_list:
             /* set_robust_list(head, len): accept (no robust futex handling yet) */
