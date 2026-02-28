@@ -33,5 +33,8 @@ int e1000_recv_frame(void *buf, size_t cap);
 /* Optional driver polling hook (for setups without NIC IRQ path). */
 void e1000_poll(void);
 
+/* Debug: print RX ring state. */
+void e1000_debug_rx(void);
+
 /* Snapshot driver counters. */
 int e1000_get_stats(e1000_stats_t *out_stats);

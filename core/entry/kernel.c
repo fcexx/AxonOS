@@ -362,6 +362,9 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 
     if (e1000_init() != 0) {
         klogprintf("net: e1000 not found\n");
+    } else {
+        int nrc = syscall_net_preinit();
+        klogprintf("net: preinit %s\n", (nrc == 0) ? "ok" : "failed");
     }
 
     

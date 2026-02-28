@@ -1233,21 +1233,15 @@ void devfs_tty_push_input_noblock(int tty, char c) {
     }
     /* Backspace (DEL 0x7F / BS 0x08): never handle in kernel; always pass to application.
        Prevents double handling (kernel try_erase + sh line editor) and keeps display in sync. */
-    /* Ctrl+C (0x03): terminate whoever is reading from this TTY (foreground) and wake their parent (shell in wait4) */
+    /* Ctrl+C (0x03): send SIGINT to foreground process group only (Linux-like). */
     if ((unsigned char)c == 0x03) {
-        /* Kill all threads blocked in read() on this TTY and unblock their waiter (e.g. shell in wait4) */
+        if (t->fg_pgrp >= 0) thread_send_sigint_to_pgrp(t->fg_pgrp);
+        /* Wake readers so they can observe updated process state. */
         for (int i = 0; i < t->waiters_count; i++) {
             int tid = t->waiters[i];
-            if (tid < 0) continue;
-            thread_t *th = thread_get(tid);
-            if (!th || th->state == THREAD_TERMINATED) continue;
-            th->exit_status = (130 & 0xFF) << 8; /* 128 + SIGINT */
-            th->state = THREAD_TERMINATED;
-            if (th->waiter_tid >= 0) thread_unblock(th->waiter_tid);
+            if (tid >= 0) thread_unblock(tid);
         }
         t->waiters_count = 0;
-        /* Also send SIGINT by pgrp in case fg_pgrp was set (covers any other threads in the group) */
-        if (t->fg_pgrp >= 0) thread_send_sigint_to_pgrp(t->fg_pgrp);
         if (tty == devfs_get_active() && (t->term_lflag & 0x00000008u)) {
             kputchar('^', t->current_attr);
             kputchar('C', t->current_attr);

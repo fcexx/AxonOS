@@ -120,7 +120,6 @@ typedef struct {
     uint8_t *tx_buf[E1000_TX_DESC_COUNT];
     uint8_t *rx_buf[E1000_RX_DESC_COUNT];
     uint32_t rx_next;
-    uint32_t rdt_sw;  /* программный RDT для возврата дескрипторов (8254x) */
 
     e1000_stats_t stats;
 } e1000_state_t;
@@ -263,8 +262,7 @@ static int e1000_setup_rx(void) {
     e1000_write32(E1000_REG_RDBAH, (uint32_t)(rx_pa >> 32));
     e1000_write32(E1000_REG_RDLEN, (uint32_t)(sizeof(e1000_rx_desc_t) * E1000_RX_DESC_COUNT));
     e1000_write32(E1000_REG_RDH, 0);
-    g_e1000.rdt_sw = E1000_RX_DESC_COUNT - 1;
-    e1000_write32(E1000_REG_RDT, g_e1000.rdt_sw);
+    e1000_write32(E1000_REG_RDT, E1000_RX_DESC_COUNT - 1);
     g_e1000.rx_next = 0;
 
     /* Enable broad receive filters during early bring-up. */
@@ -406,30 +404,27 @@ int e1000_send_frame(const void *data, size_t len) {
 int e1000_recv_frame(void *buf, size_t cap) {
     if (!g_e1000.initialized || !buf || cap == 0) return -1;
 
-    uint32_t rdh = e1000_read32(E1000_REG_RDH);
-    /* 8254x: пусто, когда голова совпадает с отданным хвостом (нет нового заполненного дескриптора). */
-    if (rdh == g_e1000.rdt_sw) return 0;
-
-    /* Пакет в дескрипторе (RDH - 1), т.к. железо уже сдвинуло RDH вперёд. */
-    uint32_t idx = (rdh == 0) ? (E1000_RX_DESC_COUNT - 1) : (rdh - 1);
-    e1000_rx_desc_t *d = &g_e1000.rx_desc[idx];
+    uint32_t idx = g_e1000.rx_next;
+    volatile e1000_rx_desc_t *d = (volatile e1000_rx_desc_t *)&g_e1000.rx_desc[idx];
+    __asm__ volatile("" ::: "memory"); /* memory barrier */
     if ((d->status & E1000_RX_STATUS_DD) == 0) return 0;
 
     if ((d->status & E1000_RX_STATUS_EOP) == 0) {
         d->status = 0;
-        g_e1000.rdt_sw = idx;
         e1000_write32(E1000_REG_RDT, idx);
+        g_e1000.rx_next = (idx + 1) % E1000_RX_DESC_COUNT;
         g_e1000.stats.rx_errors++;
         return -2;
     }
 
     size_t frame_len = d->length;
     size_t copy_len = (frame_len > cap) ? cap : frame_len;
+    __asm__ volatile("" ::: "memory"); /* ensure DMA data is visible */
     memcpy(buf, g_e1000.rx_buf[idx], copy_len);
 
     d->status = 0;
-    g_e1000.rdt_sw = idx;
     e1000_write32(E1000_REG_RDT, idx);
+    g_e1000.rx_next = (idx + 1) % E1000_RX_DESC_COUNT;
 
     g_e1000.stats.rx_packets++;
     return (int)copy_len;
@@ -438,6 +433,17 @@ int e1000_recv_frame(void *buf, size_t cap) {
 void e1000_poll(void) {
     if (!g_e1000.initialized) return;
     (void)e1000_read32(E1000_REG_ICR);
+}
+
+void e1000_debug_rx(void) {
+    if (!g_e1000.initialized) return;
+    uint32_t rdh = e1000_read32(E1000_REG_RDH);
+    uint32_t rdt = e1000_read32(E1000_REG_RDT);
+    uint32_t idx = g_e1000.rx_next;
+    __asm__ volatile("" ::: "memory");
+    volatile e1000_rx_desc_t *d = (volatile e1000_rx_desc_t *)&g_e1000.rx_desc[idx];
+    uint8_t st = d->status;
+    klogprintf("e1000: RDH=%u RDT=%u rx_next=%u status=0x%02x\n", rdh, rdt, idx, st);
 }
 
 int e1000_get_stats(e1000_stats_t *out_stats) {

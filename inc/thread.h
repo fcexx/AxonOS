@@ -20,6 +20,8 @@ typedef struct thread {
         context_t context;
         uint64_t kernel_stack;         // kernel mode stack
         uint64_t user_stack;           // user mode stack
+        uint64_t user_stack_base;      // low address of active user stack region (if known)
+        uint64_t user_stack_limit;     // high address (exclusive) of active user stack region
         uint64_t user_rip;             // user mode rip
         uint64_t user_fs_base;         // TLS base for userspace
         uint8_t ring;                  // user mode ring

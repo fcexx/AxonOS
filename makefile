@@ -80,6 +80,21 @@ iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg
 run: iso
 	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 1024M -serial stdio -boot d -hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0
 
+# Run with bridged networking (real IP from router) - requires sudo and br0 bridge
+run-bridge: iso
+	@echo "Note: Requires bridge 'br0' to be configured. Run with sudo."
+	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 1024M -serial stdio -boot d -hda ../disk.img \
+		-device e1000,netdev=net0 -netdev bridge,id=net0,br=br0
+
+# Run with TAP networking (real IP from router) - requires sudo
+run-tap: iso
+	@echo "Creating TAP interface... (requires sudo)"
+	@sudo ip tuntap add dev tap0 mode tap user $(USER) 2>/dev/null || true
+	@sudo ip link set tap0 up 2>/dev/null || true
+	@sudo ip link set tap0 master br0 2>/dev/null || echo "Warning: br0 not found, tap0 not bridged"
+	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 1024M -serial stdio -boot d -hda ../disk.img \
+		-device e1000,netdev=net0 -netdev tap,id=net0,ifname=tap0,script=no,downscript=no
+
 debug: iso
 	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 512M -serial stdio -hda ../disk.img -boot d -s -S & gdb -ex "target remote localhost:1234" $(KERNEL_ELF)
 

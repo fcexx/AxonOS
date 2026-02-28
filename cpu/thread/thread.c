@@ -37,6 +37,15 @@ void thread_mark_init_user(thread_t* t) {
 }
 static thread_t main_thread;
 
+static int thread_context_valid(thread_t *t) {
+        if (!t) return 0;
+        uintptr_t tp = (uintptr_t)t;
+        if (tp < 0x1000 || tp + sizeof(thread_t) >= (uintptr_t)MMIO_IDENTITY_LIMIT) return 0;
+        uintptr_t rsp = (uintptr_t)t->context.rsp;
+        if (rsp < 0x1000 || rsp >= (uintptr_t)MMIO_IDENTITY_LIMIT - 16) return 0;
+        return 1;
+}
+
 /* Kernel stack size per thread.
    8KiB was too small for our very large syscall handler (`syscall_do`) and led to
    kernel stack overflows, corrupting thread structs / saved user registers and
@@ -508,6 +517,10 @@ void thread_schedule() {
                         if (t->state != THREAD_READY) continue;
                         if (t->state == THREAD_TERMINATED) continue;
                         if (pass == 0 && idle_tid >= 0 && t->tid == idle_tid) continue; /* skip idle on pass0 */
+                        if (!thread_context_valid(t)) {
+                                t->state = THREAD_TERMINATED;
+                                continue;
+                        }
                         pick = t;
                         break;
                 }
@@ -515,6 +528,10 @@ void thread_schedule() {
 
         if (pick) {
                         thread_t* prev = current;
+                        if (!thread_context_valid(prev)) {
+                                prev = &main_thread;
+                                current = &main_thread;
+                        }
                         current = pick;
                         current->state = THREAD_RUNNING;
                         /* Keep TSS.RSP0 / syscall kernel stack in sync with the actually scheduled thread.
@@ -546,6 +563,12 @@ void thread_schedule() {
                         }
                         //qemu_debug_printf("thread_schedule: switching from tid=%d to tid=%d\n", prev->tid, current->tid);
                         //qemu_debug_printf("thread_schedule: prev.ctx.rflags=0x%x new.ctx.rflags=0x%x\n", (unsigned int)prev->context.rflags, (unsigned int)current->context.rflags);
+                        if (!thread_context_valid(current)) {
+                                current->state = THREAD_TERMINATED;
+                                current = &main_thread;
+                                current->state = THREAD_RUNNING;
+                                return;
+                        }
                         context_switch(&prev->context, &current->context);
                         return;
         }
@@ -561,8 +584,9 @@ void thread_schedule() {
         }
         /* As a last resort, if idle thread exists and is not current, switch to it even
            if it isn't marked READY (shouldn't happen, but safer than returning into a dead thread). */
-        if (idle_thread && current != idle_thread) {
+        if (idle_thread && current != idle_thread && thread_context_valid(idle_thread)) {
                 thread_t *prev = current;
+                if (!thread_context_valid(prev)) prev = &main_thread;
                 current = idle_thread;
                 current->state = THREAD_RUNNING;
                 mm_switch(current->mm);
@@ -594,9 +618,13 @@ void thread_send_sigint_to_pgrp(int pgrp) {
                 if (!t) continue;
                 if (t->pgid != pgrp) continue;
                 if (t->state != THREAD_TERMINATED) {
-                        t->exit_status = (130 & 0xFF) << 8; /* 128 + 2 (SIGINT) */
-                        t->state = THREAD_TERMINATED;
-                        if (t->waiter_tid >= 0) thread_unblock(t->waiter_tid);
+                        /* Mark pending SIGINT; let thread terminate via regular syscall path.
+                           Directly forcing THREAD_TERMINATED breaks vfork/exec parent restore. */
+                        t->pending_signals |= (1ULL << (2 - 1)); /* SIGINT */
+                        if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING) {
+                                t->state = THREAD_READY;
+                                t->sleep_until = 0;
+                        }
                 }
         }
 }

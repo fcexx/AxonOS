@@ -89,6 +89,8 @@
 
 /* initialize syscall subsystem (register handler) */
 void syscall_init(void);
+/* warm-up kernel net stack once during boot */
+int syscall_net_preinit(void);
 
 /* ISR-compatible handler (called by IDT dispatcher) */
 void isr_syscall(cpu_registers_t* regs);
