@@ -16,10 +16,10 @@ static uint64_t* next_free_table(void) {
     return pool[used++];
 }
 
-static inline uint64_t read_cr3(void) {
+uint64_t paging_read_cr3(void) {
     uint64_t v; __asm__ volatile("mov %%cr3, %0" : "=r"(v)); return v;
 }
-static inline void write_cr3(uint64_t v) {
+void paging_write_cr3(uint64_t v) {
     __asm__ volatile("mov %0, %%cr3" :: "r"(v) : "memory");
 }
 
@@ -27,7 +27,7 @@ void invlpg(void* va) { __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory"); }
 
 void paging_init(void) {
     // Ensure CR3 is loaded with our L4 base (it already is after bootstrap)
-    (void)read_cr3();
+    (void)paging_read_cr3();
 }
 
 int map_page_2m(uint64_t va, uint64_t pa, uint64_t flags) {

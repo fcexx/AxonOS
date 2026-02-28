@@ -9,6 +9,7 @@
 #include <debug.h>
 #include <devfs.h>
 #include <gdt.h>
+#include <mm.h>
 
 #define MAX_THREADS 32
 thread_t* threads[MAX_THREADS];
@@ -58,6 +59,7 @@ static void idle_task_entry(void) {
 }
 
 void thread_init() {
+        mm_init();
         memset(&main_thread, 0, sizeof(main_thread));
         main_thread.state = THREAD_RUNNING;
         main_thread.tid = 0;
@@ -85,6 +87,7 @@ void thread_init() {
         main_thread.exec_trampoline_rip = 0;
         main_thread.exec_trampoline_rsp = 0;
         main_thread.exec_trampoline_rax = 0;
+        main_thread.mm = mm_retain(mm_kernel());
         init = 1;
 
         /* Create an always-READY idle task (tid != 0) so the scheduler always has
@@ -181,6 +184,8 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->exec_trampoline_rip = 0;
         t->exec_trampoline_rsp = 0;
         t->exec_trampoline_rax = 0;
+        if (current && current->mm) t->mm = mm_retain(current->mm);
+        else t->mm = mm_retain(mm_kernel());
         strncpy(t->cwd, "/", sizeof(t->cwd));
         t->cwd[sizeof(t->cwd) - 1] = '\0';
         /* Use next free slot and tid so we never overwrite an existing thread. */
@@ -275,6 +280,8 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         t->exec_trampoline_rip = 0;
         t->exec_trampoline_rsp = 0;
         t->exec_trampoline_rax = 0;
+        if (current && current->mm) t->mm = mm_retain(current->mm);
+        else t->mm = mm_retain(mm_kernel());
         threads[thread_count++] = t;
         current_user = t;
         return t;
@@ -531,6 +538,7 @@ void thread_schedule() {
                         } else {
                                 set_user_fs_base(0);
                         }
+                        mm_switch(current->mm);
                         /* Only a RUNNING thread becomes READY when we switch away.
                            If it was already BLOCKED/SLEEPING/TERMINATED, preserve that state. */
                         if (prev->state == THREAD_RUNNING) {
@@ -557,6 +565,7 @@ void thread_schedule() {
                 thread_t *prev = current;
                 current = idle_thread;
                 current->state = THREAD_RUNNING;
+                mm_switch(current->mm);
                 if (prev->state == THREAD_RUNNING) prev->state = THREAD_READY;
                 context_switch(&prev->context, &current->context);
                 return;
@@ -564,6 +573,7 @@ void thread_schedule() {
         /* Fallback to tid0 context (best-effort). */
         current = &main_thread;
         current->state = THREAD_RUNNING;
+        mm_switch(current->mm);
 }
 
 void thread_unblock(int pid) {

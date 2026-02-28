@@ -7,6 +7,7 @@
 
 int vbe_init_from_multiboot(uint32_t multiboot_magic, uint64_t multiboot_info);
 int vbe_is_available(void);
+int vbe_attach_framebuffer(void *frontbuf, uint32_t width, uint32_t height, uint32_t pitch, uint32_t bpp);
 
 /* Simple framebuffer console primitives used by kprintf delegation */
 void vbefb_putchar(uint8_t ch, uint8_t attr);

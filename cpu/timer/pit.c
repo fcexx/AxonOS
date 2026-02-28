@@ -4,10 +4,9 @@
 #include <idt.h>
 #include <serial.h>
 #include <vga.h>
-// VGA text mode uses hardware cursor; no backbuffer swap needed
 #include <thread.h>
 #include <vbe.h>
-//#include <vbetty.h>
+#include <cirrusfb.h>
 
 // Global variables
 volatile uint64_t pit_ticks = 0;
@@ -28,8 +27,12 @@ void pit_handler(cpu_registers_t* regs) {
         if ((pit_ticks % 10) == 0) {
                 thread_schedule();
         }
-        vbe_flush_full();
-        vbefb_update_cursor();
+        if (cirrusfb_is_ready()) {
+                cirrusfb_update_cursor();
+        } else {
+                vbe_flush_full();
+                vbefb_update_cursor();
+        }
 }
 
 // Initialize PIT with default frequency (100 Hz)

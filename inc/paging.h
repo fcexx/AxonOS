@@ -33,4 +33,8 @@ int unmap_page_2m(uint64_t va);
 // Invalidate TLB for given virtual address
 void invlpg(void* va);
 
+/* Raw CR3 access helpers for scheduler/mm switching. */
+uint64_t paging_read_cr3(void);
+void paging_write_cr3(uint64_t v);
+
 

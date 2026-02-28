@@ -16,6 +16,7 @@
 #include <devfs.h>
 #include <gdt.h>
 #include <paging.h>
+#include <mm.h>
 #include <elf.h>
 #include <vga.h>
 
@@ -257,8 +258,10 @@ static uint64_t user_image_limit_bytes(void) {
    data access in ring3. We best-effort handle existing 1GiB/2MiB mappings without
    splitting; for 4KiB mappings we update the leaf entry. */
 static int mark_user_range_exec(uint64_t va_begin, uint64_t va_end) {
-    extern uint64_t page_table_l4[];
     if (va_end < va_begin) return -1;
+    uint64_t cr3 = paging_read_cr3();
+    uint64_t *active_l4 = (uint64_t*)(uintptr_t)(cr3 & ~0xFFFULL);
+    if (!active_l4) return -1;
 
     uint64_t begin = va_begin & ~(PAGE_SIZE_2M - 1);
     uint64_t end = (va_end + PAGE_SIZE_2M - 1) & ~(PAGE_SIZE_2M - 1);
@@ -267,7 +270,7 @@ static int mark_user_range_exec(uint64_t va_begin, uint64_t va_end) {
         uint64_t l3i = (va >> 30) & 0x1FF;
         uint64_t l2i = (va >> 21) & 0x1FF;
         uint64_t l1i = (va >> 12) & 0x1FF;
-        uint64_t *l4 = (uint64_t*)page_table_l4;
+        uint64_t *l4 = active_l4;
         if (!(l4[l4i] & PG_PRESENT)) return -1;
         l4[l4i] |= PG_US | PG_RW;
         l4[l4i] &= ~PG_NX;
@@ -377,15 +380,17 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
    on all relevant paging structure levels. This is required for both
    instruction fetch and stack/data access in ring3. */
 static int mark_user_identity_range_2m(uint64_t va_begin, uint64_t va_end) {
-    extern uint64_t page_table_l4[];
     if (va_end < va_begin) return -1;
+    uint64_t cr3 = paging_read_cr3();
+    uint64_t *active_l4 = (uint64_t*)(uintptr_t)(cr3 & ~0xFFFULL);
+    if (!active_l4) return -1;
     uint64_t begin = va_begin & ~(PAGE_SIZE_2M - 1);
     uint64_t end = (va_end + PAGE_SIZE_2M - 1) & ~(PAGE_SIZE_2M - 1);
     for (uint64_t va = begin; va < end; va += PAGE_SIZE_2M) {
         uint64_t l4i = (va >> 39) & 0x1FF;
         uint64_t l3i = (va >> 30) & 0x1FF;
         uint64_t l2i = (va >> 21) & 0x1FF;
-        uint64_t *l4 = (uint64_t*)page_table_l4;
+        uint64_t *l4 = active_l4;
         if (!(l4[l4i] & PG_PRESENT)) return -1;
         l4[l4i] |= PG_US;
         uint64_t *l3 = (uint64_t*)(uintptr_t)(l4[l4i] & ~0xFFFULL);
@@ -511,6 +516,17 @@ int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk
         }
 
         void *dst = (void*)(uintptr_t)(ph->p_vaddr + load_base);
+        /* If current task has a private mm, make destination pages private before writing ELF. */
+        {
+            thread_t *tc = thread_current();
+            if (tc && tc->mm && tc->mm != mm_kernel()) {
+                if (mm_make_private_range(tc->mm, vstart, vend, 0) != 0) {
+                    kfree(phdrs);
+                    fs_file_free(f);
+                    return -1;
+                }
+            }
+        }
         if (ph->p_filesz > 0) {
             ssize_t rr = fs_read(f, dst, (size_t)ph->p_filesz, (size_t)ph->p_offset);
             if (rr != (ssize_t)ph->p_filesz) {
@@ -810,6 +826,16 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         kprintf("execve: stack region outside identity map\n");
         return -1;
     }
+    {
+        thread_t *tc = thread_current();
+        if (tc && tc->mm && tc->mm != mm_kernel()) {
+            uintptr_t stack_base = (stack_top - USER_STACK_SIZE) & ~0xFFFULL;
+            if (mm_make_private_range(tc->mm, (uint64_t)stack_base, (uint64_t)stack_top, 0) != 0) {
+                kprintf("execve: failed to private-map user stack\n");
+                return -1;
+            }
+        }
+    }
 
     /* copy strings into their place */
     char *str_dst = (char*)(uintptr_t)strings_addr;
@@ -878,6 +904,13 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     const uintptr_t fs_base = tls_region_base + 0x1000u;      /* keep -0x78 and +0x28 in-range */
     const uintptr_t pthread_fake = tls_region_base + 0x2000u; /* within first few pages */
     {
+        thread_t *tc = thread_current();
+        if (tc && tc->mm && tc->mm != mm_kernel()) {
+            if (mm_make_private_range(tc->mm, (uint64_t)tls_region_base, (uint64_t)(pthread_fake + 0x1000u), 0) != 0) {
+                kprintf("execve: failed to private-map TLS range\n");
+                return -1;
+            }
+        }
         /* Need a few pages inside the TLS region for our minimal layout. */
         if (pthread_fake + 0x1000u >= (uintptr_t)MMIO_IDENTITY_LIMIT) {
             kprintf("execve: tls base outside identity map\n");

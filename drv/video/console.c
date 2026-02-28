@@ -2,11 +2,12 @@
 #include <vbe.h>
 #include <vga.h>
 #include <stdint.h>
+#include <cirrusfb.h>
 
 void console_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
-	if (vbe_is_available()) {
-		/* vbefb expects character writes via its putchar; compute linear writes */
-		/* Provide simple implementation: set cursor then putchar */
+	if (cirrusfb_is_ready()) {
+		cirrusfb_putch_xy(x, y, ch, attr);
+	} else if (vbe_is_available()) {
 		vbefb_set_cursor(x, y);
 		vbefb_putchar(ch, attr);
 	} else {
@@ -15,9 +16,12 @@ void console_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
 }
 
 int console_max_rows() {
+	if (cirrusfb_is_ready()) {
+		return (int)cirrusfb_rows();
+	}
 	if (vbe_is_available()) {
 		uint32_t w = vbe_get_height();
-		uint32_t fontw = 16; /* vbefb uses 8x16 font */
+		uint32_t fontw = 16;
 		if (fontw == 0) return MAX_ROWS;
 		return (int)(w / fontw);
 	}
@@ -25,9 +29,12 @@ int console_max_rows() {
 }
 
 int console_max_cols() {
+	if (cirrusfb_is_ready()) {
+		return (int)cirrusfb_cols();
+	}
 	if (vbe_is_available()) {
 		uint32_t w = vbe_get_width();
-		uint32_t fontw = 8; /* vbefb uses 8x16 font */
+		uint32_t fontw = 8;
 		if (fontw == 0) return MAX_COLS;
 		return (int)(w / fontw);
 	}
@@ -35,7 +42,13 @@ int console_max_cols() {
 }
 
 void console_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t ch, uint8_t attr) {
-	if (vbe_is_available()) {
+	if (cirrusfb_is_ready()) {
+		for (uint32_t ry = 0; ry < h; ry++) {
+			for (uint32_t rx = 0; rx < w; rx++) {
+				cirrusfb_putch_xy(x + rx, y + ry, ch, attr);
+			}
+		}
+	} else if (vbe_is_available()) {
 		for (uint32_t ry = 0; ry < h; ry++) {
 			for (uint32_t rx = 0; rx < w; rx++) {
 				vbefb_set_cursor(x + rx, y + ry);
@@ -53,14 +66,30 @@ void console_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t c
 
 void console_write_str_xy(uint32_t x, uint32_t y, const char *s, uint8_t attr) {
 	if (!s) return;
-	if (vbe_is_available()) {
-		/* write sequentially using putch; handle ANSI sequences without advancing cursor */
+	if (cirrusfb_is_ready()) {
+		uint32_t cx = x, cy = y;
+		for (size_t i = 0; s[i]; ) {
+			if (s[i] == '\t') {
+				uint32_t n = 8 - (cx % 8);
+				if (n == 0) n = 8;
+				for (uint32_t k = 0; k < n; k++) {
+					cirrusfb_putch_xy(cx, cy, ' ', attr);
+					cx++;
+					if (cx >= (uint32_t)console_max_cols()) { cx = 0; cy++; }
+				}
+				i++;
+				continue;
+			}
+			cirrusfb_putch_xy(cx, cy, (uint8_t)s[i], attr);
+			i++;
+			cx++;
+			if (cx >= (uint32_t)console_max_cols()) { cx = 0; cy++; }
+		}
+	} else if (vbe_is_available()) {
 		uint32_t cx = x, cy = y;
 		for (size_t i = 0; s[i]; ) {
 			if (s[i] == 0x1B && s[i+1] == '[') {
-				/* pass entire CSI sequence to vbefb_putchar without advancing cursor */
 				size_t j = i;
-				/* find terminator 'm' or end */
 				while (s[j] && s[j] != 'm') j++;
 				if (s[j] == 'm') {
 					for (size_t k = i; k <= j; k++) {
@@ -69,10 +98,8 @@ void console_write_str_xy(uint32_t x, uint32_t y, const char *s, uint8_t attr) {
 					i = j + 1;
 					continue;
 				}
-				/* malformed: fallthrough to send single char */
 			}
 			if (s[i] == '\t') {
-				/* Tab: пробелы до следующей таб-стопы (8 колонок) */
 				uint32_t n = 8 - (cx % 8);
 				if (n == 0) n = 8;
 				for (uint32_t k = 0; k < n; k++) {
@@ -84,7 +111,6 @@ void console_write_str_xy(uint32_t x, uint32_t y, const char *s, uint8_t attr) {
 				i++;
 				continue;
 			}
-			/* printable or normal char: set cursor then print */
 			vbefb_set_cursor(cx, cy);
 			vbefb_putchar((uint8_t)s[i], attr);
 			i++;
@@ -150,11 +176,13 @@ void console_write_str_xy(uint32_t x, uint32_t y, const char *s, uint8_t attr) {
 }
 
 void console_set_cursor(uint32_t x, uint32_t y) {
+	if (cirrusfb_is_ready()) { cirrusfb_set_cursor(x,y); return; }
 	if (vbe_is_available()) { vbefb_set_cursor(x,y); return; }
 	vga_set_cursor(x,y);
 }
 
 void console_get_cursor(uint32_t *x, uint32_t *y) {
+	if (cirrusfb_is_ready()) { cirrusfb_get_cursor(x,y); return; }
 	if (vbe_is_available()) { vbefb_get_cursor(x,y); return; }
 	vga_get_cursor(x,y);
 }

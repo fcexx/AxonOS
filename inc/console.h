@@ -18,4 +18,8 @@ void console_get_cursor(uint32_t *x, uint32_t *y);
 /* Fill rectangle with character and attribute */
 void console_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t ch, uint8_t attr);
 
+/* Current console text geometry in character cells. */
+int console_max_rows(void);
+int console_max_cols(void);
+
 

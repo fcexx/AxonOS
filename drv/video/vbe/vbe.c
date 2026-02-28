@@ -21,6 +21,40 @@ static uint8_t g_bpos = 0, g_bsize = 8;
 
 int vbe_is_available(void) { return g_enabled; }
 
+int vbe_attach_framebuffer(void *frontbuf, uint32_t width, uint32_t height, uint32_t pitch, uint32_t bpp) {
+	if (!frontbuf || width == 0 || height == 0 || pitch == 0 || bpp == 0) {
+		return -1;
+	}
+
+	/* default channel masks for common truecolor modes */
+	if (bpp == 16) {
+		g_rpos = 11; g_rsize = 5;
+		g_gpos = 5;  g_gsize = 6;
+		g_bpos = 0;  g_bsize = 5;
+	} else if (bpp == 15) {
+		g_rpos = 10; g_rsize = 5;
+		g_gpos = 5;  g_gsize = 5;
+		g_bpos = 0;  g_bsize = 5;
+	} else {
+		/* 24/32bpp XRGB/BGRx layouts usually map to these positions in QEMU/Bochs */
+		g_rpos = 16; g_rsize = 8;
+		g_gpos = 8;  g_gsize = 8;
+		g_bpos = 0;  g_bsize = 8;
+	}
+
+	g_frontbuf = frontbuf;
+	g_backbuf = NULL;
+	g_width = width;
+	g_height = height;
+	g_pitch = pitch;
+	g_bpp = bpp;
+	g_enabled = 1;
+
+	klogprintf("vbe: attached external framebuffer %ux%u bpp=%u pitch=%u front=%p\n",
+	           (unsigned)g_width, (unsigned)g_height, (unsigned)g_bpp, (unsigned)g_pitch, g_frontbuf);
+	return 0;
+}
+
 static void vbe_flush_region_internal(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 	if (!g_enabled || !g_frontbuf || !g_backbuf) return;
 	if (x >= g_width || y >= g_height) return;
@@ -76,6 +110,12 @@ void vbe_scroll_up_pixels(uint32_t pixels) {
 	/* clear bottom area */
 	uint32_t clear_y = g_height - pixels;
 	uint32_t packed_clear = vbe_pack_pixel(0,0,0);
+	size_t clear_bytes = row_bytes * (size_t)pixels;
+	if (packed_clear == 0) {
+		/* Fast path for black clear, critical for smooth text scrolling. */
+		memset(fb + (size_t)clear_y * row_bytes, 0, clear_bytes);
+		return;
+	}
 	for (uint32_t ry = 0; ry < pixels; ry++) {
 		uint8_t *line = fb + (size_t)( (clear_y + ry) * row_bytes );
 		/* fill each pixel */

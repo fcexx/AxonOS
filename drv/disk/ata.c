@@ -1,4 +1,4 @@
-/* 
+/*
    ATA PIO driver with basic IDENTIFY and PIO read/write (LBA28).
    This is written to be readable and follow POSIX-like semantics where
    possible: functions return 0 on success and -1 on error, and public
@@ -8,7 +8,7 @@
 
    Notes:
    - Only legacy IDE I/O ports are probed (primary/secondary channels).
-   - Supports up to 4 devices: primary master/slave, secondary master/slave.
+   - ATAPI probing/registration is delegated to drv/disk/atapi.c.
    - Read/write implement PIO (commands 0x20/0x30) for 512-byte sectors.
    - Error handling is conservative: operations return -1 on any failure.
 */
@@ -30,6 +30,7 @@
 
 #include <ahci.h>
 #include <scsi.h>
+#include <atapi.h>
 
 #define ATA_PRIMARY_IO      0x1F0
 #define ATA_PRIMARY_CTRL    0x3F6
@@ -68,8 +69,8 @@ typedef struct {
 	int exists;
 } ata_device_t;
 
-/* up to 4 devices indexed by registration id after registration */
-static ata_device_t ata_devices[4];
+/* indexed by disk registration id */
+static ata_device_t ata_devices[DISK_MAX_DEVICES];
 static int ata_device_count = 0;
 
 typedef struct {
@@ -191,6 +192,7 @@ static void ata_model_from_ident(const uint16_t *ident, char *out, size_t outlen
 		else break;
 	}
 }
+
 
 /* PIO read of sectors (LBA28). buf must be at least sectors*512 bytes.
    Returns 0 on success. */
@@ -315,13 +317,13 @@ static void ata_publish_mbr_partitions(int device_id, char letter, uint32_t disk
 	}
 }
 
-/* Register discovered device into disk layer and remember mapping */
+/* Register discovered ATA device into disk layer and remember mapping */
 static void ata_register_device(uint16_t io_base, uint16_t ctrl_base, int is_slave, const char *model, uint32_t sectors) {
 	disk_ops_t *ops = (disk_ops_t *)kmalloc(sizeof(disk_ops_t));
 	if (!ops) return;
 	memset(ops, 0, sizeof(*ops));
 	char namebuf[32];
-	snprintf(namebuf, sizeof(namebuf), "ata_%u%s", ata_device_count, is_slave ? "s" : "m");
+	snprintf(namebuf, sizeof(namebuf), "ata_%u%s", (unsigned)ata_device_count, is_slave ? "s" : "m");
 	ops->name = (const char *)kmalloc(strlen(namebuf) + 1);
 	if (ops->name) strcpy((char *)ops->name, namebuf);
 	ops->init = NULL;
@@ -333,6 +335,10 @@ static void ata_register_device(uint16_t io_base, uint16_t ctrl_base, int is_sla
 		klogprintf("ata: error: failed to register device %s\n", namebuf);
 		kfree((void *)ops->name);
 		kfree(ops);
+		return;
+	}
+	if (id < 0 || id >= DISK_MAX_DEVICES) {
+		klogprintf("ata: error: disk id %d out of ATA map bounds\n", id);
 		return;
 	}
 	/* store mapping by registration id (id equals current ata_device_count) */
@@ -499,7 +505,8 @@ void ata_dma_init(void) {
 				}
 				ata_register_device(channels[ch].io_base, channels[ch].ctrl_base, sl, model, sectors);
 			} else {
-				/* no device or identify failed; just continue */
+				/* If IDENTIFY DEVICE failed, let ATAPI module probe/register packet device. */
+				(void)atapi_try_register_device(channels[ch].io_base, channels[ch].ctrl_base, sl);
 			}
 		}
 	}
@@ -528,11 +535,11 @@ static void ata_irq_handler(cpu_registers_t *regs) {
 			(void)inb(ATA_REG_STATUS(ata_devices[i].io_base));
 		}
 	}
+	atapi_irq_ack_all();
 }
 
 /* wrapper with C linkage used for idt_set_handler cast compatibility */
 void ata_irq_dispatch_wrapper(cpu_registers_t *regs) {
 	ata_irq_handler(regs);
 }
-
 

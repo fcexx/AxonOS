@@ -42,6 +42,7 @@
 #include <exec.h>
 #include <klog.h>
 #include <vbe.h>
+#include <cirrus.h>
 void ata_dma_init(void);
 void scsi_init(void);
 int pvscsi_init(void);
@@ -178,7 +179,7 @@ static int boot_try_run_init(void) {
         /* Accept regular files and symlinks (symlinks already resolved by exec). */
         if (!((st.st_mode & S_IFREG) == S_IFREG || (st.st_mode & S_IFLNK) == S_IFLNK)) continue;
         const char *argv0[2] = { p, NULL };
-        static const char *init_env[] = { "PS1=[\\u@\\h \\w]\\$ ", NULL };
+        static const char *init_env[] = { "PS1=\\[\\033[1;31m\\]\\u\\033[0m:\\w\\$ ", NULL };
         klogprintf("boot: starting init candidate %s\n", p);
         int rc = kernel_execve_from_path(p, argv0, init_env);
         if (rc == 0) return 0;
@@ -471,7 +472,11 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             }
         }
     }
-
+    if (cirrus_kernel_init() == 0) {
+        klogprintf("video: cirrus initialized\n");
+    } else {
+        klogprintf("video: cirrus not available\n");
+    }
     ps2_keyboard_init();
     rtc_init();
 

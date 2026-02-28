@@ -21,6 +21,8 @@
 #include <e1000.h>
 #include <usb.h>
 #include <usbdevfs.h>
+#include <mm.h>
+#include <console.h>
 
 /* Linux x86_64 struct stat size; ensures st_mode at correct offset for S_ISREG etc. */
 #define STAT_COPY_SIZE 144
@@ -1012,29 +1014,46 @@ static void normalize_path(char *buf, size_t cap) {
     buf[cap - 1] = '\0';
 }
 
+/* Forward declarations for user-pointer-safe path handling helpers. */
+static inline int user_range_ok(const void *uaddr, size_t nbytes);
+static int copy_from_user_raw(void *kdst, const void *usrc, size_t n);
+static size_t user_strnlen_bounded(const char *s, size_t max);
+
 static void resolve_user_path(thread_t *cur, const char *path_u, char *out, size_t out_cap) {
     if (!out || out_cap == 0) return;
     out[0] = '\0';
-    if (!path_u || !path_u[0]) {
+    const char *path = path_u;
+    char path_local[256];
+    if (path_u && user_range_ok(path_u, 1)) {
+        size_t L = user_strnlen_bounded(path_u, sizeof(path_local) - 1);
+        if (!user_range_ok(path_u, L + 1) || copy_from_user_raw(path_local, path_u, L + 1) != 0) {
+            strncpy(out, "/", out_cap);
+            out[out_cap - 1] = '\0';
+            return;
+        }
+        path_local[L] = '\0';
+        path = path_local;
+    }
+    if (!path || !path[0]) {
         strncpy(out, "/", out_cap);
         out[out_cap - 1] = '\0';
         return;
     }
     const char *cwd = (cur && cur->cwd[0]) ? cur->cwd : "/";
-    if (path_u[0] == '/') {
-        strncpy(out, path_u, out_cap);
+    if (path[0] == '/') {
+        strncpy(out, path, out_cap);
         out[out_cap - 1] = '\0';
         if (path_needs_normalize(out)) normalize_path(out, out_cap);
         return;
     }
     /* "." means current directory. */
-    if (strcmp(path_u, ".") == 0) {
+    if (strcmp(path, ".") == 0) {
         strncpy(out, cwd, out_cap);
         out[out_cap - 1] = '\0';
         return;
     }
     /* ".." means parent directory. */
-    if (strcmp(path_u, "..") == 0) {
+    if (strcmp(path, "..") == 0) {
         if (strcmp(cwd, "/") == 0) {
             strncpy(out, "/", out_cap);
             out[out_cap - 1] = '\0';
@@ -1054,9 +1073,9 @@ static void resolve_user_path(thread_t *cur, const char *path_u, char *out, size
     }
     /* Build full path and normalize (handles ./run, a/./b, a/../b, etc.) */
     if (strcmp(cwd, "/") == 0) {
-        snprintf(out, out_cap, "/%s", path_u);
+        snprintf(out, out_cap, "/%s", path);
     } else {
-        snprintf(out, out_cap, "%s/%s", cwd, path_u);
+        snprintf(out, out_cap, "%s/%s", cwd, path);
     }
     if (path_needs_normalize(out)) normalize_path(out, out_cap);
 }
@@ -1065,16 +1084,24 @@ static void resolve_user_path(thread_t *cur, const char *path_u, char *out, size
 static int resolve_user_path_at(thread_t *cur, int dirfd, const char *path_u, char *out, size_t out_cap) {
     if (!out || out_cap == 0) return -EFAULT;
     out[0] = '\0';
-    if (!path_u || !path_u[0]) return -ENOENT;
+    const char *path = path_u;
+    char path_local[256];
+    if (path_u && user_range_ok(path_u, 1)) {
+        size_t L = user_strnlen_bounded(path_u, sizeof(path_local) - 1);
+        if (!user_range_ok(path_u, L + 1) || copy_from_user_raw(path_local, path_u, L + 1) != 0) return -EFAULT;
+        path_local[L] = '\0';
+        path = path_local;
+    }
+    if (!path || !path[0]) return -ENOENT;
     /* Absolute path: dirfd ignored, use standard resolve */
-    if (path_u[0] == '/') {
-        resolve_user_path(cur, path_u, out, out_cap);
+    if (path[0] == '/') {
+        resolve_user_path(cur, path, out, out_cap);
         return 0;
     }
     /* AT_FDCWD = -100: use current working directory */
     enum { AT_FDCWD = -100 };
     if (dirfd == AT_FDCWD) {
-        resolve_user_path(cur, path_u, out, out_cap);
+        resolve_user_path(cur, path, out, out_cap);
         return 0;
     }
     /* dirfd: resolve relative to that directory */
@@ -1085,18 +1112,16 @@ static int resolve_user_path_at(thread_t *cur, int dirfd, const char *path_u, ch
     const char *base = f->path ? f->path : "/";
     size_t bl = strlen(base);
     int has_trailing = (bl > 1 && base[bl - 1] == '/');
-    size_t pl = strlen(path_u);
+    size_t pl = strlen(path);
     if (has_trailing) {
-        snprintf(out, out_cap, "%s%s", base, path_u);
+        snprintf(out, out_cap, "%s%s", base, path);
     } else {
-        snprintf(out, out_cap, "%s/%s", base, path_u);
+        snprintf(out, out_cap, "%s/%s", base, path);
     }
     out[out_cap - 1] = '\0';
     if (path_needs_normalize(out)) normalize_path(out, out_cap);
     return 0;
 }
-
-static inline int user_range_ok(const void *uaddr, size_t nbytes);
 
 static int copy_to_user_safe(void *uptr, const void *kptr, size_t n) {
     if (!uptr || !kptr || n == 0) return -1;
@@ -1208,15 +1233,17 @@ void syscall_set_user_brk(uintptr_t base) {
 static inline uintptr_t align_up_u(uintptr_t v, uintptr_t a) { return (v + (a - 1)) & ~(a - 1); }
 
 static int mark_user_identity_range_2m_sys(uint64_t va_begin, uint64_t va_end) {
-    extern uint64_t page_table_l4[];
     if (va_end < va_begin) return -1;
+    uint64_t cr3 = paging_read_cr3();
+    uint64_t *active_l4 = (uint64_t*)(uintptr_t)(cr3 & ~0xFFFULL);
+    if (!active_l4) return -1;
     uint64_t begin = va_begin & ~((uint64_t)(PAGE_SIZE_2M - 1));
     uint64_t end = (va_end + PAGE_SIZE_2M - 1) & ~((uint64_t)(PAGE_SIZE_2M - 1));
     for (uint64_t va = begin; va < end; va += PAGE_SIZE_2M) {
         uint64_t l4i = (va >> 39) & 0x1FF;
         uint64_t l3i = (va >> 30) & 0x1FF;
         uint64_t l2i = (va >> 21) & 0x1FF;
-        uint64_t *l4 = (uint64_t*)page_table_l4;
+        uint64_t *l4 = active_l4;
         if (!(l4[l4i] & PG_PRESENT)) return -1;
         l4[l4i] |= PG_US | PG_RW;
         l4[l4i] &= ~PG_NX;
@@ -2298,6 +2325,9 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 user_pgrp = (uint64_t)cur->pgid;
             }
             return user_pgrp;
+        case 37: /* alarm(seconds) - no timers yet */
+            (void)a1;
+            return 0;
         case SYS_getpgrp:
             if (cur) {
                 if (cur->pgid != 0) return (uint64_t)cur->pgid;
@@ -3199,6 +3229,13 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             /* Create BLOCKED first to avoid running before initialization. */
             thread_t *child = thread_create_blocked(user_thread_entry, child_name);
             if (!child) return ret_err(ENOMEM);
+            /* Iteration 1: fork gets its own CR3 root (user pages still shared until remapped). */
+            {
+                mm_t *child_mm = mm_clone_current();
+                if (!child_mm) return ret_err(ENOMEM);
+                if (child->mm) mm_release(child->mm);
+                child->mm = child_mm;
+            }
             /* clone parent's active stack slice into child's own stack (like vfork safe variant) */
             {
                 uintptr_t parent_fs = (uintptr_t)cur->user_fs_base;
@@ -3355,6 +3392,33 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     }
                     child->user_stack = (uint64_t)child_rsp;
                     child->ring = 3;
+                }
+            }
+            /* Iteration 1 deep-copy fork:
+               materialize private writable pages for child mm (no COW yet). */
+            {
+                const uintptr_t base = (uintptr_t)0x00200000u;
+                uintptr_t used_end = (uintptr_t)cur->user_brk_cur;
+                if (cur->user_mmap_next > used_end) used_end = cur->user_mmap_next;
+                const uintptr_t min_copy_end = base + (8u * 1024u * 1024u);
+                if (used_end < min_copy_end || used_end == 0) used_end = min_copy_end;
+                if (used_end > (uintptr_t)USER_TLS_BASE) used_end = (uintptr_t)USER_TLS_BASE;
+                if (used_end > base) {
+                    if (mm_make_private_range(child->mm, (uint64_t)base, (uint64_t)used_end, 1) != 0) {
+                        return ret_err(ENOMEM);
+                    }
+                }
+                uintptr_t c_top = user_stack_top_for_tid_like_exec(child->tid ? child->tid : 1);
+                uintptr_t c_stack_base = (c_top - (uintptr_t)USER_STACK_SIZE) & ~0xFFFULL;
+                uintptr_t c_tls_base = c_top - (uintptr_t)USER_STACK_SIZE - (uintptr_t)USER_TLS_SIZE;
+                if (mm_make_private_range(child->mm, (uint64_t)c_stack_base, (uint64_t)c_top, 1) != 0) {
+                    return ret_err(ENOMEM);
+                }
+                if (mm_make_private_range(child->mm, (uint64_t)c_tls_base, (uint64_t)(c_tls_base + 0x3000u), 1) != 0) {
+                    return ret_err(ENOMEM);
+                }
+                if (mm_make_private_range(child->mm, (uint64_t)USER_VFORK_TRAMP, (uint64_t)(USER_VFORK_TRAMP + 0x1000u), 1) != 0) {
+                    return ret_err(ENOMEM);
                 }
             }
             /* inherit credentials */
@@ -3620,8 +3684,12 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                would fault while doing strcmp(). */
             if (req == TIOCGWINSZ) {
                 if (!argp) return ret_err(EFAULT);
-                struct winsize ws = { .ws_row = 25, 
-                                      .ws_col = 80, 
+                uint16_t rows = (uint16_t)console_max_rows();
+                uint16_t cols = (uint16_t)console_max_cols();
+                if (rows == 0) rows = 25;
+                if (cols == 0) cols = 80;
+                struct winsize ws = { .ws_row = rows,
+                                      .ws_col = cols,
                                       .ws_xpixel = 0, 
                                       .ws_ypixel = 0 };
                 if (copy_to_user_safe(argp, &ws, sizeof(ws)) != 0) return ret_err(EFAULT);
@@ -3951,6 +4019,10 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (!fout || !fin) {
                 return ret_err(EBADF);
             }
+            /* Keep sendfile conservative: tty output is handled better via read/write fallback. */
+            if (devfs_is_tty_file(fout)) {
+                return ret_err(ENOSYS);
+            }
             /* Only support regular file -> write and read via fs_read/fs_write */
             size_t total = 0;
             size_t tocopy = count;
@@ -3961,7 +4033,12 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 return ret_err(ENOMEM);
             }
             off_t use_pos = -1;
-            if (offp) use_pos = *offp;
+            if (offp) {
+                if (copy_from_user_raw(&use_pos, offp, sizeof(use_pos)) != 0) {
+                    kfree(tmp);
+                    return ret_err(EFAULT);
+                }
+            }
             while (tocopy > 0) {
                 size_t chunk = tocopy < bufcap ? tocopy : bufcap;
                 ssize_t rr;
@@ -3988,7 +4065,9 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 if ((size_t)rr < chunk) break;
             }
             kfree(tmp);
-            if (offp) *offp = use_pos;
+            if (offp) {
+                if (copy_to_user_safe(offp, &use_pos, sizeof(use_pos)) != 0) return ret_err(EFAULT);
+            }
             return (uint64_t)total;
         }
         case 271: /* ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *tmo_p, const sigset_t *sigmask, size_t sigsetsize) */
@@ -4408,19 +4487,85 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (!st_u) return ret_err(EFAULT);
             if ((uintptr_t)st_u + STAT_COPY_SIZE > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
             struct stat st;
-            /* AT_EMPTY_PATH (0x1000): path ignored, stat the file given by dirfd (vi uses this) */
-            if ((flags & 0x1000) != 0 && path_u && path_u[0] == '\0') {
+            enum { AT_FDCWD = -100 };
+            int st_ready = 0;
+            /* AT_EMPTY_PATH (0x1000): stat the file given by dirfd when path is empty (or NULL). */
+            char first = '\0';
+            int empty_path = 0;
+            if ((flags & 0x1000) != 0) {
+                if (!path_u) {
+                    empty_path = 1;
+                } else {
+                    if (copy_from_user_raw(&first, path_u, 1) != 0) return ret_err(EFAULT);
+                    if (first == '\0') empty_path = 1;
+                }
+            }
+            if (empty_path) {
                 if (dirfd < 0 || dirfd >= THREAD_MAX_FD) return ret_err(EBADF);
                 struct fs_file *f = cur->fds[dirfd];
                 if (!f) return ret_err(EBADF);
                 if (vfs_fstat(f, &st) != 0) return ret_err(EINVAL);
+                st_ready = 1;
             } else {
-                if (!path_u) return ret_err(EFAULT);
-                if ((uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-                char path[256];
-                resolve_user_path(cur, path_u, path, sizeof(path));
-                if (vfs_stat(path, &st) != 0) return ret_err(ENOENT);
+                if (!path_u) {
+                    /* Be permissive for userland quirks: NULL path -> stat dirfd/cwd instead of hard fault. */
+                    if (dirfd == AT_FDCWD) {
+                        if (vfs_stat(cur->cwd[0] ? cur->cwd : "/", &st) != 0) return ret_err(ENOENT);
+                        st_ready = 1;
+                    } else if (dirfd >= 0 && dirfd < THREAD_MAX_FD && cur->fds[dirfd]) {
+                        if (vfs_fstat(cur->fds[dirfd], &st) != 0) return ret_err(EINVAL);
+                        st_ready = 1;
+                    } else {
+                        return ret_err(EFAULT);
+                    }
+                } else {
+                    char *kpath = copy_user_cstr(path_u, 256);
+                    if (!kpath) {
+                        /* Avoid tight retry loops in userspace on EFAULT; fallback to dirfd/cwd stat. */
+                        if (dirfd == AT_FDCWD) {
+                            if (vfs_stat(cur->cwd[0] ? cur->cwd : "/", &st) != 0) return ret_err(ENOENT);
+                            st_ready = 1;
+                        } else if (dirfd >= 0 && dirfd < THREAD_MAX_FD && cur->fds[dirfd]) {
+                            if (vfs_fstat(cur->fds[dirfd], &st) != 0) return ret_err(EINVAL);
+                            st_ready = 1;
+                        } else {
+                            return ret_err(EFAULT);
+                        }
+                    } else {
+                        char path[256];
+                        int rc_resolve = 0;
+                        if (kpath[0] == '/') {
+                            resolve_user_path(cur, kpath, path, sizeof(path));
+                        } else if (dirfd == AT_FDCWD) {
+                            resolve_user_path(cur, kpath, path, sizeof(path));
+                        } else {
+                            if (dirfd < 0 || dirfd >= THREAD_MAX_FD) rc_resolve = -EBADF;
+                            else {
+                                struct fs_file *df = cur->fds[dirfd];
+                                if (!df) rc_resolve = -EBADF;
+                                else if (df->type != FS_TYPE_DIR) rc_resolve = -ENOTDIR;
+                                else {
+                                    const char *base = df->path ? df->path : "/";
+                                    if (strcmp(base, "/") == 0) snprintf(path, sizeof(path), "/%s", kpath);
+                                    else snprintf(path, sizeof(path), "%s/%s", base, kpath);
+                                    path[sizeof(path) - 1] = '\0';
+                                    if (path_needs_normalize(path)) normalize_path(path, sizeof(path));
+                                }
+                            }
+                        }
+                        kfree(kpath);
+                        if (rc_resolve != 0) {
+                            if (rc_resolve == -EBADF) return ret_err(EBADF);
+                            if (rc_resolve == -ENOTDIR) return ret_err(ENOTDIR);
+                            if (rc_resolve == -ENOENT) return ret_err(ENOENT);
+                            return ret_err(EFAULT);
+                        }
+                        if (vfs_stat(path, &st) != 0) return ret_err(ENOENT);
+                        st_ready = 1;
+                    }
+                }
             }
+            if (!st_ready) return ret_err(EFAULT);
 
             {
                 struct compat_stat {
@@ -4866,7 +5011,14 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 }
             }
             /* mark terminated */
-            if (cur) cur->state = THREAD_TERMINATED;
+            if (cur) {
+                cur->state = THREAD_TERMINATED;
+                /* Release private address space on task exit. */
+                if (cur->mm && cur->mm != mm_kernel()) {
+                    mm_release(cur->mm);
+                    cur->mm = mm_kernel();
+                }
+            }
             /* IMPORTANT:
                If this is a scheduled kernel thread (tid!=0), do not drop into ring0 shell.
                Just yield so the parent/other threads continue running.
@@ -4914,6 +5066,10 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     cur->clear_child_tid = 0;
                 }
                 cur->state = THREAD_TERMINATED;
+                if (cur->mm && cur->mm != mm_kernel()) {
+                    mm_release(cur->mm);
+                    cur->mm = mm_kernel();
+                }
             }
             thread_t *kcur = thread_current();
             if (kcur && kcur->tid != 0) {
@@ -4930,30 +5086,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             (void)a1;
             return 0;
         default:
-            /* Log unknown syscall with full args for easier diagnosis.
-               If it's syscall 271, try to print a possible pathname from a1 to help identify it. */
-            qemu_debug_printf("UNKNOWN SYSCALL: %u num=%u args=%llu,%llu,%llu,%llu,%llu,%llu\n",
-                    (unsigned long long)(cur->tid ? cur->tid : 1),
-                    (unsigned long long)num,
-                    (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3,
-                    (unsigned long long)a4, (unsigned long long)a5, (unsigned long long)a6);
-            if (num == 271) {
-                /* attempt to copy a NUL-terminated string from userspace pointer a1 */
-                const char *up = (const char*)(uintptr_t)a1;
-                if (up && (uintptr_t)up < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                    size_t copied = 0;
-                    void *tmp = copy_from_user_safe(up, 256, 256, &copied);
-                    if (tmp && copied > 0) {
-                        ((char*)tmp)[copied - 1] = '\\0';
-                        qemu_debug_printf("UNKNOWN SYSCALL 271: path='%s' (copied %u bytes)\n", (char*)tmp, (unsigned)copied);
-                        kfree(tmp);
-                    } else {
-                        qemu_debug_printf("UNKNOWN SYSCALL 271: failed to copy path at %p\n", (void*)up);
-                    }
-                } else {
-                    qemu_debug_printf("UNKNOWN SYSCALL 271: invalid user pointer %p\n", (void*)(uintptr_t)a1);
-                }
-            }
+            /* Keep unknown syscalls silent to avoid console stalls under heavy userland probing. */
             (void)a4; (void)a5; (void)a6;
             return ret_err(ENOSYS);
     }
@@ -4964,10 +5097,7 @@ void isr_syscall(cpu_registers_t* regs) {
     /* Record user rip/rsp for int0x80 path so fork/vfork can find return site. */
     syscall_user_return_rip = regs->rip;
     syscall_user_rsp_saved = regs->rsp;
-    /* Debug: record that we saw a syscall from user with these values */
-    qemu_debug_printf("DBG: isr_syscall: recorded user RIP=0x%llx RSP=0x%llx\n", (unsigned long long)syscall_user_return_rip, (unsigned long long)syscall_user_rsp_saved);
     if (syscall_user_return_rip == 0) {
-        qemu_debug_printf("DBG: isr_syscall: return RIP==0, dumping kernel syscall stack for diagnosis\n");
         debug_dump_kernel_syscall_stack();
     }
     regs->rax = syscall_do(regs->rax, regs->rdi, regs->rsi, regs->rdx, regs->r10, regs->r9, regs->r8);

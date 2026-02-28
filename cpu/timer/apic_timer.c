@@ -1,6 +1,7 @@
 #include <apic_timer.h>
 #include <vga.h>
 #include <vbe.h>
+#include <cirrusfb.h>
 #include <apic.h>
 #include <pit.h>
 #include <thread.h>
@@ -216,8 +217,12 @@ void apic_timer_handler(cpu_registers_t* regs) {
     /* Never call the scheduler from an interrupt handler.
        Switching context while running on an IRQ stack frame corrupts return context.
        This became a hard hang once we introduced an always-READY idle thread. */
-    if (apic_timer_ticks % 5) vbe_flush_full();
-    vbefb_update_cursor();
+    if (cirrusfb_is_ready()) {
+        cirrusfb_update_cursor();
+    } else {
+        if (apic_timer_ticks % 5) vbe_flush_full();
+        vbefb_update_cursor();
+    }
     apic_eoi();
 }
 

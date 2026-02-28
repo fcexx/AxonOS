@@ -7,7 +7,7 @@ mb2_start:
         dd 0x100000000 - (0xe85250d6 + 0 + (mb2_end - mb2_start))
 
         align 8
-        dw 0 ; Change to 5 for VBE
+        dw 0 ; framebuffer request tag (multiboot2)
         dw 0 
         dd 20
         dd 0
@@ -89,7 +89,6 @@ _start:
         lgdt        [eax]
 
         jmp 0x08:long_mode_start
-пше
         cli
         hlt
 

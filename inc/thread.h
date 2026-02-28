@@ -4,6 +4,8 @@
 #include <context.h>
 #include <fs.h>
 
+typedef struct mm_struct mm_t;
+
 typedef enum {
         THREAD_READY,
         THREAD_RUNNING,
@@ -97,6 +99,8 @@ typedef struct thread {
         int waiter_tid;
         /* exit status encoded like wait(2) returns (status word) */
         int exit_status;
+        /* process address space descriptor (CR3 + page-table root). */
+        mm_t *mm;
 } thread_t;
 
 extern int init;

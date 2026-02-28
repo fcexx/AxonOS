@@ -5,6 +5,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <vbe.h>
+#include <cirrusfb.h>
 
 static uint8_t parse_color_code(char bg, char fg);
 
@@ -51,7 +52,7 @@ void vga_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
 }
 
 uint8_t vga_get_cell_attr(uint32_t x, uint32_t y) {
-	if (vbe_is_available()) return GRAY_ON_BLACK;
+	if (cirrusfb_is_ready() || vbe_is_available()) return GRAY_ON_BLACK;
 	if (x >= MAX_COLS || y >= MAX_ROWS) return GRAY_ON_BLACK;
 	uint16_t off = (uint16_t)((y * MAX_COLS + x) * 2 + 1);
 	vga_lock_acquire();
@@ -64,7 +65,10 @@ void vga_clear_line_segment(uint32_t x0, uint32_t x1, uint32_t y, uint8_t attr) 
 	if (y >= MAX_ROWS) return;
 	if (x0 > x1) return;
 	if (x1 >= MAX_COLS) x1 = MAX_COLS - 1;
-	if (vbe_is_available()) {
+	if (cirrusfb_is_ready()) {
+		for (uint32_t x = x0; x <= x1; x++)
+			cirrusfb_putch_xy(x, y, ' ', attr);
+	} else if (vbe_is_available()) {
 		for (uint32_t x = x0; x <= x1; x++)
 			vbefb_putch_xy(x, y, ' ', attr);
 	} else {
@@ -73,6 +77,10 @@ void vga_clear_line_segment(uint32_t x0, uint32_t x1, uint32_t y, uint8_t attr) 
 }
 
 void vga_clear_screen_attr(uint8_t attr) {
+	if (cirrusfb_is_ready()) {
+		cirrusfb_clear(attr);
+		return;
+	}
 	if (vbe_is_available()) {
 		vbefb_clear(attr);
 		return;
@@ -142,7 +150,8 @@ void kprint(uint8_t *str) {
 
 void kputchar(uint8_t character, uint8_t attribute_byte)
 {
-	/* If VBE framebuffer console available, delegate */
+	/* If cirrusfb or VBE framebuffer console available, delegate */
+	if (cirrusfb_is_ready()) { cirrusfb_putchar(character, attribute_byte); return; }
 	if (vbe_is_available()) { vbefb_putchar(character, attribute_byte); return; }
 
 	/* Make the entire character output atomic: read cursor, update video memory,
@@ -648,12 +657,14 @@ PRINT_NUMBER_BASE10:
 }
 
 void vga_set_cursor(uint32_t x, uint32_t y) {
+	if (cirrusfb_is_ready()) { cirrusfb_set_cursor(x, y); return; }
 	if (vbe_is_available()) { vbefb_set_cursor(x, y); return; }
 	set_cursor_x((uint16_t)x);
 	set_cursor_y((uint16_t)y);
 }
 
 void vga_get_cursor(uint32_t* x, uint32_t* y) {
+	if (cirrusfb_is_ready()) { cirrusfb_get_cursor(x, y); return; }
 	if (vbe_is_available()) { vbefb_get_cursor(x, y); return; }
 	uint16_t pos = get_cursor();
 	if (x) *x = (pos % (MAX_COLS * 2)) / 2;
