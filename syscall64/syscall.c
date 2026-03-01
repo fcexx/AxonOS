@@ -4276,6 +4276,12 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             return 0;
         }
         case SYS_fork: {
+            /* Stability fix:
+               The custom deep-copy fork path is currently unstable (slow/hangs on some
+               workloads and can corrupt child userspace context). Route fork() through
+               the battle-tested vfork path for now. */
+            return syscall_do(SYS_vfork, 0, 0, 0, 0, 0, 0);
+
             /* Minimal fork emulation:
                - create a new kernel thread that will enter user mode at the saved
                  return RIP and user RSP (copied from syscall stack / saved RSP).
@@ -4514,8 +4520,8 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             child->euid = cur->euid;
             child->egid = cur->egid;
             child->attached_tty = cur->attached_tty;
-            /* inherit userspace TLS base so child doesn't fault on %fs */
-            child->user_fs_base = cur->user_fs_base;
+            /* Keep child->user_fs_base from the fork child TLS setup above.
+               Overwriting it with parent's FS base breaks child's TLS context. */
             /* inherit job control + parent */
             child->parent_tid = (int)(cur->tid ? cur->tid : 1);
             child->sid = cur->sid;
@@ -6002,6 +6008,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             int fd = (int)a1;
             void *dirp_u = (void*)(uintptr_t)a2;
             size_t count = (size_t)a3;
+            int want64 = (num == SYS_getdents64);
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
             if (!dirp_u) return ret_err(EFAULT);
             if (count < 32) return ret_err(EINVAL);
@@ -6077,7 +6084,19 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     }
                 }
 
-                size_t reclen = 19 + nlen + 1;
+                uint8_t dtype = 0; /* DT_UNKNOWN */
+                if (out_type == EXT2_FT_DIR) dtype = 4;       /* DT_DIR */
+                else if (out_type == EXT2_FT_REG_FILE) dtype = 8; /* DT_REG */
+                else if (out_type == EXT2_FT_SYMLINK) dtype = 10; /* DT_LNK */
+
+                size_t reclen;
+                if (want64) {
+                    /* linux_dirent64: ino(8), off(8), reclen(2), type(1), name[] */
+                    reclen = 19 + nlen + 1;
+                } else {
+                    /* linux_dirent: ino(8), off(8), reclen(2), name[], ..., type at last byte */
+                    reclen = 18 + nlen + 1 + 1;
+                }
                 reclen = (reclen + 7) & ~7u;
                 if (out_off + reclen > out_cap) break;
 
@@ -6085,10 +6104,17 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 *(uint64_t*)(outp + 0) = (uint64_t)out_ino;
                 *(int64_t*)(outp + 8) = (int64_t)f->pos;
                 *(uint16_t*)(outp + 16) = (uint16_t)reclen;
-                outp[18] = (uint8_t)out_type;
-                memcpy(outp + 19, nm, nlen);
-                outp[19 + nlen] = '\0';
-                for (size_t z = 19 + nlen + 1; z < reclen; z++) outp[z] = 0;
+                if (want64) {
+                    outp[18] = dtype;
+                    memcpy(outp + 19, nm, nlen);
+                    outp[19 + nlen] = '\0';
+                    for (size_t z = 19 + nlen + 1; z < reclen; z++) outp[z] = 0;
+                } else {
+                    memcpy(outp + 18, nm, nlen);
+                    outp[18 + nlen] = '\0';
+                    for (size_t z = 19 + nlen; z + 1 < reclen; z++) outp[z] = 0;
+                    outp[reclen - 1] = dtype;
+                }
 
                 out_off += reclen;
                 in_off += entry_rec;

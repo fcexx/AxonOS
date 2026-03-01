@@ -97,7 +97,7 @@ iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg
 		@echo "grub-mkrescue failed: try installing grub-pc-bin or xorriso" >&2; exit 1; \
 	}
 
-run: iso
+run: archive iso
 	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 1024M -serial stdio -boot d -hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0
 
 # Run with bridged networking (real IP from router) - requires sudo and br0 bridge
@@ -121,6 +121,13 @@ debug: iso
 disk:
 	@dd if=/dev/zero of=../disk.img bs=1M count=10
 	@mkfs.fat -F 32 ../disk.img
+
+archive:
+	@if [ ! -f iso/boot/initfs.cpio ]; then \
+		wget -P build apm.axont.ru/Packages/initfs.tar.xz; \
+		tar -xf build/initfs.tar.xz -C iso/boot/; \
+		rm build/initfs.tar.xz; \
+	fi
 
 clean:
 	@rm -rf $(BUILD_DIR)

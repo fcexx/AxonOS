@@ -43,6 +43,7 @@
 #include <klog.h>
 #include <vbe.h>
 #include <cirrus.h>
+#include <nvme.h>
 void ata_dma_init(void);
 void scsi_init(void);
 int pvscsi_init(void);
@@ -381,6 +382,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             scsi_init();
             ata_dma_init();
             (void)pvscsi_init();
+            (void)nvme_init();
             {
                 int n = devfs_block_count();
                 klogprintf("List of block devices: %d\n", n);

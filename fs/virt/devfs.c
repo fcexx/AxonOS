@@ -42,6 +42,17 @@ static inline size_t devfs_tty_screen_bytes(void) {
     return (size_t)devfs_tty_rows() * (size_t)devfs_tty_cols() * 2u;
 }
 
+/* Fast clear for tty backing buffer: fill cells as packed VGA words. */
+static inline void devfs_tty_clear_backing_fast(struct devfs_tty *tty, uint8_t attr) {
+    if (!tty || !tty->screen) return;
+    uint32_t cells = devfs_tty_rows() * devfs_tty_cols();
+    uint16_t cell = (uint16_t)' ' | ((uint16_t)attr << 8);
+    uint16_t *dst = (uint16_t*)tty->screen;
+    for (uint32_t i = 0; i < cells; i++) {
+        dst[i] = cell;
+    }
+}
+
 /* simple block device node registry for /dev/hdN */
 struct devfs_block {
     char path[32];
@@ -425,6 +436,15 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                 else if (bi - dev_block_count < dev_char_count)
                     path = dev_chars[bi - dev_block_count].path;
                 if (path) {
+                    /* /dev directory listing must include only direct children.
+                       Skip nested paths like /dev/bus/usb/001/001 (they belong to subdirs). */
+                    if (strncmp(path, "/dev/", 5) == 0) {
+                        const char *rest = path + 5;
+                        if (strchr(rest, '/')) {
+                            pos += 8;
+                            continue;
+                        }
+                    }
                     /* Bounded copy so we never read past path[31] or emit garbage from uninitialized bytes */
                     char safe_path[32];
                     size_t plen = 0;
@@ -681,6 +701,25 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
         if (idx == devfs_active) {
             /* write to VGA directly, but respect ANSI escape sequences on the active tty */
             struct devfs_tty *tty = t;
+            /* Hot path: many apps clear the screen with ESC[2JESC[H every frame.
+               Consume this exact sequence in one shot instead of char-by-char CSI parsing. */
+            if (tty->ansi_escape_state == 0 &&
+                i + 7 <= size &&
+                (unsigned char)s[i + 0] == 0x1B &&
+                s[i + 1] == '[' &&
+                s[i + 2] == '2' &&
+                s[i + 3] == 'J' &&
+                (unsigned char)s[i + 4] == 0x1B &&
+                s[i + 5] == '[' &&
+                s[i + 6] == 'H') {
+                devfs_tty_clear_backing_fast(tty, tty->current_attr);
+                tty->cursor_x = 0;
+                tty->cursor_y = 0;
+                vga_clear_screen_attr(tty->current_attr);
+                vga_set_cursor(0, 0);
+                i += 6; /* for-loop will add +1 */
+                continue;
+            }
             /* simple streaming ANSI CSI parser for a subset of sequences */
             if (tty->ansi_escape_state == 0) {
                 if ((unsigned char)ch == 0x1B) {
@@ -814,13 +853,7 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                         if (param == 2 || param == 3) {
                             /* 2=clear entire screen; 3=clear entire screen + scrollback (same behavior).
                                Fast path: clear visible console in one call and reset tty backing store. */
-                            if (tty->screen) {
-                                size_t scr_sz = devfs_tty_screen_bytes();
-                                for (size_t j = 0; j + 1 < scr_sz; j += 2) {
-                                    tty->screen[j] = ' ';
-                                    tty->screen[j + 1] = tty->current_attr;
-                                }
-                            }
+                            devfs_tty_clear_backing_fast(tty, tty->current_attr);
                             if (idx == devfs_active) {
                                 tty->cursor_x = 0;
                                 tty->cursor_y = 0;
