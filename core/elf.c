@@ -94,7 +94,7 @@ static void *dup_page_table(void *old) {
     return n;
 }
 
-/* Translate virtual address to physical by walking current page_table_l4.
+/* Translate virtual address to physical by walking active CR3 page tables.
    Returns physical base (frame) or 0 on failure. Works only while current
    page tables are active and mapping exists. */
 uint64_t virt_to_phys(uint64_t va) {
@@ -105,8 +105,9 @@ uint64_t virt_to_phys(uint64_t va) {
        pointer confusion). */
     if (va < 0x100000000ULL) return va;
 
-    extern uint64_t page_table_l4[];
-    uint64_t *l4 = (uint64_t*)page_table_l4;
+    uint64_t cr3 = paging_read_cr3();
+    uint64_t *l4 = (uint64_t*)(uintptr_t)(cr3 & ~0xFFFULL);
+    if (!l4) return 0;
     uint64_t l4i = (va >> 39) & 0x1FF;
     uint64_t l3i = (va >> 30) & 0x1FF;
     uint64_t l2i = (va >> 21) & 0x1FF;
@@ -132,12 +133,14 @@ uint64_t virt_to_phys(uint64_t va) {
     return (l1[l1i] & ~0xFFFULL) | (va & 0xFFFULL);
 }
 
-/* Create new PML4 by cloning current page_table_l4 contents. */
+/* Create new PML4 by cloning current active CR3 contents. */
 static void *create_process_pml4(void) {
-    extern uint64_t page_table_l4[];
+    uint64_t cr3 = paging_read_cr3();
+    uint64_t *src_l4 = (uint64_t*)(uintptr_t)(cr3 & ~0xFFFULL);
+    if (!src_l4) return NULL;
     void *newpml4 = alloc_page_table();
     if (!newpml4) return NULL;
-    memcpy(newpml4, (void*)page_table_l4, PAGE_SIZE_4K);
+    memcpy(newpml4, (void*)src_l4, PAGE_SIZE_4K);
     return newpml4;
 }
 

@@ -3,8 +3,6 @@
 #include <heap.h>
 #include <string.h>
 
-extern uint64_t page_table_l4[];
-
 static mm_t g_kernel_mm;
 static int g_mm_ready = 0;
 
@@ -112,8 +110,8 @@ static int mm_map_4k(mm_t *mm, uint64_t va, uint64_t pa, uint64_t flags) {
 void mm_init(void) {
     if (g_mm_ready) return;
     memset(&g_kernel_mm, 0, sizeof(g_kernel_mm));
-    g_kernel_mm.pml4 = (uint64_t*)page_table_l4;
     g_kernel_mm.cr3 = paging_read_cr3();
+    g_kernel_mm.pml4 = (uint64_t*)(uintptr_t)(g_kernel_mm.cr3 & ~0xFFFULL);
     g_kernel_mm.pml4_alloc_raw = NULL;
     g_kernel_mm.refcount = 1;
     g_mm_ready = 1;
@@ -158,7 +156,11 @@ mm_t *mm_clone_current(void) {
     uint64_t *new_l4 = (uint64_t*)aligned;
     uint64_t cur_cr3 = paging_read_cr3();
     uint64_t *src_l4 = (uint64_t*)(uintptr_t)(cur_cr3 & ~0xFFFULL);
-    if (!src_l4) src_l4 = (uint64_t*)page_table_l4;
+    if (!src_l4) {
+        kfree(raw);
+        kfree(m);
+        return NULL;
+    }
     memcpy(new_l4, (void*)src_l4, (size_t)PAGE_SIZE_4K);
 
     m->pml4 = new_l4;

@@ -273,9 +273,13 @@ static void page_fault_handler(cpu_registers_t* regs) {
             }
             /* dump page table entries for CR2 */
             {
-                extern uint64_t page_table_l4[];
                 uint64_t v = (uint64_t)cr2;
-                uint64_t *l4 = (uint64_t*)page_table_l4;
+                uint64_t cr3 = paging_read_cr3();
+                uint64_t *l4 = (uint64_t*)(uintptr_t)(cr3 & ~0xFFFULL);
+                if (!l4) {
+                    klogprintf("ptes for CR2: no active l4\n");
+                    goto pte_dump_done;
+                }
                 int l4i = (v >> 39) & 0x1FF;
                 int l3i = (v >> 30) & 0x1FF;
                 int l2i = (v >> 21) & 0x1FF;
@@ -304,6 +308,7 @@ static void page_fault_handler(cpu_registers_t* regs) {
                     }
                 }
             }
+pte_dump_done:
             /* show syscall_kernel_rsp0 if set */
             {
                 extern uint64_t syscall_kernel_rsp0;

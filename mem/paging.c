@@ -1,9 +1,5 @@
 #include <paging.h>
 
-// Bootstrap page tables are defined in boot/multiboot.asm
-// We import only L4. L3 identity maps first 4GiB using 1GiB pages already.
-extern uint64_t page_table_l4[];   // 4KiB aligned, 512 entries
-
 // Simple page-table allocator for creating new PDPT/PD tables for 2MiB mappings
 static uint64_t* next_free_table(void) {
     /* 2MiB remaps (MMIO, user mmaps, etc.) need to split bootstrap 1GiB pages.
@@ -36,7 +32,9 @@ int map_page_2m(uint64_t va, uint64_t pa, uint64_t flags) {
     uint64_t l3i = (va >> 30) & 0x1FF;
     uint64_t l2i = (va >> 21) & 0x1FF;
 
-    uint64_t* l4 = (uint64_t*)((uint64_t)page_table_l4);
+    uint64_t cr3 = paging_read_cr3();
+    uint64_t* l4 = (uint64_t*)(uintptr_t)(cr3 & ~0xFFFULL);
+    if (!l4) return -1;
     if (!(l4[l4i] & PG_PRESENT)) {
         uint64_t* new_l3 = next_free_table();
         if (!new_l3) return -1;
@@ -81,7 +79,9 @@ int unmap_page_2m(uint64_t va) {
     uint64_t l4i = (va >> 39) & 0x1FF;
     uint64_t l3i = (va >> 30) & 0x1FF;
     uint64_t l2i = (va >> 21) & 0x1FF;
-    uint64_t* l4 = (uint64_t*)((uint64_t)page_table_l4);
+    uint64_t cr3 = paging_read_cr3();
+    uint64_t* l4 = (uint64_t*)(uintptr_t)(cr3 & ~0xFFFULL);
+    if (!l4) return -1;
     if (!(l4[l4i] & PG_PRESENT)) return -1;
     uint64_t* l3 = (uint64_t*)(l4[l4i] & ~0xFFFULL);
     if (!(l3[l3i] & PG_PRESENT)) return -1;

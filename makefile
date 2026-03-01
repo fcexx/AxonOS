@@ -10,11 +10,16 @@ GRUB_DIR := $(ISO_BOOT)/grub
 KERNEL_SRC := kernel.asm
 KERNEL_OBJ := $(BUILD_DIR)/kernel.o
 KERNEL_ELF := $(BUILD_DIR)/axonos.elf
+PAYLOAD_ELF := $(BUILD_DIR)/axonos.payload.elf
+PAYLOAD_LZ4 := $(BUILD_DIR)/payload.lz4
+PAYLOAD_BLOB_OBJ := $(BUILD_DIR)/payload_blob.o
 KERNEL_BIN := $(BUILD_DIR)/kernel.bin
 MULTIBOOT_SRC := multiboot.asm
 MULTIBOOT_OBJ := $(BUILD_DIR)/multiboot.o
 MULTIBOOT_BIN := $(BUILD_DIR)/multiboot.bin
 ISO_IMAGE := $(BUILD_DIR)/axonos.iso
+STUB_SRC := boot/kzip_stub.c
+STUB_OBJ := $(BUILD_DIR)/$(STUB_SRC:.c=.c.o)
 
 CC := gcc -m64
 CFLAGS := -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=kernel -Iinc -w -DQEMU_LOG_ENABLE
@@ -32,6 +37,7 @@ SOBJS := $(patsubst %.S,$(BUILD_DIR)/%.S.o,$(SSRCS))
 MULTIBOOT_SRC := $(shell find . -path './build' -prune -o -path './iso' -prune -o -type f -name 'multiboot.asm' -print | sed 's|^\./||')
 MULTIBOOT_OBJ := $(if $(MULTIBOOT_SRC),$(BUILD_DIR)/$(MULTIBOOT_SRC:.asm=.asm.o),)
 OTHER_ASM_OBJS := $(filter-out $(MULTIBOOT_OBJ),$(ASMOBJS))
+PAYLOAD_COBJS := $(filter-out $(STUB_OBJ),$(COBJS))
 
 .PHONY: all kernel iso clean run
 
@@ -55,9 +61,23 @@ $(BUILD_DIR)/%.S.o: %.S
 	@echo "CC		$<"
 	@$(CC) $(CFLAGS) -c -o $@ $<
 
-$(KERNEL_ELF): $(MULTIBOOT_OBJ) $(OTHER_ASM_OBJS) $(SOBJS) $(COBJS)
+$(PAYLOAD_ELF): $(OTHER_ASM_OBJS) $(SOBJS) $(PAYLOAD_COBJS)
 	@mkdir -p $(BUILD_DIR)
-	@ld -m elf_x86_64 -T linker.ld -o $@ $^
+	@echo "LD		$@"
+	@ld -m elf_x86_64 -T linker.payload.ld -o $@ $^
+
+$(PAYLOAD_LZ4): $(PAYLOAD_ELF)
+	@echo "LZ4		$<"
+	@lz4 -z -f --content-size "$<" "$@" >/dev/null
+
+$(PAYLOAD_BLOB_OBJ): $(PAYLOAD_LZ4)
+	@echo "LD(BIN)		$<"
+	@ld -r -b binary -o "$@" "$<"
+
+$(KERNEL_ELF): $(MULTIBOOT_OBJ) $(STUB_OBJ) $(PAYLOAD_BLOB_OBJ)
+	@mkdir -p $(BUILD_DIR)
+	@echo "LD		$@"
+	@ld -m elf_x86_64 -T linker.stub.ld -o $@ $^
 
 $(KERNEL_BIN): $(KERNEL_ELF)
 	@objcopy -O binary $< $@

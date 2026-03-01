@@ -191,7 +191,6 @@ static int boot_try_run_init(void) {
 
 void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     qemu_debug_printf("Kernel started\n");
-    kclear();
     enable_cursor();
     sysinfo_init(multiboot_magic, multiboot_info);
 
@@ -227,7 +226,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             }
         }
         heap_init(heap_start, heap_size);
-        kprintf("Loading kernel without compression: heap_start: %p heap_size=%llu heap_total=%llu heap_base=%p ram_mb=%d kernel_end: %p mods_end: %p\n",
+        kprintf("Kernel starting... heap_start: %p heap_size=%llu heap_total=%llu heap_base=%p ram_mb=%d kernel_end: %p mods_end: %p\n",
                 (void*)heap_start,
                 (unsigned long long)heap_size,
                 (unsigned long long)heap_total_bytes(),
@@ -287,9 +286,10 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     /* sysfs, procfs, devfs mount — only via SYS_mount from userspace (e.g. init) */
 
     klog_init(); // for logging into /var/log/kernel file
+    klogprintf(OS_NAME " v" OS_VERSION ".\n");
     sysinfo_print_e820(multiboot_magic, multiboot_info);
-    if (vbe_is_available() == 1) klogprintf("Set VBE framebuffer mode: %ux%u@%u.\n", vbe_get_width(), vbe_get_height(), vbe_get_bpp());
-    else klogprintf("Set VGA default 80x25 mode.\n");
+    if (vbe_is_available() == 1) klogprintf("screen: Set mode: %ux%u@%u.\n", vbe_get_width(), vbe_get_height(), vbe_get_bpp());
+    else klogprintf("screen: Set VGA+ 80x25 16 colors\n");
     
     apic_init();
     apic_timer_init();
@@ -371,7 +371,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     /* If an initfs module was provided by the bootloader, unpack it into ramfs */
     int r = initfs_process_multiboot_module(multiboot_magic, multiboot_info, "initfs");
     if (r == 0) klogprintf("initfs: unpacked successfully\n");
-    else klogprintf("initfs: error: failed, code: %d\n", r);
+    else {klogprintf("initfs: error: failed, code: %d\n", r); for (;;); }
 
     /* register devfs and mount at /dev so /dev/tty0, /dev/console etc. exist before init/getty */
     if (devfs_register() == 0) {
