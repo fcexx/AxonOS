@@ -1636,15 +1636,158 @@ static char *copy_user_cstr(const char *u, size_t maxlen) {
 /* Minimal tty state for job control-ish ioctls (single session). */
 static uint64_t user_pgrp = 1;
 
-/* Minimal signal emulation (we do not actually deliver signals yet).
-   We only keep per-signal "handlers" so libc/busybox doesn't abort early. */
+/* Signal delivery: handlers, restorers, and per-thread mask. */
 typedef void (*user_sighandler_t)(int);
-static user_sighandler_t user_sig_handlers[65]; /* 1..64 */
+#define SA_SIGINFO 0x4
+#define SIG_DFL ((user_sighandler_t)0)
+#define SIG_IGN ((user_sighandler_t)1)
+typedef struct {
+    user_sighandler_t handler;
+    uint64_t restorer;   /* glibc passes __restore_rt; we need it for sigreturn */
+    uint64_t flags;      /* SA_SIGINFO etc. */
+} user_sigaction_t;
+static user_sigaction_t user_sig_actions[65]; /* 1..64 */
+/* Legacy global mask; rt_sigprocmask uses per-thread saved_sig_mask when available */
 static uint64_t user_sig_mask = 0;
-/* Compatibility shim for tools (e.g. ping) that expect periodic SIGALRM.
-   We don't deliver real signals yet, so networking code uses this interval
-   to trigger periodic ICMP sends when userland setitimer/alarm is configured. */
+/* Compatibility shim for tools (e.g. ping) that expect periodic SIGALRM. */
 static uint32_t user_itimer_interval_ms = 0;
+
+/* Linux x86_64 rt_sigframe layout for signal delivery. */
+#pragma pack(push, 1)
+typedef struct {
+    uint64_t r8, r9, r10, r11, r12, r13, r14, r15;
+    uint64_t rdi, rsi, rbp, rbx, rdx, rax, rcx;
+    uint64_t rsp, rip, eflags;
+    uint16_t cs, gs, fs;
+    uint16_t ss;
+    uint64_t err, trapno, oldmask, cr2;
+    uint64_t fpstate;
+    uint64_t reserved1[8];
+} k_sigcontext_t;
+typedef struct {
+    uint64_t uc_flags;
+    uint64_t uc_link;
+    uint64_t uc_stack_ss_sp, uc_stack_ss_size;
+    uint32_t uc_stack_ss_flags, uc_pad;
+    uint64_t uc_sigmask[2];
+    k_sigcontext_t uc_mcontext;
+} k_ucontext_t;
+#pragma pack(pop)
+#define RT_SIGFRAME_UC_OFF  8
+#define RT_SIGFRAME_SIZE   (8 + sizeof(k_ucontext_t))
+
+static int mark_user_identity_range_2m_sys(uint64_t va_begin, uint64_t va_end);
+
+/* Build signal frame and patch syscall return for delivery. Called from syscall_entry64. */
+int maybe_deliver_pending_signal(void) {
+    thread_t *cur = thread_get_current_user();
+    if (!cur) cur = thread_current();
+    if (!cur || cur->ring != 3) return 0;
+    uint64_t blocked = cur->saved_sig_mask;
+    uint64_t pending = cur->pending_signals & ~blocked;
+    if (!pending) return 0;
+    int sig = 0;
+    for (int s = 1; s <= 63 && !sig; s++) {
+        if (pending & (1ULL << (s - 1))) sig = s;
+    }
+    if (sig <= 0) return 0;
+    user_sigaction_t *sa = &user_sig_actions[sig];
+    user_sighandler_t h = sa->handler;
+    uint64_t restorer = sa->restorer;
+    if (h == SIG_IGN) {
+        cur->pending_signals &= ~(1ULL << (sig - 1));
+        return maybe_deliver_pending_signal();
+    }
+    if (h == SIG_DFL) {
+        cur->pending_signals &= ~(1ULL << (sig - 1));
+        /* Default action Term: terminate process (SIGINT, SIGQUIT, SIGTERM, SIGPIPE, etc.).
+           Process must actually exit so parent's wait() returns and shell gets control back. */
+        if (sig == SIGINT || sig == 3 /*SIGQUIT*/ || sig == 15 /*SIGTERM*/ || sig == 13 /*SIGPIPE*/) {
+            cur->exit_status = sig; /* WIFSIGNALED, WTERMSIG = sig */
+            for (int i = 0; i < THREAD_MAX_FD; i++) {
+                if (cur->fds[i]) {
+                    struct fs_file *f = cur->fds[i];
+                    cur->fds[i] = NULL;
+                    fs_file_free(f);
+                }
+            }
+            thread_yield(); /* let pipe reader run before waking parent */
+            if (cur->parent_tid >= 0) {
+                thread_t *pt = thread_get(cur->parent_tid);
+                if (pt) {
+                    thread_set_pending_signal(pt, SIGCHLD);
+                    if (cur->attached_tty >= 0 && pt->attached_tty == cur->attached_tty)
+                        devfs_set_tty_fg_pgrp(cur->attached_tty, pt->pgid);
+                }
+            }
+            if (cur->vfork_parent_tid >= 0) {
+                vfork_restore_parent_memory(cur);
+                vfork_restore_parent_stack(cur);
+                thread_unblock(cur->vfork_parent_tid);
+                cur->vfork_parent_tid = -1;
+            }
+            if (cur->waiter_tid >= 0) thread_unblock(cur->waiter_tid);
+            if (cur->clear_child_tid != 0 && cur->clear_child_tid < (uint64_t)MMIO_IDENTITY_LIMIT - 4) {
+                uint32_t zero = 0;
+                copy_to_user_safe((void*)(uintptr_t)cur->clear_child_tid, &zero, 4);
+                { extern int futex_syscall(uintptr_t uaddr, int op, int val, const void *timeout, uintptr_t uaddr2, int val3);
+                  futex_syscall((uintptr_t)cur->clear_child_tid, 1 | 128, 1, NULL, 0, 0); }
+                cur->clear_child_tid = 0;
+            }
+            cur->state = THREAD_TERMINATED;
+            if (cur->mm && cur->mm != mm_kernel()) {
+                mm_release(cur->mm);
+                cur->mm = mm_kernel();
+            }
+            thread_yield();
+            for (;;) asm volatile("sti; hlt" ::: "memory");
+        }
+        return maybe_deliver_pending_signal();
+    }
+    if (!restorer) return 0;
+    uint64_t old_rsp = cur->saved_user_rsp;
+    uint64_t old_rip = cur->saved_user_rip;
+    if (!old_rsp || !old_rip) return 0;
+    uintptr_t frame_start = ((uintptr_t)old_rsp - RT_SIGFRAME_SIZE) & ~15ULL;
+    if (frame_start < 0x200000ULL) return 0;
+    if (mark_user_identity_range_2m_sys((uint64_t)frame_start, (uint64_t)(frame_start + RT_SIGFRAME_SIZE)) != 0)
+        return 0;
+    k_ucontext_t *uc = (k_ucontext_t *)(frame_start + RT_SIGFRAME_UC_OFF);
+    memset(uc, 0, sizeof(*uc));
+    uc->uc_mcontext.r8  = cur->saved_user_r8;
+    uc->uc_mcontext.r9  = cur->saved_user_r9;
+    uc->uc_mcontext.r10 = cur->saved_user_r10;
+    uc->uc_mcontext.r11 = cur->saved_user_r11;
+    uc->uc_mcontext.r12 = cur->saved_user_r12;
+    uc->uc_mcontext.r13 = cur->saved_user_r13;
+    uc->uc_mcontext.r14 = cur->saved_user_r14;
+    uc->uc_mcontext.r15 = cur->saved_user_r15;
+    uc->uc_mcontext.rdi = cur->saved_user_rdi;
+    uc->uc_mcontext.rsi = cur->saved_user_rsi;
+    uc->uc_mcontext.rbp = cur->saved_user_rbp;
+    uc->uc_mcontext.rbx = cur->saved_user_rbx;
+    uc->uc_mcontext.rdx = cur->saved_user_rdx;
+    uc->uc_mcontext.rax = 0;
+    uc->uc_mcontext.rcx = cur->saved_user_rcx;
+    uc->uc_mcontext.rsp = old_rsp;
+    uc->uc_mcontext.rip = old_rip;
+    uc->uc_mcontext.eflags = cur->saved_user_r11;
+    uc->uc_mcontext.cs = 0x1B;
+    uc->uc_mcontext.gs = 0;
+    uc->uc_mcontext.fs = 0;
+    uc->uc_mcontext.ss = 0x23;
+    uc->uc_sigmask[0] = blocked;
+    *(uint64_t *)(uintptr_t)frame_start = restorer;
+    cur->pending_signals &= ~(1ULL << (sig - 1));
+    uint64_t *frame = cur->saved_syscall_frame;
+    if (!frame) return 0;
+    frame[8]  = (uint64_t)sig;
+    frame[13] = (uint64_t)(uintptr_t)h;
+    frame[15] = (uint64_t)frame_start;
+    syscall_user_rsp_saved = (uint64_t)frame_start;
+    asm volatile("mfence" ::: "memory");
+    return 1;
+}
 
 /* Simple getrandom() state (non-crypto). */
 static uint32_t user_rand_state = 0xA53C9E11u;
@@ -1901,7 +2044,11 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 }
             }
             if (saved_rcx == 0) return ret_err(EINVAL);
-            if (stack != 0) {
+            /* TEMP: clone3-with-stack path causes #PF/GPF when modifying page tables.
+               Return ENOSYS so glibc falls back to clone(); apm may work with reduced parallelism. */
+            if (stack != 0)
+                return ret_err(ENOSYS);
+            if (0) { /* disabled clone3-with-stack path */
                 /* clone3 stack conventions differ across libc wrappers.
                    Choose child RSP adaptively:
                    - classic clone3: rsp = stack + stack_size (stack is low address)
@@ -1922,6 +2069,19 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     if (d_top < d_size) child_rsp = rsp_from_top;
                 }
                 if (child_rsp < 0x1000 || child_rsp >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EINVAL);
+                /* Ensure saved_rcx (return site) is user-accessible - otherwise child #PF on first instruction */
+                {
+                    uintptr_t begin = (uintptr_t)saved_rcx & ~((uintptr_t)PAGE_SIZE_2M - 1);
+                    uintptr_t end = begin + (uintptr_t)PAGE_SIZE_2M;
+                    if (mark_user_identity_range_2m_sys((uint64_t)begin, (uint64_t)end) != 0) {
+                        kprintf("clone3: saved return site 0x%llx unmapped/privileged\n", (unsigned long long)saved_rcx);
+                        return ret_err(EINVAL);
+                    }
+                    /* Broad user range (like vfork) - helps code/TLS near saved_rcx and general bootstrap */
+                    (void)mark_user_identity_range_2m_sys(0x200000, (uint64_t)USER_STACK_TOP);
+                }
+                /* RSP must be 16-byte aligned per x86-64 ABI (child may use movdqa/call) */
+                child_rsp &= ~(uintptr_t)0xFULL;
                 klogprintf("clone3: flags=0x%llx stack=0x%llx size=0x%llx tls=0x%llx chosen_rsp=0x%llx\n",
                            (unsigned long long)flags,
                            (unsigned long long)stack,
@@ -1974,7 +2134,15 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     ? (uint64_t)(stack + stack_size)
                     : (uint64_t)child_rsp;
                 child->ring = 3;
-                child->user_fs_base = (flags & 0x00080000u) ? tls : cur->user_fs_base;
+                if ((flags & 0x00080000u) && tls != 0 && tls >= 0x1000 && tls < (uint64_t)MMIO_IDENTITY_LIMIT) {
+                    child->user_fs_base = tls;
+                    /* Ensure TLS region is user-accessible */
+                    uintptr_t tls_lo = ((uintptr_t)tls - 0x1000u) & ~((uintptr_t)PAGE_SIZE_2M - 1);
+                    uintptr_t tls_hi = ((uintptr_t)tls + 0x3000u + PAGE_SIZE_2M - 1) & ~((uintptr_t)PAGE_SIZE_2M - 1);
+                    (void)mark_user_identity_range_2m_sys((uint64_t)tls_lo, (uint64_t)tls_hi);
+                } else {
+                    child->user_fs_base = cur->user_fs_base;
+                }
                 child->euid = cur->euid;
                 child->egid = cur->egid;
                 child->umask = cur->umask;
@@ -1991,6 +2159,10 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                         else child->fds[i]->refcount++;
                     }
                 }
+                /* Shared mm (CLONE_VM): inherit brk/mmap state so child mmap doesn't overwrite parent's regions. */
+                child->user_brk_base = cur->user_brk_base;
+                child->user_brk_cur = cur->user_brk_cur;
+                child->user_mmap_next = cur->user_mmap_next;
                 /* clone3 semantics: touch TID pointers only when the matching flags are set. */
                 enum {
                     CLONE_PARENT_SETTID = 0x00100000u,
@@ -3944,7 +4116,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             const void *act_u = (const void*)(uintptr_t)a2;
             void *old_u = (void*)(uintptr_t)a3;
             size_t sigsetsize = (size_t)a4;
-            if (signum <= 0 || signum >= (int)(sizeof(user_sig_handlers)/sizeof(user_sig_handlers[0]))) return ret_err(EINVAL);
+            if (signum <= 0 || signum >= (int)(sizeof(user_sig_actions)/sizeof(user_sig_actions[0]))) return ret_err(EINVAL);
 
             /* Linux kernel ABI for rt_sigaction on x86_64:
                struct {
@@ -3966,13 +4138,17 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
 
             if (old_u) {
                 memset(&sa, 0, sizeof(sa));
-                sa.handler = (uint64_t)(uintptr_t)user_sig_handlers[signum];
+                sa.handler = (uint64_t)(uintptr_t)user_sig_actions[signum].handler;
+                sa.flags = user_sig_actions[signum].flags;
+                sa.restorer = user_sig_actions[signum].restorer;
                 if (copy_to_user_safe(old_u, &sa, act_sz) != 0) return ret_err(EFAULT);
             }
             if (act_u) {
                 memset(&sa, 0, sizeof(sa));
                 if (copy_from_user_raw(&sa, act_u, act_sz) != 0) return ret_err(EFAULT);
-                user_sig_handlers[signum] = (user_sighandler_t)(uintptr_t)sa.handler;
+                user_sig_actions[signum].handler = (user_sighandler_t)(uintptr_t)sa.handler;
+                user_sig_actions[signum].flags = sa.flags;
+                user_sig_actions[signum].restorer = sa.restorer;
             }
             return 0;
         }
@@ -4255,22 +4431,23 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
         }
         case SYS_rt_sigprocmask: {
             /* rt_sigprocmask(int how, const sigset_t *set, sigset_t *oldset, size_t sigsetsize)
-               Keep a single 64-bit mask; accept common calls from libc. */
+               Per-thread signal mask; use cur->saved_sig_mask for user threads. */
             int how = (int)a1;
             const void *set_u = (const void*)(uintptr_t)a2;
             void *old_u = (void*)(uintptr_t)a3;
             (void)a4;
+            uint64_t *p_mask = (cur && cur->ring == 3) ? &cur->saved_sig_mask : &user_sig_mask;
 
             if (old_u) {
-                uint64_t old = user_sig_mask;
+                uint64_t old = *p_mask;
                 if (copy_to_user_safe(old_u, &old, sizeof(old)) != 0) return ret_err(EFAULT);
             }
             if (set_u) {
                 uint64_t setv = 0;
                 if (copy_from_user_raw(&setv, set_u, sizeof(setv)) != 0) return ret_err(EFAULT);
-                if (how == 0 /* SIG_BLOCK */) user_sig_mask |= setv;
-                else if (how == 1 /* SIG_UNBLOCK */) user_sig_mask &= ~setv;
-                else if (how == 2 /* SIG_SETMASK */) user_sig_mask = setv;
+                if (how == 0 /* SIG_BLOCK */) *p_mask |= setv;
+                else if (how == 1 /* SIG_UNBLOCK */) *p_mask &= ~setv;
+                else if (how == 2 /* SIG_SETMASK */) *p_mask = setv;
                 else return ret_err(EINVAL);
             }
             return 0;
@@ -5260,12 +5437,14 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (f->type == FS_TYPE_PIPE && !f->fs_private) {
                 pipe_t *p = (pipe_t *)f->driver_private;
                 if (!p) return ret_err(EBADF);
+                if (!bufp || !user_range_ok(bufp, cnt)) return ret_err(EFAULT);
                 size_t to_read = cnt < (size_t)PIPE_BUF_SIZE ? cnt : (size_t)PIPE_BUF_SIZE;
                 void *tmp = kmalloc(to_read);
                 if (!tmp) return ret_err(ENOMEM);
                 ssize_t rr = pipe_read_bytes(p, tmp, to_read, cur);
-                if (rr > 0 && (uintptr_t)bufp + (size_t)rr <= (uintptr_t)MMIO_IDENTITY_LIMIT)
-                    memcpy(bufp, tmp, (size_t)rr);
+                if (rr > 0) {
+                    if (copy_to_user_safe(bufp, tmp, (size_t)rr) != 0) { kfree(tmp); return ret_err(EFAULT); }
+                }
                 kfree(tmp);
                 return (rr >= 0) ? (uint64_t)rr : ret_err((int)-rr);
             }
@@ -5335,7 +5514,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (f->path && strcmp(f->path, "/etc/inittab") == 0 && f->pos == 0) {
             }
             kfree(tmp);
-            return (rr >= 0) ? (uint64_t)rr : ret_err(EINVAL);
+            return (rr >= 0) ? (uint64_t)rr : ret_err((int)-rr);
         }
         case SYS_sendfile: {
             /* ssize_t sendfile(out_fd, in_fd, off_t *offset, size_t count) */
@@ -5507,6 +5686,21 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                             } else if (usb_is_devfs_file(f)) {
                                 if (events & POLLOUT) revents |= POLLOUT;
                                 /* MVP: no async IN queue yet, keep POLLIN clear unless future IRQ path adds data. */
+                            } else if (f->type == FS_TYPE_PIPE && f->driver_private) {
+                                pipe_t *p = (pipe_t *)f->driver_private;
+                                unsigned long fl = 0;
+                                acquire_irqsave(&p->lock, &fl);
+                                size_t used = (p->head >= p->tail) ? (p->head - p->tail) : (p->size - p->tail + p->head);
+                                size_t free = (p->size > 1) ? ((p->size - 1) - used) : 0;
+                                int is_write_end = (f->fs_private == (void *)1);
+                                release_irqrestore(&p->lock, fl);
+                                if (is_write_end) {
+                                    if ((events & POLLOUT) && free > 0) revents |= POLLOUT;
+                                    if (p->refcount < 2) revents |= POLLHUP;
+                                } else {
+                                    if ((events & POLLIN) && used > 0) revents |= POLLIN;
+                                    if (p->refcount < 2) revents |= POLLHUP;
+                                }
                             } else {
                                 /* regular file: readable if pos < size */
                                 if ((events & POLLIN)) {
@@ -5536,16 +5730,30 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 kfree(kbuf);
                 return 0;
             }
-            int elapsed = 0;
-            int step = 10; /* ms */
             thread_t *curth_poll = thread_get_current_user();
             if (!curth_poll) curth_poll = thread_current();
+            /* Detect if poll set includes network sockets (TCP/UDP) - need e1000_poll and bounded wait */
+            int has_net_socket = 0;
+            for (int i = 0; i < nfds && !has_net_socket; i++) {
+                int fd = *(int*)((uint8_t*)kbuf + i * entry_size + 0);
+                if (fd < 0 || fd >= THREAD_MAX_FD) continue;
+                struct fs_file *f = curth_poll ? curth_poll->fds[fd] : NULL;
+                if (!f || f->type != SYSCALL_FTYPE_SOCKET || !f->driver_private) continue;
+                ksock_net_t *s = (ksock_net_t *)f->driver_private;
+                if ((s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) ||
+                    (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL))
+                    has_net_socket = 1;
+            }
+            int elapsed = 0;
+            int step = 10; /* ms */
             int cur_tid = curth_poll ? (int)curth_poll->tid : -1;
             int tty_waiting[16];
             int n_tty_waiting;
             if (timeout < 0) {
-                /* block indefinitely: add self as TTY waiter so we wake on keypress */
+                /* block indefinitely: add self as TTY waiter so we wake on keypress.
+                   When has_net_socket: must use bounded sleep so we periodically poll e1000 and re-check. */
                 for (;;) {
+                    if (has_net_socket) e1000_poll();
                     n_tty_waiting = 0;
                     if (cur_tid >= 0) {
                         for (int i = 0; i < nfds && n_tty_waiting < (int)(sizeof(tty_waiting)/sizeof(tty_waiting[0])); i++) {
@@ -5559,9 +5767,15 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                             if (devfs_tty_add_waiter(tidx, cur_tid) == 0) tty_waiting[n_tty_waiting++] = tidx;
                         }
                     }
-                    if (n_tty_waiting > 0) {
+                    if (n_tty_waiting > 0 && !has_net_socket) {
                         thread_block(cur_tid);
                         thread_yield(); /* must yield so keyboard ISR can run and unblock */
+                        for (int w = 0; w < n_tty_waiting; w++) devfs_tty_remove_waiter(tty_waiting[w], cur_tid);
+                        goto auto_check;
+                    }
+                    if (n_tty_waiting > 0 && has_net_socket) {
+                        thread_block_with_timeout(cur_tid, (uint32_t)step);
+                        thread_yield();
                         for (int w = 0; w < n_tty_waiting; w++) devfs_tty_remove_waiter(tty_waiting[w], cur_tid);
                         goto auto_check;
                     }
@@ -6350,16 +6564,31 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 }
                 *p_mmap_next = def;
             }
+            /* Clone children have user-provided stack+TLS: ensure we never allocate in that region. */
+            if (tcur && tcur->user_stack_base != 0 && tcur->user_stack_limit > tcur->user_stack_base) {
+                uintptr_t se = (uintptr_t)tcur->user_stack_limit;
+                uintptr_t min_alloc = se;
+                if (tcur->user_fs_base > se && tcur->user_fs_base < (uintptr_t)MMIO_IDENTITY_LIMIT)
+                    min_alloc = align_up_u((uintptr_t)tcur->user_fs_base + 0x3000u, 4096);
+                if (*p_mmap_next < min_alloc)
+                    *p_mmap_next = min_alloc;
+            }
             uintptr_t addr = align_up_u(*p_mmap_next, 4096);
             if (tcur && tcur->user_stack_base != 0 && tcur->user_stack_limit > tcur->user_stack_base) {
                 uintptr_t sb = (uintptr_t)tcur->user_stack_base;
                 uintptr_t se = (uintptr_t)tcur->user_stack_limit;
                 if (!(addr + len <= sb || addr >= se)) {
                     addr = align_up_u(se, 4096);
+                    *p_mmap_next = addr; /* sync so next mmap continues above stack */
                 }
             }
             if (addr + len >= top_limit) return ret_err(ENOMEM);
-            if (mark_user_identity_range_2m_sys((uint64_t)addr, (uint64_t)(addr + len)) != 0) return ret_err(EFAULT);
+            /* Skip mark when range is in [0x200000, USER_STACK_TOP): clone3/vfork already marked it.
+               Re-calling mark can #PF when writing to read-only page-table pages (L3 at ~0x804c000). */
+            if (addr < 0x200000 || addr + len > (uintptr_t)USER_STACK_TOP) {
+                if (mark_user_identity_range_2m_sys((uint64_t)addr, (uint64_t)(addr + len)) != 0)
+                    return ret_err(EFAULT);
+            }
 
             if (flags & MAP_ANONYMOUS) {
                 flags &= ~(MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED | MAP_STACK | MAP_GROWSDOWN | MAP_NORESERVE);
@@ -6404,6 +6633,15 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (cur) {
                 int code = (int)a1;
                 cur->exit_status = (code & 0xFF) << 8;
+                /* close all FDs so pipes/sockets release (reader gets EOF, wait4 can proceed) */
+                for (int i = 0; i < THREAD_MAX_FD; i++) {
+                    if (cur->fds[i]) {
+                        struct fs_file *f = cur->fds[i];
+                        cur->fds[i] = NULL;
+                        fs_file_free(f);
+                    }
+                }
+                thread_yield(); /* let pipe reader run and see EOF before we wake vfork parent */
                 if (cur->parent_tid >= 0) {
                     thread_t *pt = thread_get(cur->parent_tid);
                     if (pt) {
@@ -6472,6 +6710,15 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (cur) {
                 int code = (int)a1;
                 cur->exit_status = (code & 0xFF) << 8;
+                /* close all FDs so pipes/sockets release (reader gets EOF, wait4 can proceed) */
+                for (int i = 0; i < THREAD_MAX_FD; i++) {
+                    if (cur->fds[i]) {
+                        struct fs_file *f = cur->fds[i];
+                        cur->fds[i] = NULL;
+                        fs_file_free(f);
+                    }
+                }
+                thread_yield(); /* let pipe reader run and see EOF before we wake vfork parent */
                 if (cur->parent_tid >= 0) {
                     thread_t *pt = thread_get(cur->parent_tid);
                     if (pt) {
@@ -6512,6 +6759,35 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 for (;;) asm volatile("sti; hlt" ::: "memory");
             }
             syscall_exit_to_shell_flag = 1;
+            return 0;
+        }
+        case SYS_rt_sigreturn: {
+            /* rt_sigreturn: restore from ucontext on user stack. RSP at entry = ucontext. */
+            uintptr_t uc_ptr = (uintptr_t)syscall_user_rsp_saved;
+            if (uc_ptr < 0x200000 || uc_ptr + sizeof(k_ucontext_t) > (uintptr_t)MMIO_IDENTITY_LIMIT)
+                return ret_err(EFAULT);
+            k_ucontext_t uc;
+            memcpy(&uc, (void*)uc_ptr, sizeof(uc));
+            k_sigcontext_t *sc = &uc.uc_mcontext;
+            cur->saved_user_r8  = sc->r8;
+            cur->saved_user_r9  = sc->r9;
+            cur->saved_user_r10 = sc->r10;
+            cur->saved_user_r11 = sc->r11;
+            cur->saved_user_r12 = sc->r12;
+            cur->saved_user_r13 = sc->r13;
+            cur->saved_user_r14 = sc->r14;
+            cur->saved_user_r15 = sc->r15;
+            cur->saved_user_rdi = sc->rdi;
+            cur->saved_user_rsi = sc->rsi;
+            cur->saved_user_rbp = sc->rbp;
+            cur->saved_user_rbx = sc->rbx;
+            cur->saved_user_rdx = sc->rdx;
+            cur->saved_user_rcx = sc->rcx;
+            cur->saved_user_rip = sc->rip;
+            cur->saved_user_rsp = sc->rsp;
+            cur->saved_sig_mask = uc.uc_sigmask[0];
+            rebuild_syscall_frame(cur);
+            syscall_user_rsp_saved = sc->rsp;
             return 0;
         }
         case 91: /* set_robust_list(head, len) - glibc/pthread; no-op */

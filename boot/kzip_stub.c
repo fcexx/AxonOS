@@ -386,7 +386,7 @@ void kernel_main(uint64_t multiboot_magic, uint64_t multiboot_info) {
     }
 
     boot_line("Parsing ELF...");
-    if (load_elf_image(decomp, decomp_len, &entry) != 0) panic_msg("KZIP: ELF load fail!");
+    if (load_elf_image(decomp, decomp_len, &entry) != 0) { panic_msg("KZIP: ELF load fail!"); for (;;); }
     boot_line("ok\n");
     if (entry == 0) panic_msg("KZIP: bad entry!");
 

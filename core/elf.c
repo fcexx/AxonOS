@@ -262,6 +262,9 @@ static uint64_t user_image_limit_bytes(void) {
    splitting; for 4KiB mappings we update the leaf entry. */
 static int mark_user_range_exec(uint64_t va_begin, uint64_t va_end) {
     if (va_end < va_begin) return -1;
+    /* Clamp to identity-mapped region; va >= 4GB would fault on invlpg. */
+    if (va_end > MMIO_IDENTITY_LIMIT) va_end = MMIO_IDENTITY_LIMIT;
+    if (va_begin >= va_end) return 0;
     uint64_t cr3 = paging_read_cr3();
     uint64_t *active_l4 = (uint64_t*)(uintptr_t)(cr3 & ~0xFFFULL);
     if (!active_l4) return -1;
@@ -384,6 +387,8 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
    instruction fetch and stack/data access in ring3. */
 static int mark_user_identity_range_2m(uint64_t va_begin, uint64_t va_end) {
     if (va_end < va_begin) return -1;
+    if (va_end > MMIO_IDENTITY_LIMIT) va_end = MMIO_IDENTITY_LIMIT;
+    if (va_begin >= va_end) return 0;
     uint64_t cr3 = paging_read_cr3();
     uint64_t *active_l4 = (uint64_t*)(uintptr_t)(cr3 & ~0xFFFULL);
     if (!active_l4) return -1;
@@ -424,7 +429,7 @@ static void mark_broad_user_ranges_for_exec(void) {
 int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk_end) {
     struct fs_file *f = fs_open(path);
     if (!f) {
-        kprintf("execve: open failed: %s\n", path ? path : "(null)");
+        //kprintf("execve: open failed: %s\n", path ? path : "(null)");
         return -1;
     }
     size_t fsz = f->size;
@@ -1073,6 +1078,21 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
                 thread_unblock(tc->vfork_parent_tid);
                 tc->vfork_parent_tid = -1;
             } else {
+                /* Parent stays blocked until we exit. Close only parent's pipe WRITE end -
+                   that releases EOF for us (read end). Must not close read end: we hold it
+                   (fd 0). Closing read end would free pipe while we use it. */
+                thread_t *parent = thread_get(tc->vfork_parent_tid);
+                if (parent) {
+                    for (int i = 0; i < THREAD_MAX_FD; i++) {
+                        struct fs_file *f = parent->fds[i];
+                        if (f && f->type == FS_TYPE_PIPE && f->fs_private == (void *)1) {
+                            parent->fds[i] = NULL;
+                            fs_file_free(f);
+                            break; /* one write end per pipe */
+                        }
+                    }
+                }
+                thread_yield(); /* let pipe reader (us) run and see EOF before we continue */
                 qemu_debug_printf("execve: NOT waking vfork parent %d (mem backup active, will wake on exit)\n",
                     tc->vfork_parent_tid);
             }

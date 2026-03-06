@@ -559,7 +559,18 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             release_irqrestore(&t->in_lock, flags);
             thread_block((int)cur->tid);
             thread_yield();
-            /* when unblocked, loop to try again */
+            /* Woke: if still no data but have pending SIGINT (Ctrl+C), return EINTR
+               so read() returns and maybe_deliver_pending_signal can terminate the process. */
+            acquire_irqsave(&t->in_lock, &flags);
+            if (t->in_count == 0) {
+                thread_t *me = thread_current();
+                if (me && (me->pending_signals & (1ULL << 1))) { /* SIGINT=2, bit 1 */
+                    release_irqrestore(&t->in_lock, flags);
+                    return got > 0 ? (ssize_t)got : (ssize_t)-4; /* -EINTR */
+                }
+            }
+            release_irqrestore(&t->in_lock, flags);
+            /* when unblocked with data, loop to try again */
             continue;
         } else {
             release_irqrestore(&t->in_lock, flags);

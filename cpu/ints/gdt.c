@@ -42,18 +42,24 @@ uint16_t USER_DS   = 0x23; // index 4, RPL=3
 
 static void set_seg_desc(int idx, uint32_t base, uint32_t limit, uint8_t access, uint8_t flags) {
         uint8_t* d = &gdt[idx * 8];
+
         // limit 15:0
         d[0] = limit & 0xFF;
         d[1] = (limit >> 8) & 0xFF;
+
         // base 15:0
         d[2] = base & 0xFF;
         d[3] = (base >> 8) & 0xFF;
+
         // base 23:16
         d[4] = (base >> 16) & 0xFF;
+
         // access
         d[5] = access;
+
         // flags and limit 19:16
         d[6] = ((flags & 0xF0)) | ((limit >> 16) & 0x0F);
+
         // base 31:24
         d[7] = (base >> 24) & 0xFF;
 }
@@ -61,15 +67,17 @@ static void set_seg_desc(int idx, uint32_t base, uint32_t limit, uint8_t access,
 static void set_tss_desc(int idx, uint64_t base, uint32_t limit) {
         // TSS descriptor occupies 16 bytes at idx and idx+1
         uint8_t* d = &gdt[idx * 8];
+
         // lower 8 bytes
-        d[0] = limit & 0xFF;                           // limit 0:7
+        d[0] = limit & 0xFF;                       // limit 0:7
         d[1] = (limit >> 8) & 0xFF;                // limit 8:15
-        d[2] = base & 0xFF;                                // base 0:7
+        d[2] = base & 0xFF;                        // base 0:7
         d[3] = (base >> 8) & 0xFF;                 // base 8:15
         d[4] = (base >> 16) & 0xFF;                // base 16:23
-        d[5] = 0x89;                                           // type=0x9, present=1, DPL=0 (64-bit TSS available)
-        d[6] = ((limit >> 16) & 0x0F);         // limit 16:19, flags=0
+        d[5] = 0x89;                               // type=0x9, present=1, DPL=0 (64-bit TSS available)
+        d[6] = ((limit >> 16) & 0x0F);             // limit 16:19, flags=0
         d[7] = (base >> 24) & 0xFF;                // base 24:31
+
         // upper 8 bytes
         d[8]  = (base >> 32) & 0xFF;           // base 32:39
         d[9]  = (base >> 40) & 0xFF;           // base 40:47
@@ -88,14 +96,19 @@ void enter_user_mode_asm(uint64_t entry, uint64_t user_stack, uint16_t user_ds, 
 void gdt_init() {
         // null descriptor
         set_seg_desc(0, 0, 0, 0, 0);
+
         // kernel code (long mode): access=0x9A (present|ring0|code|read), flags L=1 (0x20), G can be 0
         set_seg_desc(1, 0, 0, 0x9A, 0x20);
+
         // kernel data: access=0x92 (present|ring0|data|write), flags=0
         set_seg_desc(2, 0, 0, 0x92, 0x00);
+
         // user code: access=0xFA (present|ring3|code|read), flags L=1
         set_seg_desc(3, 0, 0, 0xFA, 0x20);
+
         // user data: access=0xF2 (present|ring3|data|write)
         set_seg_desc(4, 0, 0, 0xF2, 0x00);
+
         // init TSS
         for (int i = 0; i < (int)sizeof(tss)/8; ++i) ((uint64_t*)&tss)[i] = 0;
         tss.io_map_base = sizeof(tss);
@@ -109,6 +122,7 @@ void gdt_init() {
         gdt_desc.base = (uint64_t)&gdt[0];
 
         lgdt_load(&gdt_desc);
+        
         // Load TR with TSS selector (index 5 -> selector 0x28)
         ltr_load(0x28);
 

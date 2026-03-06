@@ -97,6 +97,8 @@ typedef struct thread {
         uint64_t *saved_syscall_frame;
         /* pending signal bitmask (1-based signal numbers, bit0 unused) */
         uint64_t pending_signals;
+        /* per-thread signal mask (blocked signals); used by rt_sigprocmask and signal delivery */
+        uint64_t saved_sig_mask;
         /* if non-negative, tid of thread waiting for this child (wait/waitpid) */
         int waiter_tid;
         /* exit status encoded like wait(2) returns (status word) */

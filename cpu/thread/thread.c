@@ -187,6 +187,7 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->saved_user_rcx = 0;
         t->saved_syscall_frame = NULL;
         t->pending_signals = 0;
+        t->saved_sig_mask = 0;
         t->waiter_tid = -1;
         t->exit_status = 0;
         t->exec_trampoline_flag = 0;
@@ -283,6 +284,7 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         t->saved_user_rcx = 0;
         t->saved_syscall_frame = NULL;
         t->pending_signals = 0;
+        t->saved_sig_mask = 0;
         t->waiter_tid = -1;
         t->exit_status = 0;
         t->exec_trampoline_flag = 0;

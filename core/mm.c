@@ -2,6 +2,7 @@
 #include <paging.h>
 #include <heap.h>
 #include <string.h>
+#include <mmio.h>
 
 static mm_t g_kernel_mm;
 static int g_mm_ready = 0;
@@ -185,8 +186,13 @@ int mm_switch(mm_t *mm) {
 int mm_make_private_range(mm_t *mm, uint64_t va_begin, uint64_t va_end, int copy_old) {
     if (!mm) return -1;
     if (va_end <= va_begin) return 0;
+    /* Never touch VA >= 4GB: identity map ends at MMIO_IDENTITY_LIMIT.
+       Otherwise memcpy from (void*)va would page-fault at 0x100000000. */
+    if (va_end > (uint64_t)MMIO_IDENTITY_LIMIT) va_end = (uint64_t)MMIO_IDENTITY_LIMIT;
+    if (va_begin >= va_end) return 0;
     uint64_t begin = va_begin & ~0xFFFULL;
     uint64_t end = (va_end + 0xFFFULL) & ~0xFFFULL;
+    if (end > (uint64_t)MMIO_IDENTITY_LIMIT) end = (uint64_t)MMIO_IDENTITY_LIMIT;
     for (uint64_t va = begin; va < end; va += 0x1000ULL) {
         void *raw = NULL;
         void *newp = kmalloc_aligned((size_t)PAGE_SIZE_4K, (size_t)PAGE_SIZE_4K, &raw);
