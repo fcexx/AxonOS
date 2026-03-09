@@ -101,6 +101,9 @@ static stdio_ring_t stdio_bufs[2]; /* 0 = stdout, 1 = stderr */
 static int devfs_path_to_tty(const char *path) {
     if (!path) return -1;
     if (strcmp(path, "/dev/console") == 0) return 0;
+    /* /dev/vc/N -> ttyN (BusyBox CURRENT_VC = /dev/vc/0) */
+    if (strncmp(path, "/dev/vc/", 8) == 0 && path[8] >= '0' && path[8] < '0' + DEVFS_TTY_COUNT && path[9] == '\0')
+        return path[8] - '0';
     if (strncmp(path, "/dev/tty", 8) == 0) {
         /* /dev/ttyN (virtual consoles) */
         int n = path[8] - '0';

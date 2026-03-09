@@ -288,14 +288,11 @@ void keyboard_process_scancode(uint8_t scancode) {
                 case 0x3E: // F4
                 case 0x3F: // F5
                 case 0x40: // F6
+                        /* Alt+F1..F6 or Ctrl+Alt+F1..F6 — switch virtual terminal (same as chvt 1..6) */
                         if (alt_pressed) {
-                                int idx = 0;
-                                if (scancode == 0x3B) idx = 0;
-                                else if (scancode == 0x3C) idx = 1;
-                                else if (scancode == 0x3D) idx = 2;
-                                else if (scancode == 0x3E) idx = 3;
-                                else if (scancode == 0x3F) idx = 4;
-                                else if (scancode == 0x40) idx = 5;
+                                int idx = (scancode == 0x3B) ? 0 : (scancode == 0x3C) ? 1 :
+                                          (scancode == 0x3D) ? 2 : (scancode == 0x3E) ? 3 :
+                                          (scancode == 0x3F) ? 4 : 5;
                                 devfs_switch_tty(idx);
                         } else {
                                 if (thread_get_current_user()) {

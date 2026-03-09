@@ -14,7 +14,7 @@ typedef enum {
         THREAD_SLEEPING
 } thread_state_t;
 
-#define THREAD_MAX_FD 16
+#define THREAD_MAX_FD 256
 
 typedef struct thread {
         context_t context;
@@ -38,9 +38,13 @@ typedef struct thread {
         /* current working directory for userland syscalls (POSIX-like).
            For kernel threads this is ignored; for user processes it's used to resolve relative paths. */
         char cwd[256];
-        /* POSIX credentials */
+        /* POSIX credentials (real, effective, saved for setuid) */
+        uid_t uid;
         uid_t euid;
+        uid_t suid;
+        gid_t gid;
         gid_t egid;
+        gid_t sgid;
         /* file mode creation mask (umask) for mkdir/open */
         unsigned int umask;
         /* attached tty index or -1 */

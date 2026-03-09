@@ -1,4 +1,5 @@
 #include <idt.h>
+#include <axonos.h>
 #include <vga.h>
 #include <pic.h>
 #include <thread.h>
@@ -226,6 +227,7 @@ static void page_fault_handler(cpu_registers_t* regs) {
         uint64_t cr2;
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
         int user = (regs->cs & 3) == 3;
+        if (user && fault_try_grow_user_heap(cr2)) return;
         dump("page fault", user ? "user" : "kernel", regs, cr2, regs->error_code, user);
         // Read MSR_FS_BASE to help diagnose faults caused by missing TLS base
         uint64_t fsbase_lo = 0, fsbase_hi = 0;
@@ -262,12 +264,15 @@ static void page_fault_handler(cpu_registers_t* regs) {
             } else {
                 klogprintf("stack @ RSP: (outside identity map)\n");
             }
-            /* dump memory near CR2 if available */
-            if ((uintptr_t)cr2 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+            /* dump memory near CR2 if available; skip when page is non-present
+               (err bit 0 = 0) to avoid a second page fault when reading CR2 */
+            if ((regs->error_code & 1) != 0 && (uintptr_t)cr2 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
                 klogprintf("bytes @ CR2: ");
                 const unsigned char *p = (const unsigned char*)(uintptr_t)cr2;
                 for (int i = 0; i < 32; i++) kprintf("%02x ", (unsigned)p[i]);
                 kprintf("\n");
+            } else if ((regs->error_code & 1) == 0) {
+                klogprintf("bytes @ CR2: (page not present, skipping read)\n");
             } else {
                 klogprintf("bytes @ CR2: (outside identity map)\n");
             }
@@ -275,6 +280,7 @@ static void page_fault_handler(cpu_registers_t* regs) {
             {
                 uint64_t v = (uint64_t)cr2;
                 uint64_t cr3 = paging_read_cr3();
+                klogprintf("ptes for CR2 (v=0x%llx): CR3=0x%llx\n", (unsigned long long)v, (unsigned long long)cr3);
                 uint64_t *l4 = (uint64_t*)(uintptr_t)(cr3 & ~0xFFFULL);
                 if (!l4) {
                     klogprintf("ptes for CR2: no active l4\n");
@@ -284,7 +290,7 @@ static void page_fault_handler(cpu_registers_t* regs) {
                 int l3i = (v >> 30) & 0x1FF;
                 int l2i = (v >> 21) & 0x1FF;
                 int l1i = (v >> 12) & 0x1FF;
-                klogprintf("ptes for CR2 (v=0x%llx): l4[%d]=0x%016llx\n", (unsigned long long)v, l4i, (unsigned long long)l4[l4i]);
+                klogprintf("ptes: l4[%d]=0x%016llx\n", l4i, (unsigned long long)l4[l4i]);
                 if (l4[l4i] & PG_PRESENT) {
                     uint64_t *l3 = (uint64_t*)(uintptr_t)(l4[l4i] & ~0xFFFULL);
                     klogprintf("ptes: l3[%d]=0x%016llx\n", l3i, (unsigned long long)l3[l3i]);
@@ -293,10 +299,13 @@ static void page_fault_handler(cpu_registers_t* regs) {
                         if (l3e & PG_PS_2M) {
                             klogprintf("ptes: 1GiB/2MiB large at L3\n");
                         } else {
-                            uint64_t *l2 = (uint64_t*)(uintptr_t)(l3e & ~0xFFFULL);
-                            klogprintf("ptes: l2[%d]=0x%016llx\n", l2i, (unsigned long long)l2[l2i]);
-                            if (l2[l2i] & PG_PRESENT) {
-                                uint64_t l2e = l2[l2i];
+                            uint64_t l2_phys = l3e & ~0xFFFULL;
+                            uint64_t *l2 = (uint64_t*)(uintptr_t)l2_phys;
+                            uint64_t l2e = l2[l2i];
+                            klogprintf("ptes: l2_phys=0x%llx l2[%d]=0x%016llx P=%d U=%d\n",
+                                (unsigned long long)l2_phys, l2i, (unsigned long long)l2e,
+                                (int)(!!(l2e & 1)), (int)(!!(l2e & 4)));
+                            if (l2e & PG_PRESENT) {
                                 if (l2e & PG_PS_2M) {
                                     klogprintf("ptes: 2MiB large at L2\n");
                                 } else {

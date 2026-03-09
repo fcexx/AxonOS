@@ -433,6 +433,7 @@ int e1000_recv_frame(void *buf, size_t cap) {
 void e1000_poll(void) {
     if (!g_e1000.initialized) return;
     (void)e1000_read32(E1000_REG_ICR);
+    (void)e1000_read32(E1000_REG_RDH); /* sync: VMware may need device read before DMA visibility */
 }
 
 void e1000_debug_rx(void) {

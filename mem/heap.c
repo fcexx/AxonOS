@@ -154,6 +154,17 @@ static void* kmalloc_nolock(size_t size) {
         }
         cur = cur->next;
     }
+    /* OOM: log to aid debugging adduser/addgroup and similar failures */
+    {
+        size_t largest = heap_largest_free_block();
+        size_t total_free = heap_total_free_bytes();
+        void *caller = __builtin_return_address(0);
+        kprintf("heap OOM: kmalloc(%llu) failed heap_used=%llu heap_total=%llu "
+                "largest_free=%llu total_free=%llu caller=%p\n",
+                (unsigned long long)req, (unsigned long long)heap_used_now,
+                (unsigned long long)heap_capacity, (unsigned long long)largest,
+                (unsigned long long)total_free, caller);
+    }
     return 0; // out of memory
 }
 

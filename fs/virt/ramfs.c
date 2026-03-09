@@ -7,6 +7,7 @@
 #include <heap.h>
 #include <stat.h>
 #include <thread.h>
+#include <vga.h>
 
 struct ramfs_node {
     char *name;
@@ -629,6 +630,9 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
                 d = (char*)krealloc(n->data, needed_end);
             }
             if (!d) {
+                kprintf("ramfs OOM: write alloc failed path=%s needed=%llu heap_used=%llu heap_total=%llu\n",
+                    file && file->path ? file->path : "(null)", (unsigned long long)needed_end,
+                    (unsigned long long)heap_used_bytes(), (unsigned long long)heap_total_bytes());
                 klogprintf("ramfs: write: alloc failed path=%s needed_end=%u\n",
                            file && file->path ? file->path : "(null)", (unsigned)needed_end);
                 return -1;

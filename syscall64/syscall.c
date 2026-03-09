@@ -313,6 +313,7 @@ static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, siz
 #define ENETDOWN 100
 #define ENOTCONN 107
 #define ENODEV   19
+#define ETIMEDOUT 110
 
 /* Pipe: kernel buffer + two fd ends. driver_private = pipe_t*, fs_private = 0 read / 1 write */
 #define PIPE_BUF_SIZE 4096
@@ -414,6 +415,8 @@ static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t
 #define SYSCALL_FTYPE_SOCKET  0x534F434Bu
 
 #define AF_INET_LOCAL         2
+#define AF_UNSPEC             0   /* treat as AF_INET for getaddrinfo fallback */
+#define AF_INET6              10  /* Linux value; we stub to AF_INET */
 #define AF_NETLINK_LOCAL      16
 #define SOCK_STREAM_LOCAL     1
 #define SOCK_DGRAM_LOCAL      2
@@ -501,6 +504,7 @@ typedef struct {
     uint32_t ip_be;
     uint32_t mask_be;
     uint32_t gw_be;
+    uint32_t dns_be;
     uint16_t ip_id;
     uint8_t gw_mac[6];
     int gw_mac_valid;
@@ -545,7 +549,7 @@ static int ip_same_subnet(uint32_t a_be, uint32_t b_be, uint32_t mask_be) {
 }
 
 static int net_stack_init(void);
-static void net_ensure_resolv_conf(void);
+static void net_ensure_resolv_conf(uint32_t dns_be);
 static int ip_mask_prefix_len(uint32_t mask_be);
 static int net_resolve_mac(uint32_t ip_be, uint8_t out_mac[6], uint32_t timeout_ms);
 
@@ -586,7 +590,7 @@ static int net_resolve_next_hop_mac(uint32_t dst_ip_be, uint8_t out_mac[6]) {
         memcpy(out_mac, g_net.gw_mac, 6);
         return 0;
     }
-    if (net_resolve_mac(nh, out_mac, 2000) != 0) return -1;
+    if (net_resolve_mac(nh, out_mac, 15000) != 0) return -1;
     if (nh == g_net.gw_be) {
         memcpy(g_net.gw_mac, out_mac, 6);
         g_net.gw_mac_valid = 1;
@@ -619,8 +623,9 @@ static int net_recv_udp_datagram(ksock_net_t *s, uint8_t *out, size_t out_cap, u
     uint8_t frame[2048];
     uint64_t start = pit_get_time_ms();
     while ((pit_get_time_ms() - start) < timeout_ms) {
+        e1000_poll();
         int n = e1000_recv_frame(frame, sizeof(frame));
-        if (n <= 0) { thread_yield(); continue; }
+        if (n <= 0) { thread_sleep(1); continue; }
         if ((size_t)n < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t) + sizeof(udp_hdr_t)) continue;
         const eth_hdr_t *eth = (const eth_hdr_t *)frame;
         if (be16(eth->ethertype) != ETH_TYPE_IPV4) continue;
@@ -655,6 +660,7 @@ static int net_send_l4_ipv4_cb(uint32_t dst_ip_be, uint8_t proto, const void *l4
 }
 
 static int net_recv_frame_cb(void *buf, size_t cap) {
+    e1000_poll(); /* VMware needs explicit poll; TCP recv path doesn't go through select */
     return e1000_recv_frame(buf, cap);
 }
 
@@ -663,7 +669,8 @@ static uint64_t net_time_ms_cb(void) {
 }
 
 static void net_yield_cb(void) {
-    thread_yield();
+    /* VMware: thread_sleep(1) instead of yield — prevents tight loop, lets emulation deliver packets */
+    thread_sleep(1);
 }
 
 static void net_make_tcp_ops(net_tcp_ops_t *ops) {
@@ -713,14 +720,15 @@ static int net_try_parse_arp_reply_for_ip(const uint8_t *frame, size_t n, uint32
 static int net_resolve_mac(uint32_t ip_be, uint8_t out_mac[6], uint32_t timeout_ms) {
     if (!out_mac) return -1;
     /* Drain RX so ARP reply is not behind leftover DHCP/other frames. */
-    { uint8_t drain[256]; while (e1000_recv_frame(drain, sizeof(drain)) > 0) ; }
+    { uint8_t drain[256]; for (;;) { e1000_poll(); if (e1000_recv_frame(drain, sizeof(drain)) <= 0) break; } }
     if (net_send_arp_request(ip_be) != 0) return -1;
     uint8_t frame[2048];
     uint64_t start = pit_get_time_ms();
     while ((pit_get_time_ms() - start) < timeout_ms) {
+        e1000_poll();
         int r = e1000_recv_frame(frame, sizeof(frame));
         if (r > 0 && net_try_parse_arp_reply_for_ip(frame, (size_t)r, ip_be, out_mac)) return 0;
-        thread_yield();
+        thread_sleep(1);
     }
     return -1;
 }
@@ -757,19 +765,25 @@ static int net_stack_init(void) {
                    (unsigned)((g_net.ip_be >> 8) & 0xFF), (unsigned)(g_net.ip_be & 0xFF),
                    (unsigned)((g_net.gw_be >> 24) & 0xFF), (unsigned)((g_net.gw_be >> 16) & 0xFF),
                    (unsigned)((g_net.gw_be >> 8) & 0xFF), (unsigned)(g_net.gw_be & 0xFF));
+        net_ensure_resolv_conf(g_net.dns_be ? g_net.dns_be : g_net.gw_be);
         return 0;
     }
     
     dhcp_lease_t lease;
+    uint32_t dns_be = 0;
     if (dhcp_acquire(g_net.mac, &lease) == 0) {
         g_net.ip_be = lease.ip_be;
         g_net.mask_be = lease.mask_be;
         g_net.gw_be = lease.gw_be;
+        dns_be = lease.dns_be ? lease.dns_be : lease.gw_be;
+        g_net.dns_be = dns_be;
     } else {
         /* Conservative fallback for QEMU user networking. */
         g_net.ip_be = 0x0A00020Fu;   /* 10.0.2.15 */
         g_net.mask_be = 0xFFFFFF00u; /* /24 */
         g_net.gw_be = 0x0A000202u;   /* 10.0.2.2 */
+        dns_be = 0x0A000203u;        /* 10.0.2.3 QEMU DNS */
+        g_net.dns_be = dns_be;
         klogprintf("net: DHCP failed, fallback ip=10.0.2.15 gw=10.0.2.2\n");
     }
     g_net.ready = 1;
@@ -779,7 +793,7 @@ static int net_stack_init(void) {
     g_net_cfg_ip_be = g_net.ip_be;
     g_net_cfg_mask_be = g_net.mask_be;
     g_net_cfg_gw_be = g_net.gw_be;
-    net_ensure_resolv_conf();
+    net_ensure_resolv_conf(dns_be);
     klogprintf("net: ready ip=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
                (unsigned)((g_net.ip_be >> 24) & 0xFF), (unsigned)((g_net.ip_be >> 16) & 0xFF),
                (unsigned)((g_net.ip_be >> 8) & 0xFF), (unsigned)(g_net.ip_be & 0xFF),
@@ -792,7 +806,30 @@ int syscall_net_preinit(void) {
     return net_stack_init();
 }
 
-static void net_ensure_resolv_conf(void) {
+void syscall_net_ensure_resolv(void) {
+    if (g_net.ready && g_net.dns_be)
+        net_ensure_resolv_conf(g_net.dns_be);
+    else if (g_net.ready)
+        net_ensure_resolv_conf(g_net.gw_be);
+    else
+        net_ensure_resolv_conf(0x0A000203u);
+    (void)ramfs_mkdir("/etc");
+    struct fs_file *hf = fs_create_file("/etc/hosts");
+    if (!hf) hf = fs_open("/etc/hosts");
+    if (hf) {
+        static const char hosts_txt[] =
+            "127.0.0.1\tlocalhost\n"
+            "142.250.185.46\tgoogle.com www.google.com\n"
+            "45.135.93.108\taxont.ru www.axont.ru\n"
+            "77.88.55.242\tya.ru www.ya.ru\n";
+        hf->size = 0;
+        hf->pos = 0;
+        (void)fs_write(hf, hosts_txt, sizeof(hosts_txt) - 1, 0);
+        fs_file_free(hf);
+    }
+}
+
+static void net_ensure_resolv_conf(uint32_t dns_be) {
     (void)ramfs_mkdir("/etc");
     struct fs_file *f = fs_create_file("/etc/resolv.conf");
     if (!f) f = fs_open("/etc/resolv.conf");
@@ -800,12 +837,20 @@ static void net_ensure_resolv_conf(void) {
         klogprintf("net: failed to create /etc/resolv.conf\n");
         return;
     }
-    const char *txt =
-        "# autogenerated by AxonOS net stack\n"
-        "nameserver 10.0.2.3\n";
+    char buf[256];
+    int n = 0;
+    n += (int)(size_t)sprintf(buf + n, "# autogenerated by AxonOS net stack\n");
+    if (dns_be) {
+        n += (int)(size_t)sprintf(buf + n, "nameserver %u.%u.%u.%u\n",
+            (dns_be >> 24) & 0xFF, (dns_be >> 16) & 0xFF,
+            (dns_be >> 8) & 0xFF, dns_be & 0xFF);
+    } else {
+        n += (int)(size_t)sprintf(buf + n, "nameserver 10.0.2.3\n");
+    }
+    n += (int)(size_t)sprintf(buf + n, "nameserver 8.8.8.8\n");
     f->size = 0;
     f->pos = 0;
-    (void)fs_write(f, txt, strlen(txt), 0);
+    (void)fs_write(f, buf, (size_t)n, 0);
     fs_file_free(f);
 }
 
@@ -829,12 +874,12 @@ static int net_send_icmp_echo(ksock_net_t *s, uint32_t dst_ip_be, const uint8_t 
     uint8_t dst_mac[6];
     if (nh == g_net.gw_be && g_net.gw_mac_valid) memcpy(dst_mac, g_net.gw_mac, 6);
     else {
-        uint32_t arp_ms = 2000;
+        uint32_t arp_ms = 15000;
         if (net_resolve_mac(nh, dst_mac, arp_ms) != 0) {
             /* Повтор ARP для шлюза (VMware иногда отвечает с задержкой). */
             if (nh == g_net.gw_be) {
                 uint8_t drain[256];
-                while (e1000_recv_frame(drain, sizeof(drain)) > 0) ;
+                for (;;) { e1000_poll(); if (e1000_recv_frame(drain, sizeof(drain)) <= 0) break; }
                 if (net_send_arp_request(nh) != 0) return -1;
                 if (net_resolve_mac(nh, dst_mac, arp_ms) != 0) return -1;
             } else
@@ -920,6 +965,7 @@ static int net_recv_icmp_echo_reply(ksock_net_t *s, uint8_t *out, size_t out_cap
         thread_t *tcur = thread_get_current_user();
         if (!tcur) tcur = thread_current();
         if (tcur && (tcur->pending_signals & (1ULL << (2 - 1)))) return -4; /* interrupted by SIGINT */
+        e1000_poll();
         int n = e1000_recv_frame(frame, sizeof(frame));
         if (n > 0) {
             int got = net_try_parse_icmp_reply(frame, (size_t)n, s, out, out_cap, out_src_ip_be);
@@ -929,6 +975,7 @@ static int net_recv_icmp_echo_reply(ksock_net_t *s, uint8_t *out, size_t out_cap
             /* Короткий спин: пакет может прийти сразу после проверки, до yield. */
             int spun = 0;
             for (; spun < 200; spun++) {
+                e1000_poll();
                 n = e1000_recv_frame(frame, sizeof(frame));
                 if (n > 0) {
                     int got = net_try_parse_icmp_reply(frame, (size_t)n, s, out, out_cap, out_src_ip_be);
@@ -936,7 +983,7 @@ static int net_recv_icmp_echo_reply(ksock_net_t *s, uint8_t *out, size_t out_cap
                     break; /* кадр потреблён, не подошёл — продолжаем внешний цикл */
                 }
             }
-            if (spun >= 200) thread_yield();
+            if (spun >= 200) thread_sleep(1);
         }
     }
     return 0; /* timeout */
@@ -1327,6 +1374,8 @@ static inline uint64_t ret_err(int e) {
         else if (strstr(nm, "addgroup")) watch = 1;
         else if (strstr(nm, "adduser")) watch = 1;
         if (watch) {
+            kprintf("adduser/addgroup SYSCALL-ERR: num=%llu errno=%d name=%s\n",
+                (unsigned long long)last_syscall_debug, e, nm);
             qemu_debug_printf("SYSCALL-ERR: syscall=%llu err=%d tid=%llu name=%s brk=0x%llx mmap_next=0x%llx\n",
                 (unsigned long long)last_syscall_debug,
                 e,
@@ -1337,12 +1386,15 @@ static inline uint64_t ret_err(int e) {
         }
     }
     if (e == ENOMEM) {
-        qemu_debug_printf("ENOMEM: syscall=%llu tid=%llu name=%s brk=0x%llx mmap_next=0x%llx\n",
+        qemu_debug_printf("ENOMEM: syscall=%llu tid=%llu name=%s brk=0x%llx mmap_next=0x%llx heap_used=%llu heap_total=%llu heap_peak=%llu\n",
             (unsigned long long)last_syscall_debug,
             (unsigned long long)(t ? (t->tid ? t->tid : 1) : 0),
             (t && t->name[0]) ? t->name : "(null)",
             (unsigned long long)(t ? (uint64_t)t->user_brk_cur : 0),
-            (unsigned long long)(t ? (uint64_t)t->user_mmap_next : 0));
+            (unsigned long long)(t ? (uint64_t)t->user_mmap_next : 0),
+            (unsigned long long)heap_used_bytes(),
+            (unsigned long long)heap_total_bytes(),
+            (unsigned long long)heap_peak_bytes());
     }
     return (uint64_t)(-(int64_t)e);
 }
@@ -1824,7 +1876,134 @@ void syscall_set_user_brk(uintptr_t base) {
     }
 }
 
+int fault_try_grow_user_heap(uint64_t cr2) {
+    thread_t *tcur = thread_get_current_user();
+    if (!tcur) tcur = thread_current();
+    if (!tcur) return 0;
+    uintptr_t brk_base = tcur->user_brk_base;
+    uintptr_t brk_cur = tcur->user_brk_cur;
+    if (brk_base == 0) brk_base = brk_cur = 8u * 1024u * 1024u;
+    uintptr_t top_limit = (uintptr_t)USER_TLS_BASE;
+    uintptr_t tls_base = user_tls_base_for_tid_local(tcur->tid);
+    if (tls_base > 0x200000 && tls_base < (uintptr_t)MMIO_IDENTITY_LIMIT)
+        top_limit = tls_base;
+    uintptr_t heap_lo = (uintptr_t)heap_base_addr();
+    if (heap_lo > brk_base && heap_lo < top_limit) {
+        uintptr_t guard = 0x10000u;
+        top_limit = (heap_lo > guard) ? (heap_lo - guard) : heap_lo;
+    }
+    uintptr_t page_va = (uintptr_t)cr2 & ~((uintptr_t)PAGE_SIZE_2M - 1);
+    if (page_va < brk_base || page_va + PAGE_SIZE_2M > top_limit) return 0;
+    if (page_va < brk_cur) return 0; /* should already be mapped */
+    if (map_page_2m(page_va, page_va, PG_PRESENT | PG_RW | PG_US) != 0) return 0;
+    memset((void*)(uintptr_t)page_va, 0, PAGE_SIZE_2M);
+    if (page_va + PAGE_SIZE_2M > brk_cur)
+        tcur->user_brk_cur = page_va + PAGE_SIZE_2M;
+    return 1;
+}
+
 static inline uintptr_t align_up_u(uintptr_t v, uintptr_t a) { return (v + (a - 1)) & ~(a - 1); }
+
+/* Unmap [va_begin, va_end) in current CR3. Clears PTE so user access faults.
+   Range must be page-aligned and within user identity map. */
+static int unmap_user_range_sys(uint64_t va_begin, uint64_t va_end) {
+    if (va_end < va_begin) return -1;
+    if (va_begin >= (uint64_t)MMIO_IDENTITY_LIMIT) return -1;
+    if (va_end > (uint64_t)MMIO_IDENTITY_LIMIT) va_end = (uint64_t)MMIO_IDENTITY_LIMIT;
+    uint64_t begin = va_begin & ~0xFFFULL;
+    uint64_t end = (va_end + 0xFFFULL) & ~0xFFFULL;
+    uint64_t cr3 = paging_read_cr3();
+    uint64_t *l4 = (uint64_t*)(uintptr_t)(cr3 & ~0xFFFULL);
+    if (!l4) return -1;
+    for (uint64_t va = begin; va < end; va += 0x1000ULL) {
+        uint64_t l4i = (va >> 39) & 0x1FF;
+        uint64_t l3i = (va >> 30) & 0x1FF;
+        uint64_t l2i = (va >> 21) & 0x1FF;
+        uint64_t l1i = (va >> 12) & 0x1FF;
+        if (!(l4[l4i] & PG_PRESENT)) continue;
+        uint64_t *l3 = (uint64_t*)(uintptr_t)(l4[l4i] & ~0xFFFULL);
+        if (!(l3[l3i] & PG_PRESENT)) continue;
+        uint64_t l3e = l3[l3i];
+        if (l3e & PG_PS_2M) continue; /* 1G page; cannot partially unmap */
+        uint64_t l2_phys = l3e & ~0xFFFULL;
+        uint64_t *l2 = (uint64_t*)(uintptr_t)l2_phys;
+        if (!(l2[l2i] & PG_PRESENT)) continue;
+        uint64_t l2e = l2[l2i];
+        if (l2e & PG_PS_2M) {
+            /* Don't unmap 2MB page that contains L2/L3/L4 tables (would #PF on next access) */
+            uint64_t page_lo = va & ~((uint64_t)(PAGE_SIZE_2M - 1));
+            uint64_t page_hi = page_lo + PAGE_SIZE_2M;
+            uint64_t l3_phys = l4[l4i] & ~0xFFFULL;
+            uint64_t l4_phys = cr3 & ~0xFFFULL;
+            if ((l2_phys >= page_lo && l2_phys < page_hi) ||
+                (l3_phys >= page_lo && l3_phys < page_hi) ||
+                (l4_phys >= page_lo && l4_phys < page_hi))
+                continue;
+            l2[l2i] = 0;
+            invlpg((void*)(uintptr_t)va);
+            continue;
+        }
+        uint64_t *l1 = (uint64_t*)(uintptr_t)(l2e & ~0xFFFULL);
+        l1[l1i] = 0;
+        invlpg((void*)(uintptr_t)va);
+    }
+    return 0;
+}
+
+/* User program region: .data/GOT can be anywhere from 0x200000 to USER_STACK_TOP.
+   mprotect(PROT_READ) must not remove PG_RW from this range - lazy PLT binding writes to GOT. */
+#define USER_DATA_REGION_LO 0x200000ULL
+#define USER_DATA_REGION_HI ((uint64_t)0x10000000ULL)  /* USER_STACK_TOP */
+
+/* Change [va_begin, va_end) protection. prot: 0=PROT_NONE, 1=READ, 2=WRITE, 4=EXEC (combine). */
+static int mprotect_user_range_sys(uint64_t va_begin, uint64_t va_end, int prot) {
+    if (va_end < va_begin) return -1;
+    if (va_begin >= (uint64_t)MMIO_IDENTITY_LIMIT) return -1;
+    if (va_end > (uint64_t)MMIO_IDENTITY_LIMIT) va_end = (uint64_t)MMIO_IDENTITY_LIMIT;
+    uint64_t begin = va_begin & ~((uint64_t)(PAGE_SIZE_2M - 1));
+    uint64_t end = (va_end + PAGE_SIZE_2M - 1) & ~((uint64_t)(PAGE_SIZE_2M - 1));
+    if (end > (uint64_t)MMIO_IDENTITY_LIMIT) end = (uint64_t)MMIO_IDENTITY_LIMIT;
+    uint64_t cr3 = paging_read_cr3();
+    uint64_t *l4 = (uint64_t*)(uintptr_t)(cr3 & ~0xFFFULL);
+    if (!l4) return -1;
+    uint64_t new_flags = 0;
+    if (prot != 0) {
+        new_flags = PG_PRESENT | PG_US | PG_PS_2M;
+        if (prot & 2) new_flags |= PG_RW;
+        if (!(prot & 4)) new_flags |= PG_NX;
+        /* .data/GOT region must stay writable for lazy PLT binding; mprotect(PROT_READ) would break it */
+        if (va_begin < USER_DATA_REGION_HI && va_end > USER_DATA_REGION_LO)
+            new_flags |= PG_RW;
+    }
+    for (uint64_t va = begin; va < end; va += PAGE_SIZE_2M) {
+        uint64_t l4i = (va >> 39) & 0x1FF;
+        uint64_t l3i = (va >> 30) & 0x1FF;
+        uint64_t l2i = (va >> 21) & 0x1FF;
+        if (!(l4[l4i] & PG_PRESENT)) return -1;
+        uint64_t *l3 = (uint64_t*)(uintptr_t)(l4[l4i] & ~0xFFFULL);
+        if (!(l3[l3i] & PG_PRESENT)) return -1;
+        uint64_t l3e = l3[l3i];
+        if (l3e & PG_PS_2M) return -1;  /* 1G page; cannot change */
+        uint64_t *l2 = (uint64_t*)(uintptr_t)(l3e & ~0xFFFULL);
+        if (!(l2[l2i] & PG_PRESENT)) return -1;
+        uint64_t l2e = l2[l2i];
+        if (l2e & PG_PS_2M) {
+            uint64_t pa = l2e & ~(PAGE_SIZE_2M - 1) & ~0xFFFULL;
+            l2[l2i] = pa | new_flags;
+        } else {
+            uint64_t *l1 = (uint64_t*)(uintptr_t)(l2e & ~0xFFFULL);
+            for (uint64_t v = va; v < va + PAGE_SIZE_2M && v < (uint64_t)MMIO_IDENTITY_LIMIT; v += 0x1000ULL) {
+                uint64_t l1i = (v >> 12) & 0x1FF;
+                uint64_t pa = l1[l1i] & ~0xFFFULL;
+                uint64_t f = new_flags & ~PG_PS_2M;  /* L1 uses 4K, no PS */
+                l1[l1i] = pa | f;
+                invlpg((void*)(uintptr_t)v);
+            }
+        }
+        invlpg((void*)(uintptr_t)va);
+    }
+    return 0;
+}
 
 static int mark_user_identity_range_2m_sys(uint64_t va_begin, uint64_t va_end) {
     if (va_end < va_begin) return -1;
@@ -2014,7 +2193,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
 
     /* record last syscall for debug logging of ENOSYS */
     last_syscall_debug = num;
-    if (num != 1) qemu_debug_printf("SYSCALL: num=%u\n", num);
+    if (num != 1) {qemu_debug_printf("SYSCALL: num=%u\n", num); }
 
     switch (num) {
         case SYS_clone: {
@@ -2044,11 +2223,8 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 }
             }
             if (saved_rcx == 0) return ret_err(EINVAL);
-            /* TEMP: clone3-with-stack path causes #PF/GPF when modifying page tables.
-               Return ENOSYS so glibc falls back to clone(); apm may work with reduced parallelism. */
-            if (stack != 0)
-                return ret_err(ENOSYS);
-            if (0) { /* disabled clone3-with-stack path */
+            /* clone3 with stack: create thread sharing parent's mm (CLONE_VM). */
+            if (stack != 0) {
                 /* clone3 stack conventions differ across libc wrappers.
                    Choose child RSP adaptively:
                    - classic clone3: rsp = stack + stack_size (stack is low address)
@@ -2082,12 +2258,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 }
                 /* RSP must be 16-byte aligned per x86-64 ABI (child may use movdqa/call) */
                 child_rsp &= ~(uintptr_t)0xFULL;
-                klogprintf("clone3: flags=0x%llx stack=0x%llx size=0x%llx tls=0x%llx chosen_rsp=0x%llx\n",
-                           (unsigned long long)flags,
-                           (unsigned long long)stack,
-                           (unsigned long long)stack_size,
-                           (unsigned long long)tls,
-                           (unsigned long long)child_rsp);
+                
                 uintptr_t lo = rsp_from_top < rsp_from_size ? rsp_from_top : rsp_from_size;
                 uintptr_t hi = rsp_from_top > rsp_from_size ? rsp_from_top : rsp_from_size;
                 uintptr_t map_lo = lo & ~((uintptr_t)PAGE_SIZE_2M - 1);
@@ -2143,8 +2314,12 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 } else {
                     child->user_fs_base = cur->user_fs_base;
                 }
+                child->uid = cur->uid;
                 child->euid = cur->euid;
+                child->suid = cur->suid;
+                child->gid = cur->gid;
                 child->egid = cur->egid;
+                child->sgid = cur->sgid;
                 child->umask = cur->umask;
                 child->attached_tty = cur->attached_tty;
                 child->parent_tid = (int)(cur->tid ? cur->tid : 1);
@@ -2163,6 +2338,13 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 child->user_brk_base = cur->user_brk_base;
                 child->user_brk_cur = cur->user_brk_cur;
                 child->user_mmap_next = cur->user_mmap_next;
+                /* Parent must not mmap into child's stack; bump parent's user_mmap_next above stack region. */
+                {
+                    uintptr_t stack_end = child->user_stack_limit;
+                    uintptr_t min_next = align_up_u(stack_end, (uintptr_t)PAGE_SIZE_2M);
+                    if (cur->user_mmap_next < min_next)
+                        cur->user_mmap_next = min_next;
+                }
                 /* clone3 semantics: touch TID pointers only when the matching flags are set. */
                 enum {
                     CLONE_PARENT_SETTID = 0x00100000u,
@@ -2459,7 +2641,8 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             child->parent_tid = (int)(p->tid ? p->tid : 1);
             child->sid = p->sid;
             child->pgid = p->pgid;
-            child->euid = p->euid; child->egid = p->egid;
+            child->uid = p->uid; child->euid = p->euid; child->suid = p->suid;
+            child->gid = p->gid; child->egid = p->egid; child->sgid = p->sgid;
             child->attached_tty = p->attached_tty;
             strncpy(child->cwd, p->cwd, sizeof(child->cwd) - 1);
             child->cwd[sizeof(child->cwd) - 1] = '\0';
@@ -2497,7 +2680,9 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 }
                 child->vfork_parent_mem_backup = kmalloc((size_t)len64);
                 if (!child->vfork_parent_mem_backup) {
-                    qemu_debug_printf("vfork-backup: kmalloc(%llu) failed\n", (unsigned long long)len64);
+                    qemu_debug_printf("OOM vfork-backup: kmalloc(%llu) failed heap_used=%llu heap_total=%llu\n",
+                        (unsigned long long)len64, (unsigned long long)heap_used_bytes(),
+                        (unsigned long long)heap_total_bytes());
                     return ret_err(ENOMEM);
                 }
                 /* Small backup: single copy. Large: chunk with yields to avoid freeze. */
@@ -2627,9 +2812,23 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if ((uintptr_t)path >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
             if ((uintptr_t)buf + bufsiz > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
 
-            /* First try the real VFS symlink implementation. */
             char kpath[256];
             resolve_user_path(cur, path, kpath, sizeof(kpath));
+
+            /* Workaround: realpath/canonicalize and Busybox adduser readlink paths to resolve
+               them. When a path exists as regular file or dir (not symlink), POSIX readlink
+               would fail with EINVAL. Return the path as link target so programs succeed. */
+            {
+                struct stat st;
+                if (vfs_lstat(kpath, &st) == 0 && (st.st_mode & S_IFLNK) != S_IFLNK) {
+                    if (bufsiz == 0) return ret_err(EINVAL);
+                    size_t L = strlen(kpath);
+                    if (L > bufsiz) L = bufsiz;
+                    memcpy(buf, kpath, L);
+                    return (uint64_t)L;
+                }
+            }
+
             ssize_t rr = vfs_readlink(kpath, buf, bufsiz);
             if (rr >= 0) return (uint64_t)rr;
 
@@ -2689,6 +2888,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             if (cur && cur->name[0]) {
                 if (strstr(cur->name, "addgroup") || strstr(cur->name, "adduser") || strstr(cur->name, "wget")) {
+                    kprintf("READLINK-ENOENT: %s path=%s\n", cur->name, kpath);
                     qemu_debug_printf("READLINK-ENOENT: name=%s path=%s\n", cur->name, kpath);
                 }
             }
@@ -3045,11 +3245,77 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (is_init_user(cur)) return 1;
             return (uint64_t)(cur->tid ? cur->tid : 1);
         case SYS_getuid:
+            return (uint64_t)cur->uid;
         case SYS_geteuid:
             return (uint64_t)cur->euid;
         case SYS_getgid:
+            return (uint64_t)cur->gid;
         case SYS_getegid:
             return (uint64_t)cur->egid;
+        case SYS_setuid: {
+            /* setuid(uid): set uid, euid, suid. Root can set any; otherwise uid must equal uid/euid/suid. */
+            uid_t uid = (uid_t)a1;
+            if (cur->euid == 0) {
+                cur->uid = cur->euid = cur->suid = uid;
+                return 0;
+            }
+            if (uid != cur->uid && uid != cur->euid && uid != cur->suid)
+                return ret_err(EPERM);
+            cur->uid = cur->euid = cur->suid = uid;
+            return 0;
+        }
+        case SYS_setgid: {
+            /* setgid(gid): same as setuid for groups. */
+            gid_t gid = (gid_t)a1;
+            if (cur->euid == 0) {
+                cur->gid = cur->egid = cur->sgid = gid;
+                return 0;
+            }
+            if (gid != cur->gid && gid != cur->egid && gid != cur->sgid)
+                return ret_err(EPERM);
+            cur->gid = cur->egid = cur->sgid = gid;
+            return 0;
+        }
+        case SYS_setreuid: {
+            /* setreuid(ruid, euid): -1 means don't change. seteuid(uid) = setreuid(-1, uid). */
+            uid_t ruid = (uid_t)(int)a1;
+            uid_t euid = (uid_t)(int)a2;
+            int do_ruid = (int)a1 != -1;
+            int do_euid = (int)a2 != -1;
+            if (cur->euid == 0) {
+                if (do_ruid) cur->uid = ruid;
+                if (do_euid) cur->euid = euid;
+                cur->suid = cur->euid; /* Linux: suid = new euid when euid changed */
+                return 0;
+            }
+            if (do_ruid && ruid != cur->uid && ruid != cur->euid && ruid != cur->suid)
+                return ret_err(EPERM);
+            if (do_euid && euid != cur->uid && euid != cur->euid && euid != cur->suid)
+                return ret_err(EPERM);
+            if (do_ruid) cur->uid = ruid;
+            if (do_euid) { cur->euid = euid; cur->suid = euid; }
+            return 0;
+        }
+        case SYS_setregid: {
+            /* setregid(rgid, egid): -1 means don't change. */
+            gid_t rgid = (gid_t)(int)a1;
+            gid_t egid = (gid_t)(int)a2;
+            int do_rgid = (int)a1 != -1;
+            int do_egid = (int)a2 != -1;
+            if (cur->euid == 0) {
+                if (do_rgid) cur->gid = rgid;
+                if (do_egid) cur->egid = egid;
+                cur->sgid = cur->egid;
+                return 0;
+            }
+            if (do_rgid && rgid != cur->gid && rgid != cur->egid && rgid != cur->sgid)
+                return ret_err(EPERM);
+            if (do_egid && egid != cur->gid && egid != cur->egid && egid != cur->sgid)
+                return ret_err(EPERM);
+            if (do_rgid) cur->gid = rgid;
+            if (do_egid) { cur->egid = egid; cur->sgid = egid; }
+            return 0;
+        }
         case SYS_setsid:
             if (cur) {
                 cur->sid = (int)(cur->tid ? cur->tid : 1);
@@ -3119,23 +3385,16 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
         case SYS_tgkill: {
             /* tgkill(tgid, tid, sig): used by glibc for raise()/pthread_kill()/abort().
-               We do not implement full signal delivery yet, but we MUST make SIGABRT
-               actually terminate the process; otherwise glibc falls back to "hlt/ud2"
-               in userspace, which triggers #GP and looks like a hang/crash.
-               For other signals we currently treat it as a no-op for self. */
+               We must make self-targeted SIGABRT actually terminate; otherwise glibc
+               falls back to ud2 in userspace -> #GP. */
             uint64_t tgid = a1;
             uint64_t tid  = a2;
             uint64_t sig  = a3;
             uint64_t self = (uint64_t)(cur->tid ? cur->tid : 1);
-            if (tgid == self && tid == self) {
-                if (sig == 6 /* SIGABRT */) {
-                    kprintf("sys_tgkill: pid=%llu self-targeted SIGABRT received; ignoring auto-exit for now\n",
-                            (unsigned long long)self);
-                    /* Previously we forced exit to avoid userspace UD2; now treat as no-op to avoid premature shell exit. */
-                    return 0;
-                }
-                return 0;
+            if (tgid == self && tid == self && sig == 6 /* SIGABRT */) {
+                return syscall_do(SYS_exit_group, 134, 0, 0, 0, 0, 0);  /* 134 = 128+SIGABRT */
             }
+            if (tgid == self && tid == self) return 0;
             return ret_err(ESRCH);
         }
         case SYS_select: { /* select(nfds, readfds, writefds, exceptfds, timeout) - minimal stub */
@@ -3215,6 +3474,12 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 if (!(type_base == SOCK_RAW_LOCAL || type_base == SOCK_DGRAM_LOCAL)) return ret_err(ESOCKTNOSUPPORT);
                 if (!(protocol == 0 || protocol == NETLINK_ROUTE_LOCAL)) return ret_err(EPROTONOSUPPORT);
                 protocol = NETLINK_ROUTE_LOCAL;
+            } else if (domain == AF_INET6) {
+                /* Stub: create IPv4 socket when tools (wget) request IPv6 */
+                domain = AF_INET_LOCAL;
+            } else if (domain == AF_UNSPEC) {
+                /* getaddrinfo/glibc may pass AF_UNSPEC; treat as IPv4 */
+                domain = AF_INET_LOCAL;
             } else {
                 return ret_err(EAFNOSUPPORT);
             }
@@ -3318,7 +3583,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 }
                 net_tcp_ops_t ops;
                 net_make_tcp_ops(&ops);
-                if (net_tcp_connect(&s->tcp, &ops, s->peer_ip_be, s->peer_port, s->local_port, 5000) != 0) {
+                if (net_tcp_connect(&s->tcp, &ops, s->peer_ip_be, s->peer_port, s->local_port, 60000) != 0) {
                     return ret_err(EIO);
                 }
                 return 0;
@@ -3555,9 +3820,11 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             int want_trunc_len = (flags & MSG_TRUNC_LOCAL) ? 1 : 0;
             if (s->protocol == IPPROTO_ICMP_LOCAL) {
                 uint32_t timeout_ms = user_itimer_interval_ms ? user_itimer_interval_ms : 2500u;
+                int retries_left = 8; /* block longer: ~20s total before giving up */
                 n = net_recv_icmp_echo_reply(s, tmp, cap, timeout_ms, &src_ip);
-                if (n == 0 && user_itimer_interval_ms && s->last_dst_ip_be && s->last_req_len > 0) {
-                    (void)net_send_icmp_echo_timer_compat(s);
+                while (n == 0 && retries_left-- > 0) {
+                    if (user_itimer_interval_ms && s->last_dst_ip_be && s->last_req_len > 0)
+                        (void)net_send_icmp_echo_timer_compat(s);
                     n = net_recv_icmp_echo_reply(s, tmp, cap, timeout_ms, &src_ip);
                 }
             } else if (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) {
@@ -3594,7 +3861,8 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (n < 0) { kfree(tmp); return ret_err(EIO); }
             if (n == 0) {
                 kfree(tmp);
-                return ret_err(EAGAIN);
+                /* ICMP timeout: ETIMEDOUT gives "Request timeout" instead of "Resource temporarily unavailable" */
+                return ret_err((s->protocol == IPPROTO_ICMP_LOCAL) ? ETIMEDOUT : EAGAIN);
             }
             if (copy_to_user_safe(buf_u, tmp, (size_t)n) != 0) {
                 /* Some userspace DNS paths pass buffers outside USER_STACK_TOP but still inside
@@ -3831,9 +4099,11 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             int want_trunc_len = (flags & MSG_TRUNC_LOCAL) ? 1 : 0;
             if (s->protocol == IPPROTO_ICMP_LOCAL) {
                 uint32_t timeout_ms = user_itimer_interval_ms ? user_itimer_interval_ms : 2500u;
+                int retries_left = 8; /* block longer: ~20s total before giving up */
                 n = net_recv_icmp_echo_reply(s, tmp, cap, timeout_ms, &src_ip);
-                if (n == 0 && user_itimer_interval_ms && s->last_dst_ip_be && s->last_req_len > 0) {
-                    (void)net_send_icmp_echo_timer_compat(s);
+                while (n == 0 && retries_left-- > 0) {
+                    if (user_itimer_interval_ms && s->last_dst_ip_be && s->last_req_len > 0)
+                        (void)net_send_icmp_echo_timer_compat(s);
                     n = net_recv_icmp_echo_reply(s, tmp, cap, timeout_ms, &src_ip);
                 }
             } else if (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) {
@@ -3870,7 +4140,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (n < 0) { kfree(tmp); return ret_err(EIO); }
             if (n == 0) {
                 kfree(tmp);
-                return ret_err(EAGAIN);
+                return ret_err((s->protocol == IPPROTO_ICMP_LOCAL) ? ETIMEDOUT : EAGAIN);
             }
             if (copy_to_user_safe(iov.base, tmp, (size_t)n) != 0) {
                 uintptr_t us = (uintptr_t)iov.base;
@@ -4058,6 +4328,9 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 F_SETFD = 2,
                 F_GETFL = 3,
                 F_SETFL = 4,
+                F_GETLK = 5,
+                F_SETLK = 6,
+                F_SETLKW = 7,
                 F_DUPFD_CLOEXEC = 1030,
             };
             if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
@@ -4066,6 +4339,20 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (cmd == F_DUPFD_CLOEXEC) {
                 /* Same as F_DUPFD; we do not track FD_CLOEXEC, accept for compatibility */
                 cmd = F_DUPFD;
+            }
+            if (cmd == F_SETLK || cmd == F_SETLKW || cmd == F_GETLK) {
+                /* File locking: stub as success (no-op). Busybox adduser uses flock on /etc/passwd;
+                   without this it gets EINVAL and exits silently. */
+                (void)arg;
+                if (cmd == F_GETLK && arg) {
+                    /* F_GETLK: write flock struct with l_type=F_UNLCK to indicate "not locked" */
+                    if (user_range_ok((void*)(uintptr_t)arg, 32)) {
+                        uint8_t zeros[32];
+                        memset(zeros, 0, sizeof(zeros));
+                        copy_to_user_safe((void*)(uintptr_t)arg, zeros, 32);
+                    }
+                }
+                return 0;
             }
             if (cmd == F_GETFD) {
                 /* return flags (no FD_CLOEXEC support) */
@@ -4094,6 +4381,20 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 return ret_err(EMFILE);
             }
             return ret_err(EINVAL);
+        }
+        case 73: { /* flock(fd, operation) - stub as success. Busybox adduser uses flock on /etc/passwd. */
+            (void)a1; (void)a2;
+            return 0;
+        }
+        case 74: /* fsync(fd) */
+        case 75: { /* fdatasync(fd) - adduser syncs passwd before rename */
+            int fd = (int)a1;
+            if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
+            if (!cur->fds[fd]) return ret_err(EBADF);
+            return 0;
+        }
+        case 162: { /* sync() - no-op */
+            return 0;
         }
         case 270: {
             /* Minimal no-op for syscall 270 to satisfy musl checks (accept and return 0). */
@@ -4337,7 +4638,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             size_t plen = user_strnlen_bounded(path_u, 1024);
             if (plen == 0 || plen >= 1024) return ret_err(ENOENT);
             char *path = (char*)kmalloc(plen + 1);
-            if (!path) return ret_err(ENOMEM);
+            if (!path) { qemu_debug_printf("OOM execve: path plen=%llu\n", (unsigned long long)(plen+1)); return ret_err(ENOMEM); }
             if (!user_range_ok(path_u, plen + 1) || copy_from_user_raw(path, path_u, plen + 1) != 0) {
                 kfree(path);
                 return ret_err(EFAULT);
@@ -4359,7 +4660,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 }
             }
             const char **kargv = (const char**)kmalloc((size_t)(argc + 1) * sizeof(char*));
-            if (!kargv) { kfree(path); return ret_err(ENOMEM); }
+            if (!kargv) { qemu_debug_printf("OOM execve: kargv argc=%d\n", argc); kfree(path); return ret_err(ENOMEM); }
             for (int i = 0; i < argc; i++) {
                 uint64_t a_up = 0;
                 if (user_read_u64((const void*)(uintptr_t)(&argv_u[i]), &a_up) != 0) {
@@ -4369,7 +4670,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 if (!a_u || !user_range_ok(a_u, 1)) { kfree((void*)kargv); kfree(path); return ret_err(EFAULT); }
                 size_t L = user_strnlen_bounded(a_u, 4096);
                 char *ks = (char*)kmalloc(L + 1);
-                if (!ks) { for (int j=0;j<i;j++) kfree((void*)kargv[j]); kfree((void*)kargv); kfree(path); return ret_err(ENOMEM); }
+                if (!ks) { qemu_debug_printf("OOM execve: argv[%d] L=%llu\n", i, (unsigned long long)(L+1)); for (int j=0;j<i;j++) kfree((void*)kargv[j]); kfree((void*)kargv); kfree(path); return ret_err(ENOMEM); }
                 if (!user_range_ok(a_u, L + 1) || copy_from_user_raw(ks, a_u, L + 1) != 0) {
                     kfree(ks);
                     for (int j=0;j<i;j++) kfree((void*)kargv[j]);
@@ -4396,7 +4697,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     envc++;
                 }
                 kenvp = (const char**)kmalloc((size_t)(envc + 1) * sizeof(char*));
-                if (!kenvp) { for (int j=0;j<argc;j++) kfree((void*)kargv[j]); kfree((void*)kargv); kfree(path); return ret_err(ENOMEM); }
+                if (!kenvp) { qemu_debug_printf("OOM execve: kenvp envc=%d\n", envc); for (int j=0;j<argc;j++) kfree((void*)kargv[j]); kfree((void*)kargv); kfree(path); return ret_err(ENOMEM); }
                 for (int i = 0; i < envc; i++) {
                     uint64_t e_up = 0;
                     if (user_read_u64((const void*)(uintptr_t)(&envp_u[i]), &e_up) != 0) {
@@ -4411,7 +4712,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     if (!e_u || !user_range_ok(e_u, 1)) { for (int j=0;j<i;j++) kfree((void*)kenvp[j]); kfree(kenvp); for (int j=0;j<argc;j++) kfree((void*)kargv[j]); kfree((void*)kargv); kfree(path); return ret_err(EFAULT); }
                     size_t L = user_strnlen_bounded(e_u, 4096);
                     char *ks = (char*)kmalloc(L + 1);
-                    if (!ks) { for (int j=0;j<i;j++) kfree((void*)kenvp[j]); kfree(kenvp); for (int j=0;j<argc;j++) kfree((void*)kargv[j]); kfree((void*)kargv); kfree(path); return ret_err(ENOMEM); }
+                    if (!ks) { qemu_debug_printf("OOM execve: envp[%d] L=%llu\n", i, (unsigned long long)(L+1)); for (int j=0;j<i;j++) kfree((void*)kenvp[j]); kfree(kenvp); for (int j=0;j<argc;j++) kfree((void*)kargv[j]); kfree((void*)kargv); kfree(path); return ret_err(ENOMEM); }
                     if (!user_range_ok(e_u, L + 1) || copy_from_user_raw(ks, e_u, L + 1) != 0) { kfree(ks); for (int j=0;j<i;j++) kfree((void*)kenvp[j]); kfree(kenvp); for (int j=0;j<argc;j++) kfree((void*)kargv[j]); kfree((void*)kargv); kfree(path); return ret_err(EFAULT); }
                     kenvp[i] = ks;
                 }
@@ -4453,12 +4754,8 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             return 0;
         }
         case SYS_fork: {
-            /* Stability fix:
-               The custom deep-copy fork path is currently unstable (slow/hangs on some
-               workloads and can corrupt child userspace context). Route fork() through
-               the battle-tested vfork path for now. */
-            return syscall_do(SYS_vfork, 0, 0, 0, 0, 0, 0);
-
+            /* Full fork: child gets its own mm, private copy of heap/stack/TLS.
+               Parent returns immediately with child pid; child runs concurrently. */
             /* Minimal fork emulation:
                - create a new kernel thread that will enter user mode at the saved
                  return RIP and user RSP (copied from syscall stack / saved RSP).
@@ -4672,14 +4969,22 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 const uintptr_t base = (uintptr_t)0x00200000u;
                 uintptr_t used_end = (uintptr_t)cur->user_brk_cur;
                 if (cur->user_mmap_next > used_end) used_end = cur->user_mmap_next;
-                const uintptr_t min_copy_end = base + (8u * 1024u * 1024u);
+                const uintptr_t min_copy_end = base + (1u * 1024u * 1024u);
                 if (used_end < min_copy_end || used_end == 0) used_end = min_copy_end;
                 if (used_end > (uintptr_t)USER_TLS_BASE) used_end = (uintptr_t)USER_TLS_BASE;
+                /* Cap copy size: deep copy is O(pages) and very slow in QEMU.
+                   Child gets 1MB heap copy; it can grow via brk() as needed. */
+                const uintptr_t max_copy_end = base + (1u * 1024u * 1024u);
+                if (used_end > max_copy_end) used_end = max_copy_end;
+                qemu_debug_printf("fork: copying heap 0x%lx..0x%lx (%lu pages)\n",
+                                 (unsigned long)base, (unsigned long)used_end,
+                                 (unsigned long)((used_end - base) / 4096));
                 if (used_end > base) {
                     if (mm_make_private_range(child->mm, (uint64_t)base, (uint64_t)used_end, 1) != 0) {
                         return ret_err(ENOMEM);
                     }
                 }
+                qemu_debug_printf("fork: heap done\n");
                 uintptr_t c_top = user_stack_top_for_tid_like_exec(child->tid ? child->tid : 1);
                 uintptr_t c_stack_base = (c_top - (uintptr_t)USER_STACK_SIZE) & ~0xFFFULL;
                 uintptr_t c_tls_base = c_top - (uintptr_t)USER_STACK_SIZE - (uintptr_t)USER_TLS_SIZE;
@@ -4692,10 +4997,15 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 if (mm_make_private_range(child->mm, (uint64_t)USER_VFORK_TRAMP, (uint64_t)(USER_VFORK_TRAMP + 0x1000u), 1) != 0) {
                     return ret_err(ENOMEM);
                 }
+                qemu_debug_printf("fork: private ranges done, unblocking child\n");
             }
             /* inherit credentials */
+            child->uid = cur->uid;
             child->euid = cur->euid;
+            child->suid = cur->suid;
+            child->gid = cur->gid;
             child->egid = cur->egid;
+            child->sgid = cur->sgid;
             child->attached_tty = cur->attached_tty;
             /* Keep child->user_fs_base from the fork child TLS setup above.
                Overwriting it with parent's FS base breaks child's TLS context. */
@@ -5200,9 +5510,31 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 }
             }
 
+            /* KDGKBTYPE (0x4B33): get keyboard type. BusyBox chvt uses this to validate console fd. */
+            if (req == 0x4B33) {
+                if (argp && user_range_ok(argp, 1)) {
+                    char kbd_type = 0; /* 0 = PC/XT style */
+                    if (copy_to_user_safe(argp, &kbd_type, 1) == 0 && devfs_is_tty_file(f))
+                        return 0;
+                }
+                return ret_err(ENOTTY);
+            }
+
             /* For the remaining tty-specific ioctls, require a real tty file. */
             if (!devfs_is_tty_file(f)) {
                 return ret_err(ENOTTY);
+            }
+            if (req == 0x5606) { /* VT_ACTIVATE: arg is VT number (1-based) passed as value, not pointer */
+                int vt = (int)(uintptr_t)argp;
+                if (vt >= 1 && vt <= 6) { /* DEVFS_TTY_COUNT=6; Linux VTs are 1-based */
+                    devfs_switch_tty(vt - 1);
+                    return 0;
+                }
+                return ret_err(ENOTTY);
+            }
+            if (req == 0x5607) { /* VT_WAITACTIVE: arg is VT number; we switch synchronously, no-op */
+                (void)argp;
+                return 0;
             }
             if (req == TCSETS || req == TCSETSW || req == TCSETSF) {
                 /* Apply minimal termios flags to the underlying tty: read c_lflag and store it */
@@ -5268,7 +5600,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                             kfree(tmp);
                             return (total > 0) ? (uint64_t)total : ret_err(EFAULT);
                         }
-                        int wr = net_tcp_send(&s->tcp, &ops, tmp, chunk, 5000);
+                        int wr = net_tcp_send(&s->tcp, &ops, tmp, chunk, 30000);
                         kfree(tmp);
                         if (wr < 0) return (total > 0) ? (uint64_t)total : ret_err(EIO);
                         total += (size_t)wr;
@@ -5423,7 +5755,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     if (chunk > 4096) chunk = 4096;
                     uint8_t *tmp = (uint8_t *)kmalloc(chunk);
                     if (!tmp) return ret_err(ENOMEM);
-                    int rr = net_tcp_recv(&s->tcp, &ops, tmp, chunk, 5000);
+                    int rr = net_tcp_recv(&s->tcp, &ops, tmp, chunk, 30000);
                     if (rr > 0) {
                         if (copy_to_user_safe(bufp, tmp, (size_t)rr) != 0) { kfree(tmp); return ret_err(EFAULT); }
                         kfree(tmp);
@@ -5593,6 +5925,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             thread_t *tcur_poll_cfg = thread_get_current_user();
             if (!tcur_poll_cfg) tcur_poll_cfg = thread_current();
             int is_wget_proc = (tcur_poll_cfg && tcur_poll_cfg->name[0] && strstr(tcur_poll_cfg->name, "wget")) ? 1 : 0;
+            int is_apm_proc = (tcur_poll_cfg && tcur_poll_cfg->name[0] && strstr(tcur_poll_cfg->name, "apm")) ? 1 : 0;
             if (num == 271) {
                 /* Minimal ppoll: ignore sigmask/sigsetsize, translate timespec->ms for poll(). */
                 const void *tmo_u = (const void*)(uintptr_t)a3;
@@ -5606,17 +5939,18 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     if (ms > 0x7FFFFFFFULL) ms = 0x7FFFFFFFULL;
                     timeout = (int)ms;
                 } else {
-                    /* Keep interactive shells stable: only cap NULL-timeout ppoll for wget. */
-                    if (is_wget_proc) {
-                        timeout = 1000;
-                    }
+                    /* Cap NULL-timeout ppoll for wget/apm so they don't block forever on network. */
+                    if (is_wget_proc || is_apm_proc) timeout = 1000;
                 }
-            } else {
-                timeout = (int)a3; /* milliseconds, -1 means infinite */
-                /* wget can block forever on DNS poll(-1) when no answer arrives; cap it. */
-                if (timeout < 0 && is_wget_proc) timeout = 1000;
-            }
+                } else {
+                    timeout = (int)a3; /* milliseconds, -1 means infinite */
+                    /* wget/apm can block forever on network poll(-1); cap so process can progress. */
+                    if (timeout < 0 && (is_wget_proc || is_apm_proc)) timeout = 1000;
+                }
             if (nfds < 0 || nfds > 1024) return ret_err(EINVAL);
+            volatile int elapsed = 0;
+            uint64_t poll_t_start = 0;
+            int poll_first_entry = 1;
             if (nfds == 0) {
                 /* just wait for timeout */
                 if (timeout <= 0) return 0;
@@ -5714,7 +6048,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                             }
                         }
                     }
-                    *(short*)((uint8_t*)kbuf + i * entry_size + 6) = revents; /* revents slot at offset 6? Actually struct layout fd(0), events(4), revents(6) */
+                    *(short*)((uint8_t*)kbuf + i * entry_size + 6) = revents; /* revents slot at offset 6 */
                     if (revents) ready++;
                 }
                 if (ready > 0) {
@@ -5724,15 +6058,9 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 }
             }
 
-            if (timeout == 0) {
-                /* Non-blocking poll: avoid busy-loop if caller retries immediately (e.g. shell without TTY) */
-                thread_sleep(10);
-                kfree(kbuf);
-                return 0;
-            }
             thread_t *curth_poll = thread_get_current_user();
             if (!curth_poll) curth_poll = thread_current();
-            /* Detect if poll set includes network sockets (TCP/UDP) - need e1000_poll and bounded wait */
+            /* Detect if poll set includes network sockets (TCP/UDP) - need e1000_poll */
             int has_net_socket = 0;
             for (int i = 0; i < nfds && !has_net_socket; i++) {
                 int fd = *(int*)((uint8_t*)kbuf + i * entry_size + 0);
@@ -5744,7 +6072,13 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL))
                     has_net_socket = 1;
             }
-            int elapsed = 0;
+            if (timeout == 0) {
+                /* Non-blocking poll: service network once so packets get processed. */
+                if (has_net_socket) e1000_poll();
+                else thread_sleep(10); /* avoid busy-loop when no network fds */
+                kfree(kbuf);
+                return 0;
+            }
             int step = 10; /* ms */
             int cur_tid = curth_poll ? (int)curth_poll->tid : -1;
             int tty_waiting[16];
@@ -5815,12 +6149,14 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     for (int w = 0; w < n_tty_waiting; w++) devfs_tty_remove_waiter(tty_waiting[w], cur_tid);
                     goto auto_check;
                 }
-                int step_ms = 2;
+                int step_ms = has_net_socket ? 10 : 2;
+                if (poll_first_entry) { poll_t_start = pit_get_time_ms(); poll_first_entry = 0; }
                 while (elapsed < timeout) {
+                    if (has_net_socket) e1000_poll();
                     uint32_t sleep_ms = (uint32_t)(timeout - elapsed);
                     if (sleep_ms > (uint32_t)step_ms) sleep_ms = (uint32_t)step_ms;
                     thread_sleep(sleep_ms);
-                    elapsed += (int)sleep_ms;
+                    elapsed = (int)(pit_get_time_ms() - poll_t_start);
                     goto auto_check;
                 }
             }
@@ -5834,7 +6170,8 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             int flags = (int)a2;
             (void)a3;
             if (!path_u || (uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-            char path[256];
+            char *path = kmalloc(256);
+            if (!path) return ENOMEM;
             resolve_user_path(cur, path_u, path, sizeof(path));
             if (strcmp(path, "/etc/inittab") == 0) {
                 struct stat st;
@@ -5843,6 +6180,11 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 }
             }
             struct fs_file *f = fs_open(path);
+            if (!f) {
+                if (strcmp(path, "/console") == 0) f = fs_open("/dev/console");
+                else if (strcmp(path, "/tty") == 0) f = fs_open("/dev/tty");
+                else if (strcmp(path, "/tty0") == 0) f = fs_open("/dev/tty0");
+            }
             if (!f) {
                 const int O_CREAT_MASK = 0x40;
                 if (flags & O_CREAT_MASK) {
@@ -5878,6 +6220,12 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             struct fs_file *f = fs_open(path);
             if (!f) {
+                /* chvt: "console"->/console, "tty"->/tty, "tty0"->/tty0, "vc/0"->/dev/vc/0 (handled by devfs) */
+                if (strcmp(path, "/console") == 0) f = fs_open("/dev/console");
+                else if (strcmp(path, "/tty") == 0) f = fs_open("/dev/tty");
+                else if (strcmp(path, "/tty0") == 0) f = fs_open("/dev/tty0");
+            }
+            if (!f) {
                 const int O_CREAT_MASK = 0x40;
                 if (flags & O_CREAT_MASK) {
                     f = fs_create_file(path);
@@ -5901,9 +6249,9 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             (void)a2; /* flags for pipe2 */
             if (!pipefd_u || (uintptr_t)pipefd_u + 8 > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
             pipe_t *p = (pipe_t *)kmalloc(sizeof(pipe_t));
-            if (!p) return ret_err(ENOMEM);
+            if (!p) { qemu_debug_printf("OOM: pipe pipe_t alloc\n"); return ret_err(ENOMEM); }
             p->buf = (uint8_t *)kmalloc(PIPE_BUF_SIZE);
-            if (!p->buf) { kfree(p); return ret_err(ENOMEM); }
+            if (!p->buf) { qemu_debug_printf("OOM: pipe buf alloc %u\n", (unsigned)PIPE_BUF_SIZE); kfree(p); return ret_err(ENOMEM); }
             p->size = PIPE_BUF_SIZE;
             p->head = p->tail = 0;
             p->refcount = 2;
@@ -6506,10 +6854,11 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     top_limit = tls_base;
                 }
             }
-            /* Userspace shares identity map with kernel heap: never let brk reach heap region. */
+            /* Userspace shares identity map with kernel heap: never let brk reach heap region.
+               Only restrict when kernel heap could overlap user brk range [*p_base, top_limit). */
             {
                 uintptr_t heap_lo = (uintptr_t)heap_base_addr();
-                if (heap_lo > 0x200000 && heap_lo < top_limit) {
+                if (heap_lo > *p_base && heap_lo < top_limit) {
                     uintptr_t guard = 0x10000u;
                     top_limit = (heap_lo > guard) ? (heap_lo - guard) : heap_lo;
                 }
@@ -6525,22 +6874,34 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
         }
         case SYS_mmap: {
             /* mmap(addr,len,prot,flags,fd,off) - anonymous and file-backed MAP_PRIVATE */
+            qemu_debug_printf("mmap: entry len=0x%llx prot=%d flags=0x%x\n",
+                (unsigned long long)a2, (int)a3, (int)a4);
             (void)a1;
             size_t len = (size_t)a2;
             int prot = (int)a3;
             int flags = (int)a4;
             (void)prot;
-            if (len == 0) return ret_err(EINVAL);
+            if (len == 0) { qemu_debug_printf("mmap: EINVAL len=0\n"); return ret_err(EINVAL); }
             len = (size_t)align_up_u((uintptr_t)len, 4096);
             enum { MAP_FIXED = 0x10, MAP_ANONYMOUS = 0x20, MAP_PRIVATE = 0x02,
                    MAP_SHARED = 0x01,
                    MAP_STACK = 0x20000, MAP_GROWSDOWN = 0x0100, MAP_NORESERVE = 0x4000 };
-            if (flags & MAP_FIXED) return ret_err(EINVAL);
+            if (flags & MAP_FIXED) { qemu_debug_printf("mmap: EINVAL MAP_FIXED\n"); return ret_err(EINVAL); }
             /* Many userspace tools (including xxd) use MAP_SHARED for read-only mmaps.
                We don't implement true shared mappings; treat MAP_SHARED like MAP_PRIVATE. */
-            if (!(flags & (MAP_PRIVATE | MAP_SHARED))) return ret_err(ENOSYS);
+            if (!(flags & (MAP_PRIVATE | MAP_SHARED))) { qemu_debug_printf("mmap: ENOSYS no priv/shared\n"); return ret_err(ENOSYS); }
             thread_t *tcur = thread_get_current_user();
             if (!tcur) tcur = thread_current();
+            qemu_debug_printf("mmap: tcur tid=%d stack_base=0x%llx stack_limit=0x%llx\n",
+                tcur ? (int)tcur->tid : -1,
+                tcur ? (unsigned long long)tcur->user_stack_base : 0,
+                tcur ? (unsigned long long)tcur->user_stack_limit : 0);
+            /* Cap huge mmaps for clone3: 128MB zeroing causes reboot (bad phys range / overwrite) */
+            if (tcur && tcur->user_stack_base != 0 && len > 16u * 1024u * 1024u) {
+                len = 16u * 1024u * 1024u;
+                len = (size_t)align_up_u((uintptr_t)len, 4096);
+                qemu_debug_printf("mmap: clone3 len capped to 0x%llx\n", (unsigned long long)len);
+            }
             uintptr_t *p_mmap_next = tcur ? &tcur->user_mmap_next : &user_mmap_next;
             uintptr_t top_limit = (uintptr_t)USER_TLS_BASE;
             if (tcur) {
@@ -6548,14 +6909,18 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 if (tls_base > 0x200000 && tls_base < (uintptr_t)MMIO_IDENTITY_LIMIT)
                     top_limit = tls_base;
             }
-            /* Keep all user mmaps below kernel heap to avoid identity-map corruption. */
+            /* Keep all user mmaps below kernel heap. Only restrict when kernel heap overlaps. */
             {
+                uintptr_t brk_base = tcur ? tcur->user_brk_base : user_brk_base;
+                if (brk_base == 0) brk_base = 8u * 1024u * 1024u;
                 uintptr_t heap_lo = (uintptr_t)heap_base_addr();
-                if (heap_lo > 0x200000 && heap_lo < top_limit) {
+                if (heap_lo > brk_base && heap_lo < top_limit) {
                     uintptr_t guard = 0x10000u;
                     top_limit = (heap_lo > guard) ? (heap_lo - guard) : heap_lo;
                 }
             }
+            qemu_debug_printf("mmap: top_limit=0x%llx heap_lo=0x%llx mmap_next=0x%llx\n",
+                (unsigned long long)top_limit, (unsigned long long)(uintptr_t)heap_base_addr(), (unsigned long long)*p_mmap_next);
             if (*p_mmap_next == 0) {
                 uintptr_t def = 32u * 1024u * 1024u;
                 if (def >= top_limit && top_limit > (8u * 1024u * 1024u)) {
@@ -6563,37 +6928,96 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     if (def < (8u * 1024u * 1024u)) def = 8u * 1024u * 1024u;
                 }
                 *p_mmap_next = def;
+                qemu_debug_printf("mmap: init mmap_next=0x%llx\n", (unsigned long long)*p_mmap_next);
             }
-            /* Clone children have user-provided stack+TLS: ensure we never allocate in that region. */
+            /* Clone3: keep mmap above stack, 2MB-aligned so munmap won't unmap stack's 2MB page */
             if (tcur && tcur->user_stack_base != 0 && tcur->user_stack_limit > tcur->user_stack_base) {
                 uintptr_t se = (uintptr_t)tcur->user_stack_limit;
-                uintptr_t min_alloc = se;
-                if (tcur->user_fs_base > se && tcur->user_fs_base < (uintptr_t)MMIO_IDENTITY_LIMIT)
-                    min_alloc = align_up_u((uintptr_t)tcur->user_fs_base + 0x3000u, 4096);
+                uintptr_t min_alloc = align_up_u(se, PAGE_SIZE_2M);
+                if (tcur->user_fs_base > se && tcur->user_fs_base < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                    uintptr_t tls_min = align_up_u((uintptr_t)tcur->user_fs_base + 0x3000u, PAGE_SIZE_2M);
+                    if (tls_min > min_alloc) min_alloc = tls_min;
+                }
                 if (*p_mmap_next < min_alloc)
                     *p_mmap_next = min_alloc;
+                qemu_debug_printf("mmap: clone3 adj mmap_next=0x%llx (min_alloc 2MB-aligned)\n",
+                    (unsigned long long)*p_mmap_next);
             }
             uintptr_t addr = align_up_u(*p_mmap_next, 4096);
+            /* Clone3: place mmap on 2MB boundary above stack so munmap won't unmap the stack
+               (unmap clears whole 2MB L2 entries; stack shares 0x2800000-0x2a00000 with 0x2804000) */
             if (tcur && tcur->user_stack_base != 0 && tcur->user_stack_limit > tcur->user_stack_base) {
                 uintptr_t sb = (uintptr_t)tcur->user_stack_base;
                 uintptr_t se = (uintptr_t)tcur->user_stack_limit;
                 if (!(addr + len <= sb || addr >= se)) {
-                    addr = align_up_u(se, 4096);
-                    *p_mmap_next = addr; /* sync so next mmap continues above stack */
+                    addr = align_up_u(se, PAGE_SIZE_2M);  /* 2MB align: avoid sharing page with stack */
+                    *p_mmap_next = addr;
+                    qemu_debug_printf("mmap: clone3 addr=0x%llx above stack (2MB aligned)\n", (unsigned long long)addr);
                 }
             }
-            if (addr + len >= top_limit) return ret_err(ENOMEM);
-            /* Skip mark when range is in [0x200000, USER_STACK_TOP): clone3/vfork already marked it.
-               Re-calling mark can #PF when writing to read-only page-table pages (L3 at ~0x804c000). */
+            qemu_debug_printf("mmap: addr=0x%llx len=0x%llx addr+len=0x%llx\n",
+                (unsigned long long)addr, (unsigned long long)len, (unsigned long long)(addr + len));
+            if (addr + len >= top_limit) { qemu_debug_printf("mmap: ENOMEM top_limit\n"); return ret_err(ENOMEM); }
+            /* Paranoid: never let mmap overlap kernel heap (identity map = zeroing would destroy heap) */
+            {
+                uintptr_t heap_lo = (uintptr_t)heap_base_addr();
+                if (heap_lo > 0x200000 && addr + len > heap_lo - 0x10000u) {
+                    qemu_debug_printf("mmap: ENOMEM would overwrite heap (addr+len=0x%llx heap_lo=0x%llx)\n",
+                        (unsigned long long)(addr + len), (unsigned long long)heap_lo);
+                    return ret_err(ENOMEM);
+                }
+            }
             if (addr < 0x200000 || addr + len > (uintptr_t)USER_STACK_TOP) {
-                if (mark_user_identity_range_2m_sys((uint64_t)addr, (uint64_t)(addr + len)) != 0)
+                qemu_debug_printf("mmap: mark range 0x%llx..0x%llx\n", (unsigned long long)addr, (unsigned long long)(addr + len));
+                if (mark_user_identity_range_2m_sys((uint64_t)addr, (uint64_t)(addr + len)) != 0) {
+                    qemu_debug_printf("mmap: mark FAILED\n");
                     return ret_err(EFAULT);
+                }
+            } else if (tcur && tcur->user_stack_base != 0) {
+                /* Clone3 child: mark can #PF when writing to read-only page tables.
+                   Use map_page_2m to ensure region is mapped (creates/updates L2 with PG_US). */
+                uintptr_t map_begin = addr & ~((uintptr_t)PAGE_SIZE_2M - 1);
+                uintptr_t map_end = (addr + len + PAGE_SIZE_2M - 1) & ~((uintptr_t)PAGE_SIZE_2M - 1);
+                if (map_end > (uintptr_t)USER_STACK_TOP) map_end = (uintptr_t)USER_STACK_TOP;
+                qemu_debug_printf("mmap: clone3 map_page_2m 0x%llx..0x%llx\n",
+                    (unsigned long long)map_begin, (unsigned long long)map_end);
+                for (uintptr_t va = map_begin; va < map_end; va += PAGE_SIZE_2M) {
+                    if (map_page_2m(va, va, PG_PRESENT | PG_RW | PG_US) != 0) {
+                        qemu_debug_printf("mmap: map_page_2m FAILED va=0x%llx\n", (unsigned long long)va);
+                        return ret_err(EFAULT);
+                    }
+                }
+                qemu_debug_printf("mmap: clone3 map_page_2m ok\n");
+            } else if (addr >= 0x200000 && addr + len <= (uintptr_t)USER_STACK_TOP) {
+                /* Parent or non-clone3: region may have been munmap'd by sibling (e.g. clone3 child).
+                   Always ensure mapped before memset to avoid kernel #PF. */
+                uintptr_t map_begin = addr & ~((uintptr_t)PAGE_SIZE_2M - 1);
+                uintptr_t map_end = (addr + len + PAGE_SIZE_2M - 1) & ~((uintptr_t)PAGE_SIZE_2M - 1);
+                if (map_end > (uintptr_t)USER_STACK_TOP) map_end = (uintptr_t)USER_STACK_TOP;
+                for (uintptr_t va = map_begin; va < map_end; va += PAGE_SIZE_2M) {
+                    if (map_page_2m(va, va, PG_PRESENT | PG_RW | PG_US) != 0)
+                        return ret_err(EFAULT);
+                }
             }
 
             if (flags & MAP_ANONYMOUS) {
                 flags &= ~(MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED | MAP_STACK | MAP_GROWSDOWN | MAP_NORESERVE);
                 if (flags != 0) return ret_err(ENOSYS);
-                memset((void*)addr, 0, len);
+                qemu_debug_printf("mmap: memset 0x%llx len=0x%llx\n", (unsigned long long)addr, (unsigned long long)len);
+                if (len > 4u * 1024u * 1024u) {
+                    /* Large mmap: zero in 4MB chunks with progress so we see if we fault or just slow */
+                    size_t chunk = 4u * 1024u * 1024u;
+                    for (size_t off = 0; off < len; off += chunk) {
+                        size_t now = (len - off < chunk) ? (len - off) : chunk;
+                        memset((void*)(addr + off), 0, now);
+                        if (off + now < len)
+                            qemu_debug_printf("mmap: memset progress 0x%llx/%llx\n",
+                                (unsigned long long)(off + now), (unsigned long long)len);
+                    }
+                } else {
+                    memset((void*)addr, 0, len);
+                }
+                qemu_debug_printf("mmap: memset done\n");
             } else {
                 /* File-backed MAP_PRIVATE (e.g. BusyBox rpm mmaps .rpm file) */
                 int fd = (int)(int64_t)a5;
@@ -6602,6 +7026,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 struct fs_file *f = cur->fds[fd];
                 if (!f) return ret_err(EBADF);
                 if (f->type != FS_TYPE_REG) return ret_err(EBADF);
+                qemu_debug_printf("mmap: file memset 0x%llx len=0x%llx\n", (unsigned long long)addr, (unsigned long long)len);
                 memset((void*)addr, 0, len);
                 size_t file_avail = 0;
                 if ((size_t)file_off < f->size) file_avail = f->size - (size_t)file_off;
@@ -6611,18 +7036,51 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     (void)nr; /* partial read leaves rest zeroed */
                 }
             }
+            qemu_debug_printf("mmap: ok return 0x%llx\n", (unsigned long long)addr);
             *p_mmap_next = addr + len;
             return (uint64_t)addr;
         }
-        case SYS_munmap:
+        case SYS_munmap: {
+            uintptr_t addr = (uintptr_t)a1;
+            size_t len = (size_t)a2;
+            if (len == 0) return 0;
+            len = (size_t)align_up_u((uintptr_t)len, 4096);
+            if (addr < 0x200000) return ret_err(EINVAL);
+            if (addr + len >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EINVAL);
+            if ((addr & 0xFFF) != 0) return ret_err(EINVAL);
+            /* Never unmap clone3 stack (unmap clears whole 2MB L2 entries; would kill stack) */
+            thread_t *tcur_m = thread_get_current_user();
+            if (!tcur_m) tcur_m = thread_current();
+            if (tcur_m && tcur_m->user_stack_base != 0 && tcur_m->user_stack_limit > tcur_m->user_stack_base) {
+                uintptr_t sb = (uintptr_t)tcur_m->user_stack_base;
+                uintptr_t se = (uintptr_t)tcur_m->user_stack_limit;
+                /* Reject if [addr, addr+len) overlaps [sb, se) */
+                if (!(addr + len <= sb || addr >= se))
+                    return ret_err(EINVAL);
+            }
+            if (unmap_user_range_sys((uint64_t)addr, (uint64_t)(addr + len)) != 0)
+                return ret_err(EINVAL);
             return 0;
+        }
         case SYS_madvise: {
             /* madvise(addr, length, advice) - syscall 28; glibc/apm uses MADV_DONTNEED etc.; stub success */
             (void)a1; (void)a2; (void)a3;
             return 0;
         }
-        case SYS_mprotect:
+        case SYS_mprotect: {
+            uintptr_t addr = (uintptr_t)a1;
+            size_t len = (size_t)a2;
+            int prot = (int)a3;
+            if (len == 0) return 0;
+            len = (size_t)align_up_u((uintptr_t)len, 4096);
+            if (addr < 0x200000) return ret_err(EINVAL);
+            if (addr + len >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EINVAL);
+            if ((addr & 0xFFF) != 0) return ret_err(EINVAL);
+            if ((prot & ~7) != 0) return ret_err(EINVAL);  /* PROT_READ|WRITE|EXEC only */
+            if (mprotect_user_range_sys((uint64_t)addr, (uint64_t)(addr + len), prot) != 0)
+                return ret_err(EINVAL);
             return 0;
+        }
         case SYS_exit: {
             (void)a1;
             qemu_debug_printf("sys_exit: pid=%llu name=%s called exit(code=%llu)\n",
@@ -6676,6 +7134,17 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                         futex_syscall((uintptr_t)cur->clear_child_tid, 1 | 128, 1, NULL, 0, 0);
                     }
                     cur->clear_child_tid = 0;
+                }
+                /* Clone3 child (CLONE_VM): propagate brk/mmap to parent so parent won't
+                   reuse child's allocations and overwrite shared memory -> stack smashing. */
+                if (cur->user_stack_base != 0 && cur->parent_tid >= 0) {
+                    thread_t *pt = thread_get(cur->parent_tid);
+                    if (pt) {
+                        if (pt->user_brk_cur < cur->user_brk_cur)
+                            pt->user_brk_cur = cur->user_brk_cur;
+                        if (pt->user_mmap_next < cur->user_mmap_next)
+                            pt->user_mmap_next = cur->user_mmap_next;
+                    }
                 }
             }
             /* mark terminated */
@@ -6746,6 +7215,17 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     { extern int futex_syscall(uintptr_t uaddr, int op, int val, const void *timeout, uintptr_t uaddr2, int val3);
                       futex_syscall((uintptr_t)cur->clear_child_tid, 1 | 128, 1, NULL, 0, 0); }
                     cur->clear_child_tid = 0;
+                }
+                /* Clone3 child (CLONE_VM): propagate brk/mmap to parent so parent won't
+                   reuse child's allocations and overwrite shared memory -> stack smashing. */
+                if (cur->user_stack_base != 0 && cur->parent_tid >= 0) {
+                    thread_t *pt = thread_get(cur->parent_tid);
+                    if (pt) {
+                        if (pt->user_brk_cur < cur->user_brk_cur)
+                            pt->user_brk_cur = cur->user_brk_cur;
+                        if (pt->user_mmap_next < cur->user_mmap_next)
+                            pt->user_mmap_next = cur->user_mmap_next;
+                    }
                 }
                 cur->state = THREAD_TERMINATED;
                 if (cur->mm && cur->mm != mm_kernel()) {

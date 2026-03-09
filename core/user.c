@@ -30,7 +30,10 @@ static char* strdup_k(const char *s) {
     if (!s) return NULL;
     size_t n = strlen(s);
     char *p = (char*)kmalloc(n+1);
-    if (!p) return NULL;
+    if (!p) {
+        kprintf("user OOM: strdup_k(%llu) failed (user_add/user_groups)\n", (unsigned long long)(n+1));
+        return NULL;
+    }
     memcpy(p, s, n+1);
     return p;
 }
@@ -48,9 +51,79 @@ int user_add(const char *name, uid_t uid, gid_t gid, const char *groups) {
     return 0;
 }
 
+/* Parse one passwd line "name:x:uid:gid:gecos:home:shell", extract name,uid,gid. Returns 0 on success. */
+static int parse_passwd_line(const char *line, char *out_name, size_t name_sz, uid_t *out_uid, gid_t *out_gid) {
+    if (!line || !out_name || name_sz == 0 || !out_uid || !out_gid) return -1;
+    const char *p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (!*p) return -1;
+    const char *name_start = p;
+    while (*p && *p != ':') p++;
+    size_t nlen = (size_t)(p - name_start);
+    if (nlen >= name_sz || nlen == 0) return -1;
+    memcpy(out_name, name_start, nlen);
+    out_name[nlen] = '\0';
+    if (*p != ':') return -1;
+    p++;
+    while (*p && *p != ':') p++; /* skip password field */
+    if (*p != ':') return -1;
+    p++;
+    unsigned int uid = 0;
+    while (*p >= '0' && *p <= '9') { uid = uid * 10u + (unsigned int)(*p - '0'); p++; }
+    if (*p != ':') return -1;
+    p++;
+    unsigned int gid = 0;
+    while (*p >= '0' && *p <= '9') { gid = gid * 10u + (unsigned int)(*p - '0'); p++; }
+    *out_uid = (uid_t)uid;
+    *out_gid = (gid_t)gid;
+    return 0;
+}
+
 struct user* user_find(const char *name) {
     if (!name) return NULL;
     for (int i=0;i<g_user_count;i++) if (strcmp(g_users[i].name, name)==0) return &g_users[i];
+
+    /* Fallback: sync from /etc/passwd. adduser writes there; keep g_users in sync. */
+    struct fs_file *f = fs_open("/etc/passwd");
+    if (f && f->size > 0 && f->size < (64u * 1024u)) {
+        char *buf = (char*)kmalloc((size_t)f->size + 1);
+        if (buf) {
+            ssize_t r = fs_read(f, buf, (size_t)f->size, 0);
+            if (r > 0) {
+                buf[(size_t)r] = '\0';
+                char *p = buf;
+                while (*p) {
+                    char *line = p;
+                    char *nl = strchr(p, '\n');
+                    if (nl) { *nl = '\0'; p = nl + 1; } else { p += strlen(p); }
+                    if (line[0] == '\0' || line[0] == '#') continue;
+                    char pname[32];
+                    uid_t puid; gid_t pgid;
+                    if (parse_passwd_line(line, pname, sizeof(pname), &puid, &pgid) == 0) {
+                        int found = 0;
+                        for (int i = 0; i < g_user_count; i++)
+                            if (strcmp(g_users[i].name, pname) == 0) { found = 1; break; }
+                        if (!found && g_user_count < MAX_USERS) {
+                            if (user_add(pname, puid, pgid, pname) == 0) {
+                                if (strcmp(pname, name) == 0) {
+                                    kfree(buf);
+                                    fs_file_free(f);
+                                    return &g_users[g_user_count - 1];
+                                }
+                            }
+                        } else if (strcmp(pname, name) == 0) {
+                            kfree(buf);
+                            fs_file_free(f);
+                            return user_find(name);
+                        }
+                    }
+                }
+            }
+            kfree(buf);
+        }
+        fs_file_free(f);
+    } else if (f) fs_file_free(f);
+
     return NULL;
 }
 
@@ -62,7 +135,10 @@ int user_set_password(const char *name, const char *password) {
     char buf[32];
     int n = snprintf(buf, sizeof(buf), "%lu", h);
     u->passwd_hash = (char*)kmalloc((size_t)n + 1);
-    if (!u->passwd_hash) return -1;
+    if (!u->passwd_hash) {
+        kprintf("user OOM: user_set_password kmalloc(%llu) failed for %s\n", (unsigned long long)((size_t)n+1), name);
+        return -1;
+    }
     memcpy(u->passwd_hash, buf, (size_t)n + 1);
     return 0;
 }
@@ -100,7 +176,10 @@ int user_export_passwd(char **out, size_t *out_len) {
     /* estimate size */
     size_t cap = (size_t)g_user_count * 64 + 16;
     char *buf = (char*)kmalloc(cap);
-    if (!buf) return -1;
+    if (!buf) {
+        kprintf("user OOM: user_export_passwd kmalloc(%llu) failed\n", (unsigned long long)cap);
+        return -1;
+    }
     size_t pos = 0;
     for (int i=0;i<g_user_count;i++) {
         struct user *u = &g_users[i];
@@ -115,6 +194,8 @@ int user_export_passwd(char **out, size_t *out_len) {
             /* allocate temporary buffer for /home/<name> */
             size_t hlen = strlen(u->name) + 7;
             htmp = (char*)kmalloc(hlen);
+            if (!htmp)
+                kprintf("user OOM: user_export_passwd /home/<name> kmalloc(%llu) failed\n", (unsigned long long)hlen);
             if (htmp) {
                 snprintf(htmp, hlen, "/home/%s", u->name);
                 home = htmp;

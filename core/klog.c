@@ -5,6 +5,7 @@
 */
 
 #include <klog.h>
+#include <debug.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <heap.h>
@@ -143,7 +144,13 @@ void klogprintf(const char *fmt, ...) {
         }
         fs_file_free(f);
     }
-    //qemu_debug_printf(full);
+    /* Mirror to serial (QEMU -serial stdio) for debugging when VGA is not visible */
+#ifdef QEMU_LOG_ENABLE
+    if (full)
+        qemu_debug_printf("%s", full);
+    else
+        qemu_debug_printf("%s", buf);
+#endif
     if (full) kfree(full);
     kfree(buf);
     release(&klog_lock);

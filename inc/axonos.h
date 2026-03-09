@@ -11,5 +11,11 @@ extern uint64_t syscall_kernel_rsp0;
 extern uint64_t syscall_user_return_rip;
 void syscall_set_user_brk(uintptr_t base);
 
+/* Try to handle user page fault by growing heap. Returns 1 if fault was handled. */
+int fault_try_grow_user_heap(uint64_t cr2);
+
 /* Populate default sysfs tree and /etc (called from SYS_mount when userspace mounts sysfs). */
 void kernel_sysfs_populate_default(void);
+
+/* Re-create /etc/resolv.conf and /etc/hosts from current net config. */
+void syscall_net_ensure_resolv(void);

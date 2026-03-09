@@ -20,4 +20,8 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
 /* Fixed user-space trampoline for safe vfork child entry (must be in low identity map). */
 #define USER_VFORK_TRAMP ((uintptr_t)0x00201000ULL) /* 2MiB + 4KiB */
 
+/* Ensure user mappings (PG_US) for low memory and GOT region before entering user mode.
+   Must be called from user_thread_entry for init path (elf exec path may skip it). */
+void exec_ensure_user_mappings(void);
+
 

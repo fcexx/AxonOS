@@ -419,11 +419,31 @@ static int mark_user_identity_range_2m(uint64_t va_begin, uint64_t va_end) {
 
 /* Temporary broad user-mark helper used during execve to avoid missing mappings.
    This is a defensive measure: mark a large low address range user-accessible/writable
-   to avoid spurious PFs during early userspace bootstrap. */
+   to avoid spurious PFs during early userspace bootstrap (e.g. GOT at ~0x634000).
+   After mm_make_private_range (COW), some L2 entries may be missing; fall back to
+   map_page_2m to create mappings. */
 static void mark_broad_user_ranges_for_exec(void) {
-    uintptr_t begin = 0x200000; /* 2MiB */
-    uintptr_t end = USER_STACK_TOP;
-    (void)mark_user_identity_range_2m((uint64_t)begin, (uint64_t)end);
+    uintptr_t begin = 0x200000; /* 2MiB, below kernel */
+    uintptr_t end = (uintptr_t)USER_STACK_TOP;
+    if (end > (uintptr_t)MMIO_IDENTITY_LIMIT) end = (uintptr_t)MMIO_IDENTITY_LIMIT;
+    if (mark_user_identity_range_2m((uint64_t)begin, (uint64_t)end) != 0) {
+        /* L2/L3 may be sparse after COW; create missing mappings with map_page_2m. */
+        for (uintptr_t va = begin; va < end; va += (uintptr_t)PAGE_SIZE_2M) {
+            if (map_page_2m((uint64_t)va, (uint64_t)va, PG_PRESENT | PG_RW | PG_US) != 0)
+                break; /* stop on first failure to avoid excessive allocs */
+        }
+    }
+    /* Explicitly mark GOT/data region 0x600000..0x700000; static busybox GOT ~0x634098 */
+    if (mark_user_range_exec(0x600000, 0x700000) != 0) {
+        (void)map_page_2m(0x600000, 0x600000, PG_PRESENT | PG_RW | PG_US);
+        (void)map_page_2m(0x602000, 0x602000, PG_PRESENT | PG_RW | PG_US);
+    }
+}
+
+void exec_ensure_user_mappings(void) {
+    mark_broad_user_ranges_for_exec();
+    (void)mark_user_identity_range_2m(0, ELF_ET_DYN_BASE);
+    (void)map_page_2m(0x634000, 0x634000, PG_US | PG_RW);
 }
 
 int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk_end) {
@@ -545,6 +565,13 @@ int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk
         }
         if (ph->p_memsz > ph->p_filesz) {
             memset((char*)dst + ph->p_filesz, 0, (size_t)(ph->p_memsz - ph->p_filesz));
+        }
+        /* Round vend up to 2MB boundary to cover GOT at segment tail */
+        {
+            uint64_t vend_rounded = (vend + PAGE_SIZE_2M - 1) & ~(PAGE_SIZE_2M - 1);
+            if (vend_rounded > vend && vend_rounded <= USER_IMAGE_LIMIT) {
+                vend = vend_rounded;
+            }
         }
         if (mark_user_range_exec(vstart, vend) != 0) {
             kfree(phdrs);
@@ -1001,8 +1028,12 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         }
         /* inherit basic POSIX-ish attributes and stdio from caller (usually tid0 osh) */
         if (caller) {
+            ut->uid = caller->uid;
             ut->euid = caller->euid;
+            ut->suid = caller->suid;
+            ut->gid = caller->gid;
             ut->egid = caller->egid;
+            ut->sgid = caller->sgid;
             ut->umask = caller->umask;
             ut->attached_tty = caller->attached_tty;
             strncpy(ut->cwd, caller->cwd[0] ? caller->cwd : "/", sizeof(ut->cwd));
@@ -1123,6 +1154,10 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     mark_broad_user_ranges_for_exec();
     /* Mark 0..ELF_ET_DYN_BASE (0..4MiB) as user-accessible for diagnostic */
     (void)mark_user_identity_range_2m(0, ELF_ET_DYN_BASE);
+
+    /* Force 2MiB mapping for GOT region (CR2=0x634098): ensure present+user+rw.
+       Bootstrap may have correct mapping, but something could have split/corrupted it. */
+    (void)map_page_2m(0x634000, 0x634000, PG_US | PG_RW);
 
     /* Transfer to user mode (does not return on success). */
     enter_user_mode(entry, final_stack);

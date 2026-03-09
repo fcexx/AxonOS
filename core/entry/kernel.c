@@ -241,22 +241,28 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         if (heap_start < HEAP_MIN_START) heap_start = HEAP_MIN_START;
         /* Heap size must not exceed installed RAM. The heap implementation is a
            simple identity-mapped arena; if we size it past RAM we will scribble
-           into non-existent memory and get "random" initfs extraction failures
-           that change with kernel size/timing. */
-        size_t heap_size = 0; /* 0 => heap.c default, but we'll clamp below */
+           into non-existent memory and get "random" initfs extraction failures. */
+        size_t heap_size = 0;
         int ram_mb = sysinfo_ram_mb();
         if (ram_mb > 0) {
             uint64_t ram_bytes = (uint64_t)ram_mb * 1024ULL * 1024ULL;
             uint64_t start = (uint64_t)heap_start;
-            const uint64_t guard = 16ULL * 1024ULL * 1024ULL; /* leave some slack */
-            if (ram_bytes > start + guard + (32ULL * 1024ULL * 1024ULL)) {
+            const uint64_t guard = 8ULL * 1024ULL * 1024ULL;
+            if (ram_bytes > start + guard + (16ULL * 1024ULL * 1024ULL)) {
                 uint64_t max = ram_bytes - start - guard;
-                /* keep heap reasonably bounded even on big-RAM machines */
                 const uint64_t cap = 512ULL * 1024ULL * 1024ULL;
                 if (max > cap) max = cap;
                 heap_size = (size_t)max;
             }
         }
+        if (heap_size == 0 && ram_mb > 0) {
+            uint64_t ram_bytes = (uint64_t)ram_mb * 1024ULL * 1024ULL;
+            uint64_t start = (uint64_t)heap_start;
+            if (ram_bytes > start + (4ULL * 1024ULL * 1024ULL))
+                heap_size = (size_t)(ram_bytes - start - (4ULL * 1024ULL * 1024ULL));
+        }
+        if (heap_size == 0)
+            heap_size = 64ULL * 1024ULL * 1024ULL; /* safe default when RAM unknown */
         heap_init(heap_start, heap_size);
         kprintf("Kernel starting... heap_start: %p heap_size=%llu heap_total=%llu heap_base=%p ram_mb=%d kernel_end: %p mods_end: %p\n",
                 (void*)heap_start,
@@ -426,6 +432,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         klogprintf("devfs: registering devfs\n");
         if (devfs_mount("/dev") == 0) {
             klogprintf("devfs: mounted at /dev\n");
+            /* /console -> /dev/console for chvt and tools that open "console" */
+            (void)ramfs_symlink("/console", "/dev/console");
             scsi_init();
             ata_dma_init();
             (void)pvscsi_init();
@@ -478,7 +486,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         fs_write(pf, root_passwd_line, root_passwd_len, 0);
         fs_file_free(pf);
     }
-    static const char root_group_line[] = "root:x:0:\n";
+    static const char root_group_line[] = "root:x:0:\nusers:x:100:\n";
     const size_t root_group_len = sizeof(root_group_line) - 1;
     struct fs_file *gf = fs_create_file("/etc/group");
     if (!gf) gf = fs_open("/etc/group");
@@ -496,16 +504,30 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             fs_file_free(sf);
         }
     }
+    /* adduser/addgroup may readlink /etc/gshadow; create minimal file. */
+    {
+        static const char root_gshadow[] = "root::\nusers::\n";
+        struct fs_file *gsf = fs_create_file("/etc/gshadow");
+        if (!gsf) gsf = fs_open("/etc/gshadow");
+        if (gsf) {
+            fs_write(gsf, root_gshadow, sizeof(root_gshadow) - 1, 0);
+            fs_file_free(gsf);
+        }
+    }
     (void)ramfs_mkdir("/var");
     (void)ramfs_mkdir("/var/run");
+    (void)ramfs_mkdir("/tmp");  /* passwd uses mkstemp in /tmp for shadow update */
+    syscall_net_ensure_resolv();
     /* Programs (mount, sh) open /etc/localtime; create so open doesn't fail. */
     {
         struct fs_file *lt = fs_create_file("/etc/localtime");
         if (lt) fs_file_free(lt);
     }
-    /* Remove backup/clone files that some tools create (e.g. passwd+, group+); avoid duplicate entries in ls. */
+    /* Remove backup/clone/lock files that passwd/adduser create; avoid stale locks. */
     (void)ramfs_remove("/etc/passwd+");
     (void)ramfs_remove("/etc/group+");
+    (void)ramfs_remove("/etc/shadow+");
+    (void)ramfs_remove("/etc/shadow.lock");
 
     /* Compatibility: many distros' adduser scripts call /sbin/addgroup explicitly,
        while initfs may only provide /usr/sbin/addgroup. Create a tiny wrapper if needed. */

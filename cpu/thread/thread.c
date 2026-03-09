@@ -10,8 +10,10 @@
 #include <devfs.h>
 #include <gdt.h>
 #include <mm.h>
+#include <paging.h>
+#include <exec.h>
 
-#define MAX_THREADS 32
+#define MAX_THREADS 128
 thread_t* threads[MAX_THREADS];
 int thread_count = 0;
 static thread_t* current = NULL;
@@ -80,8 +82,8 @@ void thread_init() {
         thread_count = 1;
         strncpy(main_thread.name, "idle", sizeof(main_thread.name));
         /* default credentials: root */
-        main_thread.euid = 0;
-        main_thread.egid = 0;
+        main_thread.uid = main_thread.euid = main_thread.suid = 0;
+        main_thread.gid = main_thread.egid = main_thread.sgid = 0;
         main_thread.attached_tty = devfs_get_active();
         strncpy(main_thread.cwd, "/", sizeof(main_thread.cwd));
         main_thread.cwd[sizeof(main_thread.cwd) - 1] = '\0';
@@ -139,9 +141,11 @@ static void thread_trampoline(void) {
 static thread_t* thread_create_with_state(void (*entry)(void), const char* name, thread_state_t st) {
         if (thread_count >= MAX_THREADS) return NULL;
         thread_t* t = (thread_t*)kmalloc(sizeof(thread_t));
-        if (!t) return NULL;
+        if (!t) { kprintf("OOM thread: kmalloc(thread_t) failed\n"); return NULL; }
         memset(t, 0, sizeof(thread_t));
-        t->kernel_stack = (uint64_t)kmalloc(KERNEL_STACK_SIZE + 16) + KERNEL_STACK_SIZE;
+        void *stack_mem = kmalloc(KERNEL_STACK_SIZE + 16);
+        if (!stack_mem) { kprintf("OOM thread: kmalloc(stack %u) failed\n", (unsigned)(KERNEL_STACK_SIZE+16)); kfree(t); return NULL; }
+        t->kernel_stack = (uint64_t)stack_mem + KERNEL_STACK_SIZE;
         uint64_t* stack = (uint64_t*)t->kernel_stack;
         // Ensure 16-byte alignment for the stack pointer before ret
         uint64_t sp = ((uint64_t)&stack[-1]) & ~0xFULL;
@@ -153,8 +157,8 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->sleep_until = 0;
         strncpy(t->name, name, sizeof(t->name));
         /* default credentials (root) */
-        t->euid = 0;
-        t->egid = 0;
+        t->uid = t->euid = t->suid = 0;
+        t->gid = t->egid = t->sgid = 0;
         t->attached_tty = -1;
         t->vfork_parent_tid = -1;
         t->vfork_parent_saved_rsp = 0;
@@ -222,7 +226,7 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
                 return NULL;
         }
         thread_t* t = (thread_t*)kmalloc(sizeof(thread_t));
-        if (!t) return NULL;
+        if (!t) { kprintf("OOM thread_register_user: kmalloc(thread_t) failed\n"); return NULL; }
         memset(t, 0, sizeof(thread_t));
         //for (int i=0;i<THREAD_MAX_FD;i++) t->fds[i]=NULL;
         t->ring = 3;
@@ -237,8 +241,12 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         t->sid = (int)t->tid;
         /* inherit credentials, file descriptors and attached tty from current thread if available */
         if (current) {
+                t->uid = current->uid;
                 t->euid = current->euid;
+                t->suid = current->suid;
+                t->gid = current->gid;
                 t->egid = current->egid;
+                t->sgid = current->sgid;
                 t->umask = current->umask;
                 /* copy fd table and bump refcount so close in parent doesn't free shared files (e.g. pipe) */
                 for (int i = 0; i < THREAD_MAX_FD; i++) {
@@ -251,7 +259,11 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
                 t->attached_tty = current->attached_tty >= 0 ? current->attached_tty : devfs_get_active();
                 strncpy(t->cwd, current->cwd[0] ? current->cwd : "/", sizeof(t->cwd));
                 t->cwd[sizeof(t->cwd) - 1] = '\0';
-        } else { t->euid = 0; t->egid = 0; t->attached_tty = devfs_get_active(); }
+        } else {
+                t->uid = t->euid = t->suid = 0;
+                t->gid = t->egid = t->sgid = 0;
+                t->attached_tty = devfs_get_active();
+        }
         if (!t->cwd[0]) { strncpy(t->cwd, "/", sizeof(t->cwd)); t->cwd[sizeof(t->cwd)-1] = '\0'; }
         t->vfork_parent_tid = -1;
         t->vfork_parent_saved_rsp = 0;
@@ -353,6 +365,10 @@ void user_thread_entry(void) {
 	} else {
 		qemu_debug_printf("user_thread_entry: user RIP outside identity map, skipping bytes dump\n");
 	}
+	/* Init path never calls mark_broad_user_ranges; ensure full user mappings before user mode.
+	   Clone3 children (user_stack_base != 0) already have mappings; re-marking causes #PF/triple fault. */
+	if (self->user_stack_base == 0)
+		exec_ensure_user_mappings();
 	// Jump to user mode
 	enter_user_mode(self->user_rip, self->user_stack);
 	// Should not return

@@ -21,9 +21,27 @@ void paging_write_cr3(uint64_t v) {
 
 void invlpg(void* va) { __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory"); }
 
+static inline uint64_t rdmsr_u64(uint32_t msr) {
+    uint32_t lo = 0, hi = 0;
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+static inline void wrmsr_u64(uint32_t msr, uint64_t v) {
+    uint32_t lo = (uint32_t)(v & 0xFFFFFFFFu);
+    uint32_t hi = (uint32_t)(v >> 32);
+    __asm__ volatile("wrmsr" :: "c"(msr), "a"(lo), "d"(hi));
+}
+
+#define MSR_EFER 0xC0000080u
+#define EFER_NXE (1ULL << 11)
+
 void paging_init(void) {
     // Ensure CR3 is loaded with our L4 base (it already is after bootstrap)
     (void)paging_read_cr3();
+    // Enable EFER.NXE so PG_NX in PTEs is valid; without this, NX bit causes RSVD page fault
+    uint64_t efer = rdmsr_u64(MSR_EFER);
+    efer |= EFER_NXE;
+    wrmsr_u64(MSR_EFER, efer);
 }
 
 int map_page_2m(uint64_t va, uint64_t pa, uint64_t flags) {
@@ -68,8 +86,9 @@ int map_page_2m(uint64_t va, uint64_t pa, uint64_t flags) {
     }
 
     uint64_t* l2 = (uint64_t*)(l3[l3i] & ~0xFFFULL);
-    // Set 2MiB page entry
-    l2[l2i] = (pa & ~(PAGE_SIZE_2M - 1)) | PG_PRESENT | PG_RW | PG_PS_2M | (flags & (PG_US|PG_PWT|PG_PCD|PG_GLOBAL));
+    // Set 2MiB page entry. Explicitly clear PG_NX: when EFER.NXE=0, NX bit is reserved
+    // and causes page fault with RSVD (err bit 3).
+    l2[l2i] = ((pa & ~(PAGE_SIZE_2M - 1)) | PG_PRESENT | PG_RW | PG_PS_2M | (flags & (PG_US|PG_PWT|PG_PCD|PG_GLOBAL))) & ~PG_NX;
 
     invlpg((void*)va);
     return 0;
