@@ -24,7 +24,7 @@ STUB_OBJ := $(BUILD_DIR)/$(STUB_SRC:.c=.c.o)
 CC := gcc -m64
 CFLAGS := -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=kernel -Iinc -w -DQEMU_LOG_ENABLE
 
-CSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -type f -name '*.c' -print | sed 's|^\./||')
+CSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -path './userland' -prune -o -type f -name '*.c' -print | sed 's|^\./||')
 COBJS := $(patsubst %.c,$(BUILD_DIR)/%.c.o,$(CSRCS))
 
 ASMSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -type f -name '*.asm' -print | sed 's|^\./||')
@@ -91,13 +91,13 @@ $(GRUB_DIR):
 
 
 
-iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg
+iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg archive
 	@cp $(KERNEL_ELF) $(ISO_BOOT)/axonos.elf
 	@grub-mkrescue -o $(ISO_IMAGE) $(ISO_DIR) 2>/dev/null || { \
 		@echo "grub-mkrescue failed: try installing grub-pc-bin or xorriso" >&2; exit 1; \
 	}
 
-run: archive iso
+run: archive iso userland
 	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 1024M -serial stdio -boot d -hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0
 
 # Run with bridged networking (real IP from router) - requires sudo and br0 bridge

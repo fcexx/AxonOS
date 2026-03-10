@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 #define OS_NAME "AxonOS"
-#define OS_VERSION "2.2"
+#define OS_VERSION "3.2.0"
 #define OS_AUTHORS "AxonOS Team"
 
 /* Syscall globals (defined in syscall64/syscall.c). */
@@ -19,3 +19,5 @@ void kernel_sysfs_populate_default(void);
 
 /* Re-create /etc/resolv.conf and /etc/hosts from current net config. */
 void syscall_net_ensure_resolv(void);
+
+/* SYS_resolve (1000): resolve hostname via DNS. See inc/syscall.h. */

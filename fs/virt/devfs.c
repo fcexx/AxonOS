@@ -101,18 +101,27 @@ static stdio_ring_t stdio_bufs[2]; /* 0 = stdout, 1 = stderr */
 static int devfs_path_to_tty(const char *path) {
     if (!path) return -1;
     if (strcmp(path, "/dev/console") == 0) return 0;
+    /* /dev/N -> ttyN (getty/inittab sometimes passes "1" = tty1 = first VC) */
+    if (strncmp(path, "/dev/", 5) == 0 && path[5] >= '0' && path[5] <= '9' && path[6] == '\0') {
+        int n = path[5] - '0';
+        if (n >= 1 && n <= DEVFS_TTY_COUNT) return n - 1;  /* 1->0, 2->1, ... */
+        if (n == 0) return 0;
+    }
     /* /dev/vc/N -> ttyN (BusyBox CURRENT_VC = /dev/vc/0) */
     if (strncmp(path, "/dev/vc/", 8) == 0 && path[8] >= '0' && path[8] < '0' + DEVFS_TTY_COUNT && path[9] == '\0')
         return path[8] - '0';
     if (strncmp(path, "/dev/tty", 8) == 0) {
-        /* /dev/ttyN (virtual consoles) */
-        int n = path[8] - '0';
-        if (n >= 0 && n < DEVFS_TTY_COUNT) return n;
         /* /dev/ttyS0 -> map to tty0 (serial console alias) */
         if (path[8] == 'S' && path[9] >= '0' && path[9] <= '9' && path[10] == '\0') {
             int sn = path[9] - '0';
             if (sn >= 0 && sn < DEVFS_TTY_COUNT) return sn;
             return 0;
+        }
+        /* /dev/ttyN: Linux tty1 = first VC, tty2 = second VC. Our index 0 = first VC. */
+        if (path[8] >= '0' && path[8] <= '9' && path[9] == '\0') {
+            int n = path[8] - '0';
+            if (n >= 1 && n <= DEVFS_TTY_COUNT) return n - 1;  /* tty1->0, tty2->1, ... */
+            if (n == 0) return 0;  /* tty0 = current = first at boot */
         }
     }
     return -1;
@@ -715,29 +724,52 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
         if (idx == devfs_active) {
             /* write to VGA directly, but respect ANSI escape sequences on the active tty */
             struct devfs_tty *tty = t;
-            /* Hot path: many apps clear the screen with ESC[2JESC[H every frame.
-               Consume this exact sequence in one shot instead of char-by-char CSI parsing. */
+            /* Hot path: ESC[2JESC[H (clear then home) - many apps use this */
             if (tty->ansi_escape_state == 0 &&
                 i + 7 <= size &&
-                (unsigned char)s[i + 0] == 0x1B &&
-                s[i + 1] == '[' &&
-                s[i + 2] == '2' &&
-                s[i + 3] == 'J' &&
-                (unsigned char)s[i + 4] == 0x1B &&
-                s[i + 5] == '[' &&
-                s[i + 6] == 'H') {
+                (unsigned char)s[i + 0] == 0x1B && s[i + 1] == '[' && s[i + 2] == '2' && s[i + 3] == 'J' &&
+                (unsigned char)s[i + 4] == 0x1B && s[i + 5] == '[' && s[i + 6] == 'H') {
                 devfs_tty_clear_backing_fast(tty, tty->current_attr);
                 tty->cursor_x = 0;
                 tty->cursor_y = 0;
                 vga_clear_screen_attr(tty->current_attr);
                 vga_set_cursor(0, 0);
-                i += 6; /* for-loop will add +1 */
+                i += 6;
+                continue;
+            }
+            /* Hot path: ESC[H (cursor home) - getty/login prompt */
+            if (tty->ansi_escape_state == 0 &&
+                i + 3 <= size &&
+                (unsigned char)s[i + 0] == 0x1B && s[i + 1] == '[' && s[i + 2] == 'H') {
+                tty->cursor_x = 0;
+                tty->cursor_y = 0;
+                vga_set_cursor(0, 0);
+                i += 2;
+                continue;
+            }
+            /* Hot path: ESC[HESC[J (BusyBox getty/clear: home then erase to end) */
+            if (tty->ansi_escape_state == 0 &&
+                i + 6 <= size &&
+                (unsigned char)s[i + 0] == 0x1B && s[i + 1] == '[' && s[i + 2] == 'H' &&
+                (unsigned char)s[i + 3] == 0x1B && s[i + 4] == '[' && s[i + 5] == 'J') {
+                devfs_tty_clear_backing_fast(tty, tty->current_attr);
+                tty->cursor_x = 0;
+                tty->cursor_y = 0;
+                vga_clear_screen_attr(tty->current_attr);
+                vga_set_cursor(0, 0);
+                i += 5;
                 continue;
             }
             /* simple streaming ANSI CSI parser for a subset of sequences */
             if (tty->ansi_escape_state == 0) {
                 if ((unsigned char)ch == 0x1B) {
                     tty->ansi_escape_state = 1; /* ESC seen */
+                } else if (ch == '[' && i + 1 < size && s[i + 1] == 'H') {
+                    tty->cursor_x = 0;
+                    tty->cursor_y = 0;
+                    vga_set_cursor(0, 0);
+                    i += 1;
+                    continue;
                 } else if (ch == '\r') {
                     /* carriage return: erase from cursor to EOL (no cursor advance), then move to start of line */
                     uint32_t tty_cols = devfs_tty_cols();
@@ -761,6 +793,14 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                     tty->ansi_escape_state = 2; /* CSI start */
                     tty->ansi_param_count = 0;
                     tty->ansi_current_param = 0;
+                    if (i + 2 < size && s[i + 1] == 'H') {
+                        tty->cursor_x = 0;
+                        tty->cursor_y = 0;
+                        vga_set_cursor(0, 0);
+                        tty->ansi_escape_state = 0;
+                        i += 1;
+                        continue;
+                    }
                 } else if ((unsigned char)ch == 'O') {
                     tty->ansi_escape_state = 3; /* SS3 (ESC O A/B/C/D) */
                 } else {
@@ -1490,9 +1530,16 @@ int devfs_get_tty_index_from_file(struct fs_file *file) {
     }
     if (file->path) {
         if (strcmp(file->path, "/dev/console") == 0) return 0;
-        if (strncmp(file->path, "/dev/tty", 8) == 0) {
+        /* /dev/N and /dev/ttyN: same mapping as devfs_path_to_tty */
+        if (strncmp(file->path, "/dev/", 5) == 0 && file->path[5] >= '0' && file->path[5] <= '9' && file->path[6] == '\0') {
+            int n = file->path[5] - '0';
+            if (n >= 1 && n <= DEVFS_TTY_COUNT) return n - 1;
+            if (n == 0) return 0;
+        }
+        if (strlen(file->path) >= 9 && strncmp(file->path, "/dev/tty", 8) == 0 && file->path[8] >= '0' && file->path[8] <= '9') {
             int n = file->path[8] - '0';
-            if (n >= 0 && n < DEVFS_TTY_COUNT) return n;
+            if (n >= 1 && n <= DEVFS_TTY_COUNT) return n - 1;
+            if (n == 0) return 0;
         }
         if (strcmp(file->path, "/dev/stdin") == 0 || strcmp(file->path, "/dev/tty") == 0) {
             thread_t *cur = thread_current();

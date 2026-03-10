@@ -92,6 +92,9 @@
 #define SYS_preadv 295
 #define SYS_pwritev 296
 
+/* AxonOS: resolve hostname via DNS, returns IPv4 in network byte order */
+#define SYS_resolve 1000
+
 /* initialize syscall subsystem (register handler) */
 void syscall_init(void);
 /* warm-up kernel net stack once during boot */

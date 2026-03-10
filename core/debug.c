@@ -255,3 +255,19 @@ void qemu_debug_printf(const char *format, ...) {
     va_end(args);
 #endif
 }
+
+void oom_serial_notify(unsigned long long syscall_num, const char *name) {
+    const char msg[] = "\r\n[OOM] syscall=";
+    int i;
+    for (i = 0; msg[i]; i++) write_serial(msg[i]);
+    char buf[24];
+    int n = 0;
+    unsigned long long v = syscall_num;
+    if (v == 0) buf[n++] = '0';
+    else { while (v) { buf[n++] = '0' + (v % 10); v /= 10; } }
+    while (n > 0) write_serial(buf[--n]);
+    write_serial(' ');
+    if (name) { int k = 0; while (name[k] && k < 32) { write_serial(name[k++]); } }
+    write_serial('\r');
+    write_serial('\n');
+}

@@ -16,6 +16,7 @@ extern void klogprintf(const char *fmt, ...);
 
 /* Ethernet/IP/UDP constants */
 #define ETH_TYPE_IPV4         0x0800
+#define DHCP_FRAME_BUF        2048
 #define UDP_PORT_DHCP_SERVER  67
 #define UDP_PORT_DHCP_CLIENT  68
 
@@ -185,18 +186,34 @@ int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease) {
         return 0;
     }
     
-    /* Drain any stale frames and wait for NIC to stabilize */
+    /* Wait for link (VMware NAT can be slow to bring link up) */
+    uint64_t link_wait = pit_get_time_ms();
+    while (!e1000_is_ready() && (pit_get_time_ms() - link_wait) < 5000)
+        thread_yield();
+    if (!e1000_is_ready())
+        klogprintf("dhcp: link not up after 5s, proceeding anyway\n");
+
+    /* VMware virtual switch needs time to be ready after link up */
+    uint64_t settle = pit_get_time_ms();
+    while ((pit_get_time_ms() - settle) < 1500) thread_yield();
+
+    /* Drain stale frames (limit 64 to avoid blocking on broadcast flood) */
     uint8_t drain[512];
     int drained = 0;
-    while (e1000_recv_frame(drain, sizeof(drain)) > 0) drained++;
+    for (int d = 0; d < 64; d++) {
+        e1000_poll();
+        if (e1000_recv_frame(drain, sizeof(drain)) <= 0) break;
+        drained++;
+    }
     if (drained) klogprintf("dhcp: drained %d stale frames\n", drained);
-    
-    /* Longer delay to let the NIC fully initialize (especially QEMU) */
+
+    /* Let NIC stabilize (especially QEMU) */
     for (int i = 0; i < 3000; i++) thread_yield();
     
     uint32_t xid = (uint32_t)(pit_get_ticks() ^ 0xA5F0C31Du);
     uint32_t offered_ip = 0, server_id = 0, netmask = 0, router = 0, dns = 0;
-    uint8_t frame[2048];
+    uint8_t *frame = kmalloc(DHCP_FRAME_BUF);
+    if (!frame) return -1;
     
     /* PHASE 1: DISCOVER -> OFFER (with retries) */
     for (int disc_try = 0; disc_try < 3 && !offered_ip; disc_try++) {
@@ -218,10 +235,9 @@ int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease) {
         int rx_count = 0;
         while ((pit_get_time_ms() - start) < 4000) {
             e1000_poll();
-            int n = e1000_recv_frame(frame, sizeof(frame));
+            int n = e1000_recv_frame(frame, DHCP_FRAME_BUF);
             if (n <= 0) { thread_yield(); continue; }
             rx_count++;
-            klogprintf("dhcp: rx frame len=%d\n", n);
             if ((size_t)n < sizeof(eth_hdr_t) + 20 + 8 + 240) continue;
             
             const eth_hdr_t *eth = (const eth_hdr_t *)frame;
@@ -284,9 +300,11 @@ int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease) {
             klogprintf("dhcp: no OFFER, using cached lease ip=%u.%u.%u.%u\n",
                 (g_cached_lease.ip_be >> 24) & 0xFF, (g_cached_lease.ip_be >> 16) & 0xFF,
                 (g_cached_lease.ip_be >> 8) & 0xFF, g_cached_lease.ip_be & 0xFF);
+                kfree(frame);
             return 0;
         }
         klogprintf("dhcp: failed - no OFFER\n");
+        kfree(frame);
         return -1;
     }
     
@@ -306,7 +324,7 @@ int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease) {
         uint64_t start = pit_get_time_ms();
         while ((pit_get_time_ms() - start) < 4000) {
             e1000_poll();
-            int n = e1000_recv_frame(frame, sizeof(frame));
+            int n = e1000_recv_frame(frame, DHCP_FRAME_BUF);
             if (n <= 0) { thread_yield(); continue; }
             if ((size_t)n < sizeof(eth_hdr_t) + 20 + 8 + 240) continue;
             

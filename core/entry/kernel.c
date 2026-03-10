@@ -211,7 +211,7 @@ static int boot_try_run_init(void) {
         /* Accept regular files and symlinks (symlinks already resolved by exec). */
         if (!((st.st_mode & S_IFREG) == S_IFREG || (st.st_mode & S_IFLNK) == S_IFLNK)) continue;
         const char *argv0[2] = { p, NULL };
-        static const char *init_env[] = { "PS1=\\[\\033[1;31m\\]\\u\\033[0m:\\w\\$ ", NULL };
+        static const char *init_env[] = { "PS1=\\[\\033[1;31m\\]\\u\\033[0m@\\h \e[0;37m\\w\\033[0m\\$ ", NULL };
         klogprintf("boot: starting init candidate %s\n", p);
         int rc = kernel_execve_from_path(p, argv0, init_env);
         if (rc == 0) return 0;
@@ -247,7 +247,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         if (ram_mb > 0) {
             uint64_t ram_bytes = (uint64_t)ram_mb * 1024ULL * 1024ULL;
             uint64_t start = (uint64_t)heap_start;
-            const uint64_t guard = 8ULL * 1024ULL * 1024ULL;
+            const uint64_t guard = 4ULL * 1024ULL * 1024ULL; /* 4 MiB (was 8) — more heap for VMware/low-RAM */
             if (ram_bytes > start + guard + (16ULL * 1024ULL * 1024ULL)) {
                 uint64_t max = ram_bytes - start - guard;
                 const uint64_t cap = 512ULL * 1024ULL * 1024ULL;
@@ -496,7 +496,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     }
     /* adduser expects /etc/shadow to exist and appends entries with O_APPEND. */
     {
-        static const char root_shadow[] = "root:*:0:0:99999:7:::\n";
+        /* root:: = no password (empty field allows login with Enter) */
+        static const char root_shadow[] = "root::0:0:99999:7:::\n";
         struct fs_file *sf = fs_create_file("/etc/shadow");
         if (!sf) sf = fs_open("/etc/shadow");
         if (sf) {
@@ -516,18 +517,78 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     }
     (void)ramfs_mkdir("/var");
     (void)ramfs_mkdir("/var/run");
+    (void)ramfs_mkdir("/var/log");  /* ensure exists for wtmp (klog also creates it) */
     (void)ramfs_mkdir("/tmp");  /* passwd uses mkstemp in /tmp for shadow update */
+    /* /var/log/wtmp: login history for last(1). Empty at boot; login appends utmp records. */
+    {
+        struct fs_file *wf = fs_create_file("/var/log/wtmp");
+        if (!wf) wf = fs_open("/var/log/wtmp");
+        if (wf) fs_file_free(wf);
+    }
     syscall_net_ensure_resolv();
     /* Programs (mount, sh) open /etc/localtime; create so open doesn't fail. */
     {
         struct fs_file *lt = fs_create_file("/etc/localtime");
         if (lt) fs_file_free(lt);
     }
-    /* Remove backup/clone/lock files that passwd/adduser create; avoid stale locks. */
-    (void)ramfs_remove("/etc/passwd+");
-    (void)ramfs_remove("/etc/group+");
-    (void)ramfs_remove("/etc/shadow+");
-    (void)ramfs_remove("/etc/shadow.lock");
+    /* /etc/profile: sourced by login shells (getty->login->sh -l). Sets PS1 and TERM for vim. */
+    {
+        static const char profile[] =
+            "export TERM=builtin_ansi\n"
+            "export PS1='\\[\\033[1;31m\\]\\u\\033[0m@\\h \\033[1;37m\\w\\033[0m \\$ '\n";
+        struct fs_file *pf = fs_create_file("/etc/profile");
+        if (!pf) pf = fs_open("/etc/profile");
+        if (pf) {
+            fs_write(pf, profile, sizeof(profile) - 1, 0);
+            fs_file_free(pf);
+        }   
+    }
+    /* /etc/issue: getty prints this before login prompt. \l = tty name (tty1, tty2, ...) */
+    {
+        static const char issue[] = "AxonOS v" OS_VERSION " for servers (\\l)\n\n";
+        struct fs_file *ifile = fs_create_file("/etc/issue");
+        if (!ifile) ifile = fs_open("/etc/issue");
+        if (ifile) {
+            fs_write(ifile, issue, sizeof(issue) - 1, 0);
+            fs_file_free(ifile);
+        }
+    }
+    /* /etc/securetty: TTY devices from which root can log in */
+    {
+        static const char securetty[] = "console\ntty1\ntty2\ntty3\ntty4\ntty5\ntty6\nttyS0\nttyS1\n";
+        struct fs_file *sf = fs_create_file("/etc/securetty");
+        if (!sf) sf = fs_open("/etc/securetty");
+        if (sf) {
+            fs_write(sf, securetty, sizeof(securetty) - 1, 0);
+            fs_file_free(sf);
+        }
+    }
+    /* /etc/motd: message of the day, shown after successful login */
+    {
+        static const char motd[] = "Welcome to " OS_NAME " v" OS_VERSION "!\n"
+                                   "Official site: https://axont.ru\n\n";
+        struct fs_file *mf = fs_create_file("/etc/motd");
+        if (!mf) mf = fs_open("/etc/motd");
+        if (mf) {
+            fs_write(mf, motd, sizeof(motd) - 1, 0);
+            fs_file_free(mf);
+        }
+    }
+    /* /etc/termcap: vt102/linux with arrow keys (ku/kd/kr/kl) so vim moves cursor correctly */
+    {
+        static const char termcap[] =
+            "vt102|vt100|linux|linux-term:"
+            "co#80:li#24:cl=\\E[2J\\E[H:cm=\\E[%i%d;%dH:nd=\\E[C:up=\\E[A:"
+            "ce=\\E[K:cd=\\E[J:so=\\E[7m:se=\\E[0m:us=\\E[4m:ue=\\E[0m:"
+            "ku=\\E[A:kd=\\E[B:kr=\\E[C:kl=\\E[D:"
+            "ti=\\E[?1049h:te=\\E[?1049l:\n";
+        struct fs_file *tc = fs_create_file("/etc/termcap");
+        if (!tc) tc = fs_open("/etc/termcap");
+        if (tc) {
+            fs_write(tc, termcap, sizeof(termcap) - 1, 0);
+            fs_file_free(tc);
+        }
+    }
 
     /* Compatibility: many distros' adduser scripts call /sbin/addgroup explicitly,
        while initfs may only provide /usr/sbin/addgroup. Create a tiny wrapper if needed. */
@@ -553,7 +614,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     }
     ps2_keyboard_init();
     rtc_init();
-
+    kclear();
     // Prefer linuxrc/init if present; fallback to kernel shell.
     if (boot_try_run_init() != 0) {
         kprintf("fatal: nothing to run.");

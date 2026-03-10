@@ -404,6 +404,14 @@ int e1000_send_frame(const void *data, size_t len) {
 int e1000_recv_frame(void *buf, size_t cap) {
     if (!g_e1000.initialized || !buf || cap == 0) return -1;
 
+    uint32_t rdh = e1000_read32(E1000_REG_RDH);
+    uint32_t rdt = e1000_read32(E1000_REG_RDT);
+    uint32_t next = (rdt + 1) % E1000_RX_DESC_COUNT;
+    if (rdh == next) return 0; /* ring empty */
+
+    /* Resync rx_next if desynced (second ping timeout: rx_next=3 but packets at 21-24) */
+    if (g_e1000.rx_next != next) g_e1000.rx_next = next;
+
     uint32_t idx = g_e1000.rx_next;
     volatile e1000_rx_desc_t *d = (volatile e1000_rx_desc_t *)&g_e1000.rx_desc[idx];
     __asm__ volatile("" ::: "memory"); /* memory barrier */

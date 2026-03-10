@@ -1,4 +1,5 @@
 #include <net_tcp.h>
+#include <heap.h>
 #include <string.h>
 
 #define ETH_TYPE_IPV4 0x0800
@@ -87,12 +88,14 @@ static int tcp_send_seg(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint8_t fla
     return 0;
 }
 
+#define TCP_FRAME_BUF 2048
 int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget) {
     if (!c || !ops || !ops->recv_frame) return -1;
-    uint8_t frame[2048];
+    uint8_t *frame = kmalloc(TCP_FRAME_BUF);
+    if (!frame) return -1;
     int got = 0;
     for (int i = 0; i < budget; i++) {
-        int n = ops->recv_frame(frame, sizeof(frame));
+        int n = ops->recv_frame(frame, TCP_FRAME_BUF);
         if (n <= 0) break;
         if ((size_t)n < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t) + sizeof(tcp_hdr_t)) continue;
         const eth_hdr_t *eth = (const eth_hdr_t *)frame;
@@ -145,11 +148,17 @@ int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget) {
             got = 1;
         }
     }
+    kfree(frame);
     return got;
 }
 
 int net_tcp_connect(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t dst_ip_be, uint16_t dst_port, uint16_t src_port, uint32_t timeout_ms) {
     if (!c || !ops || !ops->time_ms || !ops->yield) return -1;
+    /* Drain RX so SYN-ACK is not behind stale frames (ICMP echo, DNS, etc.). */
+    if (ops->recv_frame) {
+        uint8_t drain[256];
+        for (int d = 0; d < 64; d++) { if (ops->recv_frame(drain, sizeof(drain)) <= 0) break; }
+    }
     memset(c, 0, sizeof(*c));
     c->used = 1;
     c->dst_ip_be = dst_ip_be;
@@ -159,13 +168,18 @@ int net_tcp_connect(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t dst_ip
     c->snd_nxt = c->snd_una + 1;
     c->rcv_nxt = 0;
     if (tcp_send_seg(c, ops, 0x02u, NULL, 0) != 0) return -1; /* SYN */
+    ops->yield();
+    ops->yield();
+    ops->yield();
+    ops->yield();
+    ops->yield(); /* give VMware/NAT time to deliver SYN-ACK */
     uint64_t start = ops->time_ms();
     while ((ops->time_ms() - start) < timeout_ms) {
-        (void)net_tcp_service(c, ops, 8);
+        (void)net_tcp_service(c, ops, 16);
         if (c->established) return 0;
         ops->yield();
     }
-    return -1;
+    return -2; /* timeout: callers map to ETIMEDOUT */
 }
 
 int net_tcp_send(net_tcp_conn_t *c, const net_tcp_ops_t *ops, const uint8_t *data, size_t len, uint32_t timeout_ms) {
@@ -198,9 +212,11 @@ int net_tcp_recv(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint8_t *out, size
         c->rx_len -= n;
         return (int)n;
     }
+    ops->yield();
+    ops->yield(); /* VMware: let first response arrive */
     uint64_t start = ops->time_ms();
     while ((ops->time_ms() - start) < timeout_ms) {
-        (void)net_tcp_service(c, ops, 8);
+        (void)net_tcp_service(c, ops, 16);
         if (c->rx_len > 0) {
             size_t n = (c->rx_len > cap) ? cap : c->rx_len;
             memcpy(out, c->rx_buf, n);
