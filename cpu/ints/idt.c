@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <apic_timer.h>
+#include <apic.h>
 #include <debug.h>
 #include <mmio.h>
 #include <paging.h>
@@ -228,6 +229,13 @@ static void page_fault_handler(cpu_registers_t* regs) {
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
         int user = (regs->cs & 3) == 3;
         if (user && fault_try_grow_user_heap(cr2)) return;
+        if (!user) {
+            uint64_t resume_rip = 0;
+            if (syscall_try_handle_uaccess_fault(cr2, &resume_rip)) {
+                regs->rip = resume_rip;
+                return;
+            }
+        }
         dump("page fault", user ? "user" : "kernel", regs, cr2, regs->error_code, user);
         // Read MSR_FS_BASE to help diagnose faults caused by missing TLS base
         uint64_t fsbase_lo = 0, fsbase_hi = 0;
@@ -403,6 +411,12 @@ static void gp_fault_handler(cpu_registers_t* regs){
     for(;;){ asm volatile("sti; hlt" ::: "memory"); }
 }
 
+static void apic_ipi_resched_handler(cpu_registers_t *regs) {
+        (void)regs;
+        /* Wake target CPU from hlt; scheduler runs in thread context, not here. */
+        apic_eoi();
+}
+
 static void df_fault_handler(cpu_registers_t* regs){
         // Double Fault (#DF) — используем отдельный IST стек, чтобы избежать triple fault
         klogprintf("DOUBLE FAULT\n");
@@ -492,6 +506,7 @@ void idt_init() {
         idt_set_handler(40, rtc_handler);
 
         idt_set_handler(APIC_TIMER_VECTOR, apic_timer_handler);
-        
+        idt_set_handler(APIC_IPI_RESCHED_VECTOR, apic_ipi_resched_handler);
+
         asm volatile("lidt %0" : : "m"(idt_ptr));
 }

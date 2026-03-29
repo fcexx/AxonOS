@@ -3,6 +3,7 @@
 .extern syscall_do
 .extern syscall_kernel_rsp0
 .extern syscall_user_rsp_saved
+.extern syscall_user_return_rax
 .extern syscall_user_saved_rbx
 .extern syscall_user_saved_rbp
 .extern syscall_user_saved_r12
@@ -139,6 +140,7 @@ syscall_entry64:
     pushq   48(%rsp)            // a6 = user r9 (7th arg on stack)
     call    syscall_do
     addq    $8, %rsp
+    movq    %rax, syscall_user_return_rax(%rip)
 
     // Check for pending signals and possibly deliver before returning to user
     pushq   %rax

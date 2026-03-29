@@ -37,10 +37,15 @@ enum {
     LZ4F_MAGIC = 0x184D2204u
 };
 
+/* Must stay below smallest RAM we support (512 MiB QEMU `make debug`).
+ * Old 0x3F000000 / 0x30000000 were past 512M -> writes vanished -> "ELF bad magic". */
 enum {
-    MB2_COPY_ADDR = 0x3F000000u,
+    MB2_COPY_ADDR = 0x10000000u,
     MB2_COPY_MAX  = 2u * 1024u * 1024u
 };
+
+/* Scratch for LZ4 output (~600 KiB kernel); below stub at 0x08000000, above payload load area. */
+#define KZIP_DECOMP_PHYS 0x05000000u
 
 static void *memcpy_local(void *dst, const void *src, size_t n) {
     uint8_t *d = (uint8_t *)dst;
@@ -326,6 +331,15 @@ static int lz4f_decompress(const uint8_t *src, size_t src_len,
             out_off += wrote;
         }
         p += blk_size;
+        if (flg & 0x10u) {
+            if ((size_t)(end - p) < 4) return -1;
+            p += 4;
+        }
+    }
+
+    if (flg & 0x04u) {
+        if ((size_t)(end - p) >= 4)
+            p += 4;
     }
 
     if (content_size != 0 && out_off != (size_t)content_size) return -1;
@@ -333,37 +347,55 @@ static int lz4f_decompress(const uint8_t *src, size_t src_len,
     return 0;
 }
 
-static int load_elf_image(const uint8_t *img, size_t img_len, uint64_t *entry_out) {
-    if (img_len < sizeof(elf64_ehdr_t)) return -1;
+/* Program header stride is e_phentsize (may be > sizeof(phdr)); only first fields are used. */
+static void load_elf_image(const uint8_t *img, size_t img_len, uint64_t *entry_out) {
+    if (img_len < sizeof(elf64_ehdr_t))
+        panic_msg("KZIP: ELF truncated (hdr)\n");
+
     const elf64_ehdr_t *eh = (const elf64_ehdr_t *)img;
-    if (eh->e_ident[0] != 0x7F || eh->e_ident[1] != 'E' || eh->e_ident[2] != 'L' || eh->e_ident[3] != 'F') return -1;
-    if (eh->e_ident[4] != 2 || eh->e_ident[5] != 1) return -1;
-    if (eh->e_phoff == 0 || eh->e_phnum == 0 || eh->e_phentsize != sizeof(elf64_phdr_t)) return -1;
-    if ((uint64_t)eh->e_phoff + (uint64_t)eh->e_phnum * (uint64_t)sizeof(elf64_phdr_t) > (uint64_t)img_len) return -1;
+    if (eh->e_ident[0] != 0x7F || eh->e_ident[1] != 'E' || eh->e_ident[2] != 'L' || eh->e_ident[3] != 'F')
+        panic_msg("KZIP: ELF bad magic\n");
+    if (eh->e_ident[4] != 2 || eh->e_ident[5] != 1)
+        panic_msg("KZIP: ELF not 64-bit LE\n");
+    if (eh->e_phoff == 0 || eh->e_phnum == 0)
+        panic_msg("KZIP: ELF no program hdrs\n");
+    if (eh->e_phentsize < sizeof(elf64_phdr_t) || eh->e_phentsize > 512)
+        panic_msg("KZIP: ELF bad phentsize\n");
 
-    const elf64_phdr_t *ph = (const elf64_phdr_t *)(img + eh->e_phoff);
+    uint64_t phtab = (uint64_t)eh->e_phoff + (uint64_t)eh->e_phnum * (uint64_t)eh->e_phentsize;
+    if (phtab > (uint64_t)img_len)
+        panic_msg("KZIP: ELF phdr table past image\n");
+
     for (uint16_t i = 0; i < eh->e_phnum; i++) {
-        if (ph[i].p_type != PT_LOAD) continue;
-        if (ph[i].p_offset + ph[i].p_filesz > (uint64_t)img_len) return -1;
+        uint64_t row = (uint64_t)eh->e_phoff + (uint64_t)i * (uint64_t)eh->e_phentsize;
+        if (row + sizeof(elf64_phdr_t) > (uint64_t)img_len)
+            panic_msg("KZIP: ELF phdr row OOB\n");
+        const elf64_phdr_t *ph = (const elf64_phdr_t *)(img + row);
 
-        uintptr_t dst = (uintptr_t)(ph[i].p_vaddr ? ph[i].p_vaddr : ph[i].p_paddr);
-        if (dst == 0) return -1;
+        if (ph->p_type != PT_LOAD)
+            continue;
+        if (ph->p_offset + ph->p_filesz > (uint64_t)img_len)
+            panic_msg("KZIP: ELF PT_LOAD past image\n");
 
-        memcpy_local((void *)dst, img + ph[i].p_offset, (size_t)ph[i].p_filesz);
-        if (ph[i].p_memsz > ph[i].p_filesz) {
-            memset_local((void *)(dst + (uintptr_t)ph[i].p_filesz), 0, (size_t)(ph[i].p_memsz - ph[i].p_filesz));
+        uintptr_t dst = (uintptr_t)(ph->p_vaddr ? ph->p_vaddr : ph->p_paddr);
+        if (dst == 0)
+            panic_msg("KZIP: ELF PT_LOAD vaddr 0\n");
+
+        memcpy_local((void *)dst, img + ph->p_offset, (size_t)ph->p_filesz);
+        if (ph->p_memsz > ph->p_filesz) {
+            memset_local((void *)(dst + (uintptr_t)ph->p_filesz), 0,
+                         (size_t)(ph->p_memsz - ph->p_filesz));
         }
     }
 
     *entry_out = eh->e_entry;
-    return 0;
 }
 
 void kernel_main(uint64_t multiboot_magic, uint64_t multiboot_info) {
     const uint8_t *payload_lz4 = _binary_build_payload_lz4_start;
     size_t payload_lz4_len = (size_t)(_binary_build_payload_lz4_end - _binary_build_payload_lz4_start);
 
-    uint8_t *decomp = (uint8_t *)(uintptr_t)0x30000000u;
+    uint8_t *decomp = (uint8_t *)(uintptr_t)KZIP_DECOMP_PHYS;
     const size_t decomp_cap = 128u * 1024u * 1024u;
     size_t decomp_len = 0;
     uint64_t entry = 0;
@@ -386,7 +418,7 @@ void kernel_main(uint64_t multiboot_magic, uint64_t multiboot_info) {
     }
 
     boot_line("Parsing ELF...");
-    if (load_elf_image(decomp, decomp_len, &entry) != 0) { panic_msg("KZIP: ELF load fail!"); for (;;); }
+    load_elf_image(decomp, decomp_len, &entry);
     boot_line("ok\n");
     if (entry == 0) panic_msg("KZIP: bad entry!");
 

@@ -7,6 +7,7 @@
 #include <axonos.h>
 #include <keyboard.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <gdt.h>
 #include <string.h>
 #include <vga.h>
@@ -18,6 +19,7 @@
 #include <paging.h>
 #include <sysinfo.h>
 #include <thread.h>
+#include <smp.h>
 #include <apic.h>
 #include <apic_timer.h>
 #include <stat.h>
@@ -41,9 +43,11 @@
 #include <usb.h>
 #include <exec.h>
 #include <klog.h>
+#include <debug.h>
 #include <vbe.h>
 #include <cirrus.h>
 #include <nvme.h>
+#include <e1000.h>
 void ata_dma_init(void);
 void scsi_init(void);
 int pvscsi_init(void);
@@ -182,15 +186,50 @@ ssize_t sysfs_show_ram_mb_attr(char *buf, size_t size, void *priv) {
     return (ssize_t)written;
 }
 
+/* Linux /sys/devices/system/cpu/{online,possible,present} — musl/glibc sysconf(_SC_NPROCESSORS_*)
+ * and some tools read these before /proc/stat; a missing or wrong file yields nproc==1 despite /proc/cpuinfo. */
+static ssize_t sysfs_show_cpu_range_list(char *buf, size_t size, void *priv) {
+    (void)priv;
+    if (!buf || size == 0) return 0;
+    int n = smp_cpu_count();
+    if (n < 1)
+        n = 1;
+    if (n > SMP_MAX_CPUS)
+        n = SMP_MAX_CPUS;
+    int w = (n <= 1) ? snprintf(buf, size, "0\n") : snprintf(buf, size, "0-%d\n", n - 1);
+    if (w < 0)
+        return 0;
+    if ((size_t)w > size)
+        return (ssize_t)size;
+    return (ssize_t)w;
+}
+
 /* Populate default sysfs tree when userspace mounts sysfs via SYS_mount. */
 void kernel_sysfs_populate_default(void) {
     sysfs_mkdir("/sys/kernel");
     sysfs_mkdir("/sys/class");
     sysfs_mkdir("/sys/bus");
+    sysfs_mkdir("/sys/devices/system/cpu");
     static const struct sysfs_attr attr_cpu = { sysfs_show_cpu_name_attr, NULL, NULL };
     static const struct sysfs_attr attr_ram = { sysfs_show_ram_mb_attr, NULL, NULL };
+    static const struct sysfs_attr attr_cpu_range = { sysfs_show_cpu_range_list, NULL, NULL };
     sysfs_create_file("/sys/kernel/cpu_name", &attr_cpu);
     sysfs_create_file("/sys/kernel/ram_mb", &attr_ram);
+    sysfs_create_file("/sys/devices/system/cpu/online", &attr_cpu_range);
+    sysfs_create_file("/sys/devices/system/cpu/possible", &attr_cpu_range);
+    sysfs_create_file("/sys/devices/system/cpu/present", &attr_cpu_range);
+    {
+        int nc = smp_cpu_count();
+        if (nc < 1)
+            nc = 1;
+        if (nc > SMP_MAX_CPUS)
+            nc = SMP_MAX_CPUS;
+        for (int i = 0; i < nc; i++) {
+            char path[80];
+            snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d", i);
+            sysfs_mkdir(path);
+        }
+    }
     usb_sysfs_populate_default();
     pci_sysfs_init();  /* /sys/bus/pci/devices для lspci */
 }
@@ -274,19 +313,26 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     }
 
     gdt_init();
+    smp_init(multiboot_magic, multiboot_info);
 
-    /* allocate IST1 stack for Double Fault handler to avoid triple-faults.
-       Use a larger (16KiB) stack and ensure 16-byte alignment of the top. */
+    /* Per-CPU IST1 stacks for Double Fault (avoids triple-fault when SMP is enabled). */
     {
         const size_t DF_STACK_SIZE = 16 * 1024;
-        void *df_stack = kmalloc(DF_STACK_SIZE + 16);
-        if (df_stack) {
-            uintptr_t top = (uintptr_t)df_stack + DF_STACK_SIZE + 16;
-            uintptr_t df_top = align_up_uintptr(top, 16);
-            tss_set_ist(1, (uint64_t)df_top);
-            kprintf("Set kernel DF IST1 stack at %p.\n", (void*)(uintptr_t)df_top);
-        } else {
-            kprintf("Failed to allocate DF IST stack (warning)\n");
+        int ndf = smp_have_acpi_cpu_topology() ? smp_cpu_count() : SMP_MAX_CPUS;
+        if (ndf < 1)
+            ndf = 1;
+        if (ndf > SMP_MAX_CPUS)
+            ndf = SMP_MAX_CPUS;
+        for (int i = 0; i < ndf; i++) {
+            void *df_stack = kmalloc(DF_STACK_SIZE + 16);
+            if (df_stack) {
+                uintptr_t top = (uintptr_t)df_stack + DF_STACK_SIZE + 16;
+                uintptr_t df_top = align_up_uintptr(top, 16);
+                tss_set_ist_for_cpu(i, 1, (uint64_t)df_top);
+                kprintf("Set kernel DF IST1 for cpu %d at %p.\n", i, (void*)(uintptr_t)df_top);
+            } else {
+                kprintf("Failed to allocate DF IST stack for cpu %d (warning)\n", i);
+            }
         }
     }
     int vbe_init = 0;
@@ -381,6 +427,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     // Otherwise, for microseconds.
     klog_calibrate_tsc();
 
+    smp_finalize_topology(multiboot_magic, multiboot_info);
+
     pci_init();
     pci_dump_devices();
     intel_chipset_init();
@@ -389,7 +437,11 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
        This avoids affecting boot stability on machines where NIC init timing is sensitive. */
 
     // Scheduler and I/O scheduler
+    qemu_debug_printf("BOOT: thread_init begin\n");
     thread_init();
+    qemu_debug_printf("BOOT: thread_init ok, smp_boot_aps\n");
+    smp_boot_aps();
+    qemu_debug_printf("BOOT: smp_boot_aps ok\n");
     iothread_init();
 
     // POSIX user subsystem

@@ -130,11 +130,12 @@ void qemu_debug_printf(const char *format, ...) {
             continue;
         }
         p++;  // Skip '%'
-        int left = 0, zero_pad = 0;
+        int left = 0, zero_pad = 0, alt = 0;
         // Parse flags
-        while (*p == '-' || *p == '0') {
+        while (*p == '-' || *p == '0' || *p == '#') {
             if (*p == '-') left = 1;
             if (*p == '0') zero_pad = 1;
+            if (*p == '#') alt = 1;
             p++;
         }
 
@@ -237,11 +238,17 @@ void qemu_debug_printf(const char *format, ...) {
                 if (val == 0) buf[len++] = '0';
                 else { unsigned int tmp = val; const char *hex = uppercase ? "0123456789ABCDEF" : "0123456789abcdef"; while (tmp) { buf[len++] = hex[tmp & 0xF]; tmp >>= 4; } }
             }
-            int pad = width > len ? width - len : 0;
+            int prefix = alt ? 2 : 0;
+            int total_len = len + prefix;
+            int pad = width > total_len ? width - total_len : 0;
 
             if (!left) for (int i = 0; i < pad; i++) write_serial(pad_char);
+            if (alt) {
+                write_serial('0');
+                write_serial(uppercase ? 'X' : 'x');
+            }
             for (int i = len - 1; i >= 0; i--) write_serial(buf[i]);
-            
+
             if (left) for (int i = 0; i < pad; i++) write_serial(' ');
         } else if (spec == 'c') {
             char c = (char)va_arg(args, int);

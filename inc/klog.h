@@ -11,4 +11,7 @@ void klogprintf(const char *fmt, ...);
 /* Calibrate TSC-based high-resolution timestamping (non-blocking if APIC not ready). */
 void klog_calibrate_tsc(void);
 
+/* Set by klog_calibrate_tsc(); 0 until calibrated. Used for CLI-safe busy waits (e.g. SMP INIT/SIPI). */
+extern uint64_t klog_tsc_per_us;
+
 

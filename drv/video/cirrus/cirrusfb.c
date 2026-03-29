@@ -46,6 +46,13 @@ static uint32_t g_cursor_x = 0;
 static uint32_t g_cursor_y = 0;
 static uint8_t g_current_attr = 0x07;
 
+/* ANSI: kputchar() goes straight here when Cirrus is active — devfs may not see all output. */
+enum { CIR_ESC_NONE = 0, CIR_ESC_ESC = 1, CIR_ESC_CSI = 2, CIR_ESC_SS3 = 3 };
+static int g_esc_state = CIR_ESC_NONE;
+static int g_csi_params[8];
+static int g_csi_np = 0;
+static int g_csi_cur = 0;
+
 static uint32_t vga_palette[16] = {
 	0x00000000, 0x000000AA, 0x0000AA00, 0x0000AAAA,
 	0x00AA0000, 0x00AA00AA, 0x00AA5500, 0x00AAAAAA,
@@ -281,7 +288,7 @@ void cirrusfb_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
 	draw_glyph(x, y, ch, attr);
 }
 
-void cirrusfb_putchar(uint8_t ch, uint8_t attr) {
+static void cirrusfb_putchar_inner(uint8_t ch, uint8_t attr) {
 	if (!g_ready || !g_textbuf) return;
 	g_current_attr = attr;
 
@@ -319,8 +326,7 @@ void cirrusfb_putchar(uint8_t ch, uint8_t attr) {
 		scroll_up();
 		g_cursor_y = g_rows - 1;
 	}
-	
-	/* Update hardware cursor position */
+
 	if (g_hwcursor_ok) {
 		hwcursor_set_pos(g_cursor_x, g_cursor_y);
 	}
@@ -366,6 +372,174 @@ void cirrusfb_clear(uint8_t attr) {
 	if (g_hwcursor_ok) {
 		hwcursor_set_pos(0, 0);
 	}
+}
+
+static void cirrusfb_erase_cells(uint32_t x0, uint32_t x1, uint32_t y) {
+	if (!g_ready || !g_textbuf || g_rows == 0 || g_cols == 0 || y >= g_rows) return;
+	if (x0 > x1) return;
+	if (x1 >= g_cols) x1 = g_cols - 1;
+	for (uint32_t x = x0; x <= x1; x++) {
+		g_textbuf[y * g_cols + x].ch = ' ';
+		g_textbuf[y * g_cols + x].attr = g_current_attr;
+		draw_glyph(x, y, ' ', g_current_attr);
+	}
+}
+
+static void cirrusfb_csi_apply_sgr(void) {
+	int np = g_csi_np;
+	int *p = g_csi_params;
+	if (np == 0) {
+		g_current_attr = 0x07;
+		return;
+	}
+	for (int i = 0; i < np; i++) {
+		int v = p[i];
+		if (v == 0) {
+			g_current_attr = 0x07;
+		} else if (v == 1) {
+			g_current_attr |= 0x08;
+		} else if (v == 22) {
+			g_current_attr &= (uint8_t)~0x08;
+		} else if (v >= 30 && v <= 37) {
+			static const uint8_t map[8] = {0, 4, 2, 6, 1, 5, 3, 7};
+			int fg = map[v - 30];
+			if (g_current_attr & 0x08) fg |= 8;
+			int bg = (g_current_attr >> 4) & 0x0F;
+			g_current_attr = (uint8_t)((bg << 4) | (fg & 0x0F));
+		} else if (v >= 40 && v <= 47) {
+			static const uint8_t bmap[8] = {0, 4, 2, 6, 1, 5, 3, 0};
+			int bg = bmap[v - 40];
+			int fg = g_current_attr & 0x0F;
+			g_current_attr = (uint8_t)((bg << 4) | (fg & 0x0F));
+		}
+	}
+}
+
+static void cirrusfb_csi_dispatch(uint8_t fb) {
+	int np = g_csi_np;
+	int *p = g_csi_params;
+
+	if (fb == 'm') {
+		cirrusfb_csi_apply_sgr();
+		return;
+	}
+	if (fb == 'H' || fb == 'f') {
+		int row = 1, col = 1;
+		if (np >= 1) row = p[0];
+		if (np >= 2) col = p[1];
+		if (row < 1) row = 1;
+		if (col < 1) col = 1;
+		if ((uint32_t)row > g_rows) row = (int)g_rows;
+		if ((uint32_t)col > g_cols) col = (int)g_cols;
+		cirrusfb_set_cursor((uint32_t)(col - 1), (uint32_t)(row - 1));
+		return;
+	}
+	if (fb == 'J') {
+		int pm = (np > 0) ? p[0] : 0;
+		if (pm == 2 || pm == 3) {
+			cirrusfb_clear(g_current_attr);
+			return;
+		}
+		if (pm == 0) {
+			cirrusfb_erase_cells(g_cursor_x, g_cols - 1, g_cursor_y);
+			for (uint32_t yy = g_cursor_y + 1; yy < g_rows; yy++) {
+				cirrusfb_erase_cells(0, g_cols - 1, yy);
+			}
+			return;
+		}
+		if (pm == 1) {
+			for (uint32_t yy = 0; yy < g_cursor_y; yy++) {
+				cirrusfb_erase_cells(0, g_cols - 1, yy);
+			}
+			cirrusfb_erase_cells(0, g_cursor_x, g_cursor_y);
+			return;
+		}
+	}
+	if (fb == 'K') {
+		int pm = (np > 0) ? p[0] : 0;
+		uint32_t cy = g_cursor_y;
+		if (pm == 0) {
+			cirrusfb_erase_cells(g_cursor_x, g_cols - 1, cy);
+		} else if (pm == 1) {
+			cirrusfb_erase_cells(0, g_cursor_x, cy);
+		} else {
+			cirrusfb_erase_cells(0, g_cols - 1, cy);
+		}
+		return;
+	}
+	if (fb == 'A' || fb == 'B' || fb == 'C' || fb == 'D') {
+		int n = (np > 0 && p[0] > 0) ? p[0] : 1;
+		if (fb == 'A') {
+			if (g_cursor_y >= (uint32_t)n) g_cursor_y -= (uint32_t)n;
+			else g_cursor_y = 0;
+		} else if (fb == 'B') {
+			if (g_cursor_y + (uint32_t)n < g_rows) g_cursor_y += (uint32_t)n;
+			else g_cursor_y = g_rows - 1;
+		} else if (fb == 'C') {
+			if (g_cursor_x + (uint32_t)n < g_cols) g_cursor_x += (uint32_t)n;
+			else g_cursor_x = g_cols - 1;
+		} else {
+			if (g_cursor_x >= (uint32_t)n) g_cursor_x -= (uint32_t)n;
+			else g_cursor_x = 0;
+		}
+		if (g_hwcursor_ok) {
+			hwcursor_set_pos(g_cursor_x, g_cursor_y);
+		}
+	}
+}
+
+void cirrusfb_putchar(uint8_t ch, uint8_t attr) {
+	if (!g_ready || !g_textbuf) return;
+
+	if (g_esc_state == CIR_ESC_NONE) {
+		if (ch == 0x1B) {
+			g_esc_state = CIR_ESC_ESC;
+			return;
+		}
+		cirrusfb_putchar_inner(ch, attr);
+		return;
+	}
+	if (g_esc_state == CIR_ESC_ESC) {
+		if (ch == '[') {
+			g_esc_state = CIR_ESC_CSI;
+			g_csi_np = 0;
+			g_csi_cur = 0;
+			return;
+		}
+		if (ch == 'O') {
+			g_esc_state = CIR_ESC_SS3;
+			return;
+		}
+		g_esc_state = CIR_ESC_NONE;
+		cirrusfb_putchar_inner(0x1B, attr);
+		cirrusfb_putchar_inner(ch, attr);
+		return;
+	}
+	if (g_esc_state == CIR_ESC_SS3) {
+		g_esc_state = CIR_ESC_NONE;
+		return;
+	}
+	/* CSI */
+	if (ch >= '0' && ch <= '9') {
+		g_csi_cur = g_csi_cur * 10 + (ch - '0');
+		return;
+	}
+	if (ch == ';') {
+		if (g_csi_np < 8) g_csi_params[g_csi_np++] = g_csi_cur;
+		g_csi_cur = 0;
+		return;
+	}
+	if (ch == '?' || ch == '>') {
+		return;
+	}
+	if (g_csi_np < 8) g_csi_params[g_csi_np++] = g_csi_cur;
+	g_csi_cur = 0;
+	if ((unsigned char)ch >= 0x40 && (unsigned char)ch <= 0x7E) {
+		g_current_attr = attr;
+		cirrusfb_csi_dispatch((uint8_t)ch);
+	}
+	g_esc_state = CIR_ESC_NONE;
+	g_csi_np = 0;
 }
 
 void cirrusfb_update_cursor(void) {

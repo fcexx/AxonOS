@@ -109,15 +109,25 @@ void vbefb_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
 	vbe_flush_region(x * font_w, y * font_h, font_w, font_h);
 }
 
+static void vbefb_erase_cells(uint32_t x0, uint32_t x1, uint32_t y) {
+	if (!textbuf || rows == 0 || cols == 0 || y >= rows) return;
+	if (x0 > x1) return;
+	if (x1 >= cols) x1 = cols - 1;
+	for (uint32_t x = x0; x <= x1; x++) {
+		textbuf[y * cols + x].ch = ' ';
+		textbuf[y * cols + x].attr = current_attr;
+		draw_cell_to_backbuffer(x, y);
+	}
+}
+
 void vbefb_putchar(uint8_t ch, uint8_t attr) {
 	if (!vbe_is_available()) { return; }
 	/* Honor caller-selected color when printing raw chars (devfs/tty path). */
 	if (!esc_mode && ch != 0x1B) current_attr = attr;
-	// simple ANSI SGR parsing for color sequences: ESC [ ... m
+	/* CSI: ESC [ ... final (@ to ~). Was SGR-only; other finals were swallowed and broke the console. */
 	if (ch == 0x1B) { esc_mode = 1; esc_len = 0; return; }
 	if (esc_mode) {
 		if (esc_len < (int)sizeof(esc_buf) - 1) esc_buf[esc_len++] = (char)ch;
-		// sequence ends with 'm'
 		if (ch == 'm') {
 			esc_buf[esc_len] = '\0';
 			/* Parse CSI SGR: ESC [ ... m — same semantics as VGA console */
@@ -147,7 +157,68 @@ void vbefb_putchar(uint8_t ch, uint8_t attr) {
 			esc_len = 0;
 			return;
 		}
-		// still in escape; drop characters
+		if (ch >= 0x40 && ch <= 0x7E) {
+			int p[8], np = 0, cur = 0;
+			if (esc_len >= 2 && esc_buf[0] == '[') {
+				for (int i = 1; i < esc_len - 1; i++) {
+					char c = esc_buf[i];
+					if (c >= '0' && c <= '9') { cur = cur * 10 + (c - '0'); continue; }
+					if (c == ';') { if (np < 8) p[np++] = cur; cur = 0; continue; }
+					if (c == '?' || c == '>') continue;
+				}
+				if (np < 8) p[np++] = cur;
+			}
+			if (ch == 'H' || ch == 'f') {
+				int row = (np >= 1) ? p[0] : 1;
+				int col = (np >= 2) ? p[1] : 1;
+				if (row < 1) row = 1;
+				if (col < 1) col = 1;
+				if ((uint32_t)row > rows) row = (int)rows;
+				if ((uint32_t)col > cols) col = (int)cols;
+				vbefb_set_cursor((uint32_t)(col - 1), (uint32_t)(row - 1));
+			} else if (ch == 'J') {
+				int pm = (np > 0) ? p[0] : 0;
+				if (pm == 2 || pm == 3) {
+					vbefb_clear(current_attr);
+				} else if (pm == 0) {
+					vbefb_erase_cells(cursor_x, cols - 1, cursor_y);
+					for (uint32_t yy = cursor_y + 1; yy < rows; yy++) {
+						vbefb_erase_cells(0, cols - 1, yy);
+					}
+				} else if (pm == 1) {
+					for (uint32_t yy = 0; yy < cursor_y; yy++) {
+						vbefb_erase_cells(0, cols - 1, yy);
+					}
+					vbefb_erase_cells(0, cursor_x, cursor_y);
+				}
+			} else if (ch == 'K') {
+				int pm = (np > 0) ? p[0] : 0;
+				uint32_t cy = cursor_y;
+				if (pm == 0) {
+					vbefb_erase_cells(cursor_x, cols - 1, cy);
+				} else if (pm == 1) {
+					vbefb_erase_cells(0, cursor_x, cy);
+				} else {
+					vbefb_erase_cells(0, cols - 1, cy);
+				}
+			} else if (ch == 'A' || ch == 'B' || ch == 'C' || ch == 'D') {
+				int n = (np > 0 && p[0] > 0) ? p[0] : 1;
+				uint32_t nx = cursor_x, ny = cursor_y;
+				if (ch == 'A') {
+					if (ny >= (uint32_t)n) ny -= (uint32_t)n; else ny = 0;
+				} else if (ch == 'B') {
+					if (ny + (uint32_t)n < rows) ny += (uint32_t)n; else ny = rows - 1;
+				} else if (ch == 'C') {
+					if (nx + (uint32_t)n < cols) nx += (uint32_t)n; else nx = cols - 1;
+				} else {
+					if (nx >= (uint32_t)n) nx -= (uint32_t)n; else nx = 0;
+				}
+				vbefb_set_cursor(nx, ny);
+			}
+			esc_mode = 0;
+			esc_len = 0;
+			return;
+		}
 		return;
 	}
 

@@ -190,6 +190,14 @@ int vbe_init_from_multiboot(uint32_t multiboot_magic, uint64_t multiboot_info) {
 			klogprintf("vbe: framebuffer tag found addr=0x%016llx pitch=%u width=%u height=%u bpp=%u\n",
 				(unsigned long long)fb_addr, (unsigned)pitch, (unsigned)width, (unsigned)height, (unsigned)bpp);
 
+			/* GRUB/multiboot may advertise 0xB8000 (VGA text cell memory) as a "framebuffer".
+			   vbefb would steal kprintf from the text driver and QEMU's text console stops updating. */
+			if (fb_addr == 0xB8000ULL || fb_addr == 0xB0000ULL) {
+				klogprintf("vbe: ignoring legacy VGA text/MDA phys addr, not a linear FB\n");
+				off += (tag_size + 7) & ~7u;
+				continue;
+			}
+
 			if (fb_addr == 0 || width == 0 || height == 0 || bpp == 0) {
 				klogprintf("vbe: invalid fb fields, skipping\n");
 				off += (tag_size + 7) & ~7u;

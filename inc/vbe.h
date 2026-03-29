@@ -19,6 +19,7 @@ void vbefb_set_cursor(uint32_t x, uint32_t y);
 void vbefb_clear(uint8_t attr);
 /* Flush helpers and backbuffer access */
 void vbe_flush_region(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+void vbe_flush_full(void);
 void *vbe_get_backbuffer(void);
 uint32_t vbe_get_pitch(void);
 uint32_t vbe_get_bpp(void);

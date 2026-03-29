@@ -7,6 +7,7 @@
 #include <console.h>
 #include <keyboard.h>
 #include <thread.h>
+#include <smp.h>
 #include <string.h>
 #include <stddef.h>
 #include <spinlock.h>
@@ -50,6 +51,67 @@ static inline void devfs_tty_clear_backing_fast(struct devfs_tty *tty, uint8_t a
     uint16_t *dst = (uint16_t*)tty->screen;
     for (uint32_t i = 0; i < cells; i++) {
         dst[i] = cell;
+    }
+}
+
+/* Erase tty backing from (from_x, y) through end of line (for non-visible VC). */
+static void devfs_tty_buf_erase_eol(struct devfs_tty *tty, uint32_t from_x, uint32_t y, uint8_t attr) {
+    uint32_t cols = devfs_tty_cols();
+    uint32_t rows = devfs_tty_rows();
+    if (!tty || !tty->screen || cols == 0 || rows == 0 || y >= rows || from_x >= cols) return;
+    for (uint32_t rx = from_x; rx < cols; rx++) {
+        size_t off = ((size_t)y * cols + rx) * 2;
+        tty->screen[off] = ' ';
+        tty->screen[off + 1] = attr;
+    }
+}
+
+/* Minimal tty output into backing store only (no VGA), for non-active virtual consoles. */
+static void devfs_tty_virtual_putc(struct devfs_tty *tty, uint8_t c) {
+    uint32_t cols = devfs_tty_cols();
+    uint32_t rows = devfs_tty_rows();
+    if (!tty || !tty->screen || cols == 0 || rows == 0) return;
+
+    if (c == '\n') {
+        tty->cursor_x = 0;
+        if (tty->cursor_y + 1 < rows) tty->cursor_y++;
+        return;
+    }
+    if (c == '\r') {
+        tty->cursor_x = 0;
+        return;
+    }
+    if (c == '\b' || c == 0x7F) {
+        if (tty->cursor_x > 0) {
+            tty->cursor_x--;
+            size_t off = ((size_t)tty->cursor_y * cols + tty->cursor_x) * 2;
+            tty->screen[off] = ' ';
+            tty->screen[off + 1] = tty->current_attr;
+        }
+        return;
+    }
+    if (c == '\t') {
+        uint32_t n = 8u - (tty->cursor_x % 8u);
+        if (n == 0) n = 8;
+        for (uint32_t k = 0; k < n; k++) {
+            devfs_tty_virtual_putc(tty, ' ');
+        }
+        return;
+    }
+    if (tty->cursor_y >= rows) tty->cursor_y = rows - 1;
+    if (tty->cursor_x >= cols) {
+        tty->cursor_x = 0;
+        if (tty->cursor_y + 1 < rows) tty->cursor_y++;
+        else tty->cursor_y = rows - 1;
+    }
+    size_t off = ((size_t)tty->cursor_y * cols + tty->cursor_x) * 2;
+    tty->screen[off] = c;
+    tty->screen[off + 1] = tty->current_attr;
+    tty->cursor_x++;
+    if (tty->cursor_x >= cols) {
+        tty->cursor_x = 0;
+        if (tty->cursor_y + 1 < rows) tty->cursor_y++;
+        else tty->cursor_y = rows - 1;
     }
 }
 
@@ -716,13 +778,17 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
         }
     }
     if (!t) return -1;
+    /* Linux: /dev/console is the current foreground VC, not a fixed tty0 handle. */
+    if (file->path && strcmp(file->path, "/dev/console") == 0) {
+        t = &dev_ttys[devfs_get_active()];
+    }
     int idx = t->id;
     const char *s = (const char*)buf;
     for (size_t i = 0; i < size; i++) {
         char ch = s[i];
-        int did_output = 0; /* 1 when we printed to VGA/buffer, 0 when consumed by ANSI */
-        if (idx == devfs_active) {
-            /* write to VGA directly, but respect ANSI escape sequences on the active tty */
+        {
+            const int tty_on_vga = (idx == devfs_active);
+            /* Parse ANSI for every VC; drive VGA only when this tty is visible. */
             struct devfs_tty *tty = t;
             /* Hot path: ESC[2JESC[H (clear then home) - many apps use this */
             if (tty->ansi_escape_state == 0 &&
@@ -732,8 +798,10 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                 devfs_tty_clear_backing_fast(tty, tty->current_attr);
                 tty->cursor_x = 0;
                 tty->cursor_y = 0;
-                vga_clear_screen_attr(tty->current_attr);
-                vga_set_cursor(0, 0);
+                if (tty_on_vga) {
+                    vga_clear_screen_attr(tty->current_attr);
+                    vga_set_cursor(0, 0);
+                }
                 i += 6;
                 continue;
             }
@@ -743,7 +811,7 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                 (unsigned char)s[i + 0] == 0x1B && s[i + 1] == '[' && s[i + 2] == 'H') {
                 tty->cursor_x = 0;
                 tty->cursor_y = 0;
-                vga_set_cursor(0, 0);
+                if (tty_on_vga) vga_set_cursor(0, 0);
                 i += 2;
                 continue;
             }
@@ -755,8 +823,10 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                 devfs_tty_clear_backing_fast(tty, tty->current_attr);
                 tty->cursor_x = 0;
                 tty->cursor_y = 0;
-                vga_clear_screen_attr(tty->current_attr);
-                vga_set_cursor(0, 0);
+                if (tty_on_vga) {
+                    vga_clear_screen_attr(tty->current_attr);
+                    vga_set_cursor(0, 0);
+                }
                 i += 5;
                 continue;
             }
@@ -767,36 +837,47 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                 } else if (ch == '[' && i + 1 < size && s[i + 1] == 'H') {
                     tty->cursor_x = 0;
                     tty->cursor_y = 0;
-                    vga_set_cursor(0, 0);
+                    if (tty_on_vga) vga_set_cursor(0, 0);
                     i += 1;
                     continue;
                 } else if (ch == '\r') {
                     /* carriage return: erase from cursor to EOL (no cursor advance), then move to start of line */
                     uint32_t tty_cols = devfs_tty_cols();
                     if (tty_cols == 0) tty_cols = MAX_COLS;
-                    vga_clear_line_segment(tty->cursor_x, tty_cols - 1, tty->cursor_y, tty->current_attr);
-                    tty->cursor_x = 0;
-                    vga_set_cursor(0, tty->cursor_y);
+                    if (tty_on_vga) {
+                        vga_clear_line_segment(tty->cursor_x, tty_cols - 1, tty->cursor_y, tty->current_attr);
+                        tty->cursor_x = 0;
+                        vga_set_cursor(0, tty->cursor_y);
+                    } else {
+                        devfs_tty_buf_erase_eol(tty, tty->cursor_x, tty->cursor_y, tty->current_attr);
+                        tty->cursor_x = 0;
+                    }
                 } else if (ch == '\b' || (unsigned char)ch == 0x7F) {
                     /* backspace / DEL: move cursor left and clear cell (app line editor) */
-                    kputchar('\b', tty->current_attr);
-                    vga_get_cursor(&tty->cursor_x, &tty->cursor_y);
-                    did_output = 1;
+                    if (tty_on_vga) {
+                        kputchar('\b', tty->current_attr);
+                        vga_get_cursor(&tty->cursor_x, &tty->cursor_y);
+                    } else {
+                        devfs_tty_virtual_putc(tty, (uint8_t)'\b');
+                    }
                 } else {
                     /* normal character output using current attribute */
-                    kputchar((uint8_t)ch, tty->current_attr);
-                    vga_get_cursor(&tty->cursor_x, &tty->cursor_y);
-                    did_output = 1;
+                    if (tty_on_vga) {
+                        kputchar((uint8_t)ch, tty->current_attr);
+                        vga_get_cursor(&tty->cursor_x, &tty->cursor_y);
+                    } else {
+                        devfs_tty_virtual_putc(tty, (uint8_t)ch);
+                    }
                 }
             } else if (tty->ansi_escape_state == 1) {
                 if ((unsigned char)ch == '[') {
                     tty->ansi_escape_state = 2; /* CSI start */
                     tty->ansi_param_count = 0;
                     tty->ansi_current_param = 0;
-                    if (i + 2 < size && s[i + 1] == 'H') {
+                    if (i + 1 < size && s[i + 1] == 'H') {
                         tty->cursor_x = 0;
                         tty->cursor_y = 0;
-                        vga_set_cursor(0, 0);
+                        if (tty_on_vga) vga_set_cursor(0, 0);
                         tty->ansi_escape_state = 0;
                         i += 1;
                         continue;
@@ -806,27 +887,31 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                 } else {
                     /* unknown sequence, reset and output the ESC as literal */
                     tty->ansi_escape_state = 0;
-                    kputchar(0x1B, tty->current_attr);
-                    kputchar((uint8_t)ch, tty->current_attr);
-                    did_output = 1;
+                    if (tty_on_vga) {
+                        kputchar(0x1B, tty->current_attr);
+                        kputchar((uint8_t)ch, tty->current_attr);
+                    } else {
+                        devfs_tty_virtual_putc(tty, 0x1B);
+                        devfs_tty_virtual_putc(tty, (uint8_t)ch);
+                    }
                 }
             } else if (tty->ansi_escape_state == 3) {
                 /* SS3: single final byte (e.g. A=up, B=down, C=right, D=left) */
                 unsigned char fc = (unsigned char)ch;
                 if (fc == 'A') {
                     if (tty->cursor_y > 0) tty->cursor_y--;
-                    vga_set_cursor(tty->cursor_x, tty->cursor_y);
+                    if (tty_on_vga) vga_set_cursor(tty->cursor_x, tty->cursor_y);
                 } else if (fc == 'B') {
                     uint32_t tty_rows = devfs_tty_rows();
                     if (tty->cursor_y + 1 < tty_rows) tty->cursor_y++;
-                    vga_set_cursor(tty->cursor_x, tty->cursor_y);
+                    if (tty_on_vga) vga_set_cursor(tty->cursor_x, tty->cursor_y);
                 } else if (fc == 'C') {
                     uint32_t tty_cols = devfs_tty_cols();
                     if (tty->cursor_x + 1 < tty_cols) tty->cursor_x++;
-                    vga_set_cursor(tty->cursor_x, tty->cursor_y);
+                    if (tty_on_vga) vga_set_cursor(tty->cursor_x, tty->cursor_y);
                 } else if (fc == 'D') {
                     if (tty->cursor_x > 0) tty->cursor_x--;
-                    vga_set_cursor(tty->cursor_x, tty->cursor_y);
+                    if (tty_on_vga) vga_set_cursor(tty->cursor_x, tty->cursor_y);
                 }
                 tty->ansi_escape_state = 0;
             } else if (tty->ansi_escape_state == 2) {
@@ -901,16 +986,16 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                         if ((uint32_t)col > tty_cols) col = (int)tty_cols;
                         tty->cursor_y = row - 1;
                         tty->cursor_x = col - 1;
-                        vga_set_cursor(tty->cursor_x, tty->cursor_y);
+                        if (tty_on_vga) vga_set_cursor(tty->cursor_x, tty->cursor_y);
                     } else if (final_byte == 'J') {
                         int param = (tty->ansi_param_count > 0) ? tty->ansi_param[0] : 0;
                         if (param == 2 || param == 3) {
                             /* 2=clear entire screen; 3=clear entire screen + scrollback (same behavior).
                                Fast path: clear visible console in one call and reset tty backing store. */
                             devfs_tty_clear_backing_fast(tty, tty->current_attr);
-                            if (idx == devfs_active) {
-                                tty->cursor_x = 0;
-                                tty->cursor_y = 0;
+                            tty->cursor_x = 0;
+                            tty->cursor_y = 0;
+                            if (tty_on_vga) {
                                 vga_clear_screen_attr(tty->current_attr);
                                 vga_set_cursor(0, 0);
                             }
@@ -929,9 +1014,9 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                                         tty->screen[off + 1] = tty->current_attr;
                                     }
                                 }
-                                vga_clear_line_segment((uint32_t)x0, x1, ry, tty->current_attr);
+                                if (tty_on_vga) vga_clear_line_segment((uint32_t)x0, x1, ry, tty->current_attr);
                             }
-                            vga_set_cursor(tty->cursor_x, tty->cursor_y);
+                            if (tty_on_vga) vga_set_cursor(tty->cursor_x, tty->cursor_y);
                         } else if (param == 1) {
                             /* Clear from start of screen to cursor */
                             uint32_t cy = tty->cursor_y;
@@ -946,15 +1031,15 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                                         tty->screen[off + 1] = tty->current_attr;
                                     }
                                 }
-                                vga_clear_line_segment(x0, x1, ry, tty->current_attr);
+                                if (tty_on_vga) vga_clear_line_segment(x0, x1, ry, tty->current_attr);
                             }
-                            vga_set_cursor(tty->cursor_x, tty->cursor_y);
+                            if (tty_on_vga) vga_set_cursor(tty->cursor_x, tty->cursor_y);
                         }
                     } else if (final_byte == 'K') {
                         /* Erase in line: 0=from cursor to EOL, 1=BOL to cursor, 2=whole line.
                          * For active tty: clear on VGA so sh (and other apps) can redraw the line. */
                         int param = (tty->ansi_param_count > 0) ? tty->ansi_param[0] : 0;
-                        if (idx == devfs_active) {
+                        if (tty_on_vga) {
                             uint32_t cy = tty->cursor_y;
                             uint32_t tty_cols = devfs_tty_cols();
                             uint32_t x0 = 0, x1 = tty_cols - 1;
@@ -969,11 +1054,21 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                             }
                             vga_clear_line_segment(x0, x1, cy, tty->current_attr);
                             vga_set_cursor(tty->cursor_x, tty->cursor_y);
-                        } else if (param == 2) {
+                        } else {
+                            uint32_t cy = tty->cursor_y;
                             uint32_t tty_cols = devfs_tty_cols();
-                            for (uint32_t rx = 0; rx < tty_cols; rx++) {
-                                uint16_t off = (uint16_t)((tty->cursor_y * tty_cols + rx) * 2);
-                                if (tty->screen) {
+                            uint32_t x0 = 0, x1 = (tty_cols > 0) ? tty_cols - 1 : 0;
+                            if (param == 0) {
+                                x0 = tty->cursor_x;
+                            } else if (param == 1) {
+                                x1 = tty->cursor_x;
+                                tty->cursor_x = 0;
+                            } else {
+                                tty->cursor_x = 0;
+                            }
+                            if (tty->screen && tty_cols > 0) {
+                                for (uint32_t rx = x0; rx <= x1 && rx < tty_cols; rx++) {
+                                    uint16_t off = (uint16_t)((cy * tty_cols + rx) * 2);
                                     tty->screen[off] = ' ';
                                     tty->screen[off + 1] = tty->current_attr;
                                 }
@@ -993,7 +1088,7 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                         } else {
                             if ((int)tty->cursor_x >= n) tty->cursor_x -= n; else tty->cursor_x = 0;
                         }
-                        vga_set_cursor(tty->cursor_x, tty->cursor_y);
+                        if (tty_on_vga) vga_set_cursor(tty->cursor_x, tty->cursor_y);
                     }
                     /* reset CSI parser state after handling final byte */
                     tty->ansi_escape_state = 0;
@@ -1001,81 +1096,41 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                     tty->ansi_current_param = 0;
                 }
             }
-        } else {
-            /* non-active tty: write directly to its saved screen with its current attributes */
-            struct devfs_tty *tty = t;
-            /* similar handling but on the non-active tty's buffer */
-            if (tty->ansi_escape_state != 0) {
-                /* For simplicity, ignore escape sequences on non-active ttys to avoid desync. */
-                tty->ansi_escape_state = 0;
-                tty->ansi_param_count = 0;
-                tty->ansi_current_param = 0;
-            }
-            if (tty->screen) {
-                uint32_t x = tty->cursor_x;
-                uint32_t y = tty->cursor_y;
-                uint32_t tty_cols = devfs_tty_cols();
-                uint32_t tty_rows = devfs_tty_rows();
-                uint16_t off = (uint16_t)((y * tty_cols + x) * 2);
-                if (off + 1 < (tty_rows * tty_cols * 2)) {
-                    tty->screen[off] = (uint8_t)ch;
-                    tty->screen[off + 1] = tty->current_attr;
-                    tty->cursor_x++;
-                    if (tty->cursor_x >= tty_cols) { tty->cursor_x = 0; tty->cursor_y++; if (tty->cursor_y >= tty_rows) tty->cursor_y = tty_rows - 1; }
-                }
-            }
-            did_output = 1; /* non-active: we wrote to buffer */
         }
-            /* write into saved screen buffer only for non-active ttys.
-               Active tty is already rendered by console path, and double-write desyncs cursor. */
-            if (did_output && idx != devfs_active && t->screen) {
-                /* very naive: append at bottom-right with no wrapping */
-                uint32_t x = t->cursor_x;
-                uint32_t y = t->cursor_y;
-                uint32_t tty_cols = devfs_tty_cols();
-                uint32_t tty_rows = devfs_tty_rows();
-                uint16_t off = (uint16_t)((y * tty_cols + x) * 2);
-                if (off + 1 < (tty_rows * tty_cols * 2)) {
-                    t->screen[off] = (uint8_t)ch;
-                    t->screen[off + 1] = GRAY_ON_BLACK;
-                    t->cursor_x++;
-                    if (t->cursor_x >= tty_cols) { t->cursor_x = 0; t->cursor_y++; if (t->cursor_y >= tty_rows) t->cursor_y = tty_rows - 1; }
-                }
-            }
-        }
-        /* Also append written chars to stdout/stderr ring buffers if applicable */
-        if (file->path) {
-            int which = -1;
-            if (strcmp(file->path, "/dev/stdout") == 0) which = 0;
-            else if (strcmp(file->path, "/dev/stderr") == 0) which = 1;
-            if (which >= 0) {
-                stdio_ring_t *rb = &stdio_bufs[which];
-                unsigned long flags = 0;
-                acquire_irqsave(&rb->lock, &flags);
-                for (size_t ii = 0; ii < size; ii++) {
-                    char ch = ((const char*)buf)[ii];
-                    size_t next = (rb->tail + 1) % rb->cap;
-                    if (next != rb->head) {
-                        rb->buf[rb->tail] = ch;
-                        rb->tail = next;
-                    } else {
-                        /* buffer full: drop oldest */
-                        rb->head = (rb->head + 1) % rb->cap;
-                        rb->buf[rb->tail] = ch;
-                        rb->tail = (rb->tail + 1) % rb->cap;
-                    }
-                }
-                /* wake readers */
-                for (int wi = 0; wi < rb->waiters_count; wi++) {
-                    int tid = rb->waiters[wi];
-                    if (tid >= 0) thread_unblock(tid);
-                }
-                rb->waiters_count = 0;
-                release_irqrestore(&rb->lock, flags);
-            }
-        }
-        return (ssize_t)size;
     }
+    /* Also append written chars to stdout/stderr ring buffers if applicable */
+    if (file->path) {
+        int which = -1;
+        if (strcmp(file->path, "/dev/stdout") == 0) which = 0;
+        else if (strcmp(file->path, "/dev/stderr") == 0) which = 1;
+        if (which >= 0) {
+            stdio_ring_t *rb = &stdio_bufs[which];
+            unsigned long flags = 0;
+            acquire_irqsave(&rb->lock, &flags);
+            for (size_t ii = 0; ii < size; ii++) {
+                char ch2 = ((const char*)buf)[ii];
+                size_t next = (rb->tail + 1) % rb->cap;
+                if (next != rb->head) {
+                    rb->buf[rb->tail] = ch2;
+                    rb->tail = next;
+                } else {
+                    /* buffer full: drop oldest */
+                    rb->head = (rb->head + 1) % rb->cap;
+                    rb->buf[rb->tail] = ch2;
+                    rb->tail = (rb->tail + 1) % rb->cap;
+                }
+            }
+            /* wake readers */
+            for (int wi = 0; wi < rb->waiters_count; wi++) {
+                int tid = rb->waiters[wi];
+                if (tid >= 0) thread_unblock(tid);
+            }
+            rb->waiters_count = 0;
+            release_irqrestore(&rb->lock, flags);
+        }
+    }
+    return (ssize_t)size;
+}
 
 static void devfs_release(struct fs_file *file) {
     if (!file) return;
@@ -1307,7 +1362,8 @@ void devfs_tty_push_input_noblock(int tty, char c) {
             int pgrp = devfs_tty_get_fg_pgrp(tty);
             if (pgrp >= 0) {
                 thread_send_sigint_to_pgrp(pgrp);
-                thread_schedule();
+                if (smp_cpu_count() <= 1)
+                    thread_schedule();
             }
             return;
         }
@@ -1335,7 +1391,8 @@ void devfs_tty_push_input_noblock(int tty, char c) {
             kputchar('\n', t->current_attr);
         }
         release(&t->in_lock);
-        thread_schedule();
+        if (smp_cpu_count() <= 1)
+            thread_schedule();
         return;
     }
     if (t->in_count < (int)sizeof(t->inbuf)) {

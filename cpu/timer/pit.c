@@ -7,6 +7,8 @@
 #include <thread.h>
 #include <vbe.h>
 #include <cirrusfb.h>
+#include <smp.h>
+#include <loadavg.h>
 
 // Global variables
 volatile uint64_t pit_ticks = 0;
@@ -19,12 +21,17 @@ void pit_handler(cpu_registers_t* regs) {
         pit_ticks++;
         timer_ticks++;
 
+        if (init && smp_sched_cpu_id() == 0 && pit_ticks > 0 &&
+            pit_frequency > 0 && (pit_ticks % pit_frequency) == 0)
+                loadavg_second_tick();
+
         if (!init) return;
         /* То же правило, что и для APIC: не планируем из IRQ, пришедшего из ring3. */
         if (regs && ((regs->cs & 3) == 3)) return;
         
-        // Вызываем планировщик реже - каждые 10 тиков (10 мс при 1000 Гц)
-        if ((pit_ticks % 10) == 0) {
+        /* SMP: never thread_schedule() from IRQ — nested scheduler + sched_lock corrupts state.
+           Idle loops + IPI wake other CPUs; BSP is driven by syscalls/yield. */
+        if ((pit_ticks % 10) == 0 && smp_cpu_count() <= 1) {
                 thread_schedule();
         }
         if (cirrusfb_is_ready()) {
@@ -100,8 +107,14 @@ uint16_t pit_get_current_count() {
 void pit_sleep_ms(uint32_t milliseconds) {
         /* Use common ticks so this keeps working even if PIT is disabled later. */
         uint64_t target_ticks = timer_ticks + (milliseconds * pit_frequency / 1000);
-        
-        while (timer_ticks < target_ticks);
+        /* If timer_ticks never advance (mis-routed IRQ / SMP oddity), do not hang forever. */
+        uint64_t spins = 0;
+        uint64_t spin_limit = (uint64_t)milliseconds * 50000000ull + 500000000ull;
+        while (timer_ticks < target_ticks) {
+                if (++spins > spin_limit)
+                        break;
+                asm volatile("pause" ::: "memory");
+        }
 }
 
 // Get current tick count

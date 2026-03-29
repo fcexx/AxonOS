@@ -24,10 +24,14 @@
 #include <net_tcp.h>
 #include <dns.h>
 #include <mm.h>
+#include <smp.h>
+#include <loadavg.h>
 #include <console.h>
 #include <ramfs.h>
 #include <dhcp.h>
 #include <debug.h>
+#include <klog.h>
+#include <stdio.h>
 
 /* Linux x86_64 struct stat size; ensures st_mode at correct offset for S_ISREG etc. */
 #define STAT_COPY_SIZE 144
@@ -44,6 +48,8 @@ uint64_t syscall_user_rsp_saved = 0;
 uint64_t syscall_kernel_rsp0 = 0;
 /* Saved user RIP for SYSCALL path (RCX at syscall entry). Used by fork/vfork helpers. */
 uint64_t syscall_user_return_rip = 0;
+/* Last userspace-visible return value from syscall_do before signal delivery. */
+uint64_t syscall_user_return_rax = 0;
 /* Saved callee-saved user registers captured by syscall_entry64.
    vfork needs these to resume the parent code path correctly in the child. */
 uint64_t syscall_user_saved_rbx = 0;
@@ -78,6 +84,11 @@ extern void syscall_entry64(void);
 /* helper entry for kernel-created user threads (defined in cpu/thread.c) */
 extern void user_thread_entry(void);
 
+static inline int user_range_ok(const void *uaddr, size_t nbytes);
+static inline int user_recv_range_ok(const void *uaddr, size_t nbytes);
+static int copy_from_user_raw(void *kdst, const void *usrc, size_t n);
+static size_t user_strnlen_bounded(const char *s, size_t max);
+
 static inline uint64_t msr_read_u64(uint32_t msr) {
     uint32_t lo = 0, hi = 0;
     asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
@@ -87,6 +98,45 @@ static inline void msr_write_u64(uint32_t msr, uint64_t v) {
     uint32_t lo = (uint32_t)(v & 0xFFFFFFFFu);
     uint32_t hi = (uint32_t)(v >> 32);
     asm volatile("wrmsr" :: "c"(msr), "a"(lo), "d"(hi));
+}
+
+static thread_t *uaccess_thread(void) {
+    thread_t *t = thread_get_current_user();
+    if (!t) t = thread_current();
+    return t;
+}
+
+static void uaccess_clear(thread_t *t) {
+    if (!t) return;
+    t->uaccess_begin = 0;
+    t->uaccess_end = 0;
+    t->uaccess_resume_rip = 0;
+    t->uaccess_active = 0;
+}
+
+static int uaccess_arm(thread_t *t, const void *uptr, size_t n, void *resume_rip, int recv_range) {
+    if (!t || !resume_rip) return -1;
+    if (recv_range) {
+        if (!user_recv_range_ok(uptr, n)) return -1;
+    } else {
+        if (!user_range_ok(uptr, n)) return -1;
+    }
+    t->uaccess_begin = (uintptr_t)uptr;
+    t->uaccess_end = (uintptr_t)uptr + n;
+    t->uaccess_resume_rip = (uint64_t)(uintptr_t)resume_rip;
+    t->uaccess_active = 1;
+    asm volatile("" ::: "memory");
+    return 0;
+}
+
+int syscall_try_handle_uaccess_fault(uint64_t fault_addr, uint64_t *resume_rip_out) {
+    thread_t *t = uaccess_thread();
+    uintptr_t fault = (uintptr_t)fault_addr;
+    if (!t || !t->uaccess_active) return 0;
+    if (fault < t->uaccess_begin || fault >= t->uaccess_end) return 0;
+    if (resume_rip_out) *resume_rip_out = t->uaccess_resume_rip;
+    uaccess_clear(t);
+    return 1;
 }
 
 /* Debug helper: dump kernel syscall stack region around syscall_kernel_rsp0 */
@@ -266,21 +316,17 @@ enum {
     MSR_FS_BASE = 0xC0000100u,
 };
 
-/* Helper: copy up to `max` bytes from user pointer `uptr` into newly allocated buffer.
-   Returns allocated buffer (must be kfreed) and sets out_copied. On error returns NULL. */
+/* Helper: copy up to `max` bytes from user pointer `uptr` into newly allocated buffer. */
 static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, size_t *out_copied) {
     if (!uptr || count == 0) { if (out_copied) *out_copied = 0; return NULL; }
     size_t to_copy = count < max ? count : max;
-    /* Basic bounds check: ensure entirely within identity mapped user region. */
-    if ((uintptr_t)uptr + to_copy > (uintptr_t)MMIO_IDENTITY_LIMIT) {
+    void *buf = kmalloc(to_copy);
+    if (!buf) { if (out_copied) *out_copied = 0; return NULL; }
+    if (copy_from_user_raw(buf, uptr, to_copy) != 0) {
+        kfree(buf);
         if (out_copied) *out_copied = 0;
         return NULL;
     }
-    void *buf = kmalloc(to_copy);
-    if (!buf) { if (out_copied) *out_copied = 0; return NULL; }
-    /* Simple memcpy: assume identity-mapped user memory is accessible from kernel.
-       This mirrors previous behavior; more advanced checks caused double-faults. */
-    memcpy(buf, uptr, to_copy);
     if (out_copied) *out_copied = to_copy;
     return buf;
 }
@@ -1700,11 +1746,6 @@ static void normalize_path(char *buf, size_t cap) {
     buf[cap - 1] = '\0';
 }
 
-/* Forward declarations for user-pointer-safe path handling helpers. */
-static inline int user_range_ok(const void *uaddr, size_t nbytes);
-static int copy_from_user_raw(void *kdst, const void *usrc, size_t n);
-static size_t user_strnlen_bounded(const char *s, size_t max);
-
 static void resolve_user_path(thread_t *cur, const char *path_u, char *out, size_t out_cap) {
     if (!out || out_cap == 0) return;
     out[0] = '\0';
@@ -1810,24 +1851,35 @@ static int resolve_user_path_at(thread_t *cur, int dirfd, const char *path_u, ch
 }
 
 static int copy_to_user_safe(void *uptr, const void *kptr, size_t n) {
-    if (!uptr || !kptr || n == 0) return -1;
-    if (!user_range_ok(uptr, n)) return -1;
-    memcpy(uptr, kptr, n);
+    if (!uptr || !kptr) return -1;
+    if (n == 0) return 0;
+    thread_t *t = uaccess_thread();
+    if (uaccess_arm(t, uptr, n, &&fault, 0) != 0) return -1;
+    volatile uint8_t *dst = (volatile uint8_t *)uptr;
+    const uint8_t *src = (const uint8_t *)kptr;
+    for (size_t i = 0; i < n; i++) dst[i] = src[i];
+    uaccess_clear(t);
     return 0;
+fault:
+    uaccess_clear(t);
+    return -1;
 }
 
 static int copy_from_user_raw(void *kdst, const void *usrc, size_t n) {
-    if (!kdst || !usrc || n == 0) return -1;
-    if (!user_range_ok(usrc, n)) return -1;
-    memcpy(kdst, usrc, n);
+    if (!kdst || !usrc) return -1;
+    if (n == 0) return 0;
+    thread_t *t = uaccess_thread();
+    if (uaccess_arm(t, usrc, n, &&fault, 0) != 0) return -1;
+    uint8_t *dst = (uint8_t *)kdst;
+    const volatile uint8_t *src = (const volatile uint8_t *)usrc;
+    for (size_t i = 0; i < n; i++) dst[i] = src[i];
+    uaccess_clear(t);
     return 0;
+fault:
+    uaccess_clear(t);
+    return -1;
 }
 
-/* Conservative user pointer bounds check for our identity-mapped userspace model.
-   NOTE: We intentionally do NOT walk page tables here because virt_to_phys() is not
-   reliable with the current paging setup (it often returns 0 for valid addresses).
-   This means invalid/unmapped user pointers may still #PF; fixing that properly
-   requires a real copy_from_user with fault handling. */
 static inline int user_range_ok(const void *uaddr, size_t nbytes) {
     if (!uaddr) return 0;
     if (nbytes == 0) return 1;
@@ -1843,6 +1895,32 @@ static inline int user_range_ok(const void *uaddr, size_t nbytes) {
     return 1;
 }
 
+static inline int user_recv_range_ok(const void *uaddr, size_t nbytes) {
+    if (!uaddr) return 0;
+    if (nbytes == 0) return 1;
+    uintptr_t start = (uintptr_t)uaddr;
+    uintptr_t end = start + nbytes;
+    if (end < start) return 0;
+    if (start < 0x00200000u) return 0;
+    if (end > (uintptr_t)MMIO_IDENTITY_LIMIT) return 0;
+    return 1;
+}
+
+static int copy_to_user_recv_safe(void *uptr, const void *kptr, size_t n) {
+    if (!uptr || !kptr) return -1;
+    if (n == 0) return 0;
+    thread_t *t = uaccess_thread();
+    if (uaccess_arm(t, uptr, n, &&fault, 1) != 0) return -1;
+    volatile uint8_t *dst = (volatile uint8_t *)uptr;
+    const uint8_t *src = (const uint8_t *)kptr;
+    for (size_t i = 0; i < n; i++) dst[i] = src[i];
+    uaccess_clear(t);
+    return 0;
+fault:
+    uaccess_clear(t);
+    return -1;
+}
+
 static int user_read_u64(const void *uaddr, uint64_t *out) {
     if (!out) return -1;
     if (!user_range_ok(uaddr, sizeof(uint64_t))) return -1;
@@ -1851,12 +1929,30 @@ static int user_read_u64(const void *uaddr, uint64_t *out) {
     return 0;
 }
 
+static int user_write_u64(void *uaddr, uint64_t value) {
+    return copy_to_user_safe(uaddr, &value, sizeof(value));
+}
+
+static int user_write_u8(void *uaddr, uint8_t value) {
+    return copy_to_user_safe(uaddr, &value, sizeof(value));
+}
+
 static size_t user_strnlen_bounded(const char *s, size_t max) {
     if (!s) return 0;
+    if (max == 0) return 0;
+    thread_t *t = uaccess_thread();
+    if (uaccess_arm(t, s, max, &&fault, 0) != 0) return max;
+    const volatile char *p = (const volatile char *)s;
     for (size_t i = 0; i < max; i++) {
-        if (!user_range_ok(s + i, 1)) return max;
-        if (s[i] == '\0') return i;
+        if (p[i] == '\0') {
+            uaccess_clear(t);
+            return i;
+        }
     }
+    uaccess_clear(t);
+    return max;
+fault:
+    uaccess_clear(t);
     return max;
 }
 
@@ -1991,32 +2087,35 @@ int maybe_deliver_pending_signal(void) {
     if (frame_start < 0x200000ULL) return 0;
     if (mark_user_identity_range_2m_sys((uint64_t)frame_start, (uint64_t)(frame_start + RT_SIGFRAME_SIZE)) != 0)
         return 0;
-    k_ucontext_t *uc = (k_ucontext_t *)(frame_start + RT_SIGFRAME_UC_OFF);
-    memset(uc, 0, sizeof(*uc));
-    uc->uc_mcontext.r8  = cur->saved_user_r8;
-    uc->uc_mcontext.r9  = cur->saved_user_r9;
-    uc->uc_mcontext.r10 = cur->saved_user_r10;
-    uc->uc_mcontext.r11 = cur->saved_user_r11;
-    uc->uc_mcontext.r12 = cur->saved_user_r12;
-    uc->uc_mcontext.r13 = cur->saved_user_r13;
-    uc->uc_mcontext.r14 = cur->saved_user_r14;
-    uc->uc_mcontext.r15 = cur->saved_user_r15;
-    uc->uc_mcontext.rdi = cur->saved_user_rdi;
-    uc->uc_mcontext.rsi = cur->saved_user_rsi;
-    uc->uc_mcontext.rbp = cur->saved_user_rbp;
-    uc->uc_mcontext.rbx = cur->saved_user_rbx;
-    uc->uc_mcontext.rdx = cur->saved_user_rdx;
-    uc->uc_mcontext.rax = 0;
-    uc->uc_mcontext.rcx = cur->saved_user_rcx;
-    uc->uc_mcontext.rsp = old_rsp;
-    uc->uc_mcontext.rip = old_rip;
-    uc->uc_mcontext.eflags = cur->saved_user_r11;
-    uc->uc_mcontext.cs = 0x1B;
-    uc->uc_mcontext.gs = 0;
-    uc->uc_mcontext.fs = 0;
-    uc->uc_mcontext.ss = 0x23;
-    uc->uc_sigmask[0] = blocked;
-    *(uint64_t *)(uintptr_t)frame_start = restorer;
+    k_ucontext_t uc;
+    memset(&uc, 0, sizeof(uc));
+    uc.uc_mcontext.r8  = cur->saved_user_r8;
+    uc.uc_mcontext.r9  = cur->saved_user_r9;
+    uc.uc_mcontext.r10 = cur->saved_user_r10;
+    uc.uc_mcontext.r11 = cur->saved_user_r11;
+    uc.uc_mcontext.r12 = cur->saved_user_r12;
+    uc.uc_mcontext.r13 = cur->saved_user_r13;
+    uc.uc_mcontext.r14 = cur->saved_user_r14;
+    uc.uc_mcontext.r15 = cur->saved_user_r15;
+    uc.uc_mcontext.rdi = cur->saved_user_rdi;
+    uc.uc_mcontext.rsi = cur->saved_user_rsi;
+    uc.uc_mcontext.rbp = cur->saved_user_rbp;
+    uc.uc_mcontext.rbx = cur->saved_user_rbx;
+    uc.uc_mcontext.rdx = cur->saved_user_rdx;
+    uc.uc_mcontext.rax = syscall_user_return_rax;
+    uc.uc_mcontext.rcx = cur->saved_user_rcx;
+    uc.uc_mcontext.rsp = old_rsp;
+    uc.uc_mcontext.rip = old_rip;
+    uc.uc_mcontext.eflags = cur->saved_user_r11;
+    uc.uc_mcontext.cs = 0x1B;
+    uc.uc_mcontext.gs = 0;
+    uc.uc_mcontext.fs = 0;
+    uc.uc_mcontext.ss = 0x23;
+    uc.uc_sigmask[0] = blocked;
+    if (copy_to_user_safe((void *)(uintptr_t)(frame_start + RT_SIGFRAME_UC_OFF), &uc, sizeof(uc)) != 0)
+        return 0;
+    if (copy_to_user_safe((void *)(uintptr_t)frame_start, &restorer, sizeof(restorer)) != 0)
+        return 0;
     cur->pending_signals &= ~(1ULL << (sig - 1));
     uint64_t *frame = cur->saved_syscall_frame;
     if (!frame) return 0;
@@ -2323,7 +2422,8 @@ static void send_signal_to_pgrp(int pgrp, int signum) {
             }
         } else if (signum == SIGCONT) {
             if (t->state == THREAD_SLEEPING || t->state == THREAD_BLOCKED) {
-                t->state = THREAD_READY;
+                t->sleep_until = 0;
+                thread_note_ready(t);
             }
         }
     }
@@ -2698,10 +2798,12 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     uintptr_t pp = (uintptr_t)child_rsp;
                     uintptr_t end = (uintptr_t)child_rsp + (uintptr_t)copy_bytes;
                     for (; pp + 8 <= end; pp += 8) {
-                        uint64_t v = *(uint64_t*)(uintptr_t)pp;
+                        uint64_t v = 0;
+                        if (user_read_u64((const void *)(uintptr_t)pp, &v) != 0) return ret_err(EFAULT);
                         uintptr_t vv = (uintptr_t)v;
                         if (vv >= parent_lo && vv < parent_hi) {
-                            *(uint64_t*)(uintptr_t)pp = (uint64_t)(vv + delta);
+                            if (user_write_u64((void *)(uintptr_t)pp, (uint64_t)(vv + delta)) != 0)
+                                return ret_err(EFAULT);
                         }
                     }
                 }
@@ -2722,20 +2824,23 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     /* already zeroed */
                 }
                 /* Ensure the self pointer slot used by glibc pthread_getspecific is valid. */
-                *(volatile uint64_t*)(uintptr_t)(child_fs - 0x78u) = (uint64_t)child_pthread_fake;
+                if (user_write_u64((void *)(uintptr_t)(child_fs - 0x78u), (uint64_t)child_pthread_fake) != 0)
+                    return ret_err(EFAULT);
                 /* Provide default "C" locale string for specifics[5] (see core/elf.c). */
                 {
                     const uintptr_t c_str = child_tls_region + 0x2800u;
                     if (c_str + 2 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                        *(volatile uint8_t*)(uintptr_t)(c_str + 0) = (uint8_t)'C';
-                        *(volatile uint8_t*)(uintptr_t)(c_str + 1) = 0;
+                        if (user_write_u8((void *)(uintptr_t)(c_str + 0), (uint8_t)'C') != 0) return ret_err(EFAULT);
+                        if (user_write_u8((void *)(uintptr_t)(c_str + 1), 0) != 0) return ret_err(EFAULT);
                         const uintptr_t specific5_slot = child_pthread_fake + 0x80u + (uintptr_t)(5u * 8u);
                         /* The TLS region may have been cloned from parent and contain garbage/non-canonical
                            pointers in the specifics area. Clear a small window and force slot 5. */
                         for (int si = 0; si < 32; si++) {
-                            *(volatile uint64_t*)(uintptr_t)(child_pthread_fake + 0x80u + (uintptr_t)(si * 8u)) = 0;
+                            if (user_write_u64((void *)(uintptr_t)(child_pthread_fake + 0x80u + (uintptr_t)(si * 8u)), 0) != 0)
+                                return ret_err(EFAULT);
                         }
-                        *(volatile uint64_t*)(uintptr_t)specific5_slot = (uint64_t)c_str;
+                        if (user_write_u64((void *)(uintptr_t)specific5_slot, (uint64_t)c_str) != 0)
+                            return ret_err(EFAULT);
                     }
                 }
                 child->user_fs_base = (uint64_t)child_fs;
@@ -4078,20 +4183,15 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 /* ICMP timeout: ETIMEDOUT gives "Request timeout" instead of "Resource temporarily unavailable" */
                 return ret_err((s->protocol == IPPROTO_ICMP_LOCAL) ? ETIMEDOUT : EAGAIN);
             }
-            if (copy_to_user_safe(buf_u, tmp, (size_t)n) != 0) {
-                /* Some userspace DNS paths pass buffers outside USER_STACK_TOP but still inside
-                   identity-mapped user memory. Accept that range for socket receive copies. */
-                uintptr_t us = (uintptr_t)buf_u;
-                uintptr_t ue = us + (size_t)n;
-                if (ue < us || us < 0x00200000u || ue > (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                    if (dbg_wget) {
-                        qemu_debug_printf("RECVFROM-EFAULT: copy buf=%p n=%d us=0x%llx ue=0x%llx\n",
-                            buf_u, n, (unsigned long long)us, (unsigned long long)ue);
-                    }
-                    kfree(tmp);
-                    return ret_err(EFAULT);
+            if (copy_to_user_recv_safe(buf_u, tmp, (size_t)n) != 0) {
+                if (dbg_wget) {
+                    uintptr_t us = (uintptr_t)buf_u;
+                    uintptr_t ue = us + (size_t)n;
+                    qemu_debug_printf("RECVFROM-EFAULT: copy buf=%p n=%d us=0x%llx ue=0x%llx\n",
+                        buf_u, n, (unsigned long long)us, (unsigned long long)ue);
                 }
-                memcpy((void *)us, tmp, (size_t)n);
+                kfree(tmp);
+                return ret_err(EFAULT);
             }
             kfree(tmp);
             if (from_u && fromlen_u && user_range_ok(fromlen_u, 4)) {
@@ -4356,18 +4456,15 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 kfree(tmp);
                 return ret_err((s->protocol == IPPROTO_ICMP_LOCAL) ? ETIMEDOUT : EAGAIN);
             }
-            if (copy_to_user_safe(iov.base, tmp, (size_t)n) != 0) {
-                uintptr_t us = (uintptr_t)iov.base;
-                uintptr_t ue = us + (size_t)n;
-                if (ue < us || us < 0x00200000u || ue > (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                    if (dbg_wget) {
-                        qemu_debug_printf("RECVMSG-EFAULT: copy base=%p n=%d us=0x%llx ue=0x%llx\n",
-                            iov.base, n, (unsigned long long)us, (unsigned long long)ue);
-                    }
-                    kfree(tmp);
-                    return ret_err(EFAULT);
+            if (copy_to_user_recv_safe(iov.base, tmp, (size_t)n) != 0) {
+                if (dbg_wget) {
+                    uintptr_t us = (uintptr_t)iov.base;
+                    uintptr_t ue = us + (size_t)n;
+                    qemu_debug_printf("RECVMSG-EFAULT: copy base=%p n=%d us=0x%llx ue=0x%llx\n",
+                        iov.base, n, (unsigned long long)us, (unsigned long long)ue);
                 }
-                memcpy((void *)us, tmp, (size_t)n);
+                kfree(tmp);
+                return ret_err(EFAULT);
             }
             kfree(tmp);
             uint32_t fromlen = sizeof(sockaddr_in_k);
@@ -4396,7 +4493,9 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             memset(buf, 0, sizeof(buf));
             int64_t uptime_sec = (int64_t)(pit_get_time_ms() / 1000);
             memcpy(buf + 0, &uptime_sec, 8);
-            /* loads[3] at 8,16,24 = 0 */
+            unsigned long loads[3];
+            loadavg_get_user(loads);
+            memcpy(buf + 8, loads, 24);
             uint64_t totalram = 128 * 1024 * 1024;  /* 128MB */
             uint64_t freeram = 64 * 1024 * 1024;   /* 64MB - enough for stack allocation */
             memcpy(buf + 32, &totalram, 8);
@@ -4436,14 +4535,32 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             uint64_t self = (uint64_t)(cur->tid ? cur->tid : 1);
             if (pid != 0 && (uint64_t)pid != self) return ret_err(ESRCH);
             if (!mask_u || len < 8 || (uintptr_t)mask_u + len > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-            /* Single CPU: set bit 0 */
-            uint64_t mask = 1;
+            uint64_t mask = smp_default_affinity_mask();
             size_t copy = len < 8 ? len : 8;
             if (copy_to_user_safe(mask_u, &mask, copy) != 0) return ret_err(EFAULT);
             for (size_t i = 8; i < len; i++) {
                 char zero = 0;
                 if (copy_to_user_safe((char*)mask_u + i, &zero, 1) != 0) return ret_err(EFAULT);
             }
+            return 0;
+        }
+#ifndef PRIO_PROCESS
+#define PRIO_PROCESS 0
+#endif
+        case SYS_getpriority: { /* getpriority(which, who) */
+            int which = (int)a1;
+            int who = (int)a2;
+            if (which != PRIO_PROCESS) return ret_err(EINVAL);
+            thread_t *t = (who == 0) ? cur : thread_get(who);
+            if (!t) return ret_err(ESRCH);
+            return (uint64_t)(int64_t)t->nice;
+        }
+        case SYS_setpriority: { /* setpriority(which, who, prio) — Linux nice -20..19 */
+            int which = (int)a1;
+            int who = (int)a2;
+            int nicev = (int)a3;
+            if (which != PRIO_PROCESS) return ret_err(EINVAL);
+            if (thread_nice_set(who, nicev) != 0) return ret_err(ESRCH);
             return 0;
         }
         case 62: { /* kill(pid, sig) */
@@ -5199,10 +5316,12 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     uintptr_t pp = (uintptr_t)child_rsp;
                     uintptr_t end = (uintptr_t)child_rsp + (uintptr_t)copy_bytes;
                     for (; pp + 8 <= end; pp += 8) {
-                        uint64_t v = *(uint64_t*)(uintptr_t)pp;
+                        uint64_t v = 0;
+                        if (user_read_u64((const void *)(uintptr_t)pp, &v) != 0) return ret_err(EFAULT);
                         uintptr_t vv = (uintptr_t)v;
                         if (vv >= parent_lo && vv < parent_hi) {
-                            *(uint64_t*)(uintptr_t)pp = (uint64_t)(vv + delta);
+                            if (user_write_u64((void *)(uintptr_t)pp, (uint64_t)(vv + delta)) != 0)
+                                return ret_err(EFAULT);
                         }
                     }
                 }
@@ -5218,17 +5337,20 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 if (parent_tls_region != 0 && parent_tls_region + 0x3000u < (uintptr_t)MMIO_IDENTITY_LIMIT) {
                     memcpy((void*)child_tls_region, (void*)parent_tls_region, 0x3000u);
                 }
-                *(volatile uint64_t*)(uintptr_t)(child_fs - 0x78u) = (uint64_t)child_pthread_fake;
+                if (user_write_u64((void *)(uintptr_t)(child_fs - 0x78u), (uint64_t)child_pthread_fake) != 0)
+                    return ret_err(EFAULT);
                 {
                     const uintptr_t c_str = child_tls_region + 0x2800u;
                     if (c_str + 2 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                        *(volatile uint8_t*)(uintptr_t)(c_str + 0) = (uint8_t)'C';
-                        *(volatile uint8_t*)(uintptr_t)(c_str + 1) = 0;
+                        if (user_write_u8((void *)(uintptr_t)(c_str + 0), (uint8_t)'C') != 0) return ret_err(EFAULT);
+                        if (user_write_u8((void *)(uintptr_t)(c_str + 1), 0) != 0) return ret_err(EFAULT);
                         const uintptr_t specific5_slot = child_pthread_fake + 0x80u + (uintptr_t)(5u * 8u);
                         for (int si = 0; si < 32; si++) {
-                            *(volatile uint64_t*)(uintptr_t)(child_pthread_fake + 0x80u + (uintptr_t)(si * 8u)) = 0;
+                            if (user_write_u64((void *)(uintptr_t)(child_pthread_fake + 0x80u + (uintptr_t)(si * 8u)), 0) != 0)
+                                return ret_err(EFAULT);
                         }
-                        *(volatile uint64_t*)(uintptr_t)specific5_slot = (uint64_t)c_str;
+                        if (user_write_u64((void *)(uintptr_t)specific5_slot, (uint64_t)c_str) != 0)
+                            return ret_err(EFAULT);
                     }
                 }
                 child->user_fs_base = (uint64_t)child_fs;
@@ -5467,6 +5589,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 TCSETS    = 0x5402,
                 TCSETSW   = 0x5403,
                 TCSETSF   = 0x5404,
+                TIOCSTI   = 0x5412, /* inject byte into tty input queue (terminal ioctls) */
                 TIOCSCTTY = 0x540E,
                 TIOCGPGRP = 0x540F,
                 TIOCSPGRP = 0x5410,
@@ -5895,6 +6018,16 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 struct devfs_tty *tty = devfs_get_tty_by_index(tty_idx);
                 if (!tty) return ret_err(ENOTTY);
                 tty->term_lflag = tio.c_lflag;
+                return 0;
+            }
+            if (req == TIOCSTI) {
+                /* Push one byte as if typed on the tty (used by some tools; input path is unchanged). */
+                if (!argp) return ret_err(EFAULT);
+                unsigned char cbyte;
+                if (copy_from_user_raw(&cbyte, argp, 1) != 0) return ret_err(EFAULT);
+                int tty_idx = devfs_get_tty_index_from_file(f);
+                if (tty_idx < 0) return ret_err(ENOTTY);
+                devfs_tty_push_input(tty_idx, (char)cbyte);
                 return 0;
             }
             return ret_err(EINVAL);
@@ -7066,22 +7199,23 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 uint64_t old_fs = msr_read_u64(MSR_FS_BASE);
                 uint64_t old_guard = 0;
                 if (old_fs + 0x30 < (uint64_t)MMIO_IDENTITY_LIMIT) {
-                    old_guard = *(volatile uint64_t*)(uintptr_t)(old_fs + 0x28);
+                    (void)copy_from_user_raw(&old_guard, (const void *)(uintptr_t)(old_fs + 0x28), sizeof(old_guard));
                 } else if (0x30 < (uint64_t)MMIO_IDENTITY_LIMIT) {
                     /* common boot case: old_fs==0 */
-                    old_guard = *(volatile uint64_t*)(uintptr_t)0x28;
+                    (void)copy_from_user_raw(&old_guard, (const void *)(uintptr_t)0x28, sizeof(old_guard));
                 }
 
                 cur->user_fs_base = addr;
                 msr_write_u64(MSR_FS_BASE, addr);
 
                 if (addr + 0x30 < (uint64_t)MMIO_IDENTITY_LIMIT) {
-                    *(volatile uint64_t*)(uintptr_t)(addr + 0x28) = old_guard;
+                    (void)copy_to_user_safe((void *)(uintptr_t)(addr + 0x28), &old_guard, sizeof(old_guard));
                 }
                 return 0;
             } else if (code == ARCH_GET_FS) {
                 if (addr >= (uint64_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-                *(uint64_t*)(uintptr_t)addr = cur->user_fs_base;
+                if (copy_to_user_safe((void *)(uintptr_t)addr, &cur->user_fs_base, sizeof(cur->user_fs_base)) != 0)
+                    return ret_err(EFAULT);
                 return 0;
             } else if (code == ARCH_SET_GS || code == ARCH_GET_GS) {
                 return ret_err(ENOSYS);
@@ -7599,7 +7733,8 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (uc_ptr < 0x200000 || uc_ptr + sizeof(k_ucontext_t) > (uintptr_t)MMIO_IDENTITY_LIMIT)
                 return ret_err(EFAULT);
             k_ucontext_t uc;
-            memcpy(&uc, (void*)uc_ptr, sizeof(uc));
+            if (copy_from_user_raw(&uc, (const void *)uc_ptr, sizeof(uc)) != 0)
+                return ret_err(EFAULT);
             k_sigcontext_t *sc = &uc.uc_mcontext;
             cur->saved_user_r8  = sc->r8;
             cur->saved_user_r9  = sc->r9;
@@ -7620,7 +7755,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             cur->saved_sig_mask = uc.uc_sigmask[0];
             rebuild_syscall_frame(cur);
             syscall_user_rsp_saved = sc->rsp;
-            return 0;
+            return sc->rax;
         }
         case 91: /* set_robust_list(head, len) - glibc/pthread; no-op */
             (void)a1; (void)a2;

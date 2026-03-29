@@ -19,6 +19,7 @@
 #include <mm.h>
 #include <elf.h>
 #include <vga.h>
+#include <debug.h>
 
 extern uint8_t _end[]; /* kernel end symbol from linker */
 
@@ -446,7 +447,14 @@ void exec_ensure_user_mappings(void) {
     (void)map_page_2m(0x634000, 0x634000, PG_US | PG_RW);
 }
 
-int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk_end) {
+int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk_end,
+                       elf_tls_info_t *out_tls) {
+    if (out_tls) {
+        out_tls->vaddr = 0;
+        out_tls->filesz = 0;
+        out_tls->memsz = 0;
+        out_tls->align = 0;
+    }
     struct fs_file *f = fs_open(path);
     if (!f) {
         //kprintf("execve: open failed: %s\n", path ? path : "(null)");
@@ -497,6 +505,18 @@ int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk
             kfree(phdrs);
             fs_file_free(f);
             return -2;
+        }
+    }
+
+    if (out_tls) {
+        for (int i = 0; i < (int)eh.e_phnum; i++) {
+            if (phdrs[i].p_type == 7 /* PT_TLS */) {
+                out_tls->vaddr = phdrs[i].p_vaddr + load_base;
+                out_tls->filesz = phdrs[i].p_filesz;
+                out_tls->memsz = phdrs[i].p_memsz;
+                out_tls->align = phdrs[i].p_align;
+                break;
+            }
         }
     }
 
@@ -704,7 +724,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     const char *curpath = path;
     uint64_t entry = 0;
     uintptr_t loaded_brk_end = 0;
-    int r = elf_load_from_path(curpath, &entry, &loaded_brk_end);
+    int r = elf_load_from_path(curpath, &entry, &loaded_brk_end, NULL);
     if (r == -2) {
         /* unsupported ELF format (dynamic/PIE without relocations) */
         return -2;
@@ -999,6 +1019,8 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         /* in-place exec for current user thread */
         cur_user->user_rip = entry;
         cur_user->user_stack = final_stack;
+        cur_user->user_stack_base = (stack_top - USER_STACK_SIZE) & ~0xFFFULL;
+        cur_user->user_stack_limit = stack_top;
         cur_user->user_fs_base = (uint64_t)fs_base;
         /* update display name */
         strncpy(cur_user->name, path, sizeof(cur_user->name) - 1);
@@ -1021,6 +1043,8 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         ut->ring = 3;
         ut->user_rip = entry;
         ut->user_stack = final_stack;
+        ut->user_stack_base = (stack_top - USER_STACK_SIZE) & ~0xFFFULL;
+        ut->user_stack_limit = stack_top;
         ut->user_fs_base = (uint64_t)fs_base;
         /* Mark PID 1 only for kernel-launched init candidates */
         if (strcmp(path, "/init") == 0 || strcmp(path, "/sbin/init") == 0) {

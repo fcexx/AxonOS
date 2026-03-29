@@ -11,10 +11,13 @@
 #include <rtc.h>
 #include <sysinfo.h>
 #include <axonos.h>
+#include <smp.h>
 #include <usb.h>
 #include <scsi.h>
 #include <pci.h>
 #include <vga.h>
+#include <pit.h>
+#include <loadavg.h>
 
 struct procfs_handle {
 	int kind; /* 1=root, 2=pid_dir, 3=pid_file, 4=symlink, 5=pid_fd_dir, 6=pid_fd_link, 7=plain, 8=proc_sys_dir, 9=proc_sys_file */
@@ -69,12 +72,59 @@ static ssize_t procfs_show_meminfo(char *buf, size_t size, void *priv) {
 static ssize_t procfs_show_uptime(char *buf, size_t size, void *priv) {
 	(void)priv;
 	if (!buf || size == 0) return 0;
-	/* uptime in seconds since rtc_ticks / HZ approximation (HZ == 1000 assumed via rtc_ticks ms) */
-	double secs = (double)rtc_ticks / 1000.0;
-	int written = snprintf(buf, size, "%.2f\n", secs);
+	/* Linux: two floats — uptime seconds, combined idle (we report 0.00 for idle). */
+	double up = (double)pit_get_time_ms() / 1000.0;
+	int written = snprintf(buf, size, "%.2f 0.00\n", up);
 	if (written < 0) return 0;
 	size_t w = (size_t)written;
 	if (w > size) w = size;
+	return (ssize_t)w;
+}
+
+/* Linux /proc/loadavg — busybox uptime uses this for "load average" */
+static ssize_t procfs_show_loadavg(char *buf, size_t size, void *priv) {
+	(void)priv;
+	if (!buf || size == 0) return 0;
+	unsigned long av[3];
+	loadavg_get_user(av);
+	double l1 = (double)av[0] / 65536.0;
+	double l2 = (double)av[1] / 65536.0;
+	double l3 = (double)av[2] / 65536.0;
+	int run = thread_runnable_nonidle_count();
+	if (run < 0)
+		run = 0;
+	int nthr = thread_get_count();
+	if (nthr < 1)
+		nthr = 1;
+	int written = snprintf(buf, size, "%.2f %.2f %.2f %d/%d %d\n", l1, l2, l3, run, nthr, nthr);
+	if (written < 0) return 0;
+	size_t w = (size_t)written;
+	if (w > size) w = size;
+	return (ssize_t)w;
+}
+
+/* Minimal /proc/stat — nproc and some tools count cpu0..cpuN-1 lines */
+static ssize_t procfs_show_kernel_stat(char *buf, size_t size, void *priv) {
+	(void)priv;
+	if (!buf || size == 0) return 0;
+	int n = smp_cpu_count();
+	if (n < 1)
+		n = 1;
+	size_t w = 0;
+	w += (size_t)snprintf(buf + w, (w < size) ? (size - w) : 0,
+			      "cpu  0 0 0 0 0 0 0 0 0 0\n");
+	for (int i = 0; i < n && w < size; i++) {
+		int wr = snprintf(buf + w, (w < size) ? (size - w) : 0,
+				  "cpu%d 0 0 0 0 0 0 0 0 0 0\n", i);
+		if (wr < 0)
+			break;
+		w += (size_t)wr;
+	}
+	w += (size_t)snprintf(buf + w, (w < size) ? (size - w) : 0,
+			      "intr 0\nctxt 0\nbtime 0\nprocesses %d\nprocs_running %d\nprocs_blocked 0\n",
+			      thread_get_count(), thread_runnable_nonidle_count());
+	if (w > size)
+		w = size;
 	return (ssize_t)w;
 }
 
@@ -161,15 +211,27 @@ static ssize_t procfs_show_pci(char *buf, size_t size, void *priv) {
 static ssize_t procfs_show_cpuinfo(char *buf, size_t size, void *priv) {
 	(void)priv;
 	if (!buf || size == 0) return 0;
+	int ncpu = smp_cpu_count();
+	if (ncpu < 1)
+		ncpu = 1;
 	const char *model = sysinfo_cpu_name();
-	int written = snprintf(buf, size,
-		"processor\t: 0\n"
-		"model name\t: %s\n"
-		"cpu cores\t: %d\n",
-		model ? model : "Unknown", 1);
-	if (written < 0) return 0;
-	size_t w = (size_t)written;
-	if (w > size) w = size;
+	size_t w = 0;
+	for (int i = 0; i < ncpu && w < size; i++) {
+		int written = snprintf(buf + w, (w < size) ? (size - w) : 0,
+			"processor\t: %d\n"
+			"model name\t: %s\n"
+			"cpu cores\t: %d\n",
+			i, model ? model : "Unknown", ncpu);
+		if (written < 0)
+			break;
+		w += (size_t)written;
+		if (w >= size) {
+			w = size;
+			break;
+		}
+		if (i + 1 < ncpu && w + 1 < size)
+			buf[w++] = '\n';
+	}
 	return (ssize_t)w;
 }
 
@@ -312,10 +374,10 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 				kfree(h); kfree(pp); kfree(f); return -1;
 			}
 		}
-		/* top-level file: /proc/partitions */
+		/* top-level file: /proc/partitions (file_id 13 — 12 is cpuinfo) */
 		if (first_len == 10 && strncmp(p, "partitions", 10) == 0) {
 			h->kind = 7;
-			h->file_id = 12;
+			h->file_id = 13;
 			f->type = FS_TYPE_REG;
 			f->size = 4096; /* approximate */
 			f->driver_private = h;
@@ -377,6 +439,22 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 				f->size = 0;
 				f->driver_private = h;
 				h->file_id = 41; /* pci */
+				*out_file = f;
+				return 0;
+			}
+			if (first_len == 7 && strncmp(p, "loadavg", 7) == 0) {
+				h->kind = 7; f->type = FS_TYPE_REG;
+				f->size = 0;
+				f->driver_private = h;
+				h->file_id = 14; /* loadavg */
+				*out_file = f;
+				return 0;
+			}
+			if (first_len == 4 && strncmp(p, "stat", 4) == 0) {
+				h->kind = 7; f->type = FS_TYPE_REG;
+				f->size = 0;
+				f->driver_private = h;
+				h->file_id = 15; /* kernel stat (cpu lines) */
 				*out_file = f;
 				return 0;
 			}
@@ -524,7 +602,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
         size_t pos = 0;
         size_t written = 0;
         uint8_t *out = (uint8_t*)buf;
-        const char *top[] = { "meminfo", "cpuinfo", "uptime", "partitions", "sys", "bus", "tty", "scsi" };
+        const char *top[] = { "meminfo", "cpuinfo", "uptime", "loadavg", "stat", "partitions", "sys", "bus", "tty", "scsi" };
         for (size_t ti = 0; ti < sizeof(top)/sizeof(top[0]); ti++) {
             const char *name = top[ti];
             size_t namelen = strlen(name);
@@ -903,7 +981,10 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 		ssize_t full = 0;
 		if (h->file_id == 10) full = procfs_show_meminfo(tmpbuf, cap, NULL);
 		else if (h->file_id == 11) full = procfs_show_uptime(tmpbuf, cap, NULL);
-		else if (h->file_id == 12) full = procfs_show_partitions(tmpbuf, cap, NULL);
+		else if (h->file_id == 12) full = procfs_show_cpuinfo(tmpbuf, cap, NULL);
+		else if (h->file_id == 13) full = procfs_show_partitions(tmpbuf, cap, NULL);
+		else if (h->file_id == 14) full = procfs_show_loadavg(tmpbuf, cap, NULL);
+		else if (h->file_id == 15) full = procfs_show_kernel_stat(tmpbuf, cap, NULL);
 		else if (h->file_id == 40) full = procfs_show_scsi(tmpbuf, cap, NULL);
 		else if (h->file_id == 41) full = procfs_show_pci(tmpbuf, cap, NULL);
         else if (h->file_id == 30) full = usb_proc_bus_devices_show(tmpbuf, cap, NULL);

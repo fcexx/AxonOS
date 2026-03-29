@@ -1,10 +1,13 @@
 #include <apic_timer.h>
 #include <vga.h>
 #include <vbe.h>
+#include <klog.h>
 #include <cirrusfb.h>
 #include <apic.h>
 #include <pit.h>
 #include <thread.h>
+#include <smp.h>
+#include <loadavg.h>
 #include <stdio.h>
 #include <string.h>
 /* common ticks */
@@ -66,8 +69,8 @@ static uint32_t quick_calibrate(void) {
         /* base_hz = elapsed * divider / (pit_delta / 1000) */
         uint64_t base_hz = ((uint64_t)elapsed * (uint64_t)divider * 1000ULL) / pit_delta;
         if (base_hz >= 1000000ULL && base_hz <= 2000000000ULL) {
-            klogprintf("APIC: calibrated against PIT: elapsed=%u pit_delta=%llu -> base=%u Hz\n",
-                       elapsed, (unsigned long long)pit_delta, (unsigned)base_hz);
+            kprintf("APIC: calibrated against PIT: elapsed=%u pit_delta=%llu -> base=%u Hz\n",
+                    elapsed, (unsigned long long)pit_delta, (unsigned)base_hz);
             return (uint32_t)base_hz;
         }
     }
@@ -86,16 +89,16 @@ static uint32_t quick_calibrate(void) {
         if (el2 > 0) {
             uint64_t base_hz = (uint64_t)el2 * (uint64_t)divider * 200ULL; /* ~5ms sample */
             if (base_hz >= 1000000ULL && base_hz <= 2000000000ULL) {
-                klogprintf("APIC: pre-STI calibration fallback: elapsed=%u -> base=%u Hz\n",
-                           el2, (unsigned)base_hz);
+                kprintf("APIC: pre-STI calibration fallback: elapsed=%u -> base=%u Hz\n",
+                        el2, (unsigned)base_hz);
                 return (uint32_t)base_hz;
             }
         }
     }
 
     /* Last resort fallback: conservative default to avoid hangs/wild rates. */
-    klogprintf("APIC: calibration fallback (pit_delta=%llu elapsed=%u), using 100000000 Hz\n",
-               (unsigned long long)pit_delta, elapsed);
+    kprintf("APIC: calibration fallback (pit_delta=%llu elapsed=%u), using 100000000 Hz\n",
+            (unsigned long long)pit_delta, elapsed);
     return 100000000u;
 }
 
@@ -214,6 +217,10 @@ void apic_timer_handler(cpu_registers_t* regs) {
     apic_timer_ticks++;
     apic_timer_state.ticks = apic_timer_ticks;
     timer_ticks++;
+    if (init && smp_sched_cpu_id() == 0 && apic_timer_state.frequency > 0 &&
+        apic_timer_ticks > 0 &&
+        (apic_timer_ticks % (uint64_t)apic_timer_state.frequency) == 0)
+        loadavg_second_tick();
     /* Never call the scheduler from an interrupt handler.
        Switching context while running on an IRQ stack frame corrupts return context.
        This became a hard hang once we introduced an always-READY idle thread. */

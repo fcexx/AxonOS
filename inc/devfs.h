@@ -6,6 +6,8 @@
 #include <spinlock.h>
 #include <stat.h>
 
+typedef struct thread thread_t;
+
 /* Number of virtual ttys provided by devfs (default) */
 #ifndef DEVFS_TTY_COUNT
 #define DEVFS_TTY_COUNT 6
@@ -95,6 +97,9 @@ int devfs_is_tty_file(struct fs_file *file);
 int devfs_get_tty_index_from_file(struct fs_file *file);
 int devfs_get_tty_fg_pgrp(int tty);
 void devfs_set_tty_fg_pgrp(int tty, int pgrp);
+int devfs_tty_get_fg_pgrp(struct fs_file *file);
+int devfs_tty_set_fg_pgrp(struct fs_file *file, int pgrp);
+int devfs_tty_attach_thread(struct fs_file *file, thread_t *th);
 int devfs_get_tty_controlling_sid(struct fs_file *file);
 int devfs_set_tty_controlling_sid(struct fs_file *file, int sid);
 void devfs_clear_controlling_by_sid(int sid);

@@ -78,6 +78,8 @@
 #define SYS_getrlimit 97
 #define SYS_sysinfo  99
 #define SYS_sched_getaffinity 204
+#define SYS_getpriority       140
+#define SYS_setpriority       141
 #define SYS_nanosleep 35
 #define SYS_gettimeofday 169
 #define SYS_access 21
