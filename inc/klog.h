@@ -1,8 +1,9 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 
-/* Initialize kernel logging subsystem (create /var/log if needed). */
+/* After ramfs_register(): create /var/log and flush buffered pre-init lines to /var/log/kernel. */
 void klog_init(void);
 
 /* Kernel printf that appends to /var/log/kernel (best-effort) and to qemu debug. */

@@ -11,7 +11,8 @@
 static uint8_t parse_color_code(char bg, char fg);
 
 /* Serialize console with IRQ-save: timer/keyboard ISRs may flush or move cursor;
- * plain spin + IF=1 deadlocks if an IRQ tries to take this lock while we hold it. */
+ * plain spin + IF=1 deadlocks if an IRQ tries to take this lock while we hold it.
+ * kprintf/kprint hold this for an entire format string so SMP log lines do not interleave. */
 static spinlock_t vga_lock_spin = { 0 };
 
 /* Internal nolock primitives for callers that already hold the lock. */
@@ -130,6 +131,8 @@ static void vga_nolock_csi_dispatch(uint8_t fb, uint8_t attr) {
 }
 
 static void kputchar_vga_text_nolock(uint8_t character, uint8_t attribute_byte);
+static void console_putc_nolock(uint8_t character, uint8_t attribute_byte);
+static void kputn_nolock(char ch, int count, uint8_t color);
 
 static int vga_text_ansi_feed_nolock(uint8_t ch, uint8_t attr) {
 	if (vga_tx_esc == VGA_TX_ESC_NONE) {
@@ -287,7 +290,10 @@ uint32_t vga_write_colorized_xy(uint32_t x, uint32_t y, const char *s, uint8_t d
 
 void kprint(uint8_t *str) {
 	if (!str) return;
-	while (*str) kputchar(*str++, GRAY_ON_BLACK);
+	unsigned long fl;
+	acquire_irqsave(&vga_lock_spin, &fl);
+	while (*str) console_putc_nolock(*str++, GRAY_ON_BLACK);
+	release_irqrestore(&vga_lock_spin, fl);
 }
 
 static void kputchar_vga_text_nolock(uint8_t character, uint8_t attribute_byte)
@@ -406,18 +412,27 @@ static void kputchar_vga_text_nolock(uint8_t character, uint8_t attribute_byte)
 	}
 }
 
-void kputchar(uint8_t character, uint8_t attribute_byte)
+/* One character worth of output without taking vga_lock_spin (caller must hold lock). */
+static void console_putc_nolock(uint8_t character, uint8_t attribute_byte)
 {
 	if (cirrusfb_is_ready()) { cirrusfb_putchar(character, attribute_byte); return; }
 	if (vbe_is_available()) { vbefb_putchar(character, attribute_byte); return; }
+	if (vga_text_ansi_feed_nolock(character, attribute_byte))
+		return;
+	kputchar_vga_text_nolock(character, attribute_byte);
+}
 
+static void kputn_nolock(char ch, int count, uint8_t color)
+{
+	for (int i = 0; i < count; i++)
+		console_putc_nolock((uint8_t)ch, color);
+}
+
+void kputchar(uint8_t character, uint8_t attribute_byte)
+{
 	unsigned long fl;
 	acquire_irqsave(&vga_lock_spin, &fl);
-	if (vga_text_ansi_feed_nolock(character, attribute_byte)) {
-		release_irqrestore(&vga_lock_spin, fl);
-		return;
-	}
-	kputchar_vga_text_nolock(character, attribute_byte);
+	console_putc_nolock(character, attribute_byte);
 	release_irqrestore(&vga_lock_spin, fl);
 }
 
@@ -632,12 +647,6 @@ void ftos(double n, char *buf, int precision) {
 	buf[i] = '\0';
 }
 
-static void kputn(char ch, int count, uint8_t color)
-{
-	if (vbe_is_available()) { for (int i = 0; i < count; i++) vbefb_putchar((uint8_t)ch, color); return; }
-	for (int i = 0; i < count; i++) kputchar(ch, color);
-}
-
 static int utoa_rev(unsigned long long v, unsigned base, int upper, char *out)
 {
 	const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
@@ -653,19 +662,27 @@ void kprintf(const char* fmt, ...)
 	va_start(ap, fmt);
 
 	uint8_t color = 0x07; // светло-серый на чёрном
+	unsigned long vga_fl;
+	acquire_irqsave(&vga_lock_spin, &vga_fl);
 	for (const char *p = fmt; *p; ) {
 		// Color tags are no longer supported; treat them as normal characters.
 		// support tab character: move to next tab stop (8 columns) like Linux
 		if (*p == '\t') {
 			uint32_t cx = 0, cy = 0;
-			vga_get_cursor(&cx, &cy);
-			uint32_t spaces = 8 - (cx % 8);
+			if (cirrusfb_is_ready()) cirrusfb_get_cursor(&cx, &cy);
+			else if (vbe_is_available()) vbefb_get_cursor(&cx, &cy);
+			else {
+				uint16_t pos = get_cursor_nolock();
+				cx = (uint32_t)((pos % (MAX_COLS * 2)) / 2);
+				cy = (uint32_t)(pos / (MAX_COLS * 2));
+			}
+			uint32_t spaces = 8u - (cx % 8u);
 			if (spaces == 0) spaces = 8;
-			kputn(' ', spaces, color);
+			kputn_nolock(' ', (int)spaces, color);
 			p++; continue;
 		}
 
-		if (*p != '%') { kputchar(*p++, color); continue; }
+		if (*p != '%') { console_putc_nolock(*p++, color); continue; }
  		p++;
 		// flags
  		int left = 0, plus = 0, space = 0, alt = 0, zero = 0;
@@ -709,9 +726,9 @@ void kprintf(const char* fmt, ...)
  		case 'c': {
  			int ch = va_arg(ap, int);
  			int pad = (width > 1) ? width - 1 : 0;
- 			if (!left) kputn(' ', pad, color);
- 			kputchar((char)ch, color);
- 			if (left) kputn(' ', pad, color);
+ 			if (!left) kputn_nolock(' ', pad, color);
+ 			console_putc_nolock((char)ch, color);
+ 			if (left) kputn_nolock(' ', pad, color);
  			break; }
 
  		case 's': {
@@ -720,9 +737,9 @@ void kprintf(const char* fmt, ...)
  			int slen = 0; while (s[slen]) slen++;
  			if (prec >= 0 && prec < slen) slen = prec;
  			int pad = (width > slen) ? width - slen : 0;
- 			if (!left) kputn(' ', pad, color);
- 			for (int i = 0; i < slen; i++) kputchar(s[i], color);
- 			if (left) kputn(' ', pad, color);
+ 			if (!left) kputn_nolock(' ', pad, color);
+ 			for (int i = 0; i < slen; i++) console_putc_nolock(s[i], color);
+ 			if (left) kputn_nolock(' ', pad, color);
  			break; }
 
  		case 'd': case 'i': {
@@ -769,21 +786,21 @@ void kprintf(const char* fmt, ...)
  			int pad = (width > field_len) ? width - field_len : 0;
  			char padch = (zero && !left) ? '0' : ' ';
 
- 			if (!left && padch == ' ') kputn(' ', pad, color);
+ 			if (!left && padch == ' ') kputn_nolock(' ', pad, color);
  			// вывод префикса/нулями заполнение
- 			if (!left && padch == '0') kputn('0', pad, color);
- 			if (plen) { for (int i = 0; i < plen; i++) kputchar(prefix[i], color); }
- 			kputn('0', prec_zeros, color);
- 			for (int i = num_digits - 1; i >= 0; i--) kputchar(tmp[i], color);
- 			if (left) kputn(' ', pad, color);
+ 			if (!left && padch == '0') kputn_nolock('0', pad, color);
+ 			if (plen) { for (int i = 0; i < plen; i++) console_putc_nolock(prefix[i], color); }
+ 			kputn_nolock('0', prec_zeros, color);
+ 			for (int i = num_digits - 1; i >= 0; i--) console_putc_nolock(tmp[i], color);
+ 			if (left) kputn_nolock(' ', pad, color);
  			break; }
 
  		case '%':
- 			kputchar('%', color);
+ 			console_putc_nolock('%', color);
  			break;
 
  		default:
- 			kputchar(spec, color);
+ 			console_putc_nolock(spec, color);
  			break;
 
 PRINT_NUMBER_BASE10:
@@ -795,17 +812,18 @@ PRINT_NUMBER_BASE10:
  			int field_len = sign_len + prec_zeros + num_digits;
  			int pad = (width > field_len) ? width - field_len : 0;
  			char padch = (zero && !left) ? '0' : ' ';
- 			if (!left && padch == ' ' ) kputn(' ', pad, color);
- 			if (signch) kputchar(signch, color);
- 			if (!left && padch == '0') kputn('0', pad, color);
- 			kputn('0', prec_zeros, color);
- 			for (int i = num_digits - 1; i >= 0; i--) kputchar(tmp[i], color);
- 			if (left) kputn(' ', pad, color);
+ 			if (!left && padch == ' ' ) kputn_nolock(' ', pad, color);
+ 			if (signch) console_putc_nolock(signch, color);
+ 			if (!left && padch == '0') kputn_nolock('0', pad, color);
+ 			kputn_nolock('0', prec_zeros, color);
+ 			for (int i = num_digits - 1; i >= 0; i--) console_putc_nolock(tmp[i], color);
+ 			if (left) kputn_nolock(' ', pad, color);
  			break;
  		}
  		}
  	}
 
+	release_irqrestore(&vga_lock_spin, vga_fl);
 	va_end(ap);
 }
 

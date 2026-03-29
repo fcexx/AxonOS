@@ -8,12 +8,15 @@
 #include <stat.h>
 #include <thread.h>
 #include <vga.h>
+#include <spinlock.h>
 
 struct ramfs_node {
     char *name;
     int is_dir;
     char *data;
     size_t size;
+    /* Serialize read/write/size for this file (SMP + kernel klog vs userspace write). */
+    spinlock_t io_lock;
     unsigned long ino;
     unsigned int mode;
     unsigned int uid;
@@ -565,10 +568,17 @@ static ssize_t ramfs_read(struct fs_file *file, void *buf, size_t size, size_t o
         }
         return (ssize_t)written;
     } else {
-        if (offset >= n->size) return 0;
-        if (offset + size > n->size) size = n->size - offset;
-        memcpy(buf, n->data + offset, size);
-        return (ssize_t)size;
+        unsigned long irqf;
+        acquire_irqsave(&n->io_lock, &irqf);
+        if (offset >= n->size) {
+            release_irqrestore(&n->io_lock, irqf);
+            return 0;
+        }
+        size_t copy = size;
+        if (offset + copy > n->size) copy = n->size - offset;
+        memcpy(buf, n->data + offset, copy);
+        release_irqrestore(&n->io_lock, irqf);
+        return (ssize_t)copy;
     }
 }
 
@@ -589,6 +599,10 @@ int ramfs_fill_stat(struct fs_file *file, struct stat *st) {
     struct ramfs_file_handle *fh = (struct ramfs_file_handle*)file->driver_private;
     if (!fh || !fh->node) return -1;
     struct ramfs_node *n = fh->node;
+    unsigned long irqf;
+    int locked = (!n->is_dir);
+    if (locked)
+        acquire_irqsave(&n->io_lock, &irqf);
     st->st_ino = (ino_t)n->ino;
     /* Use stored node mode (supports S_IFLNK, S_IFREG, S_IFDIR) */
     st->st_mode = (mode_t)n->mode;
@@ -599,6 +613,8 @@ int ramfs_fill_stat(struct fs_file *file, struct stat *st) {
     st->st_atime = n->atime;
     st->st_mtime = n->mtime;
     st->st_ctime = n->ctime;
+    if (locked)
+        release_irqrestore(&n->io_lock, irqf);
     return 0;
 }
 
@@ -612,6 +628,8 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
     if (ct) {
         if (ct->euid != 0 && (unsigned)ct->euid != n->uid) return -1;
     }
+    unsigned long irqf;
+    acquire_irqsave(&n->io_lock, &irqf);
     /* Grow and copy in chunks to avoid one-shot large reallocs where possible.
        This may allow progress when large contiguous allocations fail. */
     const size_t CHUNK = 64 * 1024; /* 64 KiB */
@@ -627,14 +645,19 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
                 d = (char*)kmalloc(needed_end);
                 if (d) memset(d, 0, needed_end);
             } else {
+                size_t oldsz = n->size;
                 d = (char*)krealloc(n->data, needed_end);
+                if (d && needed_end > oldsz)
+                    memset(d + oldsz, 0, needed_end - oldsz);
             }
             if (!d) {
                 kprintf("ramfs OOM: write alloc failed path=%s needed=%llu heap_used=%llu heap_total=%llu\n",
                     file && file->path ? file->path : "(null)", (unsigned long long)needed_end,
                     (unsigned long long)heap_used_bytes(), (unsigned long long)heap_total_bytes());
-                klogprintf("ramfs: write: alloc failed path=%s needed_end=%u\n",
-                           file && file->path ? file->path : "(null)", (unsigned)needed_end);
+                /* kprintf only: never klogprintf here — klog may hold klog_lock during fs_write (deadlock). */
+                kprintf("ramfs: write: alloc failed path=%s needed_end=%u\n",
+                        file && file->path ? file->path : "(null)", (unsigned)needed_end);
+                release_irqrestore(&n->io_lock, irqf);
                 return -1;
             }
             n->data = d;
@@ -645,8 +668,11 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
         src_pos += chunk;
         remaining -= chunk;
     }
-    if (write_pos < n->size) n->size = write_pos; /* truncate when overwriting from start */
+    /* Never shrink n->size here: a short write at the start/middle must not truncate the tail.
+     * (klog and others append using offset = f->size; a bug or race that reused a stale offset
+     * previously chopped the file and left krealloc gaps full of garbage.) */
     file->size = (off_t)n->size; /* keep handle in sync for stat/read */
+    release_irqrestore(&n->io_lock, irqf);
     return (ssize_t)size;
 }
 
