@@ -5,18 +5,15 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <vbe.h>
+#include <cirrusfb.h>
+#include <spinlock.h>
 
 static uint8_t parse_color_code(char bg, char fg);
 
-/* Simple spinlock to serialize VGA/console access and avoid interleaved output
-   from multiple threads/interrupts. */
-static volatile int vga_lock = 0;
-static inline void vga_lock_acquire(void) {
-	while(__sync_lock_test_and_set(&vga_lock, 1)) { asm volatile("pause"); }
-}
-static inline void vga_lock_release(void) {
-	__sync_lock_release(&vga_lock);
-}
+/* Serialize console with IRQ-save: timer/keyboard ISRs may flush or move cursor;
+ * plain spin + IF=1 deadlocks if an IRQ tries to take this lock while we hold it.
+ * kprintf/kprint hold this for an entire format string so SMP log lines do not interleave. */
+static spinlock_t vga_lock_spin = { 0 };
 
 /* Internal nolock primitives for callers that already hold the lock. */
 static inline void write_nolock(uint8_t character, uint8_t attribute_byte, uint16_t offset) {
@@ -41,22 +38,170 @@ static inline void set_cursor_nolock(uint16_t pos) {
 	outb(REG_SCREEN_DATA, (uint8_t)(pos & 0xff));
 }
 
+/* --- ANSI CSI for plain VGA text (no Cirrus/VBE): otherwise ESC[H prints as "[H" --- */
+enum { VGA_TX_ESC_NONE = 0, VGA_TX_ESC = 1, VGA_TX_CSI = 2, VGA_TX_SS3 = 3 };
+static int vga_tx_esc = VGA_TX_ESC_NONE;
+static int vga_tx_csi_p[8];
+static int vga_tx_csi_np = 0;
+static int vga_tx_csi_cur = 0;
+
+static void vga_nolock_fill_range(uint32_t x0, uint32_t x1, uint32_t y, uint8_t attr) {
+	if (y >= MAX_ROWS || x0 > x1) return;
+	if (x1 >= MAX_COLS) x1 = MAX_COLS - 1;
+	for (uint32_t x = x0; x <= x1; x++) {
+		write_nolock(' ', attr, (uint16_t)((y * MAX_COLS + x) * 2));
+	}
+}
+
+static void vga_nolock_csi_dispatch(uint8_t fb, uint8_t attr) {
+	int np = vga_tx_csi_np;
+	int *p = vga_tx_csi_p;
+
+	if (fb == 'm') {
+		/* Swallow SGR; per-character attr comes from the caller (e.g. devfs tty). */
+		(void)np;
+		(void)p;
+		return;
+	}
+	if (fb == 'H' || fb == 'f') {
+		int row = (np >= 1) ? p[0] : 1;
+		int col = (np >= 2) ? p[1] : 1;
+		if (row < 1) row = 1;
+		if (col < 1) col = 1;
+		if ((uint32_t)row > MAX_ROWS) row = MAX_ROWS;
+		if ((uint32_t)col > MAX_COLS) col = MAX_COLS;
+		set_cursor_nolock((uint16_t)(((uint32_t)(row - 1) * MAX_COLS + (uint32_t)(col - 1)) * 2));
+		return;
+	}
+	if (fb == 'J') {
+		int pm = (np > 0) ? p[0] : 0;
+		if (pm == 2 || pm == 3) {
+			for (uint32_t i = 0; i < (uint32_t)(MAX_ROWS * MAX_COLS); i++) {
+				write_nolock(' ', attr, (uint16_t)(i * 2));
+			}
+			set_cursor_nolock(0);
+			return;
+		}
+		uint16_t off = get_cursor_nolock();
+		uint32_t cy = (uint32_t)((off / 2) / MAX_COLS);
+		uint32_t cx = (uint32_t)((off / 2) % MAX_COLS);
+		if (pm == 0) {
+			vga_nolock_fill_range(cx, MAX_COLS - 1, cy, attr);
+			for (uint32_t yy = cy + 1; yy < MAX_ROWS; yy++) {
+				vga_nolock_fill_range(0, MAX_COLS - 1, yy, attr);
+			}
+		} else if (pm == 1) {
+			for (uint32_t yy = 0; yy < cy; yy++) {
+				vga_nolock_fill_range(0, MAX_COLS - 1, yy, attr);
+			}
+			vga_nolock_fill_range(0, cx, cy, attr);
+		}
+		return;
+	}
+	if (fb == 'K') {
+		int pm = (np > 0) ? p[0] : 0;
+		uint16_t off = get_cursor_nolock();
+		uint32_t cy = (uint32_t)((off / 2) / MAX_COLS);
+		uint32_t cx = (uint32_t)((off / 2) % MAX_COLS);
+		if (pm == 0) {
+			vga_nolock_fill_range(cx, MAX_COLS - 1, cy, attr);
+		} else if (pm == 1) {
+			vga_nolock_fill_range(0, cx, cy, attr);
+		} else {
+			vga_nolock_fill_range(0, MAX_COLS - 1, cy, attr);
+		}
+		return;
+	}
+	if (fb == 'A' || fb == 'B' || fb == 'C' || fb == 'D') {
+		int n = (np > 0 && p[0] > 0) ? p[0] : 1;
+		uint16_t off = get_cursor_nolock();
+		uint32_t cy = (uint32_t)((off / 2) / MAX_COLS);
+		uint32_t cx = (uint32_t)((off / 2) % MAX_COLS);
+		if (fb == 'A') {
+			if (cy >= (uint32_t)n) cy -= (uint32_t)n; else cy = 0;
+		} else if (fb == 'B') {
+			if (cy + (uint32_t)n < MAX_ROWS) cy += (uint32_t)n; else cy = MAX_ROWS - 1;
+		} else if (fb == 'C') {
+			if (cx + (uint32_t)n < MAX_COLS) cx += (uint32_t)n; else cx = MAX_COLS - 1;
+		} else {
+			if (cx >= (uint32_t)n) cx -= (uint32_t)n; else cx = 0;
+		}
+		set_cursor_nolock((uint16_t)((cy * MAX_COLS + cx) * 2));
+	}
+}
+
+static void kputchar_vga_text_nolock(uint8_t character, uint8_t attribute_byte);
+static void console_putc_nolock(uint8_t character, uint8_t attribute_byte);
+static void kputn_nolock(char ch, int count, uint8_t color);
+
+static int vga_text_ansi_feed_nolock(uint8_t ch, uint8_t attr) {
+	if (vga_tx_esc == VGA_TX_ESC_NONE) {
+		if (ch == 0x1B) {
+			vga_tx_esc = VGA_TX_ESC;
+			return 1;
+		}
+		return 0;
+	}
+	if (vga_tx_esc == VGA_TX_ESC) {
+		if (ch == '[') {
+			vga_tx_esc = VGA_TX_CSI;
+			vga_tx_csi_np = 0;
+			vga_tx_csi_cur = 0;
+			return 1;
+		}
+		if (ch == 'O') {
+			vga_tx_esc = VGA_TX_SS3;
+			return 1;
+		}
+		vga_tx_esc = VGA_TX_ESC_NONE;
+		kputchar_vga_text_nolock(0x1B, attr);
+		kputchar_vga_text_nolock(ch, attr);
+		return 1;
+	}
+	if (vga_tx_esc == VGA_TX_SS3) {
+		vga_tx_esc = VGA_TX_ESC_NONE;
+		return 1;
+	}
+	if (ch >= '0' && ch <= '9') {
+		vga_tx_csi_cur = vga_tx_csi_cur * 10 + (ch - '0');
+		return 1;
+	}
+	if (ch == ';') {
+		if (vga_tx_csi_np < 8) vga_tx_csi_p[vga_tx_csi_np++] = vga_tx_csi_cur;
+		vga_tx_csi_cur = 0;
+		return 1;
+	}
+	if (ch == '?' || ch == '>') {
+		return 1;
+	}
+	if (vga_tx_csi_np < 8) vga_tx_csi_p[vga_tx_csi_np++] = vga_tx_csi_cur;
+	vga_tx_csi_cur = 0;
+	if ((unsigned char)ch >= 0x40 && (unsigned char)ch <= 0x7E) {
+		vga_nolock_csi_dispatch((uint8_t)ch, attr);
+	}
+	vga_tx_esc = VGA_TX_ESC_NONE;
+	vga_tx_csi_np = 0;
+	return 1;
+}
+
 /* Fast direct VGA helpers */
 void vga_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
 	if (x >= MAX_COLS || y >= MAX_ROWS) return;
 	uint16_t off = (uint16_t)((y * MAX_COLS + x) * 2);
-	vga_lock_acquire();
+	unsigned long fl;
+	acquire_irqsave(&vga_lock_spin, &fl);
 	write_nolock(ch, attr, off);
-	vga_lock_release();
+	release_irqrestore(&vga_lock_spin, fl);
 }
 
 uint8_t vga_get_cell_attr(uint32_t x, uint32_t y) {
-	if (vbe_is_available()) return GRAY_ON_BLACK;
+	if (cirrusfb_is_ready() || vbe_is_available()) return GRAY_ON_BLACK;
 	if (x >= MAX_COLS || y >= MAX_ROWS) return GRAY_ON_BLACK;
 	uint16_t off = (uint16_t)((y * MAX_COLS + x) * 2 + 1);
-	vga_lock_acquire();
+	unsigned long fl;
+	acquire_irqsave(&vga_lock_spin, &fl);
 	uint8_t attr = ((uint8_t *)VIDEO_ADDRESS)[off];
-	vga_lock_release();
+	release_irqrestore(&vga_lock_spin, fl);
 	return attr;
 }
 
@@ -64,7 +209,10 @@ void vga_clear_line_segment(uint32_t x0, uint32_t x1, uint32_t y, uint8_t attr) 
 	if (y >= MAX_ROWS) return;
 	if (x0 > x1) return;
 	if (x1 >= MAX_COLS) x1 = MAX_COLS - 1;
-	if (vbe_is_available()) {
+	if (cirrusfb_is_ready()) {
+		for (uint32_t x = x0; x <= x1; x++)
+			cirrusfb_putch_xy(x, y, ' ', attr);
+	} else if (vbe_is_available()) {
 		for (uint32_t x = x0; x <= x1; x++)
 			vbefb_putch_xy(x, y, ' ', attr);
 	} else {
@@ -73,6 +221,10 @@ void vga_clear_line_segment(uint32_t x0, uint32_t x1, uint32_t y, uint8_t attr) 
 }
 
 void vga_clear_screen_attr(uint8_t attr) {
+	if (cirrusfb_is_ready()) {
+		cirrusfb_clear(attr);
+		return;
+	}
 	if (vbe_is_available()) {
 		vbefb_clear(attr);
 		return;
@@ -89,7 +241,8 @@ void vga_write_str_xy(uint32_t x, uint32_t y, const char *s, uint8_t attr) {
 	if (y >= MAX_ROWS) return;
 	uint32_t px = x;
 	uint32_t py = y;
-	vga_lock_acquire();
+	unsigned long fl;
+	acquire_irqsave(&vga_lock_spin, &fl);
 	for (size_t i = 0; s[i]; i++) {
 		if (px >= MAX_COLS) { px = 0; py++; }
 		if (py >= MAX_ROWS) {
@@ -114,7 +267,7 @@ void vga_write_str_xy(uint32_t x, uint32_t y, const char *s, uint8_t attr) {
 		write_nolock((uint8_t)s[i], attr, (uint16_t)((py * MAX_COLS + px) * 2));
 		px++;
 	}
-	vga_lock_release();
+	release_irqrestore(&vga_lock_spin, fl);
 }
 
 void vga_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t ch, uint8_t attr) {
@@ -137,17 +290,14 @@ uint32_t vga_write_colorized_xy(uint32_t x, uint32_t y, const char *s, uint8_t d
 
 void kprint(uint8_t *str) {
 	if (!str) return;
-	while (*str) kputchar(*str++, GRAY_ON_BLACK);
+	unsigned long fl;
+	acquire_irqsave(&vga_lock_spin, &fl);
+	while (*str) console_putc_nolock(*str++, GRAY_ON_BLACK);
+	release_irqrestore(&vga_lock_spin, fl);
 }
 
-void kputchar(uint8_t character, uint8_t attribute_byte)
+static void kputchar_vga_text_nolock(uint8_t character, uint8_t attribute_byte)
 {
-	/* If VBE framebuffer console available, delegate */
-	if (vbe_is_available()) { vbefb_putchar(character, attribute_byte); return; }
-
-	/* Make the entire character output atomic: read cursor, update video memory,
-	   handle scrolling and update hardware cursor while holding the VGA lock. */
-	vga_lock_acquire();
 	uint16_t offset = get_cursor_nolock();
 	if (character == '\n')
 	{
@@ -260,7 +410,30 @@ void kputchar(uint8_t character, uint8_t attribute_byte)
 			set_cursor_nolock((uint16_t)new_offset);
 		}
 	}
-	vga_lock_release();
+}
+
+/* One character worth of output without taking vga_lock_spin (caller must hold lock). */
+static void console_putc_nolock(uint8_t character, uint8_t attribute_byte)
+{
+	if (cirrusfb_is_ready()) { cirrusfb_putchar(character, attribute_byte); return; }
+	if (vbe_is_available()) { vbefb_putchar(character, attribute_byte); return; }
+	if (vga_text_ansi_feed_nolock(character, attribute_byte))
+		return;
+	kputchar_vga_text_nolock(character, attribute_byte);
+}
+
+static void kputn_nolock(char ch, int count, uint8_t color)
+{
+	for (int i = 0; i < count; i++)
+		console_putc_nolock((uint8_t)ch, color);
+}
+
+void kputchar(uint8_t character, uint8_t attribute_byte)
+{
+	unsigned long fl;
+	acquire_irqsave(&vga_lock_spin, &fl);
+	console_putc_nolock(character, attribute_byte);
+	release_irqrestore(&vga_lock_spin, fl);
 }
 
 void kprint_colorized(const char* str)
@@ -271,7 +444,8 @@ void kprint_colorized(const char* str)
 
 void	scroll_line()
 {
-	vga_lock_acquire();
+	unsigned long fl;
+	acquire_irqsave(&vga_lock_spin, &fl);
 	uint8_t i = 1;
 	uint16_t last_line;
 
@@ -293,11 +467,15 @@ void	scroll_line()
 		i++;
 	}
 	set_cursor_nolock(last_line);
-	vga_lock_release();
+	release_irqrestore(&vga_lock_spin, fl);
 }
 
 void	kclear()
 {
+	if (cirrusfb_is_ready()) {
+		cirrusfb_clear(WHITE_ON_BLACK);
+		return;
+	}
 	if (vbe_is_available()) {
 		vbefb_clear(WHITE_ON_BLACK);
 		return;
@@ -324,24 +502,27 @@ void kclear_col(uint8_t attribute_byte)
 
 void	write(uint8_t character, uint8_t attribute_byte, uint16_t offset)
 {
-	vga_lock_acquire();
+	unsigned long fl;
+	acquire_irqsave(&vga_lock_spin, &fl);
 	write_nolock(character, attribute_byte, offset);
-	vga_lock_release();
+	release_irqrestore(&vga_lock_spin, fl);
 }
 
 uint16_t		get_cursor()
 {
-	vga_lock_acquire();
+	unsigned long fl;
+	acquire_irqsave(&vga_lock_spin, &fl);
 	uint16_t r = get_cursor_nolock();
-	vga_lock_release();
+	release_irqrestore(&vga_lock_spin, fl);
 	return r;
 }
 
 void	set_cursor(uint16_t pos)
 {
-	vga_lock_acquire();
+	unsigned long fl;
+	acquire_irqsave(&vga_lock_spin, &fl);
 	set_cursor_nolock(pos);
-	vga_lock_release();
+	release_irqrestore(&vga_lock_spin, fl);
 }
 
 // Получить текущую позицию курсора по X
@@ -470,12 +651,6 @@ void ftos(double n, char *buf, int precision) {
 	buf[i] = '\0';
 }
 
-static void kputn(char ch, int count, uint8_t color)
-{
-	if (vbe_is_available()) { for (int i = 0; i < count; i++) vbefb_putchar((uint8_t)ch, color); return; }
-	for (int i = 0; i < count; i++) kputchar(ch, color);
-}
-
 static int utoa_rev(unsigned long long v, unsigned base, int upper, char *out)
 {
 	const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
@@ -491,19 +666,27 @@ void kprintf(const char* fmt, ...)
 	va_start(ap, fmt);
 
 	uint8_t color = 0x07; // светло-серый на чёрном
+	unsigned long vga_fl;
+	acquire_irqsave(&vga_lock_spin, &vga_fl);
 	for (const char *p = fmt; *p; ) {
 		// Color tags are no longer supported; treat them as normal characters.
 		// support tab character: move to next tab stop (8 columns) like Linux
 		if (*p == '\t') {
 			uint32_t cx = 0, cy = 0;
-			vga_get_cursor(&cx, &cy);
-			uint32_t spaces = 8 - (cx % 8);
+			if (cirrusfb_is_ready()) cirrusfb_get_cursor(&cx, &cy);
+			else if (vbe_is_available()) vbefb_get_cursor(&cx, &cy);
+			else {
+				uint16_t pos = get_cursor_nolock();
+				cx = (uint32_t)((pos % (MAX_COLS * 2)) / 2);
+				cy = (uint32_t)(pos / (MAX_COLS * 2));
+			}
+			uint32_t spaces = 8u - (cx % 8u);
 			if (spaces == 0) spaces = 8;
-			kputn(' ', spaces, color);
+			kputn_nolock(' ', (int)spaces, color);
 			p++; continue;
 		}
 
-		if (*p != '%') { kputchar(*p++, color); continue; }
+		if (*p != '%') { console_putc_nolock(*p++, color); continue; }
  		p++;
 		// flags
  		int left = 0, plus = 0, space = 0, alt = 0, zero = 0;
@@ -547,9 +730,9 @@ void kprintf(const char* fmt, ...)
  		case 'c': {
  			int ch = va_arg(ap, int);
  			int pad = (width > 1) ? width - 1 : 0;
- 			if (!left) kputn(' ', pad, color);
- 			kputchar((char)ch, color);
- 			if (left) kputn(' ', pad, color);
+ 			if (!left) kputn_nolock(' ', pad, color);
+ 			console_putc_nolock((char)ch, color);
+ 			if (left) kputn_nolock(' ', pad, color);
  			break; }
 
  		case 's': {
@@ -558,9 +741,9 @@ void kprintf(const char* fmt, ...)
  			int slen = 0; while (s[slen]) slen++;
  			if (prec >= 0 && prec < slen) slen = prec;
  			int pad = (width > slen) ? width - slen : 0;
- 			if (!left) kputn(' ', pad, color);
- 			for (int i = 0; i < slen; i++) kputchar(s[i], color);
- 			if (left) kputn(' ', pad, color);
+ 			if (!left) kputn_nolock(' ', pad, color);
+ 			for (int i = 0; i < slen; i++) console_putc_nolock(s[i], color);
+ 			if (left) kputn_nolock(' ', pad, color);
  			break; }
 
  		case 'd': case 'i': {
@@ -607,21 +790,21 @@ void kprintf(const char* fmt, ...)
  			int pad = (width > field_len) ? width - field_len : 0;
  			char padch = (zero && !left) ? '0' : ' ';
 
- 			if (!left && padch == ' ') kputn(' ', pad, color);
+ 			if (!left && padch == ' ') kputn_nolock(' ', pad, color);
  			// вывод префикса/нулями заполнение
- 			if (!left && padch == '0') kputn('0', pad, color);
- 			if (plen) { for (int i = 0; i < plen; i++) kputchar(prefix[i], color); }
- 			kputn('0', prec_zeros, color);
- 			for (int i = num_digits - 1; i >= 0; i--) kputchar(tmp[i], color);
- 			if (left) kputn(' ', pad, color);
+ 			if (!left && padch == '0') kputn_nolock('0', pad, color);
+ 			if (plen) { for (int i = 0; i < plen; i++) console_putc_nolock(prefix[i], color); }
+ 			kputn_nolock('0', prec_zeros, color);
+ 			for (int i = num_digits - 1; i >= 0; i--) console_putc_nolock(tmp[i], color);
+ 			if (left) kputn_nolock(' ', pad, color);
  			break; }
 
  		case '%':
- 			kputchar('%', color);
+ 			console_putc_nolock('%', color);
  			break;
 
  		default:
- 			kputchar(spec, color);
+ 			console_putc_nolock(spec, color);
  			break;
 
 PRINT_NUMBER_BASE10:
@@ -633,28 +816,31 @@ PRINT_NUMBER_BASE10:
  			int field_len = sign_len + prec_zeros + num_digits;
  			int pad = (width > field_len) ? width - field_len : 0;
  			char padch = (zero && !left) ? '0' : ' ';
- 			if (!left && padch == ' ' ) kputn(' ', pad, color);
- 			if (signch) kputchar(signch, color);
- 			if (!left && padch == '0') kputn('0', pad, color);
- 			kputn('0', prec_zeros, color);
- 			for (int i = num_digits - 1; i >= 0; i--) kputchar(tmp[i], color);
- 			if (left) kputn(' ', pad, color);
+ 			if (!left && padch == ' ' ) kputn_nolock(' ', pad, color);
+ 			if (signch) console_putc_nolock(signch, color);
+ 			if (!left && padch == '0') kputn_nolock('0', pad, color);
+ 			kputn_nolock('0', prec_zeros, color);
+ 			for (int i = num_digits - 1; i >= 0; i--) console_putc_nolock(tmp[i], color);
+ 			if (left) kputn_nolock(' ', pad, color);
  			break;
  		}
  		}
  	}
 
+	release_irqrestore(&vga_lock_spin, vga_fl);
 	va_end(ap);
 }
 
 void vga_set_cursor(uint32_t x, uint32_t y) {
-	vbefb_set_cursor(x,y);
-	set_cursor_x(x);
-	set_cursor_y(y);
+	if (cirrusfb_is_ready()) { cirrusfb_set_cursor(x, y); return; }
+	if (vbe_is_available()) { vbefb_set_cursor(x, y); return; }
+	set_cursor_x((uint16_t)x);
+	set_cursor_y((uint16_t)y);
 }
 
 void vga_get_cursor(uint32_t* x, uint32_t* y) {
-	vbefb_get_cursor(x,y);
+	if (cirrusfb_is_ready()) { cirrusfb_get_cursor(x, y); return; }
+	if (vbe_is_available()) { vbefb_get_cursor(x, y); return; }
 	uint16_t pos = get_cursor();
 	if (x) *x = (pos % (MAX_COLS * 2)) / 2;
 	if (y) *y = pos / (MAX_COLS * 2);

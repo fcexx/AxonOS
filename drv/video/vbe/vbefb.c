@@ -1,5 +1,4 @@
 #include <vbe.h>
-#include <vbe.h>
 #include <stdint.h>
 #include <string.h>
 #include <mmio.h>
@@ -40,6 +39,9 @@ static int esc_len = 0;
 static int cursor_visible = 1; /* cursor blink state */
 static uint32_t cursor_blink_counter = 0;
 
+void draw_cursor(void);
+void erase_cursor(void);
+
 static uint32_t vga_palette[16] = {
 	0x00000000, 0x000000AA, 0x0000AA00, 0x0000AAAA,
 	0x00AA0000, 0x00AA00AA, 0x00AA5500, 0x00AAAAAA,
@@ -50,6 +52,14 @@ static uint32_t vga_palette[16] = {
 static inline uint32_t vga_attr_to_rgb(uint8_t attr, int foreground) {
 	uint8_t col = foreground ? (attr & 0x0f) : ((attr >> 4) & 0x0f);
 	return vga_palette[col];
+}
+
+static inline uint32_t vga_attr_bg_to_pixel(uint8_t attr) {
+	uint32_t bg = vga_attr_to_rgb(attr, 0);
+	uint8_t r = (uint8_t)((bg >> 16) & 0xFF);
+	uint8_t g = (uint8_t)((bg >> 8) & 0xFF);
+	uint8_t b = (uint8_t)(bg & 0xFF);
+	return vbe_pack_pixel(r, g, b);
 }
 
 static void draw_cell_to_backbuffer(uint32_t cx, uint32_t cy) {
@@ -102,13 +112,84 @@ void vbefb_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
 	vbe_flush_region(x * font_w, y * font_h, font_w, font_h);
 }
 
+static void vbefb_erase_cells(uint32_t x0, uint32_t x1, uint32_t y) {
+	if (!textbuf || rows == 0 || cols == 0 || y >= rows) return;
+	if (x0 > x1) return;
+	if (x1 >= cols) x1 = cols - 1;
+	for (uint32_t x = x0; x <= x1; x++) {
+		textbuf[y * cols + x].ch = ' ';
+		textbuf[y * cols + x].attr = current_attr;
+		draw_cell_to_backbuffer(x, y);
+	}
+}
+
+static void vbefb_emit_tty_char(uint8_t ch) {
+	int control_path = (ch == '\n' || ch == '\r' || ch == '\t' || ch == '\b');
+	uint32_t old_cx = cursor_x;
+	uint32_t old_cy = cursor_y;
+	if (control_path && cursor_visible && old_cx < cols && old_cy < rows) {
+		uint32_t save_x = cursor_x, save_y = cursor_y;
+		cursor_x = old_cx; cursor_y = old_cy;
+		erase_cursor();
+		cursor_x = save_x; cursor_y = save_y;
+	}
+
+	uint32_t ox = cursor_x;
+	uint32_t oy = cursor_y;
+
+	if (ch == '\n') {
+		cursor_x = 0;
+		cursor_y++;
+	} else if (ch == '\r') {
+		cursor_x = 0;
+	} else if (ch == '\t') {
+		uint32_t newx = (cursor_x + 8) & ~(8 - 1);
+		if (newx >= cols) { newx = 0; cursor_y++; }
+		for (uint32_t tx = ox; tx != newx; tx = (tx + 1) % cols) {
+			textbuf[oy * cols + tx].ch = ' ';
+			textbuf[oy * cols + tx].attr = current_attr;
+		}
+		cursor_x = newx;
+	} else if (ch == '\b') {
+		if (cursor_x > 0) cursor_x--;
+		textbuf[cursor_y * cols + cursor_x].ch = ' ';
+		textbuf[cursor_y * cols + cursor_x].attr = current_attr;
+		ox = cursor_x; oy = cursor_y;
+	} else {
+		textbuf[oy * cols + ox].ch = ch;
+		textbuf[oy * cols + ox].attr = current_attr;
+		cursor_x++;
+		if (cursor_x >= cols) { cursor_x = 0; cursor_y++; }
+	}
+
+	if (cursor_y >= rows) {
+		memmove(textbuf, textbuf + cols, (size_t)(cols * (rows - 1) * sizeof(cell_t)));
+		uint32_t last_row = rows - 1;
+		for (uint32_t rx = 0; rx < cols; rx++) {
+			textbuf[last_row * cols + rx].ch = ' ';
+			textbuf[last_row * cols + rx].attr = current_attr;
+		}
+		cursor_y = rows - 1;
+		vbe_scroll_up_pixels(font_h);
+		vbe_clear_region(0, last_row * font_h, fb_width, font_h, vga_attr_bg_to_pixel(current_attr));
+		if (cursor_visible)
+			draw_cursor();
+		vbe_flush_region(0, last_row * font_h, fb_width, font_h);
+	} else {
+		draw_cell_to_backbuffer(ox, oy);
+		if (cursor_visible)
+			draw_cursor();
+	}
+}
+
 void vbefb_putchar(uint8_t ch, uint8_t attr) {
 	if (!vbe_is_available()) { return; }
-	// simple ANSI SGR parsing for color sequences: ESC [ ... m
+	/* Honor caller-selected color when printing raw chars (devfs/tty path). */
+	if (!esc_mode && ch != 0x1B) current_attr = attr;
+	/* CSI: ESC [ ... final (@ to ~). Was SGR-only; other finals were swallowed and broke the console. */
 	if (ch == 0x1B) { esc_mode = 1; esc_len = 0; return; }
 	if (esc_mode) {
 		if (esc_len < (int)sizeof(esc_buf) - 1) esc_buf[esc_len++] = (char)ch;
-		// sequence ends with 'm'
 		if (ch == 'm') {
 			esc_buf[esc_len] = '\0';
 			// expect leading '[' possibly present
@@ -136,82 +217,80 @@ void vbefb_putchar(uint8_t ch, uint8_t attr) {
 			esc_mode = 0;
 			return;
 		}
-		// still in escape; drop characters
+		if (ch >= 0x40 && ch <= 0x7E) {
+			int p[8], np = 0, cur = 0;
+			if (esc_len >= 2 && esc_buf[0] == '[') {
+				for (int i = 1; i < esc_len - 1; i++) {
+					char c = esc_buf[i];
+					if (c >= '0' && c <= '9') { cur = cur * 10 + (c - '0'); continue; }
+					if (c == ';') { if (np < 8) p[np++] = cur; cur = 0; continue; }
+					if (c == '?' || c == '>') continue;
+				}
+				if (np < 8) p[np++] = cur;
+			}
+			if (ch == 'H' || ch == 'f') {
+				int row = (np >= 1) ? p[0] : 1;
+				int col = (np >= 2) ? p[1] : 1;
+				if (row < 1) row = 1;
+				if (col < 1) col = 1;
+				if ((uint32_t)row > rows) row = (int)rows;
+				if ((uint32_t)col > cols) col = (int)cols;
+				vbefb_set_cursor((uint32_t)(col - 1), (uint32_t)(row - 1));
+			} else if (ch == 'J') {
+				int pm = (np > 0) ? p[0] : 0;
+				if (pm == 2 || pm == 3) {
+					vbefb_clear(current_attr);
+				} else if (pm == 0) {
+					vbefb_erase_cells(cursor_x, cols - 1, cursor_y);
+					for (uint32_t yy = cursor_y + 1; yy < rows; yy++) {
+						vbefb_erase_cells(0, cols - 1, yy);
+					}
+				} else if (pm == 1) {
+					for (uint32_t yy = 0; yy < cursor_y; yy++) {
+						vbefb_erase_cells(0, cols - 1, yy);
+					}
+					vbefb_erase_cells(0, cursor_x, cursor_y);
+				}
+			} else if (ch == 'K') {
+				int pm = (np > 0) ? p[0] : 0;
+				uint32_t cy = cursor_y;
+				if (pm == 0) {
+					vbefb_erase_cells(cursor_x, cols - 1, cy);
+				} else if (pm == 1) {
+					vbefb_erase_cells(0, cursor_x, cy);
+				} else {
+					vbefb_erase_cells(0, cols - 1, cy);
+				}
+			} else if (ch == 'A' || ch == 'B' || ch == 'C' || ch == 'D') {
+				int n = (np > 0 && p[0] > 0) ? p[0] : 1;
+				uint32_t nx = cursor_x, ny = cursor_y;
+				if (ch == 'A') {
+					if (ny >= (uint32_t)n) ny -= (uint32_t)n; else ny = 0;
+				} else if (ch == 'B') {
+					if (ny + (uint32_t)n < rows) ny += (uint32_t)n; else ny = rows - 1;
+				} else if (ch == 'C') {
+					if (nx + (uint32_t)n < cols) nx += (uint32_t)n; else nx = cols - 1;
+				} else {
+					if (nx >= (uint32_t)n) nx -= (uint32_t)n; else nx = 0;
+				}
+				vbefb_set_cursor(nx, ny);
+			}
+			esc_mode = 0;
+			esc_len = 0;
+			return;
+		}
 		return;
 	}
 
-	/* remember old cursor position before update */
-	uint32_t old_cx = cursor_x;
-	uint32_t old_cy = cursor_y;
-	/* erase cursor at old position if visible (before moving) */
-	if (cursor_visible && old_cx < cols && old_cy < rows) {
-		/* temporarily set cursor to old position to erase */
-		uint32_t save_x = cursor_x, save_y = cursor_y;
-		cursor_x = old_cx; cursor_y = old_cy;
-		erase_cursor();
-		cursor_x = save_x; cursor_y = save_y;
-	}
-	
-	/* remember current position where the character will be placed */
-	uint32_t ox = cursor_x;
-	uint32_t oy = cursor_y;
+	vbefb_emit_tty_char(ch);
+}
 
-	// handle control characters
-	if (ch == '\n') {
-		cursor_x = 0;
-		cursor_y++;
-	} else if (ch == '\r') {
-		cursor_x = 0;
-	} else if (ch == '\t') {
-		uint32_t newx = (cursor_x + 8) & ~(8 - 1);
-		if (newx >= cols) { newx = 0; cursor_y++; }
-		for (uint32_t tx = ox; tx != newx; tx = (tx + 1) % cols) {
-			textbuf[oy * cols + tx].ch = ' ';
-			textbuf[oy * cols + tx].attr = current_attr;
-		}
-		cursor_x = newx;
-	} else if (ch == '\b') {
-		if (cursor_x > 0) cursor_x--;
-		textbuf[cursor_y * cols + cursor_x].ch = ' ';
-		textbuf[cursor_y * cols + cursor_x].attr = current_attr;
-		ox = cursor_x; oy = cursor_y;
-	} else {
-		/* normal printable */
-		textbuf[oy * cols + ox].ch = ch;
-		textbuf[oy * cols + ox].attr = current_attr;
-		cursor_x++;
-		if (cursor_x >= cols) { cursor_x = 0; cursor_y++; }
-	}
-
-	if (cursor_y >= rows) {
-		/* scroll up by one row */
-		memmove(textbuf, textbuf + cols, (size_t)(cols * (rows - 1) * sizeof(cell_t)));
-		/* clear last row */
-		memset(textbuf + cols * (rows - 1), 0, (size_t)(cols * sizeof(cell_t)));
-		cursor_y = rows - 1;
-		/* redraw whole backbuffer from textbuf */
-		/* scroll framebuffer pixels up by font_h */
-		vbe_scroll_up_pixels(font_h);
-		/* redraw only last text row into framebuffer */
-		uint32_t last_row = rows - 1;
-		for (uint32_t rx = 0; rx < cols; rx++) draw_cell_to_backbuffer(rx, last_row);
-		/* redraw cursor at new position after scroll */
-		if (cursor_visible) {
-			draw_cursor();
-		}
-		/* flush last row region (no-op if front-only) */
-		vbe_flush_region(0, last_row * font_h, fb_width, font_h);
-	} else {
-		/* draw only the single updated cell and flush small rect */
-		draw_cell_to_backbuffer(ox, oy);
-		/* redraw cursor at new position if visible (timer will handle blinking) */
-		if (cursor_visible) {
-			draw_cursor();
-		}
-		uint32_t px = ox * font_w;
-		uint32_t py = oy * font_h;
-		//vbe_flush_region(px, py, font_w, font_h);
-	}
+void vbefb_putchar_literal(uint8_t ch, uint8_t attr) {
+	if (!vbe_is_available()) return;
+	esc_mode = 0;
+	esc_len = 0;
+	current_attr = attr;
+	vbefb_emit_tty_char(ch);
 }
 
 void draw_cursor(void) {
@@ -264,9 +343,9 @@ void erase_cursor(void) {
 
 void vbefb_update_cursor(void) {
 	if (!vbe_is_available()) return;
-	/* blink at ~2 Hz: toggle every 500 ticks at 1000 Hz timer */
+	/* Keep blink perceptible on both 100Hz and 1000Hz timer setups. */
 	cursor_blink_counter++;
-	if (cursor_blink_counter >= 500) {
+	if (cursor_blink_counter >= 120) {
 		cursor_blink_counter = 0;
 		cursor_visible = !cursor_visible;
 		if (cursor_visible) {
@@ -298,6 +377,7 @@ void vbefb_set_cursor(uint32_t x, uint32_t y) {
 
 void vbefb_clear(uint8_t attr) {
 	if (!vbe_is_available() || !textbuf) return;
+	current_attr = attr;
 	for (uint32_t i = 0; i < (uint32_t)(cols * rows); i++) {
 		textbuf[i].ch = ' ';
 		textbuf[i].attr = attr;
@@ -315,20 +395,22 @@ int vbefb_init(uint32_t width, uint32_t height, uint32_t pitch, uint32_t bpp) {
 	cols = fb_width / font_w;
 	rows = fb_height / font_h;
 	if (cols == 0 || rows == 0) return -1;
+	if (textbuf) {
+		kfree(textbuf);
+		textbuf = NULL;
+	}
 	textbuf = (cell_t*)kmalloc((size_t)cols * rows * sizeof(cell_t));
 	if (!textbuf) return -1;
 	memset(textbuf, 0, (size_t)cols * rows * sizeof(cell_t));
 	cursor_x = 0; cursor_y = 0;
 	cursor_visible = 1;
 	cursor_blink_counter = 0;
+	current_attr = 0x07;
+	esc_mode = 0;
+	esc_len = 0;
 	klogprintf("vbefb: initialized cols=%u rows=%u\n", (unsigned)cols, (unsigned)rows);
-	/* draw first few lines into backbuffer and flush */
-	for (uint32_t ry = 0; ry < 2 && ry < rows; ry++) {
-		for (uint32_t rx = 0; rx < cols; rx++) draw_cell_to_backbuffer(rx, ry);
-		//vbe_flush_region(0, ry * font_h, fb_width, font_h);
-	}
-	/* draw initial cursor */
-	draw_cursor();
+	/* Full clear avoids random VRAM garbage after modeset and ensures visible cursor colors. */
+	vbefb_clear(WHITE_ON_BLACK);
 	return 0;
 }
 

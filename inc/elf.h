@@ -32,12 +32,20 @@ typedef struct {
     uint64_t p_align;
 } Elf64_Phdr;
 
+typedef struct {
+    uint64_t vaddr;
+    uint64_t filesz;
+    uint64_t memsz;
+    uint64_t align;
+} elf_tls_info_t;
+
 /* Parse ELF file in memory and load PT_LOAD segments into target virtual addresses.
    The loader is careful not to overwrite kernel region. Loaded segments are copied
    into the segment's p_vaddr (assumes identity mapping for VA < 4GiB). */
 int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry);
 
-/* Convenience: load ELF from filesystem path (reads whole file). */
-int elf_load_from_path(const char *path, uint64_t *out_entry);
+/* Convenience: load ELF from filesystem path (reads whole file).
+   If out_brk_end is non-NULL, stores the program break end (end of last PT_LOAD) there. */
+int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk_end, elf_tls_info_t *out_tls);
 
 

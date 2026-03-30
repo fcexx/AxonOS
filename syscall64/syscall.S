@@ -3,6 +3,7 @@
 .extern syscall_do
 .extern syscall_kernel_rsp0
 .extern syscall_user_rsp_saved
+.extern syscall_user_return_rax
 .extern syscall_user_saved_rbx
 .extern syscall_user_saved_rbp
 .extern syscall_user_saved_r12
@@ -21,6 +22,7 @@
 .extern syscall_return_to_shell
 .extern syscall_exec_trampoline_active
 .extern syscall_snapshot_user_regs
+.extern maybe_deliver_pending_signal
 
 // x86_64 SYSCALL entry point
 // Assumptions/constraints (current AxonOS design):
@@ -138,7 +140,12 @@ syscall_entry64:
     pushq   48(%rsp)            // a6 = user r9 (7th arg on stack)
     call    syscall_do
     addq    $8, %rsp
+    movq    %rax, syscall_user_return_rax(%rip)
 
+    // Check for pending signals and possibly deliver before returning to user
+    pushq   %rax
+    call    maybe_deliver_pending_signal
+    popq    %rax
 
     // If userspace requested exit(), do not return back to ring3.
     // Jump back to kernel shell loop instead.

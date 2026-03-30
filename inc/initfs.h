@@ -8,4 +8,7 @@
    Returns 0 on success, negative on error, 1 if module not found. */
 int initfs_process_multiboot_module(uint32_t multiboot_magic, uint64_t multiboot_info, const char *module_name);
 
+/* Debug: list VFS contents via qemu_debug_printf (call after unpack). */
+void initfs_debug_list_vfs(void);
+
 

@@ -33,6 +33,10 @@
 #define SYS_set_robust_list 273
 #define SYS_rseq 334
 #define SYS_futex 202
+#define SYS_rt_sigaction 13
+#define SYS_rt_sigprocmask 14
+#define SYS_rt_sigreturn 15
+#define SYS_ioctl   16
 #define SYS_getdents64 217
 #define SYS_getdents 78
 #define SYS_getpid  39
@@ -41,13 +45,19 @@
 #define SYS_getgid  104
 #define SYS_geteuid 107
 #define SYS_getegid 108
+#define SYS_setuid  105
+#define SYS_setgid  106
+#define SYS_setreuid 113
+#define SYS_setregid 114
 #define SYS_setsid  112
+#define SYS_syslog  103
 #define SYS_getpgrp 111
 #define SYS_setpgid 109
 #define SYS_gettid  186
 #define SYS_madvise 28
 #define SYS_brk     12
 #define SYS_pipe    22
+#define SYS_dup3    292
 #define SYS_pipe2   293
 #define SYS_arch_prctl 158
 #define SYS_exit    60
@@ -63,6 +73,7 @@
 #define SYS_tgkill  234
 #define SYS_sendfile 40
 #define SYS_mount   165
+#define SYS_umount2 166
 #define SYS_rt_sigtimedwait 128
 #define SYS_clock_nanosleep 230
 #define SYS_select  23
@@ -70,6 +81,8 @@
 #define SYS_getrlimit 97
 #define SYS_sysinfo  99
 #define SYS_sched_getaffinity 204
+#define SYS_getpriority       140
+#define SYS_setpriority       141
 #define SYS_nanosleep 35
 #define SYS_gettimeofday 169
 #define SYS_access 21
@@ -80,9 +93,17 @@
 #define SYS_chmod  90
 #define SYS_chown  92
 #define SYS_utimensat 280
+/* Linux x86_64: preadv/pwritev */
+#define SYS_preadv 295
+#define SYS_pwritev 296
+
+/* AxonOS: resolve hostname via DNS, returns IPv4 in network byte order */
+#define SYS_resolve 1000
 
 /* initialize syscall subsystem (register handler) */
 void syscall_init(void);
+/* warm-up kernel net stack once during boot */
+int syscall_net_preinit(void);
 
 /* ISR-compatible handler (called by IDT dispatcher) */
 void isr_syscall(cpu_registers_t* regs);

@@ -146,10 +146,21 @@ static size_t write_hex_prefixed(char *buf, size_t size, uint32_t value, int dig
     return (size_t)(digits + 2);
 }
 
+/* Записать hex без префикса 0x (для совместимости с lspci) */
+static size_t write_hex_plain(char *buf, size_t size, uint32_t value, int digits) {
+    if (!buf || size == 0) return 0;
+    if (digits > (int)size) digits = (int)size;
+    for (int i = 0; i < digits; i++) {
+        int shift = (digits - 1 - i) * 4;
+        buf[i] = hex_digit((value >> shift) & 0xF);
+    }
+    return (size_t)digits;
+}
+
 static ssize_t sysfs_show_pci_vendor(char *buf, size_t size, void *priv) {
     if (!buf || size == 0 || !priv) return 0;
     pci_device_t *dev = (pci_device_t*)priv;
-    size_t n = write_hex_prefixed(buf, size, dev->vendor_id, 4);
+    size_t n = write_hex_plain(buf, size, dev->vendor_id, 4);
     if (n < size) buf[n++] = '\n';
     return (ssize_t)n;
 }
@@ -157,7 +168,7 @@ static ssize_t sysfs_show_pci_vendor(char *buf, size_t size, void *priv) {
 static ssize_t sysfs_show_pci_device(char *buf, size_t size, void *priv) {
     if (!buf || size == 0 || !priv) return 0;
     pci_device_t *dev = (pci_device_t*)priv;
-    size_t n = write_hex_prefixed(buf, size, dev->device_id, 4);
+    size_t n = write_hex_plain(buf, size, dev->device_id, 4);
     if (n < size) buf[n++] = '\n';
     return (ssize_t)n;
 }
@@ -168,7 +179,7 @@ static ssize_t sysfs_show_pci_class(char *buf, size_t size, void *priv) {
     uint32_t val = ((uint32_t)dev->class_code << 16) |
                    ((uint32_t)dev->subclass << 8) |
                    ((uint32_t)dev->prog_if);
-    size_t n = write_hex_prefixed(buf, size, val, 6);
+    size_t n = write_hex_plain(buf, size, val, 6);
     if (n < size) buf[n++] = '\n';
     return (ssize_t)n;
 }
@@ -248,7 +259,6 @@ static void create_attr_file(const char *base, const char *name, const struct sy
 void pci_sysfs_init(void) {
     if (pci_sysfs_initialized) return;
     
-    klogprintf("pci: initializing sysfs for %d devices\n", pci_get_device_count());
     sysfs_mkdir("/sys/bus");
     sysfs_mkdir("/sys/bus/pci");
     sysfs_mkdir("/sys/bus/pci/devices");

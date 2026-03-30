@@ -11,8 +11,11 @@
 #include <fs.h>
 #include <ramfs.h>
 #include <heap.h>
+#include <string.h>
 #include <vga.h>
 #include <initfs.h>
+#include <debug.h>
+#include <ext2.h>
 
 /* cpio newc header (ASCII hex fields) - 110 bytes total */
 struct cpio_newc_header {
@@ -123,8 +126,11 @@ static size_t find_cpio_start(const uint8_t *base, size_t archive_size) {
         }
     }
 
-    /* scan for candidate headers */
-    for (size_t i = 0; i + sizeof(struct cpio_newc_header) <= archive_size; i++) {
+    /* Slow full-byte scan on 100+ MiB archives is too expensive.
+       In practice cpio headers are 4-byte aligned; scan a bounded prefix. */
+    size_t scan_limit = archive_size;
+    if (scan_limit > (2u * 1024u * 1024u)) scan_limit = (2u * 1024u * 1024u);
+    for (size_t i = 0; i + sizeof(struct cpio_newc_header) <= scan_limit; i += 4) {
         if (!(memcmp(base + i, "070701", 6) == 0 || memcmp(base + i, "070702", 6) == 0)) continue;
         const struct cpio_newc_header *h = (const struct cpio_newc_header*)(base + i);
         if (!plausible_cpio_header(h, archive_size - i)) continue;
@@ -154,23 +160,18 @@ static size_t find_cpio_start(const uint8_t *base, size_t archive_size) {
 /* Ensure all parent directories for `path` exist. Path must be absolute. */
 static void ensure_parent_dirs(const char *path) {
     if (!path || path[0] != '/') return;
-    /* iterate through path and call ramfs_mkdir for each prefix */
     size_t len = strlen(path);
     char tmp[512];
     if (len >= sizeof(tmp)) return;
     strcpy(tmp, path);
-    /* remove trailing slash if any */
     if (len > 1 && tmp[len - 1] == '/') {
         tmp[len - 1] = '\0';
         len--;
     }
-    /* IMPORTANT:
-       - do not call strlen() inside the loop (O(n^2) on long paths)
-       - creating prefixes "/a", "/a/b", "/a/b/c" is enough; no extra parent mkdir needed */
     for (size_t i = 1; i < len; i++) {
         if (tmp[i] == '/') {
             tmp[i] = '\0';
-            ramfs_mkdir(tmp);
+            (void)ramfs_mkdir(tmp);
             tmp[i] = '/';
         }
     }
@@ -180,8 +181,18 @@ static void ensure_parent_dirs(const char *path) {
 static int create_file_with_data(const char *path, const void *data, size_t size) {
     struct fs_file *f = fs_create_file(path);
     if (!f) {
-        klogprintf("initfs: create_file_with_data: fs_create_file returned NULL for %s\n", path);
-        return -1;
+        /* Common in busybox/initramfs trees: duplicates / overwrites. If the path already
+           exists, treat it as success to avoid spam and partial extracts. */
+        struct stat st;
+        if (vfs_stat(path, &st) == 0) {
+            return 0;
+        }
+        klogprintf("initfs: create_file_with_data: fs_create_file returned NULL for %s (heap_used=%llu heap_total=%llu heap_peak=%llu)\n",
+                   path,
+                   (unsigned long long)heap_used_bytes(),
+                   (unsigned long long)heap_total_bytes(),
+                   (unsigned long long)heap_peak_bytes());
+        return -12;
     }
     /* Ensure the created handle is recognized as a regular file by VFS/drivers.
        Some drivers may return ambiguous types; force FS_TYPE_REG for initfs-created files. */
@@ -189,16 +200,134 @@ static int create_file_with_data(const char *path, const void *data, size_t size
     ssize_t written = fs_write(f, data, size, 0);
     fs_file_free(f);
     if (written < 0 || (size_t)written != size) {
-        klogprintf("initfs: write failed %s\n", path);
-        return -2;
+        klogprintf("initfs: write failed %s (size=%u written=%d heap_used=%llu heap_total=%llu)\n",
+                   path, (unsigned)size, (int)written,
+                   (unsigned long long)heap_used_bytes(),
+                   (unsigned long long)heap_total_bytes());
+        return -12;
     }
     return 0;
+}
+
+static size_t initfs_strnlen_local(const char *s, size_t maxn) {
+    size_t n = 0;
+    if (!s) return 0;
+    while (n < maxn && s[n] != '\0') n++;
+    return n;
+}
+
+static const char *initfs_basename(const char *p) {
+    if (!p) return p;
+    const char *b = p;
+    for (const char *c = p; *c; c++) {
+        if (*c == '/') b = c + 1;
+    }
+    return b;
+}
+
+/* Robust module-name matcher:
+   accepts exact "initfs", "initfs.cpio", "/boot/initfs.cpio", and cmdline with args. */
+static int initfs_module_name_matches(const char *cmdline, size_t maxlen, const char *want_name) {
+    if (!cmdline || !want_name || !want_name[0]) return 0;
+    size_t n = initfs_strnlen_local(cmdline, maxlen);
+    if (n == 0) return 0;
+
+    /* Skip leading spaces/tabs. */
+    size_t i = 0;
+    while (i < n && (cmdline[i] == ' ' || cmdline[i] == '\t')) i++;
+    if (i >= n) return 0;
+
+    /* First token only (before whitespace). */
+    size_t start = i;
+    while (i < n && cmdline[i] != ' ' && cmdline[i] != '\t') i++;
+    size_t tok_len = i - start;
+    if (tok_len == 0 || tok_len > 255) return 0;
+
+    char tok[256];
+    memcpy(tok, cmdline + start, tok_len);
+    tok[tok_len] = '\0';
+
+    if (strcmp(tok, want_name) == 0) return 1;
+
+    const char *base = initfs_basename(tok);
+    if (strcmp(base, want_name) == 0) return 1;
+
+    /* Allow common archive suffixes for basename token. */
+    size_t want_len = strlen(want_name);
+    if (strncmp(base, want_name, want_len) == 0) {
+        if (base[want_len] == '\0' || base[want_len] == '.' || base[want_len] == '-') return 1;
+    }
+    return 0;
+}
+
+static int initfs_has_boot_init(void) {
+    struct stat st;
+    if (vfs_stat("/sbin/init", &st) == 0) return 1;
+    if (vfs_stat("/bin/init", &st) == 0) return 1;
+    return 0;
+}
+
+/* Normalize archive path to an absolute canonical-ish form suitable for VFS lookup.
+   Handles common cpio prefixes like "./", repeated '/', and trailing '/'. */
+static void initfs_normalize_target(char *out, size_t out_sz, const char *name) {
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+    if (!name || !name[0]) {
+        if (out_sz >= 2) { out[0] = '/'; out[1] = '\0'; }
+        return;
+    }
+
+    const char *src = name;
+    while (src[0] == '.') {
+        if (src[1] == '/') {
+            src += 2; /* trim leading "./" */
+            continue;
+        }
+        if (src[1] == '\0') { /* "." entry */
+            src += 1;
+            break;
+        }
+        break;
+    }
+
+    size_t w = 0;
+    out[w++] = '/';
+    int last_was_slash = 1;
+    while (*src && w + 1 < out_sz) {
+        char c = *src++;
+        if (c == '/') {
+            if (last_was_slash) continue;
+            out[w++] = '/';
+            last_was_slash = 1;
+            continue;
+        }
+        if (c == '.' && (src[0] == '/' || src[0] == '\0') && last_was_slash) {
+            /* skip "/./" and trailing "/." segments */
+            continue;
+        }
+        out[w++] = c;
+        last_was_slash = 0;
+    }
+
+    if (w > 1 && out[w - 1] == '/') w--;
+    out[w] = '\0';
 }
 
 /* Unpack cpio newc archive at archive (size bytes) into VFS root. */
 static int unpack_cpio_newc(const void *archive, size_t archive_size) {
     const uint8_t *base = (const uint8_t*)archive;
     size_t offset = 0;
+    int files_created = 0, dirs_created = 0, symlinks_created = 0;
+    int cpio_entry_num = 0;
+    /* Some symlinks depend on other symlinks in parent path. If processed too
+       early, ramfs_symlink() fails with -2. Keep them pending and retry after
+       the first scan. */
+    struct pending_symlink {
+        char target[512];
+        char *linkt;
+        struct pending_symlink *next;
+    };
+    struct pending_symlink *pending = NULL;
     /* Ensure /dev exists before unpacking - kernel may have failed to create it (OOM etc).
        Critical for ls / to show dev and for init's mount -t devtmpfs /dev. */
     (void)ramfs_mkdir("/dev");
@@ -210,40 +339,17 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
     }
     if (found != 0) klogprintf("initfs: cpio magic found\n");
     offset = found;
+    qemu_debug_printf("initfs: --- cpio entries (before unpack) ---\n");
 
     while (offset + sizeof(struct cpio_newc_header) <= archive_size) {
         const struct cpio_newc_header *h = (const struct cpio_newc_header*)(base + offset);
         /* header.magic is 6 bytes ASCII "070701" (newc) or "070702" (newc with CRC).
            Compare raw bytes from the module to avoid any struct/padding surprises. */
         const uint8_t *magic = base + offset;
-        if (!((memcmp(magic, "070701", 6) == 0) || (memcmp(magic, "070702", 6) == 0))) {
-            /* Quietly skip this partial/non-matching occurrence and search forward
-               for the next complete ASCII magic. This avoids noisy '.07070' debug lines. */
-            size_t next_found = (size_t)-1;
-            for (size_t j = offset + 1; j + 6 <= archive_size; j++) {
-                if (memcmp(base + j, "070701", 6) == 0 || memcmp(base + j, "070702", 6) == 0) { next_found = j; break; }
-            }
-            if (next_found != (size_t)-1) {
-                offset = next_found;
-                continue;
-            }
-            return -1;
-        }
+        if (!((memcmp(magic, "070701", 6) == 0) || (memcmp(magic, "070702", 6) == 0))) return -1;
         /* additional plausibility check to avoid false positives where "070701"
            appears inside file data */
-        if (!plausible_cpio_header(h, archive_size - offset)) {
-            /* header not plausible: search for next magic and continue */
-            //kprintf("initfs: header not plausible at offset %u, searching next\n", (unsigned)offset);
-            size_t next_found = (size_t)-1;
-            for (size_t j = offset + 1; j + 6 <= archive_size; j++) {
-                if (memcmp(base + j, "070701", 6) == 0 || memcmp(base + j, "070702", 6) == 0) { next_found = j; break; }
-            }
-            if (next_found != (size_t)-1) {
-                offset = next_found;
-                continue;
-            }
-            return -1;
-        }
+        if (!plausible_cpio_header(h, archive_size - offset)) return -1;
         uint32_t namesize = hex_to_uint(h->c_namesize, 8);
         uint32_t filesize = hex_to_uint(h->c_filesize, 8);
         size_t header_size = sizeof(struct cpio_newc_header);
@@ -264,26 +370,34 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
         }
         /* build target path: ensure leading slash */
         char target[512];
-        if (name[0] == '/') {
-            strncpy(target, name, sizeof(target)-1);
-            target[sizeof(target)-1] = '\0';
-        } else {
-            /* make absolute */
-            target[0] = '/';
-            size_t n = strlen(name);
-            if (n > sizeof(target)-2) n = sizeof(target)-2;
-            memcpy(target+1, name, n);
-            target[1+n] = '\0';
-        }
-        /* determine mode */
+        initfs_normalize_target(target, sizeof(target), name);
+        cpio_entry_num++;
         uint32_t mode = hex_to_uint(h->c_mode, 8);
+        const char *etype = "?";
+        if ((mode & 0170000u) == 0040000u || (strlen(target) > 1 && target[strlen(target)-1] == '/')) etype = "dir";
+        else if ((mode & 0170000u) == 0100000u) etype = "file";
+        else if ((mode & 0170000u) == 0120000u) etype = "symlink";
+        qemu_debug_printf("initfs: cpio #%d: %s [%s] mode=%o size=%u\n",
+                          cpio_entry_num, target, etype,
+                          (unsigned)mode, (unsigned)filesize);
+
+        if (strcmp(target, "/") == 0) {
+            /* Ignore root pseudo-entry like "." */
+            size_t next_root = file_data_offset + filesize;
+            if (next_root <= offset || next_root > archive_size) return -1;
+            next_root = (next_root + 3) & ~3u;
+            if (next_root <= offset) return -1;
+            offset = next_root;
+            continue;
+        }
+        /* mode already parsed above for debug */
         if ((mode & 0170000u) == 0040000u || (target[strlen(target)-1] == '/')) {
             /* directory */
             /* strip trailing slash */
             size_t tl = strlen(target);
             if (tl > 1 && target[tl-1] == '/') target[tl-1] = '\0';
-            if (ramfs_mkdir(target) < 0) {
-                /* ignore existing or other minor errors */
+            if (ramfs_mkdir(target) >= 0) {
+                dirs_created++;
             }
             /* Apply exact mode bits from archive (includes S_IFDIR + perms). */
             (void)fs_chmod(target, (mode_t)mode);
@@ -291,9 +405,15 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
             /* regular file */
             ensure_parent_dirs(target);
             const void *file_data = base + file_data_offset;
-            if (create_file_with_data(target, file_data, filesize) != 0) {
-                klogprintf("initfs: warning: failed to create %s (ingore)\n", target);
+            int cr = create_file_with_data(target, file_data, filesize);
+            if (cr != 0) {
+                if (cr == -12) {
+                    klogprintf("initfs: fatal: OOM while extracting %s\n", target);
+                    return -12;
+                }
+                qemu_debug_printf("initfs: warning: failed to create %s (ignore)\n", target);
             } else {
+                files_created++;
                 /* Apply exact mode bits from archive (includes S_IFREG + perms, esp. +x). */
                 (void)fs_chmod(target, (mode_t)mode);
             }
@@ -301,18 +421,50 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
             /* symbolic link: file data contains link target */
             ensure_parent_dirs(target);
             const void *file_data = base + file_data_offset;
-            /* make a NUL-terminated copy of link target */
             size_t tlen = filesize;
             char *linkt = (char*)kmalloc(tlen + 1);
             if (linkt) {
                 memcpy(linkt, file_data, tlen);
                 linkt[tlen] = '\0';
-                if (ramfs_symlink(target, linkt) < 0) {
-                    klogprintf("initfs: warning: failed to create symlink %s -> %s\n", target, linkt);
+                /* Ensure symlink target dir exists when target is absolute (e.g. /usr -> /bin).
+                   Otherwise parent lookup fails with -2 when path has symlinks in the middle. */
+                if (linkt[0] == '/' && tlen > 1) ensure_parent_dirs(linkt);
+                int sr = ramfs_symlink(target, linkt);
+                if (sr < 0) {
+                    /* -4: already exists, count as success. -5/-6: OOM, fatal. */
+                    if (sr == -4) {
+                        symlinks_created++;
+                    } else if (sr == -5 || sr == -6) {
+                        klogprintf("initfs: fatal: OOM while creating symlink %s\n", target);
+                        kfree(linkt);
+                        return -12;
+                    } else {
+                        /* -2 parent not found, -3 parent not dir, -1 invalid: retry later
+                           after more dirs/symlinks are created (e.g. /bin comes after bin/mount in cpio). */
+                        struct pending_symlink *ps = (struct pending_symlink*)kmalloc(sizeof(*ps));
+                        if (!ps) {
+                            klogprintf("initfs: fatal: OOM pending symlink %s\n", target);
+                            kfree(linkt);
+                            return -12;
+                        }
+                        memset(ps, 0, sizeof(*ps));
+                        strncpy(ps->target, target, sizeof(ps->target) - 1);
+                        ps->target[sizeof(ps->target) - 1] = '\0';
+                        ps->linkt = linkt; /* keep ownership */
+                        ps->next = pending;
+                        pending = ps;
+                        linkt = NULL;
+                    }
+                } else {
+                    symlinks_created++;
                 }
-                kfree(linkt);
+                if (linkt) kfree(linkt);
             } else {
-                klogprintf("initfs: warning: failed to alloc for symlink %s\n", target);
+                klogprintf("initfs: fatal: OOM alloc for symlink %s (heap_used=%llu heap_total=%llu)\n",
+                           target,
+                           (unsigned long long)heap_used_bytes(),
+                           (unsigned long long)heap_total_bytes());
+                return -12;
             }
         } else {
             /* other types (device, fifo...) - skip for now */
@@ -332,7 +484,130 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
         }
         offset = next;
     }
+    /* Retry pending symlinks now that parents should exist. */
+    if (pending) {
+        int round = 0;
+        while (pending && round < 16) {
+            int progress = 0;
+            struct pending_symlink **pp = &pending;
+            while (*pp) {
+                struct pending_symlink *ps = *pp;
+                ensure_parent_dirs(ps->target);
+                int sr = ramfs_symlink(ps->target, ps->linkt);
+                if (sr == 0 || sr == -4) {
+                    *pp = ps->next;
+                    if (ps->linkt) kfree(ps->linkt);
+                    kfree(ps);
+                    symlinks_created++;
+                    progress++;
+                    continue;
+                }
+                pp = &(*pp)->next;
+            }
+            if (!progress) break;
+            round++;
+        }
+        if (pending) {
+            int left = 0;
+            for (struct pending_symlink *ps = pending; ps; ps = ps->next) left++;
+            qemu_debug_printf("initfs: warning: %d symlinks still pending after retries\n", left);
+            while (pending) {
+                struct pending_symlink *ps = pending;
+                pending = ps->next;
+                if (ps->linkt) kfree(ps->linkt);
+                kfree(ps);
+            }
+        }
+    }
+    qemu_debug_printf("initfs: --- end cpio (%d entries) ---\n", cpio_entry_num);
+    qemu_debug_printf("initfs: extracted %d files, %d dirs, %d symlinks\n", files_created, dirs_created, symlinks_created);
     return 0;
+}
+
+/* Multiboot module and kernel heap are identity-mapped; if ranges are disjoint, unpack
+ * from loader memory like Linux initrd (no memcpy, no extra 100+ MiB allocation). */
+static int initfs_module_overlaps_heap(uintptr_t mod_start, size_t mod_size) {
+    uintptr_t mod_end;
+    if (mod_size == 0)
+        return 0;
+    if (__builtin_add_overflow(mod_start, mod_size, &mod_end))
+        return 1;
+    uintptr_t h0 = heap_base_addr();
+    size_t ht = heap_total_bytes();
+    if (h0 == 0 || ht == 0)
+        return 1;
+    uintptr_t h1 = h0 + ht;
+    if (mod_end <= mod_start)
+        return 1;
+    return mod_start < h1 && mod_end > h0;
+}
+
+static int initfs_unpack_multiboot_module(const void *mod_ptr, size_t mod_size) {
+    uintptr_t a = (uintptr_t)mod_ptr;
+    if (!initfs_module_overlaps_heap(a, mod_size)) {
+        klogprintf("initfs: unpack in place (%u bytes, no heap copy)\n", (unsigned)mod_size);
+        return unpack_cpio_newc(mod_ptr, mod_size);
+    }
+    void *buf = kmalloc(mod_size);
+    if (!buf) {
+        klogprintf("initfs: OOM for module buffer (%u bytes), direct unpack\n", (unsigned)mod_size);
+        return unpack_cpio_newc(mod_ptr, mod_size);
+    }
+    memcpy(buf, mod_ptr, mod_size);
+    int r = unpack_cpio_newc(buf, mod_size);
+    kfree(buf);
+    return r;
+}
+
+/* Recursively list VFS entries via qemu_debug_printf for debugging. */
+static void initfs_debug_list_vfs_dir(const char *dirpath, int depth, int *count, int max_entries) {
+    if (depth > 4 || *count >= max_entries) return;
+    struct fs_file *d = fs_open(dirpath);
+    if (!d) return;
+    uint8_t buf[512];
+    size_t file_off = 0;
+    for (;;) {
+        ssize_t nr = fs_read(d, buf, sizeof(buf), file_off);
+        if (nr <= 0) break;
+        size_t rr = (size_t)nr;
+        size_t off = 0;
+        while (off + 8 <= rr && *count < max_entries) {
+            struct ext2_dir_entry *de = (struct ext2_dir_entry*)(buf + off);
+            if (de->rec_len < 8) break;
+            size_t reclen = (size_t)de->rec_len;
+            if (off + reclen > rr) break;
+            if (de->name_len > 0 && de->name_len < 256) {
+                char name[260];
+                size_t nlen = de->name_len < sizeof(name) - 1 ? de->name_len : sizeof(name) - 1;
+                memcpy(name, (char*)(de + 1), nlen);
+                name[nlen] = '\0';
+                if (strcmp(name, ".") != 0 && strcmp(name, "..") != 0) {
+                    char full[512];
+                    if (strcmp(dirpath, "/") == 0)
+                        snprintf(full, sizeof(full), "/%s", name);
+                    else
+                        snprintf(full, sizeof(full), "%s/%s", dirpath, name);
+                    const char *t = (de->file_type == EXT2_FT_DIR) ? "dir" :
+                                   (de->file_type == EXT2_FT_SYMLINK) ? "lnk" : "reg";
+                    qemu_debug_printf("initfs: vfs  %s [%s]\n", full, t);
+                    (*count)++;
+                    if (de->file_type == EXT2_FT_DIR && *count < max_entries)
+                        initfs_debug_list_vfs_dir(full, depth + 1, count, max_entries);
+                }
+            }
+            off += reclen;
+        }
+        file_off += off;
+        if (off == 0 || (size_t)nr < sizeof(buf)) break;
+    }
+    fs_file_free(d);
+}
+
+void initfs_debug_list_vfs(void) {
+    qemu_debug_printf("initfs: --- VFS contents after unpack ---\n");
+    int count = 0;
+    initfs_debug_list_vfs_dir("/", 0, &count, 500);
+    qemu_debug_printf("initfs: --- VFS total %d entries ---\n", count);
 }
 
 /* Scan multiboot2 tags for module named `module_name` and unpack it. */
@@ -347,17 +622,12 @@ int initfs_process_multiboot_module(uint32_t multiboot_magic, uint64_t multiboot
     }
     uint8_t *p = (uint8_t*)(uintptr_t)multiboot_info;
     uint32_t total_size = *(uint32_t*)p;
-    /* Deep diagnostic: print header + first tags; this helps when some VMs
-       pass different structures / pointers. */
-    /* Allow larger multiboot info blocks (some loaders place large modules).
-       Increase cap to 256 MiB to avoid false-positive 'suspicious' aborts. */
-    if (total_size < 16 || total_size > (256u * 1024u * 1024u)) {
-        klogprintf("initfs: suspicious total_size=%u, aborting mb2 scan\n", (unsigned)total_size);
-        return 4;
-    }
-    uint32_t offset = 8; /* tags start after total_size + reserved */
+    /* total_size 0 or huge: loader may pass pointer to first tag (alt layout).
+       Run standard loop only when total_size is plausible [16, 256MB]. */
+    uint32_t offset = 8;
     uint32_t tag_count = 0;
-    while (offset + 8 <= total_size) {
+    int module_tags_seen = 0;
+    if (total_size >= 16 && total_size <= (256u * 1024u * 1024u)) while (offset + 8 <= total_size) {
         if (++tag_count > 1024) break;
         uint32_t tag_type = *(uint32_t*)(p + offset);
         uint32_t tag_size = *(uint32_t*)(p + offset + 4);
@@ -366,6 +636,7 @@ int initfs_process_multiboot_module(uint32_t multiboot_magic, uint64_t multiboot
         if ((uint64_t)offset + (uint64_t)tag_size > (uint64_t)total_size) break;
         if (tag_type == 0) break; /* end */
         if (tag_type == 3) { /* module */
+            module_tags_seen++;
             /* Multiboot2 module tag layout is ALWAYS:
                u32 mod_start, u32 mod_end, then NUL-terminated cmdline string.
                (Even for 64-bit kernels, addresses here are 32-bit physical). */
@@ -379,29 +650,23 @@ int initfs_process_multiboot_module(uint32_t multiboot_magic, uint64_t multiboot
                 uint64_t mod_end = (uint64_t)me32;
                 size_t name_field_offset = offset + 16;
                 const char *name = (const char*)(p + name_field_offset);
-            if (strcmp(name, module_name) == 0) {
+                size_t name_max = (size_t)tag_size - 16u;
+                size_t name_len = initfs_strnlen_local(name, name_max);
+                char shown[128];
+                size_t sn = name_len;
+                if (sn >= sizeof(shown)) sn = sizeof(shown) - 1;
+                memcpy(shown, name, sn);
+                shown[sn] = '\0';
+                klogprintf("initfs: mb2 module cmdline=\"%s\" start=0x%llx end=0x%llx size=%u\n",
+                           shown, (unsigned long long)mod_start, (unsigned long long)mod_end,
+                           (unsigned)(mod_end > mod_start ? (mod_end - mod_start) : 0));
+
+            if (initfs_module_name_matches(name, name_max, module_name)) {
                 size_t mod_size = mod_end > mod_start ? (size_t)(mod_end - mod_start) : 0;
                 const void *mod_ptr = (const void*)(uintptr_t)mod_start;
                 klogprintf("initfs: found module '%s' at %p size %u\n", module_name, mod_ptr, (unsigned)mod_size);
                 if (mod_size == 0) return -2;
-                /* Prefer unpacking directly from the module pointer.
-                   Copying the whole module into heap can easily OOM while we are also
-                   allocating extracted files into ramfs. */
-                int r_direct = unpack_cpio_newc(mod_ptr, mod_size);
-                if (r_direct == 0) return 0;
-
-                /* Fallback: copy module into heap and unpack from there for environments
-                   where direct reads from the module region are unreliable. */
-                klogprintf("initfs: direct unpack failed (%d), trying heap copy fallback\n", r_direct);
-                void *buf = kmalloc(mod_size);
-                if (!buf) {
-                    klogprintf("initfs: heap copy fallback failed (kmalloc %u)\n", (unsigned)mod_size);
-                    return r_direct;
-                }
-                memcpy(buf, mod_ptr, mod_size);
-                int r_copy = unpack_cpio_newc(buf, mod_size);
-                kfree(buf);
-                return r_copy;
+                return initfs_unpack_multiboot_module(mod_ptr, mod_size);
             }
             }
         }
@@ -409,26 +674,92 @@ int initfs_process_multiboot_module(uint32_t multiboot_magic, uint64_t multiboot
         uint32_t next = (tag_size + 7) & ~7u;
         offset += next;
     }
-    /* If we didn't find a multiboot module, attempt a tolerant fallback:
-       scan low physical memory for a cpio newc magic ("070701"/"070702")
-       and try to unpack from there.
-
-       NOTE: This can be EXTREMELY slow if done byte-by-byte over hundreds of MiB.
-       Keep the scan bounded and coarse; this fallback is only for broken loaders. */
+    /* В VMware загрузчик может передать указатель на первый тег (в p+0 тип 3), а не на заголовок.
+       Пробуем разбор с offset=0 при любой неудаче — при стандартном layout (p+0=total_size) сразу выйдем. */
     {
-        const uintptr_t scan_start = 0x10000; /* 64KB */
-        const uintptr_t scan_end = 0x02000000; /* 32MB max scan to avoid long boot stalls */
-        const uintptr_t stride = 4;            /* cpio newc headers are 4-byte aligned */
-        for (uintptr_t a = scan_start; a + 6 <= scan_end; a += stride) {
-            const uint8_t *p6 = (const uint8_t*)(uintptr_t)a;
-            if (memcmp(p6, "070701", 6) == 0 || memcmp(p6, "070702", 6) == 0) {
-                size_t remaining = (size_t)(scan_end - a);
-                if (remaining >= sizeof(struct cpio_newc_header) && plausible_cpio_header((const struct cpio_newc_header*)p6, remaining)) {
-                    int r = unpack_cpio_newc(p6, remaining);
-                    if (r == 0) return 0;
+        const uint32_t alt_max = 65536u;
+        uint32_t alt_off = 0;
+        while (alt_off + 8 <= alt_max) {
+            uint32_t tag_type = *(uint32_t*)(p + alt_off);
+            uint32_t tag_size = *(uint32_t*)(p + alt_off + 4);
+            if (tag_size < 8 || tag_size > alt_max) break;
+            if (tag_type == 0) break;
+            if (tag_type == 3 && tag_size >= 16) {
+                const uint8_t *field_ptr = p + alt_off + 8;
+                uint32_t ms32 = *(uint32_t*)(field_ptr);
+                uint32_t me32 = *(uint32_t*)(field_ptr + 4);
+                uint64_t mod_start = (uint64_t)ms32;
+                uint64_t mod_end = (uint64_t)me32;
+                size_t name_max = (size_t)tag_size - 16u;
+                const char *name = (const char*)(p + alt_off + 16);
+                if (initfs_module_name_matches(name, name_max, module_name)) {
+                    size_t mod_size = mod_end > mod_start ? (size_t)(mod_end - mod_start) : 0;
+                    const void *mod_ptr = (const void*)(uintptr_t)mod_start;
+                    klogprintf("initfs: found module '%s' at %p size %u (alt mb2 layout)\n",
+                               module_name, mod_ptr, (unsigned)mod_size);
+                    if (mod_size == 0) return -2;
+                    void *buf = kmalloc(mod_size);
+                    if (buf) {
+                        memcpy(buf, mod_ptr, mod_size);
+                        int r = unpack_cpio_newc(buf, mod_size);
+                        kfree(buf);
+                        if (r == 0) return 0;
+                    }
+                    return unpack_cpio_newc(mod_ptr, mod_size);
                 }
+            }
+            alt_off += (tag_size + 7) & ~7u;
+        }
+    }
+
+    /* Fallback: некоторые загрузчики дают битую/обрезанную цепочку тегов (например, end-tag
+       раньше module). В таком случае пробуем "рыхлый" поиск module-tag (type=3) только
+       в небольшом окне около multiboot_info, без глобального сканирования памяти. */
+    {
+        const uint32_t meta_scan = 65536u; /* 64 KiB */
+        for (uint32_t off = 0; off + 16u <= meta_scan; off += 4u) {
+            uint32_t tag_type = *(uint32_t *)(p + off);
+            if (tag_type != 3u) continue;
+            uint32_t tag_size = *(uint32_t *)(p + off + 4u);
+            if (tag_size < 16u || tag_size > 4096u) continue;
+            if (off + tag_size > meta_scan) continue;
+
+            const uint8_t *field_ptr = p + off + 8u;
+            uint32_t ms32 = *(uint32_t *)(field_ptr);
+            uint32_t me32 = *(uint32_t *)(field_ptr + 4u);
+            if (me32 <= ms32) continue;
+
+            uint64_t mod_start = (uint64_t)ms32;
+            uint64_t mod_end = (uint64_t)me32;
+            size_t mod_size = (size_t)(mod_end - mod_start);
+            if (mod_size == 0 || mod_size > (512u * 1024u * 1024u)) continue;
+
+            const char *name = (const char *)(p + off + 16u);
+            size_t name_max = (size_t)tag_size - 16u;
+            if (!initfs_module_name_matches(name, name_max, module_name)) continue;
+
+            const void *mod_ptr = (const void *)(uintptr_t)mod_start;
+            klogprintf("initfs: found module '%s' at %p size %u (loose mb2 tag scan)\n",
+                       module_name ? module_name : "(null)",
+                       mod_ptr, (unsigned)mod_size);
+            return initfs_unpack_multiboot_module(mod_ptr, mod_size);
+        }
+    }
+
+    /* Последняя попытка: часть загрузчиков передаёт в multiboot_info адрес initrd напрямую
+       (по указателю сразу cpio magic). Не сканируем память — только один адрес. */
+    if ((memcmp(p, "070701", 6) == 0 || memcmp(p, "070702", 6) == 0)) {
+        const size_t direct_max = 64u * 1024u * 1024u; /* не читать дальше 64 MiB */
+        if (plausible_cpio_header((const struct cpio_newc_header *)p, direct_max)) {
+            int r = unpack_cpio_newc(p, direct_max);
+            if (r == 0 && initfs_has_boot_init()) {
+                klogprintf("initfs: found cpio at multiboot_info (direct initrd)\n");
+                return 0;
             }
         }
     }
+
+    klogprintf("initfs: module '%s' not found in mb2 tags (tags=%u modules=%d)\n",
+               module_name ? module_name : "(null)", (unsigned)tag_count, module_tags_seen);
     return 1; /* module not found */
 }

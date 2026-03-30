@@ -1,4 +1,5 @@
 #include <string.h>
+#include <stdint.h>
 #include <heap.h>
 
 // Вычисляет длину строки
@@ -173,16 +174,30 @@ char* strstr(const char* haystack, const char* needle) {
         return NULL;
 }
 
-// Копирует память
+/*
+ * Large copies: byte loop is unusable for initrd-sized buffers (~100+ MiB).
+ * On x86_64 use "rep movsb" with DF=0 — like Linux memcpy_to_user / __memcpy —
+ * modern CPUs (ERMS) handle this well; small copies stay in a tight loop.
+ */
 void* memcpy(void* dest, const void* src, size_t n) {
-        uint8_t* d = (uint8_t*)dest;
-        const uint8_t* s = (const uint8_t*)src;
-        
-        for (size_t i = 0; i < n; i++) {
-                d[i] = s[i];
-        }
-        
-        return dest;
+	unsigned char* d = (unsigned char*)dest;
+	const unsigned char* s = (const unsigned char*)src;
+
+#if defined(__x86_64__)
+	if (n >= 128) {
+		size_t cnt = n;
+		__asm__ __volatile__(
+			"cld\n\t"
+			"rep movsb"
+			: "+D"(d), "+S"(s), "+c"(cnt)
+			:
+			: "memory", "cc");
+		return dest;
+	}
+#endif
+	for (size_t i = 0; i < n; i++)
+		d[i] = s[i];
+	return dest;
 }
 
 // Перемещает память (с учетом перекрытия)

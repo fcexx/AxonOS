@@ -20,6 +20,9 @@
    Если возвращаемое значение NULL — ошибка (не поддерживается). */
 void *mmio_map_phys(uint64_t pa, size_t len);
 
+/* Linear framebuffer / VRAM: cached (WB) PTEs. Use for PCI video RAM scanout; keep mmio_map_phys for device regs. */
+void *mmio_map_framebuffer(uint64_t pa, size_t len);
+
 /* Освободить отображение, если оно было создано (noop для identity-mapped). */
 void mmio_unmap(void *va, size_t len);
 

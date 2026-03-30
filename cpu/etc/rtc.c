@@ -86,6 +86,7 @@ void rtc_handler(cpu_registers_t* regs) {
 
 // Инициализация RTC
 void rtc_init() {
+    klogprintf("RTC driver for AxonOS by kotazz\n");
     // Отключаем прерывания на время настройки
     asm volatile("cli");
 

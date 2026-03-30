@@ -47,5 +47,3 @@ int disk_write_sectors(int device_id, uint32_t lba, const void *buf, uint32_t se
 	if (!d || !d->write) return -1;
 	return d->write(device_id, lba, buf, sectors);
 }
-
-

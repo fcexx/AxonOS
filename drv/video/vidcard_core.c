@@ -77,4 +77,11 @@ video_device_t *video_find_by_name(const char *name) {
 	return NULL;
 }
 
+void video_flush_region_pixels(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+	for (size_t i = 0; i < g_device_count; i++) {
+		video_device_t *d = &g_devices[i];
+		if (d->ops && d->ops->flush_region)
+			d->ops->flush_region(d, x, y, w, h);
+	}
+}
 

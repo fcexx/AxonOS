@@ -2,9 +2,16 @@
 #include <string.h>
 #include <stdint.h>
 #include <vga.h>
+#include <spinlock.h>
 
 // Very simple kernel heap: first-fit free list with headers, 16-byte alignment,
-// coalescing on free. No thread safety assumed (callers should serialize).
+// coalescing on free.
+//
+// IMPORTANT:
+// Callers in this kernel are not serialized (IRQs + multiple threads can call
+// kmalloc/kfree concurrently). Without a lock the free list corrupts easily,
+// causing non-deterministic failures (e.g. initfs extraction "breaks on any change").
+// Protect heap operations with a spinlock + IRQ-save to avoid reentrancy.
 
 typedef struct heap_block_header {
     size_t size;                 // payload size (bytes)
@@ -23,6 +30,8 @@ static heap_block_header_t* head = 0;
 
 static size_t heap_used_now = 0;
 static size_t heap_peak     = 0;
+
+static spinlock_t heap_lock = { 0 };
 
 extern uint8_t _end[]; // provided by linker as end of kernel image
 
@@ -118,7 +127,7 @@ static void coalesce(heap_block_header_t* blk) {
 static size_t heap_largest_free_block(void);
 static size_t heap_total_free_bytes(void);
 
-void* kmalloc(size_t size) {
+static void* kmalloc_nolock(size_t size) {
     if (!head || size == 0) return 0;
     size_t req = size;
 #if HEAP_GUARD
@@ -145,10 +154,11 @@ void* kmalloc(size_t size) {
         }
         cur = cur->next;
     }
-    return 0; // out of memory
+    /* OOM: do not kprintf here — kmalloc() holds heap_lock and kprintf may kmalloc → deadlock. */
+    return 0; /* out of memory */
 }
 
-void kfree(void* ptr) {
+static void kfree_nolock(void* ptr) {
     if (!ptr) return;
     if (!heap_ptr_in_range(ptr)) {
         kprintf("heap: invalid free ptr=%p (out of heap range)\n", ptr);
@@ -192,9 +202,9 @@ void kfree(void* ptr) {
     coalesce(blk);
 }
 
-void* krealloc(void* ptr, size_t new_size) {
-    if (!ptr) return kmalloc(new_size);
-    if (new_size == 0) { kfree(ptr); return 0; }
+static void* krealloc_nolock(void* ptr, size_t new_size) {
+    if (!ptr) return kmalloc_nolock(new_size);
+    if (new_size == 0) { kfree_nolock(ptr); return 0; }
     if (!heap_ptr_in_range(ptr)) {
         kprintf("heap: invalid realloc ptr=%p\n", ptr);
         return 0;
@@ -262,21 +272,65 @@ void* krealloc(void* ptr, size_t new_size) {
             return ptr;
         }
     }
-    void* n = kmalloc(new_req);
+    void* n = kmalloc_nolock(new_req);
     if (!n) {
-        /* diagnose fragmentation / OOM to aid debugging */
-        size_t largest = heap_largest_free_block();
-        size_t total_free = heap_total_free_bytes();
-        kprintf("heap: krealloc kmalloc failed old_size=%llu new_req=%llu heap_used=%llu heap_total=%llu largest_free=%llu total_free=%llu\n",
-                (unsigned long long)old_size, (unsigned long long)new_req,
-                (unsigned long long)heap_used_now, (unsigned long long)heap_capacity,
-                (unsigned long long)largest, (unsigned long long)total_free);
+        /* Same as kmalloc_nolock OOM: no kprintf under heap_lock. */
         return 0;
     }
     size_t to_copy = old_req < new_req ? old_req : new_req;
     memcpy(n, ptr, to_copy);
-    kfree(ptr);
+    kfree_nolock(ptr);
     return n;
+}
+
+void* kmalloc(size_t size) {
+    unsigned long flags = 0;
+    acquire_irqsave(&heap_lock, &flags);
+    void *p = kmalloc_nolock(size);
+    release_irqrestore(&heap_lock, flags);
+    if (!p && size != 0) {
+        acquire_irqsave(&heap_lock, &flags);
+        size_t largest = heap_largest_free_block();
+        size_t total_free = heap_total_free_bytes();
+        size_t used = heap_used_now;
+        size_t cap = heap_capacity;
+        release_irqrestore(&heap_lock, flags);
+        void *caller = __builtin_return_address(0);
+        kprintf("heap OOM: kmalloc(%llu) failed heap_used=%llu heap_total=%llu "
+                "largest_free=%llu total_free=%llu caller=%p\n",
+                (unsigned long long)size, (unsigned long long)used,
+                (unsigned long long)cap, (unsigned long long)largest,
+                (unsigned long long)total_free, caller);
+    }
+    return p;
+}
+
+void kfree(void* ptr) {
+    unsigned long flags = 0;
+    acquire_irqsave(&heap_lock, &flags);
+    kfree_nolock(ptr);
+    release_irqrestore(&heap_lock, flags);
+}
+
+void* krealloc(void* ptr, size_t new_size) {
+    unsigned long flags = 0;
+    acquire_irqsave(&heap_lock, &flags);
+    void *p = krealloc_nolock(ptr, new_size);
+    release_irqrestore(&heap_lock, flags);
+    if (!p && ptr != NULL && new_size != 0) {
+        acquire_irqsave(&heap_lock, &flags);
+        size_t largest = heap_largest_free_block();
+        size_t total_free = heap_total_free_bytes();
+        size_t used = heap_used_now;
+        size_t cap = heap_capacity;
+        release_irqrestore(&heap_lock, flags);
+        kprintf("heap: krealloc(%p, %llu) failed heap_used=%llu heap_total=%llu "
+                "largest_free=%llu total_free=%llu\n",
+                ptr, (unsigned long long)new_size, (unsigned long long)used,
+                (unsigned long long)cap, (unsigned long long)largest,
+                (unsigned long long)total_free);
+    }
+    return p;
 }
 
 void* kcalloc(size_t num, size_t size) {

@@ -6,7 +6,10 @@
 // gdt is an important shi
 
 void gdt_init();
+void gdt_fill_smp_mailbox_lgdt(uint16_t *gdt_lim, uint32_t *gdt_base32);
+void gdt_ltr_for_cpu(int cpu_index);
 void tss_set_rsp0(uint64_t rsp0);
+void tss_set_ist_for_cpu(int cpu, int idx, uint64_t rsp_top);
 // when we returning to ring3 we need to switch to user mode
 void enter_user_mode(uint64_t user_entry, uint64_t user_stack_top);
 // set per-thread user FS base (wrmsr MSR_FS_BASE)

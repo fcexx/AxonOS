@@ -4,6 +4,9 @@
 #include <fs.h>
 #include <stdint.h>
 #include <spinlock.h>
+#include <stat.h>
+
+typedef struct thread thread_t;
 
 /* Number of virtual ttys provided by devfs (default) */
 #ifndef DEVFS_TTY_COUNT
@@ -54,6 +57,8 @@ struct devfs_tty {
 };
 
 int devfs_register(void);
+/* Reallocate all virtual-console screen buffers to match current console_max_cols/rows (call after fbcon init). */
+void devfs_tty_realloc_for_console(void);
 int devfs_unregister(void);
 int devfs_mount(const char *path);
 /* Open a devfs node directly without requiring a VFS mount. */
@@ -94,6 +99,9 @@ int devfs_is_tty_file(struct fs_file *file);
 int devfs_get_tty_index_from_file(struct fs_file *file);
 int devfs_get_tty_fg_pgrp(int tty);
 void devfs_set_tty_fg_pgrp(int tty, int pgrp);
+int devfs_tty_get_fg_pgrp(struct fs_file *file);
+int devfs_tty_set_fg_pgrp(struct fs_file *file, int pgrp);
+int devfs_tty_attach_thread(struct fs_file *file, thread_t *th);
 int devfs_get_tty_controlling_sid(struct fs_file *file);
 int devfs_set_tty_controlling_sid(struct fs_file *file, int sid);
 void devfs_clear_controlling_by_sid(int sid);
@@ -104,6 +112,15 @@ struct devfs_tty *devfs_get_tty_by_index(int idx);
 /* Create a block device node at given path and associate with disk device_id.
    sectors - total number of 512-byte sectors on device (for size reporting). */
 int devfs_create_block_node(const char *path, int device_id, uint32_t sectors);
+/* Create a block node mapped to [start_lba, start_lba+sectors) on parent device. */
+int devfs_create_block_node_lba(const char *path, int device_id, uint32_t start_lba, uint32_t sectors);
+
+/* Fill a POSIX-like stat struct for a devfs file handle. */
+int devfs_fill_stat(struct fs_file *file, struct stat *st);
+
+/* Enumerate registered block devices (created via devfs_create_block_node). */
+int devfs_block_count(void);
+int devfs_block_get(int index, char *out_name, size_t out_cap, int *out_device_id, uint32_t *out_sectors);
 
 
 

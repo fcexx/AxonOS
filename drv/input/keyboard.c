@@ -41,6 +41,23 @@ static void ps2_flush_output(void) {
         }
 }
 
+/* Send a command byte to keyboard (port 0x60) and wait for ACK (0xFA).
+   Returns 0 on success, -1 on timeout/unexpected response. */
+static int ps2_kbd_send_ack(uint8_t byte) {
+        for (int tries = 0; tries < 3; tries++) {
+                if (!ps2_wait_input_empty()) return -1;
+                outb(0x60, byte);
+                io_wait_local();
+                if (!ps2_wait_output_full()) return -1;
+                uint8_t resp = inb(0x60);
+                if (resp == 0xFA) return 0; /* ACK */
+                if (resp == 0xFE) continue; /* RESEND */
+                /* Some controllers may echo/emit extra bytes; flush once and retry. */
+                ps2_flush_output();
+        }
+        return -1;
+}
+
 // Прототип функции обработки байта сканкода (используется в handler и для polling)
 void keyboard_process_scancode(uint8_t scancode);
 
@@ -52,7 +69,7 @@ void keyboard_process_scancode(uint8_t scancode);
 
 // Таблица сканкодов для преобразования в ASCII
 static const char scancode_to_ascii[128] = {
-        0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b', 0,
+        0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 0x7F, 0,
         'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n', 0, 'a', 's',
         'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0, '\\', 'z', 'x', 'c', 'v',
         'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' ', 0, 0, 0, 0, 0, 0,
@@ -64,7 +81,7 @@ static const char scancode_to_ascii[128] = {
 
 // Таблица сканкодов для Shift
 static const char scancode_to_ascii_shift[128] = {
-        0, 0, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b', 0,
+        0, 0, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', 0x7F, 0,
         'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n', 0, 'A', 'S',
         'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~', 0, '|', 'Z', 'X', 'C', 'V',
         'B', 'N', 'M', '<', '>', '?', 0, '*', 0, ' ', 0, 0, 0, 0, 0, 0,
@@ -150,6 +167,8 @@ void keyboard_process_scancode(uint8_t scancode) {
 #if KBD_DEBUG
     qemu_debug_printf("kbd: scancode=0x%02x\n", scancode);
 #endif
+        /* Ignore ACK/RESEND bytes that can appear after init commands. */
+        if (scancode == 0xFA || scancode == 0xFE) return;
         if (scancode == 0xE0) {
                 kbd_extended_prefix = true;
                 return;
@@ -269,14 +288,11 @@ void keyboard_process_scancode(uint8_t scancode) {
                 case 0x3E: // F4
                 case 0x3F: // F5
                 case 0x40: // F6
+                        /* Alt+F1..F6 or Ctrl+Alt+F1..F6 — switch virtual terminal (same as chvt 1..6) */
                         if (alt_pressed) {
-                                int idx = 0;
-                                if (scancode == 0x3B) idx = 0;
-                                else if (scancode == 0x3C) idx = 1;
-                                else if (scancode == 0x3D) idx = 2;
-                                else if (scancode == 0x3E) idx = 3;
-                                else if (scancode == 0x3F) idx = 4;
-                                else if (scancode == 0x40) idx = 5;
+                                int idx = (scancode == 0x3B) ? 0 : (scancode == 0x3C) ? 1 :
+                                          (scancode == 0x3D) ? 2 : (scancode == 0x3E) ? 3 :
+                                          (scancode == 0x3F) ? 4 : 5;
                                 devfs_switch_tty(idx);
                         } else {
                                 if (thread_get_current_user()) {
@@ -370,7 +386,9 @@ void ps2_keyboard_init() {
                 /* Enable IRQ1 and ensure keyboard clock is enabled (clear disable bit4). */
                 cmd |= 0x01u;          // enable IRQ1
                 cmd &= (uint8_t)~0x10u; // clear "disable keyboard" if set
-                /* Translation on helps with some setups; keep as-is if already set. */
+                /* Force translation on (bit6). Our scancode parser expects set1 semantics
+                   (break = make|0x80). VMware can expose set2 unless translation is enabled. */
+                cmd |= 0x40u;
         }
         if (!ps2_wait_input_empty()) qemu_debug_printf("ps2_keyboard_init: warning input buffer never emptied before writing cmd\n");
         outb(0x64, 0x60); // write command byte
@@ -378,17 +396,13 @@ void ps2_keyboard_init() {
         outb(0x60, cmd);
         io_wait_local();
 
+        /* Ensure keyboard uses scancode set 2 (typical) so controller translation can
+           reliably translate to set1. */
+        (void)ps2_kbd_send_ack(0xF0);
+        (void)ps2_kbd_send_ack(0x02);
+
         /* Enable scanning on the keyboard (0xF4) and optionally consume ACK (0xFA). */
-        if (!ps2_wait_input_empty()) qemu_debug_printf("ps2_keyboard_init: warning input buffer busy before sending 0xF4\n");
-        outb(0x60, 0xF4);
-        io_wait_local();
-        if (ps2_wait_output_full()) {
-                uint8_t resp = inb(0x60);
-                if (resp != 0xFA) {
-                        /* Not fatal; just report for diagnostics. */
-                        qemu_debug_printf("ps2_keyboard_init: keyboard enable scan resp=0x%02x\n", resp);
-                }
-        }
+        (void)ps2_kbd_send_ack(0xF4);
         keyboard_register_sysfs();
 }
 

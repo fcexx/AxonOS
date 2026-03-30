@@ -1,25 +1,39 @@
 /*
- * core/klog.c
- * klog tools
- * Author: fcexx
-*/
+ * core/klog.c — kernel ring buffer log + /var/log/kernel
+ *
+ * Until klog_init(): messages go only to console + a fixed early buffer (no VFS).
+ * klog_init() creates /var/log, flushes the early buffer to /var/log/kernel, then
+ * each line is appended in a single fs_write (one contiguous buffer: timestamp + text).
+ */
 
 #include <klog.h>
+#include <debug.h>
+#include <vga.h>
 #include <stdarg.h>
 #include <stdio.h>
-#include <heap.h>
 #include <fs.h>
 #include <ramfs.h>
+#include <stat.h>
 #include <spinlock.h>
 #include <string.h>
 #include <apic_timer.h>
 
-static spinlock_t klog_lock = { 0 };
-static int klog_inited = 0;
-/* TSC-based high-res time calibration */
+static spinlock_t klog_lock;
+static int klog_inited;
+
+/* Early log ring: no kmalloc, safe before klog_init() and avoids fragile heap+vfs races. */
+#define KLOG_EARLY_SZ (96 * 1024)
+static char klog_early[KLOG_EARLY_SZ];
+static size_t klog_early_used;
+
+#define KLOG_TS_MAX 48
+#define KLOG_MSG_MAX 900
+#define KLOG_OUT_MAX 1024
+static char klog_out[KLOG_OUT_MAX];
+
 uint64_t klog_tsc_base = 0;
 uint64_t klog_time_base_usec = 0;
-uint64_t klog_tsc_per_us = 0; /* tsc ticks per microsecond */
+uint64_t klog_tsc_per_us = 0;
 
 static inline uint64_t read_tsc(void) {
 	unsigned int lo, hi;
@@ -27,15 +41,12 @@ static inline uint64_t read_tsc(void) {
 	return ((uint64_t)hi << 32) | lo;
 }
 
-/* Public: calibrate TSC against APIC timer. Safe to call early; if APIC not running it returns. */
 void klog_calibrate_tsc(void) {
 	if (klog_tsc_per_us != 0) return;
 	if (!apic_timer_is_calibrated() && !apic_timer_is_running()) return;
 
-	/* sample for ~10 ms to get measurable delta, but avoid long blocking:
-	 * wait up to max_wait_us (200 ms) */
-	const uint64_t want_us = 10000;   /* desired sample window: 10 ms */
-	const uint64_t max_wait_us = 200000; /* max wait: 200 ms */
+	const uint64_t want_us = 10000;
+	const uint64_t max_wait_us = 200000;
 
 	uint64_t u1 = apic_timer_get_time_us();
 	uint64_t t1 = read_tsc();
@@ -43,11 +54,7 @@ void klog_calibrate_tsc(void) {
 	while (1) {
 		now = apic_timer_get_time_us();
 		if (now > u1 && (now - u1) >= want_us) break;
-		if (now > u1 && (now - u1) >= max_wait_us) {
-			/* timeout: give up calibration for now */
-			return;
-		}
-		/* small pause to avoid busy burn */
+		if (now > u1 && (now - u1) >= max_wait_us) return;
 		asm volatile("pause");
 	}
 
@@ -57,96 +64,139 @@ void klog_calibrate_tsc(void) {
 	uint64_t dt_tsc = (t2 > t1) ? (t2 - t1) : 0;
 	if (dt_usec > 0 && dt_tsc > 0) {
 		klog_tsc_per_us = dt_tsc / dt_usec;
-		/* store base at t2/u2 */
 		klog_tsc_base = t2;
 		klog_time_base_usec = u2;
 		kprintf("klog: calibrated tsc_per_us=%llu\n", (unsigned long long)klog_tsc_per_us);
 	}
 }
-/* TSC-based high-res time calibration */
-/* Simple time source: use APIC timer microseconds (non-blocking). */
+
 static uint64_t klog_get_time_us(void) {
-	/* Use TSC-derived time if calibrated */
 	if (klog_tsc_per_us != 0 && klog_tsc_base != 0) {
 		uint64_t now_tsc = read_tsc();
 		uint64_t dt_tsc = (now_tsc > klog_tsc_base) ? (now_tsc - klog_tsc_base) : 0;
 		uint64_t dt_us = klog_tsc_per_us ? (dt_tsc / klog_tsc_per_us) : 0;
 		return klog_time_base_usec + dt_us;
 	}
-	/* else fall back to APIC timer */
 	return apic_timer_get_time_us();
 }
 
+static void klog_early_append(const char *p, size_t n) {
+	if (!p || n == 0) return;
+	if (klog_early_used + n > KLOG_EARLY_SZ) {
+		static int once;
+		if (!once) {
+			once = 1;
+			kprintf("klog: early buffer full; dropping further pre-init lines\n");
+		}
+		return;
+	}
+	memcpy(klog_early + klog_early_used, p, n);
+	klog_early_used += n;
+}
+
+/* Caller must hold klog_lock + irq disabled. */
+static void klog_flush_early_to_file(void) {
+	if (klog_early_used == 0) return;
+	struct fs_file *f = fs_create_file("/var/log/kernel");
+	if (!f)
+		f = fs_open("/var/log/kernel");
+	if (!f)
+		return;
+	(void)fs_write(f, klog_early, klog_early_used, 0);
+	fs_file_free(f);
+	klog_early_used = 0;
+}
+
 void klog_init(void) {
-    acquire(&klog_lock);
-    if (klog_inited) { release(&klog_lock); return; }
-    /* Ensure /var and /var/log exist (ramfs-backed) */
-    ramfs_mkdir("/var");
-    ramfs_mkdir("/var/log");
-    klog_inited = 1;
-    release(&klog_lock);
+	unsigned long irqf;
+	acquire_irqsave(&klog_lock, &irqf);
+	if (klog_inited) {
+		release_irqrestore(&klog_lock, irqf);
+		return;
+	}
+	(void)ramfs_mkdir("/var");
+	(void)ramfs_mkdir("/var/log");
+	klog_flush_early_to_file();
+	klog_inited = 1;
+	release_irqrestore(&klog_lock, irqf);
 }
 
 void klogprintf(const char *fmt, ...) {
-    const size_t cap = 1024;
-    char *buf = kmalloc(cap);
-    if (!buf) return;
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(buf, cap, fmt, ap);
-    va_end(ap);
-    if (n < 0) { kfree(buf); return; }
-    size_t len = (size_t)n;
-    if (len >= cap) len = cap - 1;
+	unsigned long irqf;
+	acquire_irqsave(&klog_lock, &irqf);
 
-    /* Build timestamp prefix like: [    0.000000]  */
-    char tsbuf[32];
-    uint64_t usec = klog_get_time_us();
-    uint64_t secs = usec / 1000000;
-    uint64_t micros = usec % 1000000;
-    int tslen = snprintf(tsbuf, sizeof(tsbuf), "[%5llu.%06llu] ", (unsigned long long)secs, (unsigned long long)micros);
-    if (tslen < 0) tslen = 0;
+	char msg[KLOG_MSG_MAX];
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vsnprintf(msg, sizeof msg, fmt, ap);
+	va_end(ap);
+	if (n < 0) {
+		release_irqrestore(&klog_lock, irqf);
+		return;
+	}
+	size_t len = (size_t)n;
+	if (len >= sizeof msg)
+		len = sizeof msg - 1;
+	if (len == 0 || msg[len - 1] != '\n') {
+		if (len + 1 < sizeof msg)
+			msg[len++] = '\n';
+		else if (len > 0)
+			msg[len - 1] = '\n';
+	}
 
-    /* Combine timestamp + message for console and file */
-    size_t total_cap = tslen + len + 1;
-    char *full = kmalloc(total_cap);
-    if (full) {
-        memcpy(full, tsbuf, tslen);
-        memcpy(full + tslen, buf, len);
-        full[tslen + len] = '\0';
-        kprintf("%s", full);
-    } else {
-        /* Fallback: print without timestamp */
-        kprintf("%s", buf);
-    }
+	char ts[KLOG_TS_MAX];
+	uint64_t usec = klog_get_time_us();
+	uint64_t secs = usec / 1000000;
+	uint64_t micros = usec % 1000000;
+	int tn = snprintf(ts, sizeof ts, "[%5llu.%06llu] ",
+			  (unsigned long long)secs, (unsigned long long)micros);
+	size_t tslen = 0;
+	if (tn > 0) {
+		if ((size_t)tn < sizeof ts)
+			tslen = (size_t)tn;
+		else
+			tslen = sizeof ts - 1u;
+	}
 
-    acquire(&klog_lock);
-    if (!klog_inited) {
-        /* try to initialize lazily */
-        ramfs_mkdir("/var");
-        ramfs_mkdir("/var/log");
-        klog_inited = 1;
-    }
-    /* best-effort append to /var/log/kernel */
-    struct fs_file *f = fs_open("/var/log/kernel");
-    if (!f) {
-        f = fs_create_file("/var/log/kernel");
-    }
-    if (f) {
-        /* write at end */
-        if (full) {
-            ssize_t wr = fs_write(f, full, tslen + len, f->size);
-            (void)wr;
-        } else {
-            ssize_t wr = fs_write(f, buf, len, f->size);
-            (void)wr;
-        }
-        fs_file_free(f);
-    }
-    //qemu_debug_printf(full);
-    if (full) kfree(full);
-    kfree(buf);
-    release(&klog_lock);
+	size_t outlen = tslen + len;
+	if (outlen + 1 > sizeof klog_out) {
+		size_t room = sizeof klog_out - tslen - 1u;
+		if (room > len)
+			room = len;
+		memcpy(klog_out, ts, tslen);
+		memcpy(klog_out + tslen, msg, room);
+		outlen = tslen + room;
+	} else {
+		memcpy(klog_out, ts, tslen);
+		memcpy(klog_out + tslen, msg, len);
+	}
+	klog_out[outlen] = '\0';
+
+	kprintf("%s", klog_out);
+
+	if (!klog_inited) {
+		klog_early_append(klog_out, outlen);
+#ifdef QEMU_LOG_ENABLE
+		qemu_debug_printf("%s", klog_out);
+#endif
+		release_irqrestore(&klog_lock, irqf);
+		return;
+	}
+
+	struct fs_file *f = fs_open("/var/log/kernel");
+	if (!f)
+		f = fs_create_file("/var/log/kernel");
+	if (f) {
+		size_t off = (size_t)f->size;
+		struct stat st;
+		if (vfs_fstat(f, &st) == 0 && st.st_size >= 0)
+			off = (size_t)st.st_size;
+		(void)fs_write(f, klog_out, outlen, off);
+		fs_file_free(f);
+	}
+
+#ifdef QEMU_LOG_ENABLE
+	qemu_debug_printf("%s", klog_out);
+#endif
+	release_irqrestore(&klog_lock, irqf);
 }
-
-

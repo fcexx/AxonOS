@@ -14,6 +14,8 @@ extern "C" {
 #endif
 
 void context_switch(context_t *old_ctx, context_t *new_ctx);
+/* Save old, then unlock sched_lock (IF stays off); caller must restore_irqflags(irq_f) after return. */
+void context_switch_with_prev(context_t *old_ctx, context_t *new_ctx, void *prev_thread);
 
 #ifdef __cplusplus
 }

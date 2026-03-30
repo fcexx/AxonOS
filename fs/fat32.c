@@ -147,10 +147,13 @@ static int fat32_parse_boot(struct fat32_mount *m, uint32_t lba) {
 
 /* try mount boot sector at lba; return 0 on success */
 int fat32_mount_from_device(int device_id) {
-    /* allow remounting the same device; but prevent multiple different mounts */
+    /* allow remounting same device; if another device is requested, switch context */
     if (g_fat) {
         if (g_fat->device_id == device_id) return 0;
-        return -1; /* already mounted from another device */
+        klogprintf("fat32: switching mounted device %d -> %d\n", g_fat->device_id, device_id);
+        kfree(g_fat);
+        g_fat = NULL;
+        fat32_driver.driver_data = NULL;
     }
     struct fat32_mount *m = (struct fat32_mount*)kmalloc(sizeof(*m));
     if (!m) return -1;
