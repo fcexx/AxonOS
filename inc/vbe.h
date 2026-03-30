@@ -11,6 +11,7 @@ int vbe_attach_framebuffer(void *frontbuf, uint32_t width, uint32_t height, uint
 
 /* Simple framebuffer console primitives used by kprintf delegation */
 void vbefb_putchar(uint8_t ch, uint8_t attr);
+void vbefb_putchar_literal(uint8_t ch, uint8_t attr);
 /* Write character at (x,y) without moving cursor (for clearing line segments). */
 void vbefb_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr);
 void vbefb_putn(char ch, int count, uint8_t attr);

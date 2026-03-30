@@ -4,6 +4,7 @@
 #include <fonts/default_8x16.h>
 #include <vga.h>
 #include <klog.h>
+#include <video.h>
 
 /* VGA Sequencer registers for Cirrus hardware cursor */
 #define VGA_SEQ_INDEX   0x3C4
@@ -46,6 +47,12 @@ static uint32_t g_cursor_x = 0;
 static uint32_t g_cursor_y = 0;
 static uint8_t g_current_attr = 0x07;
 
+/* Software cursor (used when hardware cursor isn't available).
+   Uses "save-under by redraw": cursor draws an underscore on the bottom scanlines,
+   and erase restores the original cell by redrawing its glyph from g_textbuf. */
+static int g_swcursor_visible = 1;
+static uint32_t g_swcursor_blink_counter = 0;
+
 /* ANSI: kputchar() goes straight here when Cirrus is active — devfs may not see all output. */
 enum { CIR_ESC_NONE = 0, CIR_ESC_ESC = 1, CIR_ESC_CSI = 2, CIR_ESC_SS3 = 3 };
 static int g_esc_state = CIR_ESC_NONE;
@@ -67,6 +74,9 @@ static inline uint32_t attr_to_rgb(uint8_t attr, int fg) {
 
 static inline uint32_t pack_pixel(uint8_t r, uint8_t g, uint8_t b) {
 	if (g_bpp == 32 || g_bpp == 24) {
+		/* VMware SVGA / many hosts treat A=0 as fully transparent in 32bpp — force opaque. */
+		if (g_bpp == 32)
+			return 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 		return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 	} else if (g_bpp == 16) {
 		return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
@@ -110,6 +120,43 @@ static void draw_glyph(uint32_t cx, uint32_t cy, uint8_t ch, uint8_t attr) {
 			}
 		}
 	}
+	video_flush_region_pixels(px, py, FONT_W, FONT_H);
+}
+
+static void swcursor_erase_at(uint32_t cx, uint32_t cy) {
+	if (!g_ready || !g_textbuf) return;
+	if (cx >= g_cols || cy >= g_rows) return;
+	cell_t c = g_textbuf[cy * g_cols + cx];
+	draw_glyph(cx, cy, c.ch, c.attr);
+}
+
+static void swcursor_draw_at(uint32_t cx, uint32_t cy) {
+	if (!g_ready || !g_textbuf || !g_fb) return;
+	if (cx >= g_cols || cy >= g_rows) return;
+
+	uint32_t px = cx * FONT_W;
+	uint32_t py = cy * FONT_H;
+	uint32_t bpp = (g_bpp + 7) / 8;
+
+	uint8_t attr = g_textbuf[cy * g_cols + cx].attr;
+	uint32_t fg_pix = rgb_to_pixel(attr_to_rgb(attr, 1));
+
+	/* Underscore cursor: paint bottom 2 scanlines in FG color. */
+	for (uint32_t row = (FONT_H - 2); row < FONT_H; row++) {
+		uint8_t *line = (uint8_t*)g_fb + (py + row) * g_pitch + px * bpp;
+		for (uint32_t bit = 0; bit < FONT_W; bit++) {
+			if (bpp == 4) {
+				*(uint32_t*)(line + bit * 4) = fg_pix;
+			} else if (bpp == 3) {
+				line[bit * 3 + 0] = fg_pix & 0xFF;
+				line[bit * 3 + 1] = (fg_pix >> 8) & 0xFF;
+				line[bit * 3 + 2] = (fg_pix >> 16) & 0xFF;
+			} else if (bpp == 2) {
+				*(uint16_t*)(line + bit * 2) = (uint16_t)fg_pix;
+			}
+		}
+	}
+	video_flush_region_pixels(px, py + (FONT_H - 2), FONT_W, 2);
 }
 
 static void scroll_up(void) {
@@ -133,6 +180,7 @@ static void scroll_up(void) {
 			else if (bpp == 2) *(uint16_t*)(line + x * 2) = (uint16_t)bg_pix;
 		}
 	}
+	video_flush_region_pixels(0, 0, g_width, g_height);
 }
 
 /*
@@ -201,7 +249,7 @@ static void hwcursor_init(void) {
 	seq_write(SR12_CURSOR_CTL, sr12);
 	
 	g_hwcursor_ok = 1;
-	klogprintf("cirrusfb: hardware cursor enabled at offset 0x%x\n", g_hwcursor_offset);
+	klogprintf("fbcon: hardware cursor (VGA seq) at offset 0x%x\n", g_hwcursor_offset);
 }
 
 static void hwcursor_set_pos(uint32_t x, uint32_t y) {
@@ -237,7 +285,8 @@ static void hwcursor_enable(int enable) {
 	seq_write(SR12_CURSOR_CTL, sr12);
 }
 
-int cirrusfb_init(void *fb, uint32_t width, uint32_t height, uint32_t pitch, uint32_t bpp, uint32_t fb_size) {
+int cirrusfb_init(void *fb, uint32_t width, uint32_t height, uint32_t pitch, uint32_t bpp, uint32_t fb_size,
+                  int hw_cursor) {
 	if (!fb || width == 0 || height == 0) return -1;
 	g_fb = fb;
 	g_width = width;
@@ -262,17 +311,26 @@ int cirrusfb_init(void *fb, uint32_t width, uint32_t height, uint32_t pitch, uin
 	g_cursor_x = 0;
 	g_cursor_y = 0;
 	g_current_attr = 0x07;
+	g_swcursor_visible = 1;
+	g_swcursor_blink_counter = 0;
 	g_ready = 1;
 
 	cirrusfb_clear(WHITE_ON_BLACK);
-	
-	/* Initialize hardware cursor */
-	hwcursor_init();
-	if (g_hwcursor_ok) {
-		hwcursor_set_pos(0, 0);
+
+	if (hw_cursor) {
+		hwcursor_init();
+		if (g_hwcursor_ok)
+			hwcursor_set_pos(0, 0);
+	} else {
+		g_hwcursor_ok = 0;
+	}
+
+	/* If no HW cursor, draw initial SW cursor so it is visible immediately. */
+	if (!g_hwcursor_ok && g_swcursor_visible) {
+		swcursor_draw_at(g_cursor_x, g_cursor_y);
 	}
 	
-	klogprintf("cirrusfb: initialized %ux%u cols=%u rows=%u bpp=%u hwcursor=%d\n",
+	klogprintf("fbcon: linear text console %ux%u cols=%u rows=%u bpp=%u hwcursor=%d\n",
 	           width, height, g_cols, g_rows, bpp, g_hwcursor_ok);
 	return 0;
 }
@@ -323,30 +381,77 @@ static void cirrusfb_putchar_inner(uint8_t ch, uint8_t attr) {
 	}
 
 	if (g_cursor_y >= g_rows) {
+		/* Ensure cursor doesn't get "stuck" in scrolled pixels. */
+		if (!g_hwcursor_ok && g_swcursor_visible) {
+			swcursor_erase_at(ox, oy);
+		}
 		scroll_up();
 		g_cursor_y = g_rows - 1;
 	}
 
 	if (g_hwcursor_ok) {
 		hwcursor_set_pos(g_cursor_x, g_cursor_y);
+	} else {
+		/* If cursor moved without overwriting the old cell (e.g. newline), erase underline there. */
+		if (g_swcursor_visible && (ox != g_cursor_x || oy != g_cursor_y)) {
+			swcursor_erase_at(ox, oy);
+		}
+		if (g_swcursor_visible) {
+			swcursor_draw_at(g_cursor_x, g_cursor_y);
+		}
 	}
+}
+
+void cirrusfb_putchar_literal(uint8_t ch, uint8_t attr) {
+	if (!g_ready || !g_textbuf) return;
+	cirrusfb_putchar_inner(ch, attr);
 }
 
 void cirrusfb_set_cursor(uint32_t x, uint32_t y) {
 	if (!g_ready) return;
 	if (x >= g_cols) x = g_cols - 1;
 	if (y >= g_rows) y = g_rows - 1;
+	uint32_t ox = g_cursor_x, oy = g_cursor_y;
+	if (!g_hwcursor_ok && g_swcursor_visible) {
+		swcursor_erase_at(ox, oy);
+	}
 	g_cursor_x = x;
 	g_cursor_y = y;
 	
 	if (g_hwcursor_ok) {
 		hwcursor_set_pos(x, y);
+	} else {
+		if (g_swcursor_visible) swcursor_draw_at(x, y);
 	}
 }
 
 void cirrusfb_get_cursor(uint32_t *x, uint32_t *y) {
 	if (x) *x = g_cursor_x;
 	if (y) *y = g_cursor_y;
+}
+
+uint8_t cirrusfb_get_cell_attr(uint32_t x, uint32_t y) {
+	if (!g_ready || !g_textbuf || x >= g_cols || y >= g_rows)
+		return 0x07;
+	return g_textbuf[y * g_cols + x].attr;
+}
+
+void cirrusfb_snapshot_screen(uint8_t *out, size_t max_bytes) {
+	if (!g_ready || !g_textbuf || !out) return;
+	size_t need = (size_t)g_cols * (size_t)g_rows * 2u;
+	if (need > max_bytes) return;
+	memcpy(out, g_textbuf, need);
+}
+
+void cirrusfb_restore_screen(const uint8_t *src, uint32_t cols, uint32_t rows) {
+	if (!g_ready || !g_textbuf || !src) return;
+	if (cols != g_cols || rows != g_rows) return;
+	for (uint32_t y = 0; y < rows; y++) {
+		for (uint32_t x = 0; x < cols; x++) {
+			size_t off = ((size_t)y * cols + x) * 2u;
+			cirrusfb_putch_xy(x, y, src[off], src[off + 1]);
+		}
+	}
 }
 
 void cirrusfb_clear(uint8_t attr) {
@@ -372,6 +477,7 @@ void cirrusfb_clear(uint8_t attr) {
 	if (g_hwcursor_ok) {
 		hwcursor_set_pos(0, 0);
 	}
+	video_flush_region_pixels(0, 0, g_width, g_height);
 }
 
 static void cirrusfb_erase_cells(uint32_t x0, uint32_t x1, uint32_t y) {
@@ -543,6 +649,17 @@ void cirrusfb_putchar(uint8_t ch, uint8_t attr) {
 }
 
 void cirrusfb_update_cursor(void) {
-	/* Hardware cursor blinks automatically - nothing to do here */
-	(void)0;
+	if (!g_ready) return;
+	if (g_hwcursor_ok) {
+		/* Hardware cursor blinks automatically. */
+		return;
+	}
+	/* Keep blink perceptible on both 100Hz and 1000Hz timer setups. */
+	g_swcursor_blink_counter++;
+	if (g_swcursor_blink_counter >= 120) {
+		g_swcursor_blink_counter = 0;
+		g_swcursor_visible = !g_swcursor_visible;
+		if (g_swcursor_visible) swcursor_draw_at(g_cursor_x, g_cursor_y);
+		else swcursor_erase_at(g_cursor_x, g_cursor_y);
+	}
 }

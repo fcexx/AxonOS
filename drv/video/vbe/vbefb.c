@@ -39,6 +39,9 @@ static int esc_len = 0;
 static int cursor_visible = 1; /* cursor blink state */
 static uint32_t cursor_blink_counter = 0;
 
+void draw_cursor(void);
+void erase_cursor(void);
+
 static uint32_t vga_palette[16] = {
 	0x00000000, 0x000000AA, 0x0000AA00, 0x0000AAAA,
 	0x00AA0000, 0x00AA00AA, 0x00AA5500, 0x00AAAAAA,
@@ -117,6 +120,65 @@ static void vbefb_erase_cells(uint32_t x0, uint32_t x1, uint32_t y) {
 		textbuf[y * cols + x].ch = ' ';
 		textbuf[y * cols + x].attr = current_attr;
 		draw_cell_to_backbuffer(x, y);
+	}
+}
+
+static void vbefb_emit_tty_char(uint8_t ch) {
+	int control_path = (ch == '\n' || ch == '\r' || ch == '\t' || ch == '\b');
+	uint32_t old_cx = cursor_x;
+	uint32_t old_cy = cursor_y;
+	if (control_path && cursor_visible && old_cx < cols && old_cy < rows) {
+		uint32_t save_x = cursor_x, save_y = cursor_y;
+		cursor_x = old_cx; cursor_y = old_cy;
+		erase_cursor();
+		cursor_x = save_x; cursor_y = save_y;
+	}
+
+	uint32_t ox = cursor_x;
+	uint32_t oy = cursor_y;
+
+	if (ch == '\n') {
+		cursor_x = 0;
+		cursor_y++;
+	} else if (ch == '\r') {
+		cursor_x = 0;
+	} else if (ch == '\t') {
+		uint32_t newx = (cursor_x + 8) & ~(8 - 1);
+		if (newx >= cols) { newx = 0; cursor_y++; }
+		for (uint32_t tx = ox; tx != newx; tx = (tx + 1) % cols) {
+			textbuf[oy * cols + tx].ch = ' ';
+			textbuf[oy * cols + tx].attr = current_attr;
+		}
+		cursor_x = newx;
+	} else if (ch == '\b') {
+		if (cursor_x > 0) cursor_x--;
+		textbuf[cursor_y * cols + cursor_x].ch = ' ';
+		textbuf[cursor_y * cols + cursor_x].attr = current_attr;
+		ox = cursor_x; oy = cursor_y;
+	} else {
+		textbuf[oy * cols + ox].ch = ch;
+		textbuf[oy * cols + ox].attr = current_attr;
+		cursor_x++;
+		if (cursor_x >= cols) { cursor_x = 0; cursor_y++; }
+	}
+
+	if (cursor_y >= rows) {
+		memmove(textbuf, textbuf + cols, (size_t)(cols * (rows - 1) * sizeof(cell_t)));
+		uint32_t last_row = rows - 1;
+		for (uint32_t rx = 0; rx < cols; rx++) {
+			textbuf[last_row * cols + rx].ch = ' ';
+			textbuf[last_row * cols + rx].attr = current_attr;
+		}
+		cursor_y = rows - 1;
+		vbe_scroll_up_pixels(font_h);
+		vbe_clear_region(0, last_row * font_h, fb_width, font_h, vga_attr_bg_to_pixel(current_attr));
+		if (cursor_visible)
+			draw_cursor();
+		vbe_flush_region(0, last_row * font_h, fb_width, font_h);
+	} else {
+		draw_cell_to_backbuffer(ox, oy);
+		if (cursor_visible)
+			draw_cursor();
 	}
 }
 
@@ -222,81 +284,15 @@ void vbefb_putchar(uint8_t ch, uint8_t attr) {
 		return;
 	}
 
-	int control_path = (ch == '\n' || ch == '\r' || ch == '\t' || ch == '\b');
-	/* remember old cursor position before update */
-	uint32_t old_cx = cursor_x;
-	uint32_t old_cy = cursor_y;
-	/* Erase old cursor only for control-path updates where the old cell may not be redrawn. */
-	if (control_path && cursor_visible && old_cx < cols && old_cy < rows) {
-		/* temporarily set cursor to old position to erase */
-		uint32_t save_x = cursor_x, save_y = cursor_y;
-		cursor_x = old_cx; cursor_y = old_cy;
-		erase_cursor();
-		cursor_x = save_x; cursor_y = save_y;
-	}
-	
-	/* remember current position where the character will be placed */
-	uint32_t ox = cursor_x;
-	uint32_t oy = cursor_y;
+	vbefb_emit_tty_char(ch);
+}
 
-	// handle control characters
-	if (ch == '\n') {
-		cursor_x = 0;
-		cursor_y++;
-	} else if (ch == '\r') {
-		cursor_x = 0;
-	} else if (ch == '\t') {
-		uint32_t newx = (cursor_x + 8) & ~(8 - 1);
-		if (newx >= cols) { newx = 0; cursor_y++; }
-		for (uint32_t tx = ox; tx != newx; tx = (tx + 1) % cols) {
-			textbuf[oy * cols + tx].ch = ' ';
-			textbuf[oy * cols + tx].attr = current_attr;
-		}
-		cursor_x = newx;
-	} else if (ch == '\b') {
-		if (cursor_x > 0) cursor_x--;
-		textbuf[cursor_y * cols + cursor_x].ch = ' ';
-		textbuf[cursor_y * cols + cursor_x].attr = current_attr;
-		ox = cursor_x; oy = cursor_y;
-	} else {
-		/* normal printable */
-		textbuf[oy * cols + ox].ch = ch;
-		textbuf[oy * cols + ox].attr = current_attr;
-		cursor_x++;
-		if (cursor_x >= cols) { cursor_x = 0; cursor_y++; }
-	}
-
-	if (cursor_y >= rows) {
-		/* scroll up by one row */
-		memmove(textbuf, textbuf + cols, (size_t)(cols * (rows - 1) * sizeof(cell_t)));
-		/* clear last row in text buffer with active attributes */
-		uint32_t last_row = rows - 1;
-		for (uint32_t rx = 0; rx < cols; rx++) {
-			textbuf[last_row * cols + rx].ch = ' ';
-			textbuf[last_row * cols + rx].attr = current_attr;
-		}
-		cursor_y = rows - 1;
-		/* scroll framebuffer pixels up by font_h */
-		vbe_scroll_up_pixels(font_h);
-		/* fast clear only the newly exposed pixel band instead of glyph redraw for each cell */
-		vbe_clear_region(0, last_row * font_h, fb_width, font_h, vga_attr_bg_to_pixel(current_attr));
-		/* redraw cursor at new position after scroll */
-		if (cursor_visible) {
-			draw_cursor();
-		}
-		/* flush last row region (no-op if front-only) */
-		vbe_flush_region(0, last_row * font_h, fb_width, font_h);
-	} else {
-		/* draw only the single updated cell and flush small rect */
-		draw_cell_to_backbuffer(ox, oy);
-		/* redraw cursor at new position if visible (timer will handle blinking) */
-		if (cursor_visible) {
-			draw_cursor();
-		}
-		uint32_t px = ox * font_w;
-		uint32_t py = oy * font_h;
-		//vbe_flush_region(px, py, font_w, font_h);
-	}
+void vbefb_putchar_literal(uint8_t ch, uint8_t attr) {
+	if (!vbe_is_available()) return;
+	esc_mode = 0;
+	esc_len = 0;
+	current_attr = attr;
+	vbefb_emit_tty_char(ch);
 }
 
 void draw_cursor(void) {

@@ -187,4 +187,52 @@ void console_get_cursor(uint32_t *x, uint32_t *y) {
 	vga_get_cursor(x,y);
 }
 
+void console_clear_screen_attr(uint8_t attr) {
+	if (cirrusfb_is_ready()) {
+		cirrusfb_clear(attr);
+		return;
+	}
+	if (vbe_is_available()) {
+		vbefb_clear(attr);
+		return;
+	}
+	vga_clear_screen_attr(attr);
+}
 
+void console_clear_line_segment(uint32_t x0, uint32_t x1, uint32_t y, uint8_t attr) {
+	if (cirrusfb_is_ready()) {
+		if (x0 > x1) return;
+		for (uint32_t x = x0; x <= x1; x++)
+			cirrusfb_putch_xy(x, y, ' ', attr);
+		return;
+	}
+	if (vbe_is_available()) {
+		if (x0 > x1) return;
+		for (uint32_t x = x0; x <= x1; x++) {
+			vbefb_set_cursor(x, y);
+			vbefb_putchar(' ', attr);
+		}
+		return;
+	}
+	vga_clear_line_segment(x0, x1, y, attr);
+}
+
+uint8_t console_get_cell_attr(uint32_t x, uint32_t y) {
+	if (cirrusfb_is_ready())
+		return cirrusfb_get_cell_attr(x, y);
+	if (vbe_is_available())
+		return 0x07;
+	return vga_get_cell_attr(x, y);
+}
+
+void console_putc_tty_literal(uint8_t ch, uint8_t attr) {
+	if (cirrusfb_is_ready()) {
+		cirrusfb_putchar_literal(ch, attr);
+		return;
+	}
+	if (vbe_is_available()) {
+		vbefb_putchar_literal(ch, attr);
+		return;
+	}
+	kputchar(ch, attr);
+}

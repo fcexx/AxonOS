@@ -343,11 +343,12 @@ int e1000_init(void) {
     /* Не ждём link здесь: pit_sleep_ms в контексте первого ping (syscall) на VMware может зависнуть. */
     {
         int link_up = (e1000_read32(E1000_REG_STATUS) & E1000_STATUS_LU) ? 1 : 0;
-        klogprintf("e1000: initialized %02x:%02x.%x dev=%04x mac=%02x:%02x:%02x:%02x:%02x:%02x link=%s\n",
+        klogprintf("e1000: %02x:%02x.%x dev=%04x mac=%02x:%02x:%02x:%02x:%02x:%02x link=%s\n",
                    pdev->bus, pdev->device, pdev->function, pdev->device_id,
                    g_e1000.mac[0], g_e1000.mac[1], g_e1000.mac[2],
                    g_e1000.mac[3], g_e1000.mac[4], g_e1000.mac[5],
                    link_up ? "up" : "down");
+        klogprintf("\n");
     }
     return 0;
 }

@@ -472,6 +472,10 @@ void	scroll_line()
 
 void	kclear()
 {
+	if (cirrusfb_is_ready()) {
+		cirrusfb_clear(WHITE_ON_BLACK);
+		return;
+	}
 	if (vbe_is_available()) {
 		vbefb_clear(WHITE_ON_BLACK);
 		return;

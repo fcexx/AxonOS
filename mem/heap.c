@@ -154,18 +154,8 @@ static void* kmalloc_nolock(size_t size) {
         }
         cur = cur->next;
     }
-    /* OOM: log to aid debugging adduser/addgroup and similar failures */
-    {
-        size_t largest = heap_largest_free_block();
-        size_t total_free = heap_total_free_bytes();
-        void *caller = __builtin_return_address(0);
-        kprintf("heap OOM: kmalloc(%llu) failed heap_used=%llu heap_total=%llu "
-                "largest_free=%llu total_free=%llu caller=%p\n",
-                (unsigned long long)req, (unsigned long long)heap_used_now,
-                (unsigned long long)heap_capacity, (unsigned long long)largest,
-                (unsigned long long)total_free, caller);
-    }
-    return 0; // out of memory
+    /* OOM: do not kprintf here — kmalloc() holds heap_lock and kprintf may kmalloc → deadlock. */
+    return 0; /* out of memory */
 }
 
 static void kfree_nolock(void* ptr) {
@@ -284,13 +274,7 @@ static void* krealloc_nolock(void* ptr, size_t new_size) {
     }
     void* n = kmalloc_nolock(new_req);
     if (!n) {
-        /* diagnose fragmentation / OOM to aid debugging */
-        size_t largest = heap_largest_free_block();
-        size_t total_free = heap_total_free_bytes();
-        kprintf("heap: krealloc kmalloc failed old_size=%llu new_req=%llu heap_used=%llu heap_total=%llu largest_free=%llu total_free=%llu\n",
-                (unsigned long long)old_size, (unsigned long long)new_req,
-                (unsigned long long)heap_used_now, (unsigned long long)heap_capacity,
-                (unsigned long long)largest, (unsigned long long)total_free);
+        /* Same as kmalloc_nolock OOM: no kprintf under heap_lock. */
         return 0;
     }
     size_t to_copy = old_req < new_req ? old_req : new_req;
@@ -304,6 +288,20 @@ void* kmalloc(size_t size) {
     acquire_irqsave(&heap_lock, &flags);
     void *p = kmalloc_nolock(size);
     release_irqrestore(&heap_lock, flags);
+    if (!p && size != 0) {
+        acquire_irqsave(&heap_lock, &flags);
+        size_t largest = heap_largest_free_block();
+        size_t total_free = heap_total_free_bytes();
+        size_t used = heap_used_now;
+        size_t cap = heap_capacity;
+        release_irqrestore(&heap_lock, flags);
+        void *caller = __builtin_return_address(0);
+        kprintf("heap OOM: kmalloc(%llu) failed heap_used=%llu heap_total=%llu "
+                "largest_free=%llu total_free=%llu caller=%p\n",
+                (unsigned long long)size, (unsigned long long)used,
+                (unsigned long long)cap, (unsigned long long)largest,
+                (unsigned long long)total_free, caller);
+    }
     return p;
 }
 
@@ -319,6 +317,19 @@ void* krealloc(void* ptr, size_t new_size) {
     acquire_irqsave(&heap_lock, &flags);
     void *p = krealloc_nolock(ptr, new_size);
     release_irqrestore(&heap_lock, flags);
+    if (!p && ptr != NULL && new_size != 0) {
+        acquire_irqsave(&heap_lock, &flags);
+        size_t largest = heap_largest_free_block();
+        size_t total_free = heap_total_free_bytes();
+        size_t used = heap_used_now;
+        size_t cap = heap_capacity;
+        release_irqrestore(&heap_lock, flags);
+        kprintf("heap: krealloc(%p, %llu) failed heap_used=%llu heap_total=%llu "
+                "largest_free=%llu total_free=%llu\n",
+                ptr, (unsigned long long)new_size, (unsigned long long)used,
+                (unsigned long long)cap, (unsigned long long)largest,
+                (unsigned long long)total_free);
+    }
     return p;
 }
 

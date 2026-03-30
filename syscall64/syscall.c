@@ -31,6 +31,7 @@
 #include <dhcp.h>
 #include <debug.h>
 #include <klog.h>
+#include <fbdev.h>
 #include <stdio.h>
 
 /* Linux x86_64 struct stat size; ensures st_mode at correct offset for S_ISREG etc. */
@@ -2951,12 +2952,24 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 const uintptr_t base = (uintptr_t)0x00200000u;
                 uintptr_t end = (uintptr_t)USER_TLS_BASE;
                 if (end < base) end = base;
-                /* Backup only up to the end of used memory */
+                /* Backup only up to the end of *heap/program* used memory.
+                   IMPORTANT: user_mmap_next can jump high due to large device mmaps
+                   (e.g. /dev/fb0 mapping the whole framebuffer). Backing up to that
+                   address makes every vfork copy tens/hundreds of MiB and effectively
+                   stalls boot. We therefore only extend backup to mmap_next when it is
+                   close to brk (heuristic for small anon/file-private mmaps). */
                 uintptr_t used_end = (uintptr_t)p->user_brk_cur;
-                if (p->user_mmap_next > used_end) used_end = p->user_mmap_next;
                 /* Minimum: cover program load + small heap (busybox ~2MB at 0x400000) */
                 const uintptr_t min_backup = base + (8u * 1024u * 1024u);
                 if (used_end < min_backup || used_end == 0) used_end = min_backup;
+                /* Heuristic: include mmap area only if it's not "far away" (avoid fb0/VRAM-sized mappings). */
+                if (p->user_mmap_next != 0) {
+                    const uintptr_t mmap_next = (uintptr_t)p->user_mmap_next;
+                    const uintptr_t slack = (8u * 1024u * 1024u);
+                    if (mmap_next > used_end && mmap_next - used_end <= slack) {
+                        used_end = mmap_next;
+                    }
+                }
                 if (used_end > end) used_end = end;
                 uint64_t len64 = (uint64_t)(used_end - base);
                 qemu_debug_printf("vfork-backup: parent=%llu brk=0x%llx mmap_next=0x%llx used_end=0x%llx len=%llu\n",
@@ -7512,14 +7525,36 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 struct fs_file *f = cur->fds[fd];
                 if (!f) return ret_err(EBADF);
                 if (f->type != FS_TYPE_REG) return ret_err(EBADF);
-                qemu_debug_printf("mmap: file memset 0x%llx len=0x%llx\n", (unsigned long long)addr, (unsigned long long)len);
-                memset((void*)addr, 0, len);
-                size_t file_avail = 0;
-                if ((size_t)file_off < f->size) file_avail = f->size - (size_t)file_off;
-                size_t to_read = len < file_avail ? len : file_avail;
-                if (to_read > 0) {
-                    ssize_t nr = fs_read(f, (void*)addr, to_read, (size_t)file_off);
-                    (void)nr; /* partial read leaves rest zeroed */
+                if (fbdev_is_fb0_file(f)) {
+                    if (!fbdev_is_active()) {
+                        qemu_debug_printf("mmap: /dev/fb0 inactive\n");
+                        return ret_err(ENODEV);
+                    }
+                    if (file_off < 0) return ret_err(EINVAL);
+                    size_t fo = (size_t)file_off;
+                    size_t cap = f->size;
+                    if (fo > cap) return ret_err(EINVAL);
+                    size_t maxl = cap - fo;
+                    size_t maplen = len;
+                    if (maplen > maxl) maplen = maxl;
+                    if (maplen > 0) {
+                        qemu_debug_printf("mmap: fb0 0x%llx len=0x%llx off=0x%llx\n",
+                            (unsigned long long)addr, (unsigned long long)maplen, (unsigned long long)fo);
+                        if (fbdev_mmap_user(addr, maplen, fo) != 0) {
+                            qemu_debug_printf("mmap: fb0 map failed\n");
+                            return ret_err(EFAULT);
+                        }
+                    }
+                } else {
+                    qemu_debug_printf("mmap: file memset 0x%llx len=0x%llx\n", (unsigned long long)addr, (unsigned long long)len);
+                    memset((void*)addr, 0, len);
+                    size_t file_avail = 0;
+                    if ((size_t)file_off < f->size) file_avail = f->size - (size_t)file_off;
+                    size_t to_read = len < file_avail ? len : file_avail;
+                    if (to_read > 0) {
+                        ssize_t nr = fs_read(f, (void*)addr, to_read, (size_t)file_off);
+                        (void)nr; /* partial read leaves rest zeroed */
+                    }
                 }
             }
             qemu_debug_printf("mmap: ok return 0x%llx\n", (unsigned long long)addr);

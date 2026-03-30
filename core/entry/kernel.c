@@ -46,6 +46,8 @@
 #include <debug.h>
 #include <vbe.h>
 #include <cirrus.h>
+#include <vmwgfx.h>
+#include <cirrusfb.h>
 #include <nvme.h>
 #include <e1000.h>
 void ata_dma_init(void);
@@ -270,14 +272,26 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     {
         uintptr_t heap_start = align_up_uintptr((uintptr_t)_end, 0x1000);
         uintptr_t mods_end = mb2_modules_max_end(multiboot_magic, multiboot_info);
+        uintptr_t mods_end_aligned = 0;
         if (mods_end) {
-            uintptr_t mods_end_aligned = align_up_uintptr(mods_end, 0x1000);
+            mods_end_aligned = align_up_uintptr(mods_end, 0x1000);
             if (mods_end_aligned > heap_start) heap_start = mods_end_aligned;
         }
-        
-        // DO NOT TOUCH
-        const uintptr_t HEAP_MIN_START = (uintptr_t)(64u * 1024u * 1024u); /* 64 MiB minimal heap start */
-        if (heap_start < HEAP_MIN_START) heap_start = HEAP_MIN_START;
+        /*
+         * Avoid placing the heap below 64 MiB only when that does not re-enter the
+         * multiboot module/initrd range. Forcing heap_start=64M while a ~160 MiB
+         * module lives at 0x080b9000..0x1234xxxx overlaps the arena with the CPIO:
+         * kmalloc returns addresses inside the module, unpack corrupts heap headers,
+         * krealloc then fails with magic=0.
+         */
+        const uintptr_t HEAP_MIN_START = (uintptr_t)(64u * 1024u * 1024u);
+        if (heap_start < HEAP_MIN_START) {
+            uintptr_t want = HEAP_MIN_START;
+            if (mods_end_aligned != 0 && want < mods_end_aligned)
+                want = mods_end_aligned;
+            if (heap_start < want)
+                heap_start = want;
+        }
         /* Heap size must not exceed installed RAM. The heap implementation is a
            simple identity-mapped arena; if we size it past RAM we will scribble
            into non-existent memory and get "random" initfs extraction failures. */
@@ -430,18 +444,23 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     smp_finalize_topology(multiboot_magic, multiboot_info);
 
     pci_init();
+    /* Fbcon before long PCI/disk logs: otherwise klog uses VGA 80x25 and lines wrap ~66 chars with timestamps. */
+    if (vmwgfx_kernel_init() == 0) {
+        klogprintf("video: vmwgfx fbcon enabled early (wide console)\n");
+        devfs_tty_realloc_for_console();
+    } else if (cirrus_kernel_init() == 0) {
+        klogprintf("video: cirrus fbcon enabled early\n");
+        devfs_tty_realloc_for_console();
+    }
     pci_dump_devices();
     intel_chipset_init();
     usb_init();
+
     /* Keep NIC driver non-intrusive until full net stack is wired.
        This avoids affecting boot stability on machines where NIC init timing is sensitive. */
-
-    // Scheduler and I/O scheduler
-    qemu_debug_printf("BOOT: thread_init begin\n");
     thread_init();
-    qemu_debug_printf("BOOT: thread_init ok, smp_boot_aps\n");
     smp_boot_aps();
-    qemu_debug_printf("BOOT: smp_boot_aps ok\n");
+ 
     iothread_init();
 
     // POSIX user subsystem
@@ -630,7 +649,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     {
         static const char termcap[] =
             "vt102|vt100|linux|linux-term:"
-            "co#80:li#24:cl=\\E[2J\\E[H:cm=\\E[%i%d;%dH:nd=\\E[C:up=\\E[A:"
+            /* 1280x800 / 8x16 fbcon ≈ 160×50; ioctl winsize overrides for other vmwgfx modes */
+            "co#160:li#50:cl=\\E[2J\\E[H:cm=\\E[%i%d;%dH:nd=\\E[C:up=\\E[A:"
             "ce=\\E[K:cd=\\E[J:so=\\E[7m:se=\\E[0m:us=\\E[4m:ue=\\E[0m:"
             "ku=\\E[A:kd=\\E[B:kr=\\E[C:kl=\\E[D:"
             "ti=\\E[?1049h:te=\\E[?1049l:\n";
@@ -658,11 +678,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 fs_file_free(af);
             }
         }
-    }
-    if (cirrus_kernel_init() == 0) {
-        klogprintf("video: cirrus initialized\n");
-    } else {
-        klogprintf("video: cirrus not available\n");
     }
     ps2_keyboard_init();
     rtc_init();

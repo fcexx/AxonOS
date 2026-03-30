@@ -11,6 +11,7 @@
 #include <fs.h>
 #include <ramfs.h>
 #include <heap.h>
+#include <string.h>
 #include <vga.h>
 #include <initfs.h>
 #include <debug.h>
@@ -523,6 +524,41 @@ static int unpack_cpio_newc(const void *archive, size_t archive_size) {
     return 0;
 }
 
+/* Multiboot module and kernel heap are identity-mapped; if ranges are disjoint, unpack
+ * from loader memory like Linux initrd (no memcpy, no extra 100+ MiB allocation). */
+static int initfs_module_overlaps_heap(uintptr_t mod_start, size_t mod_size) {
+    uintptr_t mod_end;
+    if (mod_size == 0)
+        return 0;
+    if (__builtin_add_overflow(mod_start, mod_size, &mod_end))
+        return 1;
+    uintptr_t h0 = heap_base_addr();
+    size_t ht = heap_total_bytes();
+    if (h0 == 0 || ht == 0)
+        return 1;
+    uintptr_t h1 = h0 + ht;
+    if (mod_end <= mod_start)
+        return 1;
+    return mod_start < h1 && mod_end > h0;
+}
+
+static int initfs_unpack_multiboot_module(const void *mod_ptr, size_t mod_size) {
+    uintptr_t a = (uintptr_t)mod_ptr;
+    if (!initfs_module_overlaps_heap(a, mod_size)) {
+        klogprintf("initfs: unpack in place (%u bytes, no heap copy)\n", (unsigned)mod_size);
+        return unpack_cpio_newc(mod_ptr, mod_size);
+    }
+    void *buf = kmalloc(mod_size);
+    if (!buf) {
+        klogprintf("initfs: OOM for module buffer (%u bytes), direct unpack\n", (unsigned)mod_size);
+        return unpack_cpio_newc(mod_ptr, mod_size);
+    }
+    memcpy(buf, mod_ptr, mod_size);
+    int r = unpack_cpio_newc(buf, mod_size);
+    kfree(buf);
+    return r;
+}
+
 /* Recursively list VFS entries via qemu_debug_printf for debugging. */
 static void initfs_debug_list_vfs_dir(const char *dirpath, int depth, int *count, int max_entries) {
     if (depth > 4 || *count >= max_entries) return;
@@ -630,19 +666,7 @@ int initfs_process_multiboot_module(uint32_t multiboot_magic, uint64_t multiboot
                 const void *mod_ptr = (const void*)(uintptr_t)mod_start;
                 klogprintf("initfs: found module '%s' at %p size %u\n", module_name, mod_ptr, (unsigned)mod_size);
                 if (mod_size == 0) return -2;
-                /* Always copy to heap before unpacking to avoid module region being
-                   overwritten by heap/drivers. Direct read can return corrupt data when
-                   module overlaps with heap or gets overwritten during early boot. */
-                void *buf = kmalloc(mod_size);
-                if (!buf) {
-                    klogprintf("initfs: OOM copying module (%u bytes), trying direct unpack\n", (unsigned)mod_size);
-                    int r_direct = unpack_cpio_newc(mod_ptr, mod_size);
-                    return r_direct;
-                }
-                memcpy(buf, mod_ptr, mod_size);
-                int r = unpack_cpio_newc(buf, mod_size);
-                kfree(buf);
-                return r;
+                return initfs_unpack_multiboot_module(mod_ptr, mod_size);
             }
             }
         }
@@ -718,14 +742,7 @@ int initfs_process_multiboot_module(uint32_t multiboot_magic, uint64_t multiboot
             klogprintf("initfs: found module '%s' at %p size %u (loose mb2 tag scan)\n",
                        module_name ? module_name : "(null)",
                        mod_ptr, (unsigned)mod_size);
-            void *buf = kmalloc(mod_size);
-            if (buf) {
-                memcpy(buf, mod_ptr, mod_size);
-                int r = unpack_cpio_newc(buf, mod_size);
-                kfree(buf);
-                if (r == 0) return 0;
-            }
-            return unpack_cpio_newc(mod_ptr, mod_size);
+            return initfs_unpack_multiboot_module(mod_ptr, mod_size);
         }
     }
 

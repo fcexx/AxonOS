@@ -37,6 +37,9 @@ int video_probe_all(void);
 /* Find a device by name (returns first match) */
 video_device_t *video_find_by_name(const char *name);
 
+/* Notify video drivers of a dirty rectangle in pixel space (e.g. VMware SVGA FIFO UPDATE). */
+void video_flush_region_pixels(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+
 #endif /* VIDEO_H */
 
 

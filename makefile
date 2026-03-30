@@ -42,6 +42,7 @@ PAYLOAD_COBJS := $(filter-out $(STUB_OBJ),$(COBJS))
 
 AP_TRAMP_BIN := $(BUILD_DIR)/ap_trampoline.bin
 AP_TRAMP_OBJ := $(BUILD_DIR)/ap_trampoline.bin.o
+AP_TRAMP_BIN_SYM := $(subst -,_,$(subst .,_,$(subst /,_,$(AP_TRAMP_BIN))))
 
 .PHONY: all kernel iso clean run
 
@@ -74,8 +75,8 @@ $(AP_TRAMP_OBJ): $(AP_TRAMP_BIN)
 	@echo "LD(BIN)	$<"
 	@ld -r -b binary -o $@ $<
 	@objcopy \
-		--redefine-sym _binary_build_ap_trampoline_bin_start=ap_trampoline_bin_start \
-		--redefine-sym _binary_build_ap_trampoline_bin_end=ap_trampoline_bin_end \
+		--redefine-sym _binary_$(AP_TRAMP_BIN_SYM)_start=ap_trampoline_bin_start \
+		--redefine-sym _binary_$(AP_TRAMP_BIN_SYM)_end=ap_trampoline_bin_end \
 		"$@"
 
 $(PAYLOAD_ELF): $(OTHER_ASM_OBJS) $(SOBJS) $(AP_TRAMP_OBJ) $(PAYLOAD_COBJS)
@@ -120,7 +121,7 @@ iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg archive
 	}
 
 run: archive iso userland
-	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 1024M -smp 2 -serial stdio -boot d -hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0
+	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 1024M -smp 2 -serial stdio -boot d -hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0 -vga vmware
 
 # Run with bridged networking (real IP from router) - requires sudo and br0 bridge
 run-bridge: iso

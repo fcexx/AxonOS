@@ -57,6 +57,8 @@ struct devfs_tty {
 };
 
 int devfs_register(void);
+/* Reallocate all virtual-console screen buffers to match current console_max_cols/rows (call after fbcon init). */
+void devfs_tty_realloc_for_console(void);
 int devfs_unregister(void);
 int devfs_mount(const char *path);
 /* Open a devfs node directly without requiring a VFS mount. */

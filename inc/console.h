@@ -22,4 +22,10 @@ void console_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint8_t c
 int console_max_rows(void);
 int console_max_cols(void);
 
+void console_clear_screen_attr(uint8_t attr);
+void console_clear_line_segment(uint32_t x0, uint32_t x1, uint32_t y, uint8_t attr);
+uint8_t console_get_cell_attr(uint32_t x, uint32_t y);
+
+/* Write one TTY cell from devfs: framebuffer path skips kernel ANSI state machines. */
+void console_putc_tty_literal(uint8_t ch, uint8_t attr);
 

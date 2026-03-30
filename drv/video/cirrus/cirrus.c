@@ -1,5 +1,6 @@
 #include <cirrus.h>
 #include <cirrusfb.h>
+#include <fbdev.h>
 #include <klog.h>
 #include <mmio.h>
 #include <pci.h>
@@ -351,7 +352,12 @@ int cirrus_driver_register(void) {
 	return video_register_driver("cirrus", &cirrus_video_ops, NULL);
 }
 
+static int s_cirrus_kernel_inited;
+
 int cirrus_kernel_init(void) {
+	if (s_cirrus_kernel_inited)
+		return 0;
+
 	pci_device_t *devs = pci_get_devices();
 	int count = pci_get_device_count();
 	pci_device_t *cirrus = NULL;
@@ -414,12 +420,21 @@ int cirrus_kernel_init(void) {
 
 	video_device_t *vd = video_find_by_name("cirrus");
 	if (!vd || !vd->mmio_base) return -1;
-	if (cirrusfb_init(vd->mmio_base, vd->width, vd->height, vd->pitch, vd->bpp, g_cirrus_ctx.fb_len) != 0) return -1;
+	if (cirrusfb_init(vd->mmio_base, vd->width, vd->height, vd->pitch, vd->bpp, g_cirrus_ctx.fb_len, 1) != 0)
+		return -1;
+
+	{
+		size_t vis = (size_t)vd->pitch * (size_t)vd->height * ((size_t)vd->bpp / 8u);
+		if (vis > (size_t)g_cirrus_ctx.fb_len) vis = (size_t)g_cirrus_ctx.fb_len;
+		fbdev_register_linear(vd->mmio_base, g_cirrus_ctx.fb_pa, vis,
+		                      vd->width, vd->height, vd->pitch, vd->bpp);
+	}
 
 	klogprintf("cirrus: ready %02x:%02x.%u mode=%ux%u@%u fb=%p pa=0x%llx len=%u\n",
 	           g_cirrus_ctx.bus, g_cirrus_ctx.device, g_cirrus_ctx.function,
 	           (unsigned)vd->width, (unsigned)vd->height, (unsigned)vd->bpp,
 	           vd->mmio_base, (unsigned long long)g_cirrus_ctx.fb_pa, (unsigned)g_cirrus_ctx.fb_len);
+	s_cirrus_kernel_inited = 1;
 	return 0;
 }
 
