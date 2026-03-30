@@ -7,7 +7,7 @@ mb2_start:
         dd 0x100000000 - (0xe85250d6 + 0 + (mb2_end - mb2_start))
 
         align 8
-        dw 0 ; Change to 5 for VBE
+        dw 0 ; framebuffer request tag (multiboot2)
         dw 0 
         dd 20
         dd 0
@@ -89,7 +89,6 @@ _start:
         lgdt        [eax]
 
         jmp 0x08:long_mode_start
-
         cli
         hlt
 
@@ -320,7 +319,7 @@ error1_msg: db "Error loading kernel: no cpuid support.", 0
 error2_msg: db "Error loading kernel: your cpu does not support 64 mode.", 0
 error3_msg: db "Error loading kernel: code 3. If you see this, please contact the Axon team.", 0
 error4_msg: db "Error loading kernel: code 4. If you see this, please contact the Axon team.", 0
-initmsg:    db "Loading AxonOS kernel...", 10
+initmsg:    db "", 0
 ; ---------------- GDT ----------------
 align 8
 tmp_gdt:
@@ -379,8 +378,8 @@ long_mode_start:
 ; simple 64-bit VGA print routine and messages
 section .rodata
 align 8
-longmode_msg: db "[LONG MODE]\n", 0
-after_paging_msg: db "[LONG_MODE_CONT]\n", 0
+longmode_msg: db "", 0
+after_paging_msg: db "", 0
 
 section .text
 bits 64
