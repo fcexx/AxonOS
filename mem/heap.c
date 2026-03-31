@@ -20,6 +20,7 @@ typedef struct heap_block_header {
     uint32_t magic;
     uint32_t free;
     size_t req_size;             // requested size (before alignment), for diagnostics
+    void *alloc_caller;          // return address of allocator (best-effort)
 } heap_block_header_t;
 
 #define ALIGN16(x)   (((x) + 15) & ~((size_t)15))
@@ -85,6 +86,7 @@ void heap_init(uintptr_t heap_start, size_t heap_size) {
     head->free = 1;
     head->magic = HEAP_MAGIC_FREE;
     head->req_size = 0;
+    head->alloc_caller = 0;
 
     heap_used_now = 0;
     heap_peak = 0;
@@ -98,6 +100,7 @@ static void split_block(heap_block_header_t* blk, size_t size) {
     newblk->free = 1;
     newblk->magic = HEAP_MAGIC_FREE;
     newblk->req_size = 0;
+    newblk->alloc_caller = 0;
     newblk->next = blk->next;
     newblk->prev = blk;
     if (newblk->next) newblk->next->prev = newblk;
@@ -121,6 +124,7 @@ static void coalesce(heap_block_header_t* blk) {
     }
     blk->magic = HEAP_MAGIC_FREE;
     blk->req_size = 0;
+    blk->alloc_caller = 0;
 }
 
 /* forward declarations for diagnostic helpers used by krealloc */
@@ -142,6 +146,8 @@ static void* kmalloc_nolock(size_t size) {
             cur->free = 0;
             cur->magic = HEAP_MAGIC_ALLOC;
             cur->req_size = req;
+            /* best-effort: capture external caller of kmalloc(), not kmalloc_nolock() */
+            cur->alloc_caller = __builtin_return_address(1);
             heap_used_now += cur->size;
             if (heap_used_now > heap_peak) heap_peak = heap_used_now;
             uint8_t *p = (uint8_t*)cur + sizeof(heap_block_header_t);
@@ -193,6 +199,10 @@ static void kfree_nolock(void* ptr) {
                     ptr, (unsigned)blk->req_size, (void*)canp);
             void *caller = __builtin_return_address(0);
             kprintf("    caller: %p\n", caller);
+            kprintf("    alloc_caller: %p\n", blk->alloc_caller);
+            kprintf("    hdr: addr=%p size=%u req=%u prev=%p next=%p\n",
+                    (void*)blk, (unsigned)blk->size, (unsigned)blk->req_size,
+                    (void*)blk->prev, (void*)blk->next);
         }
     }
 #endif
@@ -230,11 +240,13 @@ static void* krealloc_nolock(void* ptr, size_t new_size) {
 #if HEAP_GUARD
         /* refresh canary at the new requested end */
         blk->req_size = new_req;
+        blk->alloc_caller = __builtin_return_address(1);
         uint8_t *p = (uint8_t*)blk + sizeof(heap_block_header_t);
         uint64_t v = (uint64_t)HEAP_CANARY_QWORD;
         memcpy(p + new_req, &v, sizeof(v));
 #else
         blk->req_size = new_req;
+        blk->alloc_caller = __builtin_return_address(1);
 #endif
         return ptr;
     }
@@ -263,11 +275,13 @@ static void* krealloc_nolock(void* ptr, size_t new_size) {
             if (heap_used_now > heap_peak) heap_peak = heap_used_now;
 #if HEAP_GUARD
             blk->req_size = new_req;
+            blk->alloc_caller = __builtin_return_address(1);
             uint8_t *p = (uint8_t*)blk + sizeof(heap_block_header_t);
             uint64_t v = (uint64_t)HEAP_CANARY_QWORD;
             memcpy(p + new_req, &v, sizeof(v));
 #else
             blk->req_size = new_req;
+            blk->alloc_caller = __builtin_return_address(1);
 #endif
             return ptr;
         }
@@ -280,6 +294,11 @@ static void* krealloc_nolock(void* ptr, size_t new_size) {
     size_t to_copy = old_req < new_req ? old_req : new_req;
     memcpy(n, ptr, to_copy);
     kfree_nolock(ptr);
+    /* record realloc caller on the new block too */
+    {
+        heap_block_header_t* nblk = (heap_block_header_t*)((uint8_t*)n - sizeof(heap_block_header_t));
+        if (heap_ptr_in_range(nblk)) nblk->alloc_caller = __builtin_return_address(1);
+    }
     return n;
 }
 

@@ -30,7 +30,8 @@ static int parse_ipv4(const char *s, uint32_t *out) {
     unsigned a, b, c, d;
     if (sscanf(s, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) return -1;
     if (a > 255 || b > 255 || c > 255 || d > 255) return -1;
-    *out = (a << 24) | (b << 16) | (c << 8) | d;
+    /* in_addr_t on LE: octets a.b.c.d in increasing address order */
+    *out = (uint32_t)a | ((uint32_t)b << 8) | ((uint32_t)c << 16) | ((uint32_t)d << 24);
     return 0;
 }
 

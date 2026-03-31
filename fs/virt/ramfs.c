@@ -594,6 +594,65 @@ int ramfs_chmod(const char *path, mode_t mode) {
     return 0;
 }
 
+int ramfs_ftruncate(struct fs_file *file, off_t length) {
+    if (!file || !file->driver_private) return -22; /* EINVAL */
+    if (length < 0) return -22;
+    struct ramfs_file_handle *fh = (struct ramfs_file_handle *)file->driver_private;
+    struct ramfs_node *n = fh->node;
+    if (!n || n->is_dir) return -22;
+    thread_t *ct = thread_current();
+    if (ct && ct->euid != 0 && (unsigned)ct->euid != n->uid) return -22;
+    size_t newsize = (size_t)length;
+    if ((off_t)newsize != length) return -22; /* overflow */
+    unsigned long irqf;
+    acquire_irqsave(&n->io_lock, &irqf);
+    if (newsize == n->size) {
+        release_irqrestore(&n->io_lock, irqf);
+        return 0;
+    }
+    if (newsize == 0) {
+        if (n->data) {
+            kfree(n->data);
+            n->data = NULL;
+        }
+        n->size = 0;
+        file->size = 0;
+        release_irqrestore(&n->io_lock, irqf);
+        return 0;
+    }
+    if (newsize < n->size) {
+        char *d = (char *)krealloc(n->data, newsize);
+        if (!d) {
+            release_irqrestore(&n->io_lock, irqf);
+            return -12; /* ENOMEM */
+        }
+        n->data = d;
+        n->size = newsize;
+        file->size = (off_t)n->size;
+        release_irqrestore(&n->io_lock, irqf);
+        return 0;
+    }
+    /* grow */
+    char *d;
+    if (!n->data) {
+        d = (char *)kmalloc(newsize);
+        if (d) memset(d, 0, newsize);
+    } else {
+        d = (char *)krealloc(n->data, newsize);
+        if (d && newsize > n->size)
+            memset(d + n->size, 0, newsize - n->size);
+    }
+    if (!d) {
+        release_irqrestore(&n->io_lock, irqf);
+        return -12;
+    }
+    n->data = d;
+    n->size = newsize;
+    file->size = (off_t)n->size;
+    release_irqrestore(&n->io_lock, irqf);
+    return 0;
+}
+
 int ramfs_fill_stat(struct fs_file *file, struct stat *st) {
     if (!file || !st || !file->driver_private) return -1;
     struct ramfs_file_handle *fh = (struct ramfs_file_handle*)file->driver_private;
@@ -814,6 +873,7 @@ int ramfs_register(void) {
     ramfs_ops.chmod = ramfs_chmod;
     ramfs_ops.link = ramfs_link;
     ramfs_ops.rename = ramfs_rename;
+    ramfs_ops.unlink = ramfs_remove;
     ramfs_ops.release = ramfs_release;
 
     return fs_register_driver(&ramfs_driver);

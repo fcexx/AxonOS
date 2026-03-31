@@ -25,7 +25,7 @@ STUB_OBJ := $(BUILD_DIR)/$(STUB_SRC:.c=.c.o)
 CC := gcc -m64
 CFLAGS := -g -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=kernel -Iinc
 
-CSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -path './userland' -prune -o -type f -name '*.c' -print | sed 's|^\./||')
+CSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -path './userland' -prune -o -path './core/nss_dns_shim' -prune -o -type f -name '*.c' -print | sed 's|^\./||')
 COBJS := $(patsubst %.c,$(BUILD_DIR)/%.c.o,$(CSRCS))
 
 ASMSRCS := $(shell find . -path './build' -prune -o -path './iso' -prune -o -type f -name '*.asm' -print | sed 's|^\./||')
@@ -43,6 +43,12 @@ PAYLOAD_COBJS := $(filter-out $(STUB_OBJ),$(COBJS))
 AP_TRAMP_BIN := $(BUILD_DIR)/ap_trampoline.bin
 AP_TRAMP_OBJ := $(BUILD_DIR)/ap_trampoline.bin.o
 AP_TRAMP_BIN_SYM := $(subst -,_,$(subst .,_,$(subst /,_,$(AP_TRAMP_BIN))))
+
+# Host-built glibc NSS shim; embedded into payload for /lib/libnss_dns.so.2
+# Use a short path for ld -b binary so _binary_* symbols stay predictable; then
+# rename via nm-discovered names (handles absolute $< paths / different linkers).
+NSS_DNS_SHIM := $(BUILD_DIR)/nss_dns/shim
+NSS_DNS_BLOB_OBJ := $(BUILD_DIR)/nss_dns/shim_blob.o
 
 .PHONY: all kernel iso clean run
 
@@ -79,7 +85,21 @@ $(AP_TRAMP_OBJ): $(AP_TRAMP_BIN)
 		--redefine-sym _binary_$(AP_TRAMP_BIN_SYM)_end=ap_trampoline_bin_end \
 		"$@"
 
-$(PAYLOAD_ELF): $(OTHER_ASM_OBJS) $(SOBJS) $(AP_TRAMP_OBJ) $(PAYLOAD_COBJS)
+$(NSS_DNS_SHIM): core/nss_dns_shim/nss_dns.c
+	@mkdir -p $(dir $@)
+	@echo "HOST CC [nss_dns]	$<"
+	@gcc -shared -fPIC -O2 -Wall -Wextra -Wl,-soname,libnss_dns.so.2 -o $@ $<
+
+$(NSS_DNS_BLOB_OBJ): $(NSS_DNS_SHIM)
+	@echo "LD(BIN) [nss_dns]	$<"
+	@ld -r -b binary -o $@.tmp $< && \
+	START=$$(nm $@.tmp | awk '$$3 ~ /^_binary_.*_start$$/ {print $$3; exit}') && \
+	END=$$(nm $@.tmp | awk '$$3 ~ /^_binary_.*_end$$/ {print $$3; exit}') && \
+	test -n "$$START" && test -n "$$END" && \
+	objcopy --redefine-sym $$START=nss_dns_so_blob_start --redefine-sym $$END=nss_dns_so_blob_end $@.tmp $@ && \
+	rm -f $@.tmp
+
+$(PAYLOAD_ELF): $(OTHER_ASM_OBJS) $(SOBJS) $(AP_TRAMP_OBJ) $(NSS_DNS_BLOB_OBJ) $(PAYLOAD_COBJS)
 	@mkdir -p $(BUILD_DIR)
 	@echo "LD		$@"
 	@ld -m elf_x86_64 -T linker.payload.ld -o $@ $^

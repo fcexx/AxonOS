@@ -24,6 +24,7 @@
 
 static struct devfs_tty dev_ttys[DEVFS_TTY_COUNT];
 static int devfs_active = 0;
+static int devfs_ready = 0;
 
 static struct fs_driver devfs_driver;
 static struct fs_driver_ops devfs_ops;
@@ -1294,7 +1295,9 @@ int devfs_register(void) {
     /* set a unique non-NULL driver_data so VFS dispatch finds this driver for our files */
     devfs_driver_data = &devfs_driver; /* unique pointer */
     devfs_driver.driver_data = &devfs_driver_data;
-    return fs_register_driver(&devfs_driver);
+    int r = fs_register_driver(&devfs_driver);
+    if (r == 0) devfs_ready = 1;
+    return r;
 }
 
 void devfs_tty_realloc_for_console(void) {
@@ -1394,8 +1397,11 @@ int devfs_unregister(void) {
     for (int i = 0; i < DEVFS_TTY_COUNT; i++) {
         if (dev_ttys[i].screen) kfree(dev_ttys[i].screen);
     }
+    devfs_ready = 0;
     return fs_unregister_driver(&devfs_driver);
 }
+
+int devfs_is_ready(void) { return devfs_ready; }
 
 static int devfs_tty_try_erase(struct devfs_tty *t, int tty) {
     if (!t || t->in_count <= 0) return 0;
@@ -1572,6 +1578,28 @@ void devfs_tty_remove_waiter(int tty, int tid) {
         }
     }
     release_irqrestore(&t->in_lock, flags);
+}
+
+void devfs_tty_remove_waiter_from_all_ttys(int tid) {
+    if (tid < 0) return;
+    for (int tty = 0; tty < DEVFS_TTY_COUNT; tty++) {
+        for (;;) {
+            struct devfs_tty *t = &dev_ttys[tty];
+            unsigned long flags = 0;
+            int found = 0;
+            acquire_irqsave(&t->in_lock, &flags);
+            for (int i = 0; i < t->waiters_count; i++) {
+                if (t->waiters[i] == tid) {
+                    t->waiters[i] = t->waiters[t->waiters_count - 1];
+                    t->waiters_count--;
+                    found = 1;
+                    break;
+                }
+            }
+            release_irqrestore(&t->in_lock, flags);
+            if (!found) break;
+        }
+    }
 }
 
 /* Helpers exposed to other kernel components */

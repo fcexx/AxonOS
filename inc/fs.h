@@ -48,6 +48,8 @@ struct fs_driver_ops {
     int (*link)(const char *oldpath, const char *newpath);
     /* Optional rename: rename(oldpath, newpath). Return 0 on success. */
     int (*rename)(const char *oldpath, const char *newpath);
+    /* Optional unlink/remove: unlink(path). Return 0 on success. */
+    int (*unlink)(const char *path);
 };
 
 /* Registered driver object */
@@ -85,6 +87,8 @@ ssize_t fs_readdir_next(struct fs_file *file, void *buf, size_t size);
 
 /* POSIX-like stat helpers */
 int vfs_fstat(struct fs_file *file, struct stat *st);
+/* Truncate/grow open file where driver supports it. Returns 0 or negative -errno (Linux). */
+int vfs_ftruncate(struct fs_file *file, off_t length);
 int vfs_stat(const char *path, struct stat *st);
 int vfs_lstat(const char *path, struct stat *st);
 ssize_t vfs_readlink(const char *path, char *buf, size_t bufsiz);
@@ -92,6 +96,8 @@ int fs_chmod(const char *path, mode_t mode);
 int fs_link(const char *oldpath, const char *newpath);
 int fs_rename(const char *oldpath, const char *newpath);
 int fs_mkdir(const char *path);
+/* Unlink/remove a file. Returns 0 on success. */
+int fs_unlink(const char *path);
 
 /* file types */
 #define FS_TYPE_UNKNOWN 0

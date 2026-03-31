@@ -350,7 +350,7 @@ static ssize_t fat32_read(struct fs_file *file, void *buf, size_t size, size_t o
     uint32_t bytes_per_cluster = bytes_per_cluster_512(m);
     uint8_t *tmp = (uint8_t*)kmalloc(bytes_per_cluster);
     if (!tmp) return -1;
-    size_t pos = 0;      /* total bytes "virtually" produced so far */
+    size_t stream_pos = 0;      /* total bytes "virtually" produced so far */
     size_t written = 0;  /* bytes actually copied into buf */
     uint32_t c = cluster;
     while (1) {
@@ -416,14 +416,14 @@ static ssize_t fat32_read(struct fs_file *file, void *buf, size_t size, size_t o
             if (bytes_per_cluster > namebuf_cap) namebuf_cap = bytes_per_cluster;
             if (namebuf_cap > 4096) namebuf_cap = 4096;
             char *namebuf = (char*)kmalloc(namebuf_cap);
-            if (!namebuf) { kfree(buf); return -1; }
+            if (!namebuf) { kfree(tmp); return -1; }
             if (lfn_present && lfn_count > 0 && lfn_ck_valid) {
                 uint8_t short_ck = fat32_lfn_checksum(tmp + off);
                 if (short_ck != lfn_ck) {
                     lfn_present = 0; lfn_count = 0; lfn_ck_valid = 0;
                 }
             }
-            int pos = 0;
+            int name_pos = 0;
             if (lfn_present && lfn_count > 0) {
                 /* assemble from lfn_u16 parts [0 .. lfn_count-1] converting UTF-16LE -> UTF-8 */
                 for (int si = 0; si < lfn_count; si++) {
@@ -431,44 +431,45 @@ static ssize_t fat32_read(struct fs_file *file, void *buf, size_t size, size_t o
                     char tmputf[128];
                     int conv = utf16le_to_utf8(lfn_u16[si], lfn_u16_len[si], tmputf, (int)sizeof(tmputf));
                     if (conv > 0) {
-                        for (int k = 0; k < conv && pos < (int)namebuf_cap - 1; k++) namebuf[pos++] = tmputf[k];
+                        for (int k = 0; k < conv && name_pos < (int)namebuf_cap - 1; k++) namebuf[name_pos++] = tmputf[k];
                     }
                 }
-                namebuf[pos] = '\0';
+                namebuf[name_pos] = '\0';
             } else {
                 /* No LFN — fallback to legacy 8.3 (better than hiding files). */
                 for (int i = 0; i < 8; i++) {
                     char ch = (char)tmp[off + i];
-                    if (ch != ' ' && pos < (int)namebuf_cap - 1) namebuf[pos++] = ch;
+                    if (ch != ' ' && name_pos < (int)namebuf_cap - 1) namebuf[name_pos++] = ch;
                 }
                 if (tmp[off + 8] != ' ') {
-                    if (pos < (int)namebuf_cap - 1) namebuf[pos++] = '.';
+                    if (name_pos < (int)namebuf_cap - 1) namebuf[name_pos++] = '.';
                     for (int i = 0; i < 3; i++) {
                         char ch = (char)tmp[off + 8 + i];
-                        if (ch != ' ' && pos < (int)namebuf_cap - 1) namebuf[pos++] = ch;
+                        if (ch != ' ' && name_pos < (int)namebuf_cap - 1) namebuf[name_pos++] = ch;
                     }
                 }
-                namebuf[pos] = '\0';
+                namebuf[name_pos] = '\0';
             }
             size_t namelen = strlen(namebuf);
             size_t rec_len = 8 + namelen;
 
             /* Apply offset/size slicing over the generated ext2_dir_entry stream */
-            if (pos + rec_len <= offset) {
-                pos += rec_len;
+            if (stream_pos + rec_len <= offset) {
+                stream_pos += rec_len;
                 lfn_present = 0; lfn_count = 0; lfn_ck_valid = 0;
+                kfree(namebuf);
                 continue;
             }
             if (written >= size) goto dir_done;
             size_t entry_off = 0;
-            if (offset > pos) entry_off = offset - pos;
+            if (offset > stream_pos) entry_off = offset - stream_pos;
             size_t tmpent_cap = 8 + namebuf_cap;
             uint8_t *tmpent = (uint8_t*)kmalloc(tmpent_cap);
-            if (!tmpent) { kfree(namebuf); kfree(buf); return -1; }
+            if (!tmpent) { kfree(namebuf); return -1; }
             if (rec_len > tmpent_cap) {
                 /* name too long for our entry buffer; skip */
                 kfree(tmpent);
-                pos += rec_len;
+                stream_pos += rec_len;
                 lfn_present = 0; lfn_count = 0; lfn_ck_valid = 0;
                 kfree(namebuf);
                 continue;
@@ -487,7 +488,7 @@ static ssize_t fat32_read(struct fs_file *file, void *buf, size_t size, size_t o
             if (tocopy > avail) tocopy = avail;
             if (tocopy > 0) memcpy((uint8_t*)buf + written, tmpent + entry_off, tocopy);
             written += tocopy;
-            pos += rec_len;
+            stream_pos += rec_len;
             /* reset LFN state */
             lfn_present = 0; lfn_count = 0; lfn_ck_valid = 0;
             kfree(tmpent);
@@ -1225,9 +1226,85 @@ static int fat32_mkdir(const char *path) {
     return -1;
 }
 
+/* Free a cluster chain starting at `start` (FAT32 data clusters are >= 2). */
+static void fat32_free_cluster_chain(struct fat32_mount *m, uint32_t start) {
+    if (!m || start < 2) return;
+    uint32_t c = start;
+    while (c >= 2 && c < 0x0FFFFFF8u) {
+        uint32_t nxt = fat32_read_fat_entry(m, c);
+        if (fat32_write_fat_entry(m, c, 0) != 0) break;
+        if (nxt >= 0x0FFFFFF8u || nxt < 2) break;
+        c = nxt;
+    }
+}
+
+/* Write start_cluster + file size into the parent directory (11-byte short name match, same as create). */
+static int fat32_sync_direntry_meta(struct fs_file *file, uint32_t start_cluster, uint32_t size_bytes) {
+    if (!file || !file->path) return -1;
+    struct fat32_file_handle *xfh = (struct fat32_file_handle *)file->driver_private;
+    struct fat32_mount *m = xfh && xfh->m ? xfh->m : g_fat;
+    if (!m) return -1;
+    const char *path = file->path;
+    char mount_prefix[128];
+    if (fs_get_matching_mount_prefix(path, mount_prefix, sizeof(mount_prefix)) != 0) mount_prefix[0] = '\0';
+    const char *name = path;
+    if (mount_prefix[0] != '\0') {
+        size_t mp_len = strlen(mount_prefix);
+        if (strncmp(path, mount_prefix, mp_len) == 0) name = path + mp_len;
+    }
+    uint32_t parent_cluster = m->root_cluster;
+    char basename_raw[256];
+    if (fat32_resolve_parent_cluster(m, name, &parent_cluster, basename_raw, sizeof(basename_raw)) != 0) {
+        const char *p = strrchr(name, '/');
+        const char *b = p ? p+1 : (name[0] == '/' ? name+1 : name);
+        if (!b || !*b) return -1;
+        if (strlen(b) >= sizeof(basename_raw)) return -1;
+        strcpy(basename_raw, b);
+        parent_cluster = m->root_cluster;
+    }
+    char cleanname[256];
+    size_t bl_in = strlen(basename_raw);
+    if (bl_in >= sizeof(cleanname)) return -1;
+    memcpy(cleanname, basename_raw, bl_in + 1);
+    strip_matching_quotes_local(cleanname);
+
+    uint8_t sname[11];
+    fat32_make_shortname(cleanname, sname);
+    uint32_t bytes_per_cluster = bytes_per_cluster_512(m);
+    uint32_t c = parent_cluster;
+    uint8_t *d = (uint8_t*)kmalloc(bytes_per_cluster);
+    if (!d) return -1;
+    while (1) {
+        uint32_t lba = cluster_to_lba(m, c);
+        if (read_sectors(m->device_id, lba, d, m->sectors_per_cluster) != 0) break;
+        for (uint32_t off = 0; off + 32 <= bytes_per_cluster; off += 32) {
+            if (memcmp(d + off, sname, 11) == 0) {
+                uint16_t high = (uint16_t)((start_cluster >> 16) & 0xFFFF);
+                uint16_t low = (uint16_t)(start_cluster & 0xFFFF);
+                memcpy(d + off + 20, &high, 2);
+                memcpy(d + off + 26, &low, 2);
+                uint32_t sz = size_bytes;
+                memcpy(d + off + 28, &sz, 4);
+                if (disk_write_sectors(m->device_id, lba, d, m->sectors_per_cluster) != 0) {
+                    kfree(d);
+                    return -1;
+                }
+                kfree(d);
+                return 0;
+            }
+        }
+        uint32_t nxt = fat32_read_fat_entry(m, c);
+        if (nxt >= 0x0FFFFFF8u || nxt == 0) break;
+        c = nxt;
+    }
+    kfree(d);
+    return -1;
+}
+
 /* write data to an open file (supports creating clusters) */
 static ssize_t fat32_write(struct fs_file *file, const void *buf_in, size_t size, size_t offset) {
     if (!file || !file->driver_private) return -1;
+    if (size == 0) return 0;
     struct fat32_file_handle *fh = (struct fat32_file_handle*)file->driver_private;
     struct fat32_mount *m = fh->m;
     uint32_t bytes_per_cluster = bytes_per_cluster_512(m);
@@ -1247,11 +1324,17 @@ static ssize_t fat32_write(struct fs_file *file, const void *buf_in, size_t size
     uint32_t cluster = fh->start_cluster;
     uint32_t skip_clusters = (uint32_t)(offset / bytes_per_cluster);
     uint32_t off_in_cluster = (uint32_t)(offset % bytes_per_cluster);
-    /* advance to start cluster */
-    for (uint32_t i=0;i<skip_clusters;i++) {
+    /* advance to start cluster; extend chain if offset reaches past last allocated cluster */
+    for (uint32_t i = 0; i < skip_clusters; i++) {
         uint32_t nxt = fat32_read_fat_entry(m, cluster);
-        if (nxt >= 0x0FFFFFF8) { return -1; }
-        cluster = nxt;
+        if (nxt >= 0x0FFFFFF8 || nxt == 0) {
+            uint32_t newc = fat32_alloc_clusters(m, 1);
+            if (newc == 0) return -1;
+            if (fat32_write_fat_entry(m, cluster, newc) != 0) return -1;
+            cluster = newc;
+        } else {
+            cluster = nxt;
+        }
     }
     uint8_t *tmp = (uint8_t*)kmalloc(bytes_per_cluster);
     if (!tmp) return -1;
@@ -1285,53 +1368,38 @@ static ssize_t fat32_write(struct fs_file *file, const void *buf_in, size_t size
     /* update file size in directory entry */
     fh->size = endpos > fh->size ? endpos : fh->size;
     file->size = fh->size;
-    /* update directory entry in parent directory */
-    /* build shortname from path and resolve parent cluster */
-    const char *path = file->path;
-    const char *basename = strrchr(path, '/');
-    basename = basename ? basename+1 : path;
-    /* determine mount-relative name for resolve helper */
-    char mount_prefix[128];
-    if (fs_get_matching_mount_prefix(path, mount_prefix, sizeof(mount_prefix)) != 0) mount_prefix[0] = '\0';
-    const char *name = path;
-    if (mount_prefix[0] != '\0') {
-        size_t mp_len = strlen(mount_prefix);
-        if (strncmp(path, mount_prefix, mp_len) == 0) name = path + mp_len;
-    }
-    uint32_t parent_cluster = m->root_cluster;
-    char basename_raw[256];
-    if (fat32_resolve_parent_cluster(m, name, &parent_cluster, basename_raw, sizeof(basename_raw)) != 0) {
-        /* fallback to root */
-        parent_cluster = m->root_cluster;
-    }
-    uint8_t sname[11];
-    fat32_make_shortname(basename, sname);
-    uint32_t c = parent_cluster;
-    uint8_t *d = (uint8_t*)kmalloc(bytes_per_cluster);
-    if (!d) return (ssize_t)written;
-    while (1) {
-        uint32_t lba = cluster_to_lba(m, c);
-        if (read_sectors(m->device_id, lba, d, m->sectors_per_cluster) != 0) break;
-        for (uint32_t off=0; off + 32 <= bytes_per_cluster; off += 32) {
-            if (memcmp(d + off, sname, 11) == 0) {
-                /* write start cluster high/low and size */
-                uint16_t high = (uint16_t)((fh->start_cluster >> 16) & 0xFFFF);
-                uint16_t low = (uint16_t)(fh->start_cluster & 0xFFFF);
-                memcpy(d + off + 20, &high, 2);
-                memcpy(d + off + 26, &low, 2);
-                uint32_t sz = fh->size;
-                memcpy(d + off + 28, &sz, 4);
-                disk_write_sectors(m->device_id, lba, d, m->sectors_per_cluster);
-                kfree(d);
-                return (ssize_t)written;
-            }
-        }
-        uint32_t nxt = fat32_read_fat_entry(m, c);
-        if (nxt >= 0x0FFFFFF8 || nxt == 0) break;
-        c = nxt;
-    }
-    kfree(d);
+    (void)fat32_sync_direntry_meta(file, fh->start_cluster, fh->size);
     return (ssize_t)written;
+}
+
+int fat32_ftruncate(struct fs_file *file, off_t length) {
+    if (!file || !file->driver_private) return -22;
+    if (file->type != FS_TYPE_REG) return -22;
+    if (length < 0) return -22;
+    if (length != 0) return -95;
+
+    struct fat32_file_handle *fh = (struct fat32_file_handle *)file->driver_private;
+    struct fat32_mount *m = fh->m ? fh->m : g_fat;
+    if (!m) return -22;
+
+    uint32_t old_chain = fh->start_cluster;
+    uint32_t old_fh_sz = fh->size;
+    off_t old_file_sz = file->size;
+
+    fh->start_cluster = 0;
+    fh->cur_cluster = 0;
+    fh->size = 0;
+    file->size = 0;
+    file->pos = 0;
+
+    if (fat32_sync_direntry_meta(file, 0, 0) != 0) {
+        fh->start_cluster = old_chain;
+        fh->size = old_fh_sz;
+        file->size = old_file_sz;
+        return -5;
+    }
+    fat32_free_cluster_chain(m, old_chain);
+    return 0;
 }
 
 int fat32_register(void) {

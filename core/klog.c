@@ -17,6 +17,8 @@
 #include <spinlock.h>
 #include <string.h>
 #include <apic_timer.h>
+#include <console.h>
+#include <devfs.h>
 
 static spinlock_t klog_lock;
 static int klog_inited;
@@ -34,6 +36,23 @@ static char klog_out[KLOG_OUT_MAX];
 uint64_t klog_tsc_base = 0;
 uint64_t klog_time_base_usec = 0;
 uint64_t klog_tsc_per_us = 0;
+
+static void klog_console_write_sync_tty(const char *s, size_t n) {
+	/* Keep devfs tty cursor in sync for kernel log output so that interactive
+	   tty programs don't overwrite logs (klogprintf bypasses /dev/tty writes). */
+	if (!s || n == 0) return;
+	struct devfs_tty *tty = devfs_get_tty_by_index(devfs_get_active());
+	if (!tty) {
+		/* Fall back to VGA printf path. */
+		kprintf("%.*s", (int)n, s);
+		return;
+	}
+	for (size_t i = 0; i < n; i++) {
+		console_set_cursor(tty->cursor_x, tty->cursor_y);
+		console_putc_tty_literal((uint8_t)s[i], tty->current_attr ? tty->current_attr : 0x07);
+		console_get_cursor(&tty->cursor_x, &tty->cursor_y);
+	}
+}
 
 static inline uint64_t read_tsc(void) {
 	unsigned int lo, hi;
@@ -172,7 +191,7 @@ void klogprintf(const char *fmt, ...) {
 	}
 	klog_out[outlen] = '\0';
 
-	kprintf("%s", klog_out);
+	klog_console_write_sync_tty(klog_out, outlen);
 
 	if (!klog_inited) {
 		klog_early_append(klog_out, outlen);

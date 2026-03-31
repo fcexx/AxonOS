@@ -11,6 +11,7 @@
 #include <ramfs.h>
 #include <procfs.h>
 #include <devfs.h>
+#include <fat32.h>
 
 #define MAX_FS_DRIVERS 8
 #define MAX_FS_MOUNTS 8
@@ -670,6 +671,24 @@ int fs_rename(const char *oldpath, const char *newpath) {
     return -1;
 }
 
+int fs_unlink(const char *path) {
+    if (!path) return -1;
+    struct fs_driver *mount_drv = fs_match_mount(path);
+    if (mount_drv && mount_drv->ops && mount_drv->ops->unlink) {
+        int r = mount_drv->ops->unlink(path);
+        if (r == 0) return 0;
+        if (r < 0) return r;
+    }
+    for (int i = 0; i < g_drivers_count; i++) {
+        struct fs_driver *drv = g_drivers[i];
+        if (!drv || !drv->ops || !drv->ops->unlink) continue;
+        int r = drv->ops->unlink(path);
+        if (r == 0) return 0;
+        if (r < 0 && r != -1) return r;
+    }
+    return -1;
+}
+
 ssize_t fs_readdir_next(struct fs_file *file, void *buf, size_t size) {
     if (!file) return -1;
     ssize_t r = fs_read(file, buf, size, file->pos);
@@ -735,6 +754,23 @@ done:
     st->st_size = (off_t)file->size;
     st->st_nlink = 1;
     return 0;
+}
+
+int vfs_ftruncate(struct fs_file *file, off_t length) {
+    if (!file) return -9; /* EBADF */
+    for (int i = 0; i < g_drivers_count; i++) {
+        struct fs_driver *drv = g_drivers[i];
+        if (!drv) continue;
+        if (!fs_file_matches_driver(drv, file)) continue;
+        const char *name = drv->ops ? drv->ops->name : NULL;
+        if (name && strcmp(name, "ramfs") == 0)
+            return ramfs_ftruncate(file, length);
+        if (name && strcmp(name, "fat32") == 0)
+            return fat32_ftruncate(file, length);
+        /* Open file belongs to a driver we do not truncate yet */
+        return -95; /* EOPNOTSUPP */
+    }
+    return -95; /* EOPNOTSUPP */
 }
 
 int vfs_stat(const char *path, struct stat *st) {

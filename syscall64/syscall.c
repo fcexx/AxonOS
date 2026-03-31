@@ -38,6 +38,12 @@
 #define STAT_COPY_SIZE 144
 #define NET_FRAME_BUF 2048
 
+/* Verbose DNS tracing for threads named "wget" — off by default: heavy klog+fs_write
+ * and per-byte kprintf were implicated in heap stress / reentrancy under VMware. */
+#ifndef AXON_WGET_DNS_TRACE
+#define AXON_WGET_DNS_TRACE 0
+#endif
+
 extern void kprintf(const char *fmt, ...);
 
 /* Helper exported from core/elf.c */
@@ -309,6 +315,46 @@ static void vfork_restore_parent_memory(thread_t *child) {
     child->vfork_parent_brk_saved = 0;
 }
 
+/* exit_group must tear down clone3 peers: they share pgid and may sit in devfs tty waiters.
+ * waiters[] is only 8 slots; excess blocks the shell's read(stdin) after wget returns. */
+static void exit_group_reap_peer_threads(thread_t *cur) {
+    if (!cur || cur->ring != 3) return;
+    /* vfork child before execve still has parent's pgid; reaping would kill the shell. */
+    if (cur->parent_tid >= 0) {
+        thread_t *pt = thread_get(cur->parent_tid);
+        if (pt && pt->ring == 3 && (int)cur->pgid == (int)pt->pgid)
+            return;
+    }
+    int group_pgid = cur->pgid;
+    int nt = thread_get_count();
+    for (int i = 0; i < nt; i++) {
+        thread_t *t = thread_get_by_index(i);
+        if (!t || t == cur) continue;
+        if (t->ring != 3) continue;
+        if (t->state == THREAD_TERMINATED) continue;
+        if ((int)t->pgid != group_pgid) continue;
+        devfs_tty_remove_waiter_from_all_ttys((int)(t->tid ? t->tid : 1));
+        if (t->waiter_tid >= 0) {
+            int w = t->waiter_tid;
+            t->waiter_tid = -1;
+            thread_unblock(w);
+        }
+        for (int fd = 0; fd < THREAD_MAX_FD; fd++) {
+            if (t->fds[fd]) {
+                struct fs_file *f = t->fds[fd];
+                t->fds[fd] = NULL;
+                fs_file_free(f);
+            }
+        }
+        if (t->mm && t->mm != mm_kernel()) {
+            mm_release(t->mm);
+            t->mm = mm_kernel();
+        }
+        t->exit_status = 9; /* WTERMSIG: SIGKILL */
+        t->state = THREAD_TERMINATED;
+    }
+}
+
 enum {
     MSR_EFER  = 0xC0000080u,
     MSR_STAR  = 0xC0000081u,
@@ -361,6 +407,7 @@ static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, siz
 #define EOPNOTSUPP 95
 #define EDESTADDRREQ 89
 #define ENETDOWN 100
+#define ENETUNREACH 101
 #define ENOTCONN 107
 #define ENODEV   19
 #define ETIMEDOUT 110
@@ -408,11 +455,11 @@ static ssize_t pipe_read_bytes(pipe_t *p, void *buf, size_t cnt, thread_t *cur) 
         if (used > 0) {
             size_t n = used < cnt ? used : cnt;
             size_t tail = p->tail;
-            release_irqrestore(&p->lock, fl);
+            /* Copy ring -> kernel buffer entirely under lock: another thread must not move
+               tail/head while we read, or memcpy runs on stale indices and corrupts data. */
             size_t first = (tail + n <= p->size) ? n : (p->size - tail);
             memcpy(buf, p->buf + tail, first);
             if (first < n) memcpy((char*)buf + first, p->buf, n - first);
-            acquire_irqsave(&p->lock, &fl);
             p->tail = (tail + n) % p->size;
             if (p->writer_waiter_tid >= 0) { thread_unblock(p->writer_waiter_tid); p->writer_waiter_tid = -1; }
             release_irqrestore(&p->lock, fl);
@@ -440,11 +487,13 @@ static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t
         if (free > 0) {
             size_t n = (cnt - written) < free ? (cnt - written) : free;
             size_t head = p->head;
-            release_irqrestore(&p->lock, fl);
-            for (size_t i = 0; i < n; i++) {
-                p->buf[(head + i) % p->size] = src[written + i];
+            size_t to_end = p->size - head;
+            if (n <= to_end) {
+                memcpy(p->buf + head, src + written, n);
+            } else {
+                memcpy(p->buf + head, src + written, to_end);
+                memcpy(p->buf, src + written + to_end, n - to_end);
             }
-            acquire_irqsave(&p->lock, &fl);
             p->head = (head + n) % p->size;
             written += n;
             if (p->reader_waiter_tid >= 0) { thread_unblock(p->reader_waiter_tid); p->reader_waiter_tid = -1; }
@@ -472,6 +521,10 @@ static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t
 #define SOCK_STREAM_LOCAL     1
 #define SOCK_DGRAM_LOCAL      2
 #define SOCK_RAW_LOCAL        3
+/* Linux: SOCK_NONBLOCK == O_NONBLOCK (glibc sets this in socket type / fcntl). */
+#define O_NONBLOCK_LINUX      0x800
+/* F_GETFL must include accmode; 0 breaks glibc fdopen/wget (bogus "out of memory"). */
+#define O_RDWR_LINUX          2
 #define IPPROTO_ICMP_LOCAL    1
 #define IPPROTO_TCP_LOCAL     6
 #define IPPROTO_UDP_LOCAL     17
@@ -521,6 +574,8 @@ typedef struct __attribute__((packed)) {
 
 typedef struct {
     int sock_domain;
+    /* socket(AF_UNIX) is created as IPv4 internally; nscd uses connect(sockaddr_un). */
+    int unix_domain_stub;
     int type_base;
     int protocol;
     int connected;
@@ -529,6 +584,7 @@ typedef struct {
     uint16_t local_port;
     int rx_has_pending;
     size_t rx_pending_len;
+    size_t rx_pending_off;
     uint32_t rx_pending_src_ip_be;
     uint16_t rx_pending_src_port;
     uint8_t rx_pending[2048];
@@ -545,8 +601,42 @@ typedef struct {
     uint8_t nl_rx[4096];
     size_t nl_rx_len;
     size_t nl_rx_off;
+    /* glibc tries TCP :53 first; many routers RST -> ECONNREFUSED. Fake connect and use UDP for DNS. */
+    int dns_tcp_udp_bridge;
+    int nonblock; /* O_NONBLOCK: recv must not fake-EAGAIN after an internal short timeout */
     net_tcp_conn_t tcp;
 } ksock_net_t;
+
+static inline size_t ksock_rx_pending_cap(void) {
+    return (size_t)sizeof(((ksock_net_t *)0)->rx_pending);
+}
+
+/* Drop inconsistent pending state (e.g. off > len) before using rx_pending. */
+static inline void ksock_rx_pending_normalize(ksock_net_t *s) {
+    if (!s || !s->rx_has_pending) return;
+    size_t cap = ksock_rx_pending_cap();
+    if (s->rx_pending_len > cap || s->rx_pending_off > s->rx_pending_len) {
+        s->rx_has_pending = 0;
+        s->rx_pending_len = 0;
+        s->rx_pending_off = 0;
+    }
+}
+
+static inline size_t ksock_rx_pending_avail(const ksock_net_t *s) {
+    if (!s || !s->rx_has_pending) return 0;
+    if (s->rx_pending_off > s->rx_pending_len) return 0;
+    return s->rx_pending_len - s->rx_pending_off;
+}
+
+static inline void ksock_rx_pending_install(ksock_net_t *s, int rn) {
+    if (!s || rn <= 0) return;
+    size_t n = (size_t)rn;
+    size_t cap = ksock_rx_pending_cap();
+    if (n > cap) n = cap;
+    s->rx_has_pending = 1;
+    s->rx_pending_len = n;
+    s->rx_pending_off = 0;
+}
 
 typedef struct {
     int inited;
@@ -571,9 +661,401 @@ static uint32_t g_net_cfg_mask_be = 0;
 static uint32_t g_net_cfg_gw_be = 0;
 static uint32_t g_net_cfg_dns_be = 0;
 
+/* ---------- RX pump: answer ARP/ICMP and queue everything else ---------- */
+static inline uint16_t be16(uint16_t v);
+static inline uint32_t be32(uint32_t v);
+static uint16_t ip_checksum16(const void *data, size_t len);
+static void ip_be_to_bytes(uint32_t ip_be, uint8_t out[4]);
+static int net_send_eth_ipv4(const uint8_t dst_mac[6], uint32_t dst_ip_be, uint8_t proto, const void *l4, size_t l4_len);
+
+#define NET_RXQ_SLOTS  32
+#define NET_RXQ_BUF    2048
+static uint8_t g_net_rxq[NET_RXQ_SLOTS][NET_RXQ_BUF];
+static uint16_t g_net_rxq_len[NET_RXQ_SLOTS];
+static uint32_t g_net_rxq_head = 0, g_net_rxq_tail = 0, g_net_rxq_count = 0;
+static spinlock_t g_net_rxq_lock = { 0 };
+static int g_net_rx_thread_started = 0;
+
+static int net_rxq_push(const uint8_t *frame, size_t n) {
+    if (!frame || n == 0) return -1;
+    if (n > NET_RXQ_BUF) n = NET_RXQ_BUF;
+    unsigned long irqf = 0;
+    acquire_irqsave(&g_net_rxq_lock, &irqf);
+    if (g_net_rxq_count >= NET_RXQ_SLOTS) {
+        release_irqrestore(&g_net_rxq_lock, irqf);
+        return -2;
+    }
+    memcpy(g_net_rxq[g_net_rxq_tail], frame, n);
+    g_net_rxq_len[g_net_rxq_tail] = (uint16_t)n;
+    g_net_rxq_tail = (g_net_rxq_tail + 1) % NET_RXQ_SLOTS;
+    g_net_rxq_count++;
+    release_irqrestore(&g_net_rxq_lock, irqf);
+    return 0;
+}
+
+static int net_rxq_pop(void *out, size_t cap) {
+    if (!out || cap == 0) return -1;
+    unsigned long irqf = 0;
+    acquire_irqsave(&g_net_rxq_lock, &irqf);
+    if (g_net_rxq_count == 0) {
+        release_irqrestore(&g_net_rxq_lock, irqf);
+        return 0;
+    }
+    uint32_t idx = g_net_rxq_head;
+    uint16_t n = g_net_rxq_len[idx];
+    g_net_rxq_len[idx] = 0;
+    g_net_rxq_head = (idx + 1) % NET_RXQ_SLOTS;
+    g_net_rxq_count--;
+    release_irqrestore(&g_net_rxq_lock, irqf);
+    size_t copy_len = (n > cap) ? cap : (size_t)n;
+    memcpy(out, g_net_rxq[idx], copy_len);
+    return (int)copy_len;
+}
+
+static int net_reply_arp_if_needed(const uint8_t *frame, size_t n) {
+    if (!g_net.ready || !frame || n < sizeof(eth_hdr_t) + sizeof(arp_hdr_t)) return 0;
+    static int arp_dbg_left = 3;
+    const eth_hdr_t *eth = (const eth_hdr_t *)frame;
+    if (be16(eth->ethertype) != ETH_TYPE_ARP) return 0;
+    const arp_hdr_t *arp = (const arp_hdr_t *)(frame + sizeof(eth_hdr_t));
+    if (be16(arp->oper) != 1) return 0; /* request */
+    if (be16(arp->htype) != 1 || be16(arp->ptype) != ETH_TYPE_IPV4 || arp->hlen != 6 || arp->plen != 4) return 0;
+    uint32_t tpa = ((uint32_t)arp->tpa[0] << 24) | ((uint32_t)arp->tpa[1] << 16) | ((uint32_t)arp->tpa[2] << 8) | arp->tpa[3];
+    if (tpa != g_net.ip_be) return 0;
+    if (arp_dbg_left-- > 0) {
+        uint32_t spa = ((uint32_t)arp->spa[0] << 24) | ((uint32_t)arp->spa[1] << 16) | ((uint32_t)arp->spa[2] << 8) | arp->spa[3];
+        klogprintf("net: ARP who-has %u.%u.%u.%u tell %u.%u.%u.%u (from %02x:%02x:%02x:%02x:%02x:%02x)\n",
+                   (unsigned)((tpa >> 24) & 0xFF), (unsigned)((tpa >> 16) & 0xFF), (unsigned)((tpa >> 8) & 0xFF), (unsigned)(tpa & 0xFF),
+                   (unsigned)((spa >> 24) & 0xFF), (unsigned)((spa >> 16) & 0xFF), (unsigned)((spa >> 8) & 0xFF), (unsigned)(spa & 0xFF),
+                   eth->src[0], eth->src[1], eth->src[2], eth->src[3], eth->src[4], eth->src[5]);
+    }
+
+    uint8_t reply[64];
+    memset(reply, 0, sizeof(reply));
+    eth_hdr_t *reth = (eth_hdr_t *)reply;
+    memcpy(reth->dst, eth->src, 6);
+    memcpy(reth->src, g_net.mac, 6);
+    reth->ethertype = be16(ETH_TYPE_ARP);
+    arp_hdr_t *rarp = (arp_hdr_t *)(reply + sizeof(eth_hdr_t));
+    rarp->htype = be16(1);
+    rarp->ptype = be16(ETH_TYPE_IPV4);
+    rarp->hlen = 6;
+    rarp->plen = 4;
+    rarp->oper = be16(2); /* reply */
+    memcpy(rarp->sha, g_net.mac, 6);
+    ip_be_to_bytes(g_net.ip_be, rarp->spa);
+    memcpy(rarp->tha, arp->sha, 6);
+    memcpy(rarp->tpa, arp->spa, 4);
+    (void)e1000_send_frame(reply, sizeof(reply));
+    if (arp_dbg_left >= 0) klogprintf("net: ARP reply sent\n");
+    return 1;
+}
+
+static int net_reply_icmp_echo_if_needed(const uint8_t *frame, size_t n) {
+    if (!g_net.ready || !frame || n < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t) + 8) return 0;
+    static int icmp_dbg_left = 3;
+    const eth_hdr_t *eth = (const eth_hdr_t *)frame;
+    if (be16(eth->ethertype) != ETH_TYPE_IPV4) return 0;
+    const ipv4_hdr_t *ip = (const ipv4_hdr_t *)(frame + sizeof(eth_hdr_t));
+    size_t ihl = (size_t)((ip->ver_ihl & 0x0Fu) * 4u);
+    if (ihl < sizeof(ipv4_hdr_t)) return 0;
+    if (ip->proto != IPPROTO_ICMP_LOCAL) return 0;
+    uint32_t dst_ip_be = be32(ip->dst);
+    if (dst_ip_be != g_net.ip_be) return 0;
+    uint16_t tot = be16(ip->total_len);
+    if (tot < ihl + 8) return 0;
+    if (sizeof(eth_hdr_t) + (size_t)tot > n) return 0;
+    const uint8_t *icmp = frame + sizeof(eth_hdr_t) + ihl;
+    if (icmp[0] != 8 || icmp[1] != 0) return 0; /* echo request */
+    size_t icmp_len = (size_t)tot - ihl;
+    if (icmp_dbg_left-- > 0) {
+        uint32_t src_ip_be = be32(ip->src);
+        klogprintf("net: ICMP echo request from %u.%u.%u.%u len=%u\n",
+                   (unsigned)((src_ip_be >> 24) & 0xFF), (unsigned)((src_ip_be >> 16) & 0xFF),
+                   (unsigned)((src_ip_be >> 8) & 0xFF), (unsigned)(src_ip_be & 0xFF),
+                   (unsigned)icmp_len);
+    }
+
+    uint8_t *reply = (uint8_t *)kmalloc(icmp_len);
+    if (!reply) return 1; /* consume to avoid loops; out of memory */
+    memcpy(reply, icmp, icmp_len);
+    reply[0] = 0; /* echo reply */
+    reply[2] = 0; reply[3] = 0;
+    uint16_t csum = ip_checksum16(reply, icmp_len);
+    reply[2] = (uint8_t)(csum >> 8);
+    reply[3] = (uint8_t)(csum);
+    uint32_t src_ip_be = be32(ip->src);
+    (void)net_send_eth_ipv4(eth->src, src_ip_be, IPPROTO_ICMP_LOCAL, reply, icmp_len);
+    kfree(reply);
+    if (icmp_dbg_left >= 0) klogprintf("net: ICMP echo reply sent\n");
+    return 1;
+}
+
+static int net_process_incoming_or_queue(const uint8_t *frame, size_t n) {
+    if (!frame || n == 0) return 0;
+    if (net_reply_arp_if_needed(frame, n)) return 1;
+    if (net_reply_icmp_echo_if_needed(frame, n)) return 1;
+    (void)net_rxq_push(frame, n);
+    return 1;
+}
+
+static int net_recv_frame_any(void *buf, size_t cap) {
+    if (!buf || cap == 0) return -1;
+    int qn = net_rxq_pop(buf, cap);
+    if (qn > 0) return qn;
+    /* Pull from NIC; auto-respond to ARP/ICMP requests and keep looking. */
+    for (int i = 0; i < 16; i++) {
+        e1000_poll();
+        int n = e1000_recv_frame(buf, cap);
+        if (n <= 0) return n;
+        if (net_reply_arp_if_needed((const uint8_t *)buf, (size_t)n)) continue;
+        if (net_reply_icmp_echo_if_needed((const uint8_t *)buf, (size_t)n)) continue;
+        return n;
+    }
+    return 0;
+}
+
+static void net_rx_pump_thread(void) {
+    uint8_t buf[NET_RXQ_BUF];
+    for (;;) {
+        if (!g_net.ready) { thread_sleep(50); continue; }
+        /* Drain a small budget to keep latency low but avoid starving other work. */
+        for (int i = 0; i < 32; i++) {
+            e1000_poll();
+            int n = e1000_recv_frame(buf, sizeof(buf));
+            if (n <= 0) break;
+            (void)net_process_incoming_or_queue(buf, (size_t)n);
+        }
+        thread_sleep(1);
+    }
+}
+
 static inline uint16_t be16(uint16_t v) { return (uint16_t)((v << 8) | (v >> 8)); }
 static inline uint32_t be32(uint32_t v) {
     return ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) | ((v & 0x00FF0000u) >> 8) | ((v & 0xFF000000u) >> 24);
+}
+
+/* Linux-style demux: scan the software RX ring for a matching UDP datagram; do not drop non-matches
+ * that belong to TCP or another UDP port (head-of-line blocking was losing DNS replies). */
+static int net_udp_match_sock_frame(const uint8_t *frame, size_t n, ksock_net_t *s) {
+    if (!s || !frame || n < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t) + sizeof(udp_hdr_t)) return 0;
+    const eth_hdr_t *eth = (const eth_hdr_t *)frame;
+    if (be16(eth->ethertype) != ETH_TYPE_IPV4) return 0;
+    const ipv4_hdr_t *ip = (const ipv4_hdr_t *)(frame + sizeof(eth_hdr_t));
+    size_t ihl = (size_t)((ip->ver_ihl & 0x0Fu) * 4u);
+    if (ip->proto != IPPROTO_UDP_LOCAL || ihl < sizeof(ipv4_hdr_t)) return 0;
+    if (n < sizeof(eth_hdr_t) + ihl + sizeof(udp_hdr_t)) return 0;
+    const udp_hdr_t *uh = (const udp_hdr_t *)(frame + sizeof(eth_hdr_t) + ihl);
+    if (be16(uh->dst_port) != s->local_port) return 0;
+    uint32_t src_ip = be32(ip->src);
+    uint16_t sport = be16(uh->src_port);
+    if (s->connected) {
+        int ok = (src_ip == s->peer_ip_be && sport == s->peer_port);
+        if (!ok && s->peer_port == 53u && sport == 53u &&
+            ((s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) ||
+             (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && s->dns_tcp_udp_bridge)))
+            ok = 1;
+        if (!ok) return 0;
+    }
+    uint16_t ulen = be16(uh->len);
+    if (ulen < sizeof(udp_hdr_t)) return 0;
+    return 1;
+}
+
+static int net_udp_match_raw_frame(const uint8_t *frame, size_t n, uint16_t local_port,
+                                   uint32_t peer_ip_be, uint16_t peer_port) {
+    if (!frame || n < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t) + sizeof(udp_hdr_t)) return 0;
+    const eth_hdr_t *eth = (const eth_hdr_t *)frame;
+    if (be16(eth->ethertype) != ETH_TYPE_IPV4) return 0;
+    const ipv4_hdr_t *ip = (const ipv4_hdr_t *)(frame + sizeof(eth_hdr_t));
+    size_t ihl = (size_t)((ip->ver_ihl & 0x0Fu) * 4u);
+    if (ip->proto != IPPROTO_UDP_LOCAL || ihl < sizeof(ipv4_hdr_t)) return 0;
+    if (n < sizeof(eth_hdr_t) + ihl + sizeof(udp_hdr_t)) return 0;
+    const udp_hdr_t *uh = (const udp_hdr_t *)(frame + sizeof(eth_hdr_t) + ihl);
+    if (be16(uh->dst_port) != local_port) return 0;
+    uint32_t sip = be32(ip->src);
+    uint16_t sp = be16(uh->src_port);
+    int ok = (sip == peer_ip_be && sp == peer_port);
+    if (!ok && peer_port == 53u && sp == 53u) ok = 1;
+    return ok ? 1 : 0;
+}
+
+static int net_udp_copy_payload_from_frame(const uint8_t *frame, size_t n, uint8_t *out, size_t out_cap,
+                                          uint32_t *out_src_ip_be, uint16_t *out_src_port) {
+    if (!frame || !out || out_cap == 0) return 0;
+    if (n < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t) + sizeof(udp_hdr_t)) return 0;
+    const eth_hdr_t *eth = (const eth_hdr_t *)frame;
+    if (be16(eth->ethertype) != ETH_TYPE_IPV4) return 0;
+    const ipv4_hdr_t *ip = (const ipv4_hdr_t *)(frame + sizeof(eth_hdr_t));
+    size_t ihl = (size_t)((ip->ver_ihl & 0x0Fu) * 4u);
+    if (ihl < sizeof(ipv4_hdr_t) || ihl > 60) return 0;
+    if (ip->proto != IPPROTO_UDP_LOCAL) return 0;
+    if (n < sizeof(eth_hdr_t) + ihl + sizeof(udp_hdr_t)) return 0;
+    const udp_hdr_t *uh = (const udp_hdr_t *)(frame + sizeof(eth_hdr_t) + ihl);
+    uint16_t sport = be16(uh->src_port);
+    uint32_t src_ip = be32(ip->src);
+    uint16_t ulen = be16(uh->len);
+    if (ulen < sizeof(udp_hdr_t)) return 0;
+    size_t payload_len = (size_t)ulen - sizeof(udp_hdr_t);
+    size_t have = n - (sizeof(eth_hdr_t) + ihl + sizeof(udp_hdr_t));
+    if (payload_len > have) payload_len = have;
+    size_t copy_len = (payload_len > out_cap) ? out_cap : payload_len;
+    if (copy_len > 0) memcpy(out, (const uint8_t *)uh + sizeof(udp_hdr_t), copy_len);
+    if (out_src_ip_be) *out_src_ip_be = src_ip;
+    if (out_src_port) *out_src_port = sport;
+    return (int)copy_len;
+}
+
+/* UDP payload length in frame (for FIONREAD); 0 if not a valid IPv4 UDP datagram. */
+static int net_udp_payload_len_from_frame(const uint8_t *frame, size_t n) {
+    if (!frame || n < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t) + sizeof(udp_hdr_t)) return 0;
+    const eth_hdr_t *eth = (const eth_hdr_t *)frame;
+    if (be16(eth->ethertype) != ETH_TYPE_IPV4) return 0;
+    const ipv4_hdr_t *ip = (const ipv4_hdr_t *)(frame + sizeof(eth_hdr_t));
+    size_t ihl = (size_t)((ip->ver_ihl & 0x0Fu) * 4u);
+    if (ihl < sizeof(ipv4_hdr_t) || ihl > 60) return 0;
+    if (ip->proto != IPPROTO_UDP_LOCAL) return 0;
+    if (n < sizeof(eth_hdr_t) + ihl + sizeof(udp_hdr_t)) return 0;
+    const udp_hdr_t *uh = (const udp_hdr_t *)(frame + sizeof(eth_hdr_t) + ihl);
+    uint16_t ulen = be16(uh->len);
+    if (ulen < sizeof(udp_hdr_t)) return 0;
+    size_t payload_len = (size_t)ulen - sizeof(udp_hdr_t);
+    size_t have = n - (sizeof(eth_hdr_t) + ihl + sizeof(udp_hdr_t));
+    if (payload_len > have) payload_len = have;
+    if (payload_len > 0x7fffffffu) return 0;
+    return (int)payload_len;
+}
+
+/* Bytes available for recv without dequeuing (head-of-line: first matching UDP in RX queue). */
+static int net_rxq_peek_udp_payload_for_sock(ksock_net_t *s) {
+    if (!s || s->local_port == 0) return 0;
+    unsigned long irqf = 0;
+    acquire_irqsave(&g_net_rxq_lock, &irqf);
+    uint32_t cnt = g_net_rxq_count;
+    uint32_t head0 = g_net_rxq_head;
+    int plen = 0;
+    for (uint32_t i = 0; i < cnt; i++) {
+        uint32_t idx = (head0 + i) % NET_RXQ_SLOTS;
+        uint16_t fn = g_net_rxq_len[idx];
+        if (fn == 0) continue;
+        if (net_udp_match_sock_frame(g_net_rxq[idx], fn, s)) {
+            plen = net_udp_payload_len_from_frame(g_net_rxq[idx], fn);
+            break;
+        }
+    }
+    release_irqrestore(&g_net_rxq_lock, irqf);
+    return plen;
+}
+
+static int net_recv_post_arp_icmp_from_nic(void *buf, size_t cap) {
+    if (!buf || cap == 0) return -1;
+    for (int i = 0; i < 16; i++) {
+        e1000_poll();
+        int nn = e1000_recv_frame(buf, cap);
+        if (nn <= 0) return nn;
+        if (net_reply_arp_if_needed((const uint8_t *)buf, (size_t)nn)) continue;
+        if (net_reply_icmp_echo_if_needed((const uint8_t *)buf, (size_t)nn)) continue;
+        return nn;
+    }
+    return 0;
+}
+
+static int net_rxq_take_udp_datagram(ksock_net_t *s, uint8_t *out, size_t out_cap,
+                                    uint32_t *out_src_ip_be, uint16_t *out_src_port) {
+    if (!s || !out || out_cap == 0) return -1;
+    unsigned long irqf = 0;
+    acquire_irqsave(&g_net_rxq_lock, &irqf);
+    uint32_t cnt = g_net_rxq_count;
+    if (cnt == 0) {
+        release_irqrestore(&g_net_rxq_lock, irqf);
+        return 0;
+    }
+    uint32_t head0 = g_net_rxq_head;
+    int found_at = -1;
+    for (uint32_t i = 0; i < cnt; i++) {
+        uint32_t idx = (head0 + i) % NET_RXQ_SLOTS;
+        uint16_t fn = g_net_rxq_len[idx];
+        if (fn == 0) continue;
+        if (net_udp_match_sock_frame(g_net_rxq[idx], fn, s)) {
+            found_at = (int)i;
+            break;
+        }
+    }
+    if (found_at < 0) {
+        release_irqrestore(&g_net_rxq_lock, irqf);
+        return 0;
+    }
+    uint8_t tmp[NET_RXQ_BUF];
+    for (int r = 0; r < found_at; r++) {
+        uint32_t hi = g_net_rxq_head;
+        uint16_t tn = g_net_rxq_len[hi];
+        memcpy(tmp, g_net_rxq[hi], tn);
+        g_net_rxq_len[hi] = 0;
+        g_net_rxq_head = (hi + 1) % NET_RXQ_SLOTS;
+        g_net_rxq_count--;
+        uint32_t ti = g_net_rxq_tail;
+        memcpy(g_net_rxq[ti], tmp, tn);
+        g_net_rxq_len[ti] = tn;
+        g_net_rxq_tail = (ti + 1) % NET_RXQ_SLOTS;
+        g_net_rxq_count++;
+    }
+    uint32_t hi2 = g_net_rxq_head;
+    uint16_t n = g_net_rxq_len[hi2];
+    memcpy(tmp, g_net_rxq[hi2], n);
+    g_net_rxq_len[hi2] = 0;
+    g_net_rxq_head = (hi2 + 1) % NET_RXQ_SLOTS;
+    g_net_rxq_count--;
+    release_irqrestore(&g_net_rxq_lock, irqf);
+    return net_udp_copy_payload_from_frame(tmp, n, out, out_cap, out_src_ip_be, out_src_port);
+}
+
+static int net_rxq_take_udp_raw(uint16_t local_port, uint32_t peer_ip_be, uint16_t peer_port,
+                               uint8_t *out, size_t out_cap) {
+    if (!out || out_cap == 0 || local_port == 0) return -1;
+    unsigned long irqf = 0;
+    acquire_irqsave(&g_net_rxq_lock, &irqf);
+    uint32_t cnt = g_net_rxq_count;
+    if (cnt == 0) {
+        release_irqrestore(&g_net_rxq_lock, irqf);
+        return 0;
+    }
+    uint32_t head0 = g_net_rxq_head;
+    int found_at = -1;
+    for (uint32_t i = 0; i < cnt; i++) {
+        uint32_t idx = (head0 + i) % NET_RXQ_SLOTS;
+        uint16_t fn = g_net_rxq_len[idx];
+        if (fn == 0) continue;
+        if (net_udp_match_raw_frame(g_net_rxq[idx], fn, local_port, peer_ip_be, peer_port)) {
+            found_at = (int)i;
+            break;
+        }
+    }
+    if (found_at < 0) {
+        release_irqrestore(&g_net_rxq_lock, irqf);
+        return 0;
+    }
+    uint8_t tmp[NET_RXQ_BUF];
+    for (int r = 0; r < found_at; r++) {
+        uint32_t hi = g_net_rxq_head;
+        uint16_t tn = g_net_rxq_len[hi];
+        memcpy(tmp, g_net_rxq[hi], tn);
+        g_net_rxq_len[hi] = 0;
+        g_net_rxq_head = (hi + 1) % NET_RXQ_SLOTS;
+        g_net_rxq_count--;
+        uint32_t ti = g_net_rxq_tail;
+        memcpy(g_net_rxq[ti], tmp, tn);
+        g_net_rxq_len[ti] = tn;
+        g_net_rxq_tail = (ti + 1) % NET_RXQ_SLOTS;
+        g_net_rxq_count++;
+    }
+    uint32_t hi2 = g_net_rxq_head;
+    uint16_t n = g_net_rxq_len[hi2];
+    memcpy(tmp, g_net_rxq[hi2], n);
+    g_net_rxq_len[hi2] = 0;
+    g_net_rxq_head = (hi2 + 1) % NET_RXQ_SLOTS;
+    g_net_rxq_count--;
+    release_irqrestore(&g_net_rxq_lock, irqf);
+    return net_udp_copy_payload_from_frame(tmp, n, out, out_cap, NULL, NULL);
 }
 
 static uint16_t ip_checksum16(const void *data, size_t len) {
@@ -669,6 +1151,15 @@ static int net_send_udp_datagram(uint32_t dst_ip_be, uint16_t src_port, uint16_t
     return r;
 }
 
+static uint32_t g_net_ephemeral_port_seq;
+
+/* Linux-style dynamic ports (32768–65535). Per-tid reuse broke resolver: parallel A/AAAA
+ * UDP sockets on one thread shared the same local port and stole each other's replies. */
+static uint16_t net_alloc_ephemeral_port(void) {
+    uint32_t n = __atomic_add_fetch(&g_net_ephemeral_port_seq, 1u, __ATOMIC_RELAXED);
+    return (uint16_t)(32768u + (n % 32768u));
+}
+
 static int net_recv_udp_datagram(ksock_net_t *s, uint8_t *out, size_t out_cap, uint32_t timeout_ms, uint32_t *out_src_ip_be, uint16_t *out_src_port) {
     if (!s || !out || out_cap == 0 || s->local_port == 0) return -1;
     if (net_stack_init() != 0) return -1;
@@ -676,35 +1167,24 @@ static int net_recv_udp_datagram(ksock_net_t *s, uint8_t *out, size_t out_cap, u
     if (!frame) return -1;
     uint64_t start = pit_get_time_ms();
     int ret = 0;
-    while ((pit_get_time_ms() - start) < timeout_ms) {
-        e1000_poll();
-        int n = e1000_recv_frame(frame, NET_FRAME_BUF);
-        if (n <= 0) { thread_sleep(1); continue; }
-        if ((size_t)n < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t) + sizeof(udp_hdr_t)) continue;
-        const eth_hdr_t *eth = (const eth_hdr_t *)frame;
-        if (be16(eth->ethertype) != ETH_TYPE_IPV4) continue;
-        const ipv4_hdr_t *ip = (const ipv4_hdr_t *)(frame + sizeof(eth_hdr_t));
-        size_t ihl = (size_t)((ip->ver_ihl & 0x0Fu) * 4u);
-        if (ip->proto != IPPROTO_UDP_LOCAL || ihl < sizeof(ipv4_hdr_t)) continue;
-        if ((size_t)n < sizeof(eth_hdr_t) + ihl + sizeof(udp_hdr_t)) continue;
-        const udp_hdr_t *uh = (const udp_hdr_t *)(frame + sizeof(eth_hdr_t) + ihl);
-        uint16_t dport = be16(uh->dst_port);
-        uint16_t sport = be16(uh->src_port);
-        if (dport != s->local_port) continue;
-        uint32_t src_ip = be32(ip->src);
-        if (s->connected && (src_ip != s->peer_ip_be || sport != s->peer_port)) continue;
-        uint16_t ulen = be16(uh->len);
-        if (ulen < sizeof(udp_hdr_t)) continue;
-        size_t payload_len = (size_t)ulen - sizeof(udp_hdr_t);
-        size_t have = (size_t)n - (sizeof(eth_hdr_t) + ihl + sizeof(udp_hdr_t));
-        if (payload_len > have) payload_len = have;
-        size_t copy_len = (payload_len > out_cap) ? out_cap : payload_len;
-        if (copy_len > 0) memcpy(out, (const uint8_t *)uh + sizeof(udp_hdr_t), copy_len);
-        if (out_src_ip_be) *out_src_ip_be = src_ip;
-        if (out_src_port) *out_src_port = sport;
-        ret = (int)copy_len;
-        break;
-    }
+    /* timeout_ms==0: single attempt (poll / non-blocking). Old code used while(elapsed<0) and ran zero times. */
+    do {
+        int q = net_rxq_take_udp_datagram(s, out, out_cap, out_src_ip_be, out_src_port);
+        if (q > 0) { ret = q; break; }
+        if (q < 0) { ret = q; break; }
+        int n = net_recv_post_arp_icmp_from_nic(frame, NET_FRAME_BUF);
+        if (n <= 0) {
+            if (pit_get_time_ms() - start >= (uint64_t)timeout_ms) break;
+            thread_sleep(1);
+            continue;
+        }
+        if (net_udp_match_sock_frame((const uint8_t *)frame, (size_t)n, s)) {
+            ret = net_udp_copy_payload_from_frame((const uint8_t *)frame, (size_t)n, out, out_cap, out_src_ip_be, out_src_port);
+            break;
+        }
+        (void)net_rxq_push((const uint8_t *)frame, (size_t)n);
+        thread_sleep(0);
+    } while (ret == 0 && (pit_get_time_ms() - start) < (uint64_t)timeout_ms);
     kfree(frame);
     return ret;
 }
@@ -718,32 +1198,57 @@ static int net_recv_udp_raw(uint16_t local_port, uint32_t peer_ip_be, uint16_t p
     if (!frame) return -1;
     uint64_t start = pit_get_time_ms();
     int ret = 0;
-    while ((pit_get_time_ms() - start) < timeout_ms) {
-        e1000_poll();
-        int n = e1000_recv_frame(frame, NET_FRAME_BUF);
-        if (n <= 0) { thread_sleep(1); continue; }
-        if ((size_t)n < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t) + sizeof(udp_hdr_t)) continue;
-        const eth_hdr_t *eth = (const eth_hdr_t *)frame;
-        if (be16(eth->ethertype) != ETH_TYPE_IPV4) continue;
-        const ipv4_hdr_t *ip = (const ipv4_hdr_t *)(frame + sizeof(eth_hdr_t));
-        size_t ihl = (size_t)((ip->ver_ihl & 0x0Fu) * 4u);
-        if (ip->proto != IPPROTO_UDP_LOCAL || ihl < sizeof(ipv4_hdr_t)) continue;
-        if ((size_t)n < sizeof(eth_hdr_t) + ihl + sizeof(udp_hdr_t)) continue;
-        const udp_hdr_t *uh = (const udp_hdr_t *)(frame + sizeof(eth_hdr_t) + ihl);
-        if (be16(uh->dst_port) != local_port) continue;
-        if (be32(ip->src) != peer_ip_be || be16(uh->src_port) != peer_port) continue;
-        uint16_t ulen = be16(uh->len);
-        if (ulen < sizeof(udp_hdr_t)) continue;
-        size_t payload_len = (size_t)ulen - sizeof(udp_hdr_t);
-        size_t have = (size_t)n - (sizeof(eth_hdr_t) + ihl + sizeof(udp_hdr_t));
-        if (payload_len > have) payload_len = have;
-        size_t copy_len = (payload_len > out_cap) ? out_cap : payload_len;
-        if (copy_len > 0) memcpy(out, (const uint8_t *)uh + sizeof(udp_hdr_t), copy_len);
-        ret = (int)copy_len;
-        break;
-    }
+    do {
+        int q = net_rxq_take_udp_raw(local_port, peer_ip_be, peer_port, out, out_cap);
+        if (q > 0) { ret = q; break; }
+        if (q < 0) { ret = q; break; }
+        int n = net_recv_post_arp_icmp_from_nic(frame, NET_FRAME_BUF);
+        if (n <= 0) {
+            if (pit_get_time_ms() - start >= (uint64_t)timeout_ms) break;
+            thread_sleep(1);
+            continue;
+        }
+        if (net_udp_match_raw_frame((const uint8_t *)frame, (size_t)n, local_port, peer_ip_be, peer_port)) {
+            ret = net_udp_copy_payload_from_frame((const uint8_t *)frame, (size_t)n, out, out_cap, NULL, NULL);
+            break;
+        }
+        (void)net_rxq_push((const uint8_t *)frame, (size_t)n);
+        thread_sleep(0);
+    } while (ret == 0 && (pit_get_time_ms() - start) < (uint64_t)timeout_ms);
     kfree(frame);
     return ret;
+}
+
+#define NET_UDP_BLOCK_MAX_MS 120000u
+
+/* One blocking recv: keep waiting (slice by slice) instead of returning EAGAIN after ~3s like a non-blocking socket. */
+static int net_udp_recv_into_pending(ksock_net_t *s) {
+    if (!s || s->rx_has_pending) return 1;
+    if (s->local_port == 0) return -1;
+    if (s->nonblock) {
+        int rn = net_recv_udp_datagram(s, s->rx_pending, sizeof(s->rx_pending), 0u,
+                                       &s->rx_pending_src_ip_be, &s->rx_pending_src_port);
+        if (rn > 0) {
+            ksock_rx_pending_install(s, rn);
+            return 1;
+        }
+        return (rn < 0) ? -1 : 0;
+    }
+    uint64_t deadline = pit_get_time_ms() + (uint64_t)NET_UDP_BLOCK_MAX_MS;
+    for (;;) {
+        uint32_t slice = 10000u;
+        uint64_t now = pit_get_time_ms();
+        if (now >= deadline) return 0;
+        if (now + slice > deadline) slice = (uint32_t)(deadline - now);
+        if (slice < 1u) slice = 1u;
+        int rn = net_recv_udp_datagram(s, s->rx_pending, sizeof(s->rx_pending), slice,
+                                       &s->rx_pending_src_ip_be, &s->rx_pending_src_port);
+        if (rn > 0) {
+            ksock_rx_pending_install(s, rn);
+            return 1;
+        }
+        if (rn < 0) return -1;
+    }
 }
 
 static int net_send_l4_ipv4_cb(uint32_t dst_ip_be, uint8_t proto, const void *l4, size_t l4_len) {
@@ -753,10 +1258,7 @@ static int net_send_l4_ipv4_cb(uint32_t dst_ip_be, uint8_t proto, const void *l4
 }
 
 static int net_recv_frame_cb(void *buf, size_t cap) {
-    e1000_poll(); /* VMware: device read before DMA visibility */
-    int n = e1000_recv_frame(buf, cap);
-    if (n <= 0) e1000_poll(); /* second poll helps on VMware */
-    return n;
+    return net_recv_frame_any(buf, cap);
 }
 
 static uint64_t net_time_ms_cb(void) {
@@ -768,6 +1270,11 @@ static void net_yield_cb(void) {
     thread_sleep(1);
 }
 
+static void net_tcp_return_frame_cb(const void *frame, size_t n) {
+    if (!frame || n == 0) return;
+    (void)net_rxq_push((const uint8_t *)frame, n);
+}
+
 static void net_make_tcp_ops(net_tcp_ops_t *ops) {
     if (!ops) return;
     memset(ops, 0, sizeof(*ops));
@@ -776,6 +1283,7 @@ static void net_make_tcp_ops(net_tcp_ops_t *ops) {
     ops->recv_frame = net_recv_frame_cb;
     ops->time_ms = net_time_ms_cb;
     ops->yield = net_yield_cb;
+    ops->return_frame = net_tcp_return_frame_cb;
 }
 
 static int net_send_arp_request(uint32_t target_ip_be) {
@@ -815,15 +1323,14 @@ static int net_try_parse_arp_reply_for_ip(const uint8_t *frame, size_t n, uint32
 static int net_resolve_mac(uint32_t ip_be, uint8_t out_mac[6], uint32_t timeout_ms) {
     if (!out_mac) return -1;
     /* Drain RX so ARP reply is not behind leftover DHCP/other frames. */
-    { uint8_t drain[256]; for (;;) { e1000_poll(); if (e1000_recv_frame(drain, sizeof(drain)) <= 0) break; } }
+    { uint8_t drain[256]; for (;;) { if (net_recv_frame_any(drain, sizeof(drain)) <= 0) break; } }
     if (net_send_arp_request(ip_be) != 0) return -1;
     uint8_t *frame = kmalloc(NET_FRAME_BUF);
     if (!frame) return -1;
     uint64_t start = pit_get_time_ms();
     int ret = -1;
     while ((pit_get_time_ms() - start) < timeout_ms) {
-        e1000_poll();
-        int r = e1000_recv_frame(frame, NET_FRAME_BUF);
+        int r = net_recv_frame_any(frame, NET_FRAME_BUF);
         if (r > 0 && net_try_parse_arp_reply_for_ip(frame, (size_t)r, ip_be, out_mac)) { ret = 0; break; }
         thread_sleep(1);
     }
@@ -864,7 +1371,6 @@ static int net_stack_init(void) {
                    (unsigned)((g_net.ip_be >> 8) & 0xFF), (unsigned)(g_net.ip_be & 0xFF),
                    (unsigned)((g_net.gw_be >> 24) & 0xFF), (unsigned)((g_net.gw_be >> 16) & 0xFF),
                    (unsigned)((g_net.gw_be >> 8) & 0xFF), (unsigned)(g_net.gw_be & 0xFF));
-        net_ensure_resolv_conf(g_net.dns_be ? g_net.dns_be : g_net.gw_be);
         return 0;
     }
     
@@ -897,12 +1403,20 @@ static int net_stack_init(void) {
         g_net_cfg_gw_be = g_net.gw_be;
         g_net_cfg_dns_be = g_net.dns_be;
     }
-    net_ensure_resolv_conf(dns_be);
     klogprintf("net: ready ip=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
                (unsigned)((g_net.ip_be >> 24) & 0xFF), (unsigned)((g_net.ip_be >> 16) & 0xFF),
                (unsigned)((g_net.ip_be >> 8) & 0xFF), (unsigned)(g_net.ip_be & 0xFF),
                (unsigned)((g_net.gw_be >> 24) & 0xFF), (unsigned)((g_net.gw_be >> 16) & 0xFF),
                (unsigned)((g_net.gw_be >> 8) & 0xFF), (unsigned)(g_net.gw_be & 0xFF));
+
+    /* Start background RX pump once: reply to ARP/ICMP even when userland is idle. */
+    if (!g_net_rx_thread_started) {
+        thread_t *t = thread_create(net_rx_pump_thread, "net_rx");
+        if (t) {
+            t->nice = 10; /* low priority */
+            g_net_rx_thread_started = 1;
+        }
+    }
     return 0;
 }
 
@@ -911,35 +1425,34 @@ int syscall_net_preinit(void) {
 }
 
 void syscall_net_ensure_resolv(void) {
-    if (g_net.ready && g_net.dns_be)
-        net_ensure_resolv_conf(g_net.dns_be);
-    else if (g_net.ready)
-        net_ensure_resolv_conf(g_net.gw_be);
-    else
-        net_ensure_resolv_conf(0);  /* no nameserver when net not ready */
-    (void)ramfs_mkdir("/etc");
-    struct fs_file *hf = fs_create_file("/etc/hosts");
-    if (!hf) hf = fs_open("/etc/hosts");
-    if (hf) {
-        static const char hosts_txt[] =
-            "127.0.0.1\tlocalhost\n"
-            "142.250.185.46\tgoogle.com www.google.com\n"
-            "45.135.93.108\taxont.ru www.axont.ru\n"
-            "77.88.55.242\tya.ru www.ya.ru\n";
-        hf->size = 0;
-        hf->pos = 0;
-        (void)fs_write(hf, hosts_txt, sizeof(hosts_txt) - 1, 0);
-        fs_file_free(hf);
-    }
-    /* nsswitch.conf: files (hosts), axonos (kernel SYS_resolve: hosts+DNS), dns (glibc UDP). axonos provides full DNS when libnss_axonos is present. */
-    struct fs_file *nf = fs_create_file("/etc/nsswitch.conf");
-    if (!nf) nf = fs_open("/etc/nsswitch.conf");
-    if (nf) {
-        static const char nss_txt[] = "hosts: files axonos dns\n";
-        nf->size = 0;
-        nf->pos = 0;
-        (void)fs_write(nf, nss_txt, sizeof(nss_txt) - 1, 0);
-        fs_file_free(nf);
+    /* Without /etc/resolv.conf, glibc/musl/wget try stub paths (e.g. 127.0.0.1) and
+       report "bad address". Mirror the same DNS choice as SYS_resolve. */
+    (void)net_stack_init();
+    uint32_t dns_be = 0;
+    if (g_net.ready)
+        dns_be = g_net.dns_be ? g_net.dns_be : g_net.gw_be;
+    if (!dns_be && g_net.gw_be)
+        dns_be = g_net.gw_be;
+    /* Last resort for QEMU usernet; bridged setups should have gw/dns above. */
+    if (!dns_be)
+        dns_be = 0x0A000202u;
+
+    char line[96];
+    unsigned a = (unsigned)((dns_be >> 24) & 0xFFu);
+    unsigned b = (unsigned)((dns_be >> 16) & 0xFFu);
+    unsigned c = (unsigned)((dns_be >> 8) & 0xFFu);
+    unsigned d = (unsigned)(dns_be & 0xFFu);
+    int n = snprintf(line, sizeof(line), "nameserver %u.%u.%u.%u\n", a, b, c, d);
+    if (n <= 0 || (size_t)n >= sizeof(line))
+        return;
+
+    (void)fs_unlink("/etc/resolv.conf");
+    struct fs_file *f = fs_create_file("/etc/resolv.conf");
+    if (!f)
+        f = fs_open("/etc/resolv.conf");
+    if (f) {
+        fs_write(f, line, (size_t)n, 0);
+        fs_file_free(f);
     }
 }
 
@@ -1055,26 +1568,8 @@ static int kernel_resolve_full(const char *hostname, uint32_t dns_ip_be, uint32_
 }
 
 static void net_ensure_resolv_conf(uint32_t dns_be) {
-    (void)ramfs_mkdir("/etc");
-    struct fs_file *f = fs_create_file("/etc/resolv.conf");
-    if (!f) f = fs_open("/etc/resolv.conf");
-    if (!f) {
-        klogprintf("net: failed to create /etc/resolv.conf\n");
-        return;
-    }
-    char buf[256];
-    int n = 0;
-    n += (int)(size_t)sprintf(buf + n, "# autogenerated by AxonOS net stack\n");
-    if (dns_be) {
-        n += (int)(size_t)sprintf(buf + n, "nameserver %u.%u.%u.%u\n",
-            (dns_be >> 24) & 0xFF, (dns_be >> 16) & 0xFF,
-            (dns_be >> 8) & 0xFF, dns_be & 0xFF);
-    }
-    n += (int)(size_t)sprintf(buf + n, "nameserver 8.8.8.8\n"); /* public DNS; 10.0.2.3 useless for bridged */
-    f->size = 0;
-    f->pos = 0;
-    (void)fs_write(f, buf, (size_t)n, 0);
-    fs_file_free(f);
+    (void)dns_be;
+    /* no-op: see syscall_net_ensure_resolv() */
 }
 
 static int ip_mask_prefix_len(uint32_t mask_be) {
@@ -1092,7 +1587,7 @@ static int net_send_icmp_echo(ksock_net_t *s, uint32_t dst_ip_be, const uint8_t 
     if (!s || !icmp || icmp_len == 0) return -1;
     if (net_stack_init() != 0) return -1;
     /* Drain RX before send (limit 64) so old echo replies don't block next recv (second ping timeout). */
-    { uint8_t drain[256]; for (int d = 0; d < 64; d++) { e1000_poll(); if (e1000_recv_frame(drain, sizeof(drain)) <= 0) break; } }
+    { uint8_t drain[256]; for (int d = 0; d < 64; d++) { if (net_recv_frame_any(drain, sizeof(drain)) <= 0) break; } }
     /* 0.0.0.0 and 255.255.255.255: no host replies; send to gateway so user gets a reply. */
     if (dst_ip_be == 0 || dst_ip_be == 0xFFFFFFFFu) dst_ip_be = g_net.gw_be;
     uint32_t nh = ip_same_subnet(dst_ip_be, g_net.ip_be, g_net.mask_be) ? dst_ip_be : g_net.gw_be;
@@ -1104,7 +1599,7 @@ static int net_send_icmp_echo(ksock_net_t *s, uint32_t dst_ip_be, const uint8_t 
             /* Повтор ARP для шлюза (VMware иногда отвечает с задержкой). */
             if (nh == g_net.gw_be) {
                 uint8_t drain[256];
-                for (;;) { e1000_poll(); if (e1000_recv_frame(drain, sizeof(drain)) <= 0) break; }
+                for (;;) { if (net_recv_frame_any(drain, sizeof(drain)) <= 0) break; }
                 if (net_send_arp_request(nh) != 0) return -1;
                 if (net_resolve_mac(nh, dst_mac, arp_ms) != 0) return -1;
             } else
@@ -1192,16 +1687,14 @@ static int net_recv_icmp_echo_reply(ksock_net_t *s, uint8_t *out, size_t out_cap
         thread_t *tcur = thread_get_current_user();
         if (!tcur) tcur = thread_current();
         if (tcur && (tcur->pending_signals & (1ULL << (2 - 1)))) { ret = -4; break; } /* SIGINT */
-        e1000_poll();
-        int n = e1000_recv_frame(frame, NET_FRAME_BUF);
+        int n = net_recv_frame_any(frame, NET_FRAME_BUF);
         if (n > 0) {
             int got = net_try_parse_icmp_reply(frame, (size_t)n, s, out, out_cap, out_src_ip_be);
             if (got > 0) { ret = got; break; }
         } else {
             int spun = 0;
             for (; spun < 200 && ret <= 0; spun++) {
-                e1000_poll();
-                n = e1000_recv_frame(frame, NET_FRAME_BUF);
+                n = net_recv_frame_any(frame, NET_FRAME_BUF);
                 if (n > 0) {
                     int got = net_try_parse_icmp_reply(frame, (size_t)n, s, out, out_cap, out_src_ip_be);
                     if (got > 0) { ret = got; break; }
@@ -1327,12 +1820,170 @@ static struct fs_file *socket_file_get(thread_t *cur, int fd, ksock_net_t **out_
     return f;
 }
 
+/* Linux /proc/net/tcp IPv4 hex: byte-reverse of network-order IP (see /proc/net/tcp). */
+static uint32_t ip_be_to_proc_net_hex(uint32_t ip_be) {
+    return ((ip_be & 0xFFu) << 24) | ((ip_be & 0xFF00u) << 8)
+         | ((ip_be >> 8) & 0xFF00u) | ((ip_be >> 24) & 0xFFu);
+}
+
+ssize_t procfs_net_snap_tcp(char *buf, size_t size) {
+    if (!buf || size < 64) return 0;
+    size_t w = 0;
+    int n = snprintf((char *)buf + w, size - w,
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n");
+    if (n < 0) return 0;
+    w += (size_t)n;
+    int sl = 0;
+    int tcnt = thread_get_count();
+    for (int ti = 0; ti < tcnt; ti++) {
+        thread_t *t = thread_get_by_index(ti);
+        if (!t) continue;
+        for (int fd = 0; fd < THREAD_MAX_FD; fd++) {
+            struct fs_file *f = t->fds[fd];
+            if (!f || f->type != SYSCALL_FTYPE_SOCKET || !f->driver_private) continue;
+            ksock_net_t *s = (ksock_net_t *)f->driver_private;
+            if (s->type_base != SOCK_STREAM_LOCAL || s->protocol != IPPROTO_TCP_LOCAL) continue;
+            if (!s->tcp.used) continue;
+            uint32_t lip_be = g_net.ready ? g_net.ip_be : 0u;
+            uint32_t lhx = ip_be_to_proc_net_hex(lip_be);
+            uint32_t rhx = ip_be_to_proc_net_hex(s->peer_ip_be);
+            unsigned st = s->tcp.established ? 1u : 2u;
+            unsigned long inode = (unsigned long)(((unsigned)t->tid + 1u) * 100000u + (unsigned)fd + 1000u);
+            n = snprintf((char *)buf + w, w < size ? size - w : 0,
+                "%4d: %08X:%04X %08X:%04X %02X %08X:%08X %02X:%08X %08X %5d %8d %lu\n",
+                sl++, lhx, (unsigned)(s->local_port & 0xFFFFu), rhx, (unsigned)(s->peer_port & 0xFFFFu), st,
+                0u, 0u, 0u, 0u, 0u, (int)t->euid, 0, inode);
+            if (n < 0) return (ssize_t)w;
+            w += (size_t)n;
+            if (w + 256 >= size) return (ssize_t)w;
+        }
+    }
+    return (ssize_t)w;
+}
+
+ssize_t procfs_net_snap_udp(char *buf, size_t size) {
+    if (!buf || size < 64) return 0;
+    size_t w = 0;
+    int n = snprintf((char *)buf + w, size - w,
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n");
+    if (n < 0) return 0;
+    w += (size_t)n;
+    int sl = 0;
+    int tcnt = thread_get_count();
+    for (int ti = 0; ti < tcnt; ti++) {
+        thread_t *t = thread_get_by_index(ti);
+        if (!t) continue;
+        for (int fd = 0; fd < THREAD_MAX_FD; fd++) {
+            struct fs_file *f = t->fds[fd];
+            if (!f || f->type != SYSCALL_FTYPE_SOCKET || !f->driver_private) continue;
+            ksock_net_t *s = (ksock_net_t *)f->driver_private;
+            if (s->type_base != SOCK_DGRAM_LOCAL || s->protocol != IPPROTO_UDP_LOCAL) continue;
+            if (s->local_port == 0 && !s->connected) continue;
+            uint32_t lip_be = g_net.ready ? g_net.ip_be : 0u;
+            uint32_t lhx = ip_be_to_proc_net_hex(lip_be);
+            uint32_t rhx = s->connected ? ip_be_to_proc_net_hex(s->peer_ip_be) : 0u;
+            uint32_t rp = s->connected ? (uint32_t)(s->peer_port & 0xFFFFu) : 0u;
+            unsigned st = 7u;
+            unsigned long inode = (unsigned long)(((unsigned)t->tid + 1u) * 100000u + (unsigned)fd + 50000u);
+            n = snprintf((char *)buf + w, w < size ? size - w : 0,
+                "%4d: %08X:%04X %08X:%04X %02X %08X:%08X %02X:%08X %08X %5d %8d %lu\n",
+                sl++, lhx, (unsigned)(s->local_port & 0xFFFFu), rhx, rp, st,
+                0u, 0u, 0u, 0u, 0u, (int)t->euid, 0, inode);
+            if (n < 0) return (ssize_t)w;
+            w += (size_t)n;
+            if (w + 256 >= size) return (ssize_t)w;
+        }
+    }
+    return (ssize_t)w;
+}
+
+ssize_t procfs_net_snap_tcp6(char *buf, size_t size) {
+    if (!buf || size < 80) return 0;
+    return (ssize_t)snprintf((char *)buf, size,
+        "sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n");
+}
+
+ssize_t procfs_net_snap_udp6(char *buf, size_t size) {
+    if (!buf || size < 80) return 0;
+    return (ssize_t)snprintf((char *)buf, size,
+        "sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode ref pointer drops\n");
+}
+
+ssize_t procfs_net_snap_raw(char *buf, size_t size) {
+    if (!buf || size < 64) return 0;
+    return (ssize_t)snprintf((char *)buf, size,
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n");
+}
+
+ssize_t procfs_net_snap_raw6(char *buf, size_t size) {
+    return procfs_net_snap_raw(buf, size);
+}
+
+ssize_t procfs_net_snap_unix(char *buf, size_t size) {
+    if (!buf || size < 64) return 0;
+    return (ssize_t)snprintf((char *)buf, size,
+        "Num       RefCount Protocol Flags    Type St Inode Path\n");
+}
+
 typedef struct __attribute__((packed)) {
     uint16_t sin_family;
     uint16_t sin_port;
     uint32_t sin_addr;
     uint8_t sin_zero[8];
 } sockaddr_in_k;
+
+typedef struct __attribute__((packed)) {
+    uint16_t sin6_family;
+    uint16_t sin6_port;
+    uint32_t sin6_flowinfo;
+    uint8_t sin6_addr[16];
+} sockaddr_in6_k;
+
+/* connect/sendto: Linux glibc often passes AF_INET6 (v4-mapped or ::1). Returns 0 or errno. */
+static int user_sockaddr_to_ipv4_peer(const void *addr_u, size_t addrlen, sockaddr_in_k *out) {
+    if (!out) return EFAULT;
+    if (!addr_u || addrlen < 2) return EFAULT;
+    if (!user_range_ok(addr_u, addrlen)) return EFAULT;
+    uint16_t fam = 0;
+    if (copy_from_user_raw(&fam, addr_u, sizeof(fam)) != 0) return EFAULT;
+    if (fam == 1) return ECONNREFUSED;
+    if (fam == AF_INET_LOCAL) {
+        if (addrlen < sizeof(sockaddr_in_k)) return EINVAL;
+        if (copy_from_user_raw(out, addr_u, sizeof(*out)) != 0) return EFAULT;
+        /* Trust sa_family at addr_u; glibc padding/quirks can leave sin_family != 2 in the copy. */
+        out->sin_family = AF_INET_LOCAL;
+        return 0;
+    }
+    if (fam == AF_INET6) {
+        if (addrlen < sizeof(sockaddr_in6_k)) return EINVAL;
+        sockaddr_in6_k s6;
+        if (copy_from_user_raw(&s6, addr_u, sizeof(s6)) != 0) return EFAULT;
+        int v4m = 1;
+        for (int i = 0; i < 10; i++) {
+            if (s6.sin6_addr[i]) v4m = 0;
+        }
+        if (s6.sin6_addr[10] != 0xff || s6.sin6_addr[11] != 0xff) v4m = 0;
+        memset(out, 0, sizeof(*out));
+        out->sin_family = AF_INET_LOCAL;
+        out->sin_port = s6.sin6_port;
+        if (v4m) {
+            memcpy(&out->sin_addr, s6.sin6_addr + 12, 4);
+            return 0;
+        }
+        int lo6 = 1;
+        for (int i = 0; i < 15; i++) {
+            if (s6.sin6_addr[i]) lo6 = 0;
+        }
+        if (lo6 && s6.sin6_addr[15] == 1) {
+            out->sin_addr = 0x0100007Fu; /* 127.0.0.1 s_addr as on Linux LE */
+            return 0;
+        }
+        /* No IPv6 stack: not EAFNOSUPPORT — glibc/wget treats that as fatal and may surface bogus OOM. */
+        return ENETUNREACH;
+    }
+    /* Same as IPv6: avoid EAFNOSUPPORT so glibc can try other addresses / paths. */
+    return ENETUNREACH;
+}
 
 typedef struct __attribute__((packed)) {
     uint16_t nl_family;
@@ -1591,6 +2242,69 @@ static int netlink_build_route_dump(ksock_net_t *s, uint16_t req_type, uint32_t 
 }
 
 static uint64_t last_syscall_debug = 0;
+static inline int is_watch_proc(thread_t *t) {
+    if (!t || !t->name[0]) return 0;
+    const char *nm = t->name;
+    /* BusyBox is a multicall binary: applets often run with name "busybox". */
+    return (strstr(nm, "busybox") || strstr(nm, "wget") || strstr(nm, "adduser") || strstr(nm, "addgroup")) ? 1 : 0;
+}
+
+static inline int path_is_passwdish(const char *p) {
+    if (!p) return 0;
+    /* BusyBox update_passwd uses suffixes: /etc/passwd+, /etc/passwd- */
+    return (strncmp(p, "/etc/passwd", 11) == 0) ||
+           (strncmp(p, "/etc/group", 10) == 0) ||
+           (strncmp(p, "/etc/shadow", 11) == 0) ||
+           (strncmp(p, "/etc/gshadow", 12) == 0);
+}
+
+/* Syscall trace for debugging multicall userland (BusyBox). */
+static int g_syscall_trace_on = 1;
+static int g_syscall_trace_budget = 4000;
+static inline int syscall_trace_pick(uint64_t num) {
+    /* Keep this tight: only the syscalls that explain "hang" or "can't create user". */
+    switch ((int)num) {
+        case 0:  /* read */
+        case 1:  /* write */
+        case 3:  /* close */
+        case 9:  /* mmap */
+        case 10: /* mprotect */
+        case 11: /* munmap */
+        case 12: /* brk */
+        case 16: /* ioctl */
+        case 23: /* select */
+        case 35: /* nanosleep */
+        case 42: /* connect */
+        case 57: /* fork */
+        case 59: /* execve */
+        case 60: /* exit */
+        case 61: /* wait4 */
+        case 72: /* fcntl */
+        case 78: /* getdents */
+        case 79: /* getcwd */
+        case 87: /* unlink */
+        case 89: /* readlink */
+        case 97: /* getrlimit */
+        case 158:/* arch_prctl */
+        case 202:/* futex */
+        case 231:/* exit_group */
+        case 217:/* getdents64 */
+        case 257:/* openat */
+        case 258:/* mkdirat */
+        case 259:/* mknodat */
+        case 260:/* fchownat */
+        case 262:/* newfstatat */
+        case 263:/* unlinkat */
+        case 264:/* renameat */
+        case 265:/* linkat */
+        case 268:/* fchmodat */
+        case 271:/* ppoll */
+        case 7:  /* poll */
+            return 1;
+        default:
+            return 0;
+    }
+}
 static inline uint64_t ret_err(int e) {
     /* Temporary diagnostics for userland failures (wget, adduser, addgroup). */
     thread_t *t = thread_get_current_user();
@@ -1602,6 +2316,9 @@ static inline uint64_t ret_err(int e) {
         else if (strstr(nm, "addgroup")) watch = 1;
         else if (strstr(nm, "adduser")) watch = 1;
         if (watch) {
+            /* close(3) + EBADF: часто двойной close в glibc при обходе резолвера — не путать с корнем ошибки. */
+            if (last_syscall_debug == 3u && e == EBADF)
+                return (uint64_t)(-(int64_t)e);
             kprintf("SYSCALL-ERR: syscall=%llu errno=%d pid=%s\n",
                 (unsigned long long)last_syscall_debug, e, nm);
             qemu_debug_printf("SYSCALL-ERR: syscall=%llu err=%d tid=%llu name=%s brk=0x%llx mmap_next=0x%llx\n",
@@ -1988,6 +2705,229 @@ static uint64_t user_sig_mask = 0;
 /* Compatibility shim for tools (e.g. ping) that expect periodic SIGALRM. */
 static uint32_t user_itimer_interval_ms = 0;
 
+/* write()/writev() on sockets: glibc DNS may use writev; fs_write() does not handle SYSCALL_FTYPE_SOCKET. */
+static ssize_t net_sock_write_userspace(thread_t *cur, int fd, ksock_net_t *s, const void *bufp, size_t cnt) {
+    static int tcp_wr_dbg_left = 16;
+    if (!s) return -EINVAL;
+    if (s->unix_domain_stub) {
+        if (!bufp || cnt == 0) return -EINVAL;
+        if (!user_range_ok(bufp, cnt)) return -EFAULT;
+        return (ssize_t)cnt;
+    }
+    if (s->sock_domain == AF_NETLINK_LOCAL) {
+        if (!bufp || cnt == 0) return -EINVAL;
+        if (cnt < sizeof(nlmsghdr_k) || !user_range_ok(bufp, cnt)) return -EFAULT;
+        uint8_t pkt[256];
+        size_t cp = (cnt > sizeof(pkt)) ? sizeof(pkt) : cnt;
+        if (copy_from_user_raw(pkt, bufp, cp) != 0) return -EFAULT;
+        nlmsghdr_k *h = (nlmsghdr_k *)pkt;
+        if (h->nlmsg_len < sizeof(*h) || h->nlmsg_len > cnt) return -EINVAL;
+        if (s->nl_pid == 0) s->nl_pid = (uint32_t)((cur && cur->tid) ? cur->tid : 1);
+        (void)netlink_build_route_dump(s, h->nlmsg_type, h->nlmsg_seq);
+        return (ssize_t)cnt;
+    }
+    if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
+        if (s->dns_tcp_udp_bridge) {
+            if (!bufp || cnt == 0 || !user_range_ok(bufp, cnt)) return -EFAULT;
+            if (!s->connected) return -EDESTADDRREQ;
+            if (cnt > 2048) return -EINVAL;
+            if (s->local_port == 0)
+                s->local_port = net_alloc_ephemeral_port();
+            uint8_t *payload = (uint8_t *)kmalloc(cnt);
+            if (!payload) return -ENOMEM;
+            if (copy_from_user_raw(payload, bufp, cnt) != 0) {
+                kfree(payload);
+                return -EFAULT;
+            }
+            int r = net_send_udp_datagram(s->peer_ip_be, s->local_port, s->peer_port, payload, cnt);
+            kfree(payload);
+            if (r != 0) return (ssize_t)(e1000_is_ready() ? -EIO : -ENETDOWN);
+            return (ssize_t)cnt;
+        }
+        if (!bufp || cnt == 0 || !user_range_ok(bufp, cnt)) return -EFAULT;
+        size_t total = 0;
+        net_tcp_ops_t ops;
+        net_make_tcp_ops(&ops);
+        if (tcp_wr_dbg_left-- > 0) {
+            klogprintf("tcp: write fd=%d cnt=%u dst=%u.%u.%u.%u:%u\n",
+                fd, (unsigned)cnt,
+                (unsigned)((s->peer_ip_be >> 24) & 0xFF), (unsigned)((s->peer_ip_be >> 16) & 0xFF),
+                (unsigned)((s->peer_ip_be >> 8) & 0xFF), (unsigned)(s->peer_ip_be & 0xFF),
+                (unsigned)s->peer_port);
+        }
+        while (total < cnt) {
+            size_t chunk = cnt - total;
+            if (chunk > 4096) chunk = 4096;
+            uint8_t *tmp = (uint8_t *)kmalloc(chunk);
+            if (!tmp) return (ssize_t)((total > 0) ? (ssize_t)total : -ENOMEM);
+            if (copy_from_user_raw(tmp, (const uint8_t *)bufp + total, chunk) != 0) {
+                kfree(tmp);
+                return (ssize_t)((total > 0) ? (ssize_t)total : -EFAULT);
+            }
+            int wr = net_tcp_send(&s->tcp, &ops, tmp, chunk, 30000);
+            kfree(tmp);
+            if (wr < 0) {
+                if (tcp_wr_dbg_left >= 0) klogprintf("tcp: write net_tcp_send failed wr=%d total=%u\n", wr, (unsigned)total);
+                return (ssize_t)((total > 0) ? (ssize_t)total : -EIO);
+            }
+            total += (size_t)wr;
+            if ((size_t)wr < chunk) break;
+        }
+        return (ssize_t)total;
+    }
+    if (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) {
+        if (!bufp || cnt == 0 || !user_range_ok(bufp, cnt)) return -EFAULT;
+        if (!s->connected) return -EDESTADDRREQ;
+        if (cnt > 2048) return -EINVAL;
+        if (s->local_port == 0)
+            s->local_port = net_alloc_ephemeral_port();
+        uint8_t *payload = (uint8_t *)kmalloc(cnt);
+        if (!payload) return -ENOMEM;
+        if (copy_from_user_raw(payload, bufp, cnt) != 0) {
+            kfree(payload);
+            return -EFAULT;
+        }
+        int r = net_send_udp_datagram(s->peer_ip_be, s->local_port, s->peer_port, payload, cnt);
+        kfree(payload);
+        if (r != 0) return (ssize_t)(e1000_is_ready() ? -EIO : -ENETDOWN);
+        return (ssize_t)cnt;
+    }
+    return -EINVAL;
+}
+
+/* read()/readv() on sockets; readv uses repeated calls (UDP rx_pending_off preserves datagram). */
+static ssize_t net_sock_read_userspace(thread_t *cur, ksock_net_t *s, void *bufp, size_t cnt) {
+    (void)cur;
+    if (!s) return -EINVAL;
+    if (s->unix_domain_stub) {
+        if (cnt == 0) return 0;
+        if (!bufp || !user_range_ok(bufp, cnt)) return -EFAULT;
+        return 0;
+    }
+    if (s->sock_domain == AF_NETLINK_LOCAL) {
+        if (cnt == 0) return 0;
+        if (!bufp || !user_range_ok(bufp, cnt)) return -EFAULT;
+        if (s->nl_rx_off >= s->nl_rx_len) return -EAGAIN;
+        size_t avail = s->nl_rx_len - s->nl_rx_off;
+        size_t ncopy = (avail > cnt) ? cnt : avail;
+        if (copy_to_user_safe(bufp, s->nl_rx + s->nl_rx_off, ncopy) != 0) return -EFAULT;
+        s->nl_rx_off += ncopy;
+        return (ssize_t)ncopy;
+    }
+    if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
+        if (s->dns_tcp_udp_bridge) {
+            if (!bufp || cnt == 0 || !user_range_ok(bufp, cnt)) return -EFAULT;
+            size_t cap = cnt > 8192 ? 8192 : cnt;
+            uint8_t *utmp = (uint8_t *)kmalloc(cap);
+            if (!utmp) return -ENOMEM;
+            if (!s->rx_has_pending) {
+                int pr = net_udp_recv_into_pending(s);
+                if (pr != 1) {
+                    kfree(utmp);
+                    if (pr == 0) return (ssize_t)(s->nonblock ? -EAGAIN : -ETIMEDOUT);
+                    return -EIO;
+                }
+            }
+            int n = 0;
+            ksock_rx_pending_normalize(s);
+            if (s->rx_has_pending) {
+                size_t avail = ksock_rx_pending_avail(s);
+                n = (int)((avail > cap) ? cap : avail);
+                if (n > 0) memcpy(utmp, s->rx_pending + s->rx_pending_off, (size_t)n);
+                s->rx_pending_off += (size_t)n;
+                if (s->rx_pending_off >= s->rx_pending_len) {
+                    s->rx_has_pending = 0;
+                    s->rx_pending_off = 0;
+                    s->rx_pending_len = 0;
+                }
+            }
+            if (n > 0 && copy_to_user_safe(bufp, utmp, (size_t)n) != 0) {
+                kfree(utmp);
+                return -EFAULT;
+            }
+            kfree(utmp);
+            if (n <= 0) return -EAGAIN;
+            return (ssize_t)n;
+        }
+        if (!bufp || cnt == 0 || !user_range_ok(bufp, cnt)) return -EFAULT;
+        net_tcp_ops_t ops;
+        net_make_tcp_ops(&ops);
+        size_t chunk = cnt;
+        if (chunk > 4096) chunk = 4096;
+        uint8_t *tmp = (uint8_t *)kmalloc(chunk);
+        if (!tmp) return -ENOMEM;
+        int rr = net_tcp_recv(&s->tcp, &ops, tmp, chunk, 60000);
+        if (rr > 0) {
+            if (copy_to_user_safe(bufp, tmp, (size_t)rr) != 0) {
+                kfree(tmp);
+                return -EFAULT;
+            }
+            kfree(tmp);
+            return (ssize_t)rr;
+        }
+        kfree(tmp);
+        if (rr == 0) return 0;
+        return (ssize_t)((rr == -2) ? -ETIMEDOUT : -EAGAIN);
+    }
+    if (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) {
+        if (!bufp || cnt == 0 || !user_range_ok(bufp, cnt)) return -EFAULT;
+        size_t cap = cnt > 8192 ? 8192 : cnt;
+        uint8_t *tmp = (uint8_t *)kmalloc(cap);
+        if (!tmp) return -ENOMEM;
+        if (!s->rx_has_pending) {
+            int pr = net_udp_recv_into_pending(s);
+            if (pr != 1) {
+                kfree(tmp);
+                if (pr == 0) return (ssize_t)(s->nonblock ? -EAGAIN : -ETIMEDOUT);
+                return -EIO;
+            }
+        }
+        int n = 0;
+        ksock_rx_pending_normalize(s);
+        if (s->rx_has_pending) {
+            size_t avail = ksock_rx_pending_avail(s);
+            n = (int)((avail > cap) ? cap : avail);
+            if (n > 0) memcpy(tmp, s->rx_pending + s->rx_pending_off, (size_t)n);
+            s->rx_pending_off += (size_t)n;
+            if (s->rx_pending_off >= s->rx_pending_len) {
+                s->rx_has_pending = 0;
+                s->rx_pending_off = 0;
+                s->rx_pending_len = 0;
+            }
+        }
+        if (n > 0 && copy_to_user_safe(bufp, tmp, (size_t)n) != 0) {
+            kfree(tmp);
+            return -EFAULT;
+        }
+        kfree(tmp);
+        if (n <= 0) return -EAGAIN;
+        return (ssize_t)n;
+    }
+    if (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_ICMP_LOCAL) {
+        if (!bufp || cnt == 0 || !user_range_ok(bufp, cnt)) return -EFAULT;
+        size_t cap = cnt > 8192 ? 8192 : cnt;
+        uint8_t *tmp = (uint8_t *)kmalloc(cap);
+        if (!tmp) return -ENOMEM;
+        uint32_t timeout_ms = user_itimer_interval_ms ? user_itimer_interval_ms : 2500u;
+        int n = net_recv_icmp_echo_reply(s, tmp, cap, timeout_ms, NULL);
+        if (n < 0) {
+            kfree(tmp);
+            return -EIO;
+        }
+        if (n == 0) {
+            kfree(tmp);
+            return -ETIMEDOUT;
+        }
+        if (copy_to_user_safe(bufp, tmp, (size_t)n) != 0) {
+            kfree(tmp);
+            return -EFAULT;
+        }
+        kfree(tmp);
+        return (ssize_t)n;
+    }
+    return -EINVAL;
+}
+
 /* Linux x86_64 rt_sigframe layout for signal delivery. */
 #pragma pack(push, 1)
 typedef struct {
@@ -2134,6 +3074,7 @@ static uint32_t user_rand_state = 0xA53C9E11u;
 /* Very small user VM allocator (identity-mapped).
    We keep it below the user stack region and below the kernel heap floor. */
 static uintptr_t user_mmap_next = 0;
+static uintptr_t user_mmap_hi = 0;
 static uintptr_t user_brk_base = 0;
 static uintptr_t user_brk_cur = 0;
 static inline uintptr_t align_up_u(uintptr_t v, uintptr_t a);
@@ -2155,10 +3096,12 @@ void syscall_set_user_brk(uintptr_t base) {
            Parent (sh) may have bumped user_mmap_next above heap_lo (64 MiB), causing
            ENOMEM for child (wget) on first mmap. */
         tcur->user_mmap_next = 0;
+        tcur->user_mmap_hi = 0;
     } else {
         user_brk_base = base;
         user_brk_cur = base;
         user_mmap_next = 0;
+        user_mmap_hi = 0;
     }
 }
 
@@ -2179,6 +3122,12 @@ int fault_try_grow_user_heap(uint64_t cr2) {
         top_limit = (heap_lo > guard) ? (heap_lo - guard) : heap_lo;
     }
     uintptr_t page_va = (uintptr_t)cr2 & ~((uintptr_t)PAGE_SIZE_2M - 1);
+    /* Heap and lazy brk live only in low canonical identity map. Faults at high
+     * canonical addresses (e.g. 0xffffffffffe00000) come from corrupted malloc state;
+     * treating them as brk growth would memset() outside the identity map and #PF in CPL0.
+     * Also reject unsigned wrap on page_va + PAGE_SIZE_2M. */
+    if (page_va >= (uintptr_t)MMIO_IDENTITY_LIMIT) return 0;
+    if (page_va + PAGE_SIZE_2M < page_va) return 0;
     if (page_va < brk_base || page_va + PAGE_SIZE_2M > top_limit) return 0;
     if (page_va < brk_cur) return 0; /* should already be mapped */
     if (map_page_2m(page_va, page_va, PG_PRESENT | PG_RW | PG_US) != 0) return 0;
@@ -2448,10 +3397,39 @@ static void send_hup_to_session(int sid) {
     devfs_clear_controlling_by_sid(sid);
 }
 
+static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6);
+
+/* Verbose per-syscall trace for /usr/bin/wget (budget-limited). Set left=0 to disable. */
+static void axon_wget_sc_log(uint64_t num, uint64_t rax, uint64_t a1, uint64_t a2, uint64_t a3) {
+    thread_t *t = thread_get_current_user();
+    if (!t) t = thread_current();
+    if (!t || !t->name[0]) return;
+    if (!strstr(t->name, "wget")) return;
+    static int wget_sc_left = 512;
+    static int wget_sc_warned;
+    if (wget_sc_left <= 0) {
+        if (!wget_sc_warned) {
+            wget_sc_warned = 1;
+            kprintf("WGET-SC: trace budget exhausted (disable in axon_wget_sc_log)\n");
+        }
+        return;
+    }
+    wget_sc_left--;
+    int64_t sr = (int64_t)rax;
+    if (sr < 0 && sr >= -4096) {
+        kprintf("WGET-SC nr=%llu ERR=%d a1=0x%llx a2=0x%llx a3=0x%llx\n",
+            (unsigned long long)num, (int)(-sr),
+            (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)a3);
+    } else {
+        kprintf("WGET-SC nr=%llu rax=0x%llx a1=0x%llx a2=0x%llx\n",
+            (unsigned long long)num, (unsigned long long)rax,
+            (unsigned long long)a1, (unsigned long long)a2);
+    }
+}
 
 /* Common syscall dispatcher used by both int0x80 and SYSCALL.
    Calling convention follows Linux x86_64: num + up to 6 args. */  
-uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
+static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
     /* IMPORTANT:
        current_user can be stale if some subsystem (e.g. tty switching) overwrote it.
        Syscalls must be handled for the *currently running* thread. */
@@ -2480,12 +3458,13 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
 
     /* record last syscall for debug logging of ENOSYS */
     last_syscall_debug = num;
-    if (num != 1) {qemu_debug_printf("SYSCALL: num=%u\n", num); }
+
+    //if (num != 1) klogprintf("syscall: num=%llu\n", (unsigned long long)num);
 
     switch (num) {
         case SYS_clone: {
             /* Minimal compatibility: treat clone() without complex flags as fork(). */
-            return syscall_do(SYS_fork, 0, 0, 0, 0, 0, 0);
+            return syscall_do_inner(SYS_fork, 0, 0, 0, 0, 0, 0);
         }
         case SYS_clone3: {
             /* clone3(cl_args, size) - glibc pthreads passes user stack; must use it or advise_stack_range assert fails */
@@ -2625,6 +3604,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 child->user_brk_base = cur->user_brk_base;
                 child->user_brk_cur = cur->user_brk_cur;
                 child->user_mmap_next = cur->user_mmap_next;
+                child->user_mmap_hi = cur->user_mmap_hi;
                 /* Parent must not mmap into child's stack; bump parent's user_mmap_next above stack region. */
                 {
                     uintptr_t stack_end = child->user_stack_limit;
@@ -2653,7 +3633,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 thread_unblock((int)(child->tid ? child->tid : 1));
                 return (uint64_t)(child->tid ? child->tid : 1);
             }
-            return syscall_do(SYS_fork, 0, 0, 0, 0, 0, 0);
+            return syscall_do_inner(SYS_fork, 0, 0, 0, 0, 0, 0);
         }
         case SYS_set_tid_address: {
             /* set_tid_address(int *tidptr): used by glibc to set clear_child_tid. */
@@ -2791,19 +3771,21 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 }
                 /* copy active stack slice */
                 memcpy((void*)child_rsp, (void*)(uintptr_t)saved_rsp, (size_t)copy_bytes);
-                /* Relocate pointers inside the copied stack slice itself */
+                /* Relocate pointers inside the copied stack slice itself.
+                   Use nv = child_rsp + (vv - parent_lo) so a lower child_rsp than parent_lo
+                   never triggers unsigned wrap (was: vv + (uintptr_t)(child - parent)). */
                 {
                     const uintptr_t parent_lo = (uintptr_t)saved_rsp;
                     const uintptr_t parent_hi = parent_lo + (uintptr_t)copy_bytes;
-                    const uintptr_t delta = (uintptr_t)child_rsp - parent_lo;
                     uintptr_t pp = (uintptr_t)child_rsp;
                     uintptr_t end = (uintptr_t)child_rsp + (uintptr_t)copy_bytes;
                     for (; pp + 8 <= end; pp += 8) {
                         uint64_t v = 0;
                         if (user_read_u64((const void *)(uintptr_t)pp, &v) != 0) return ret_err(EFAULT);
                         uintptr_t vv = (uintptr_t)v;
-                        if (vv >= parent_lo && vv < parent_hi) {
-                            if (user_write_u64((void *)(uintptr_t)pp, (uint64_t)(vv + delta)) != 0)
+                        if ((vv & 7u) == 0 && vv >= parent_lo && vv < parent_hi) {
+                            uintptr_t nv = (uintptr_t)child_rsp + (uintptr_t)(vv - parent_lo);
+                            if (user_write_u64((void *)(uintptr_t)pp, (uint64_t)nv) != 0)
                                 return ret_err(EFAULT);
                         }
                     }
@@ -3212,6 +4194,54 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (r == 0) return 0;
             return ret_err(r < 0 ? -r : EIO);
         }
+        case 87: { /* unlink(path) */
+            const char *path_u = (const char*)(uintptr_t)a1;
+            if (!path_u) return ret_err(EFAULT);
+            if ((uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+            char path[256];
+            resolve_user_path(cur, path_u, path, sizeof(path));
+            int r = fs_unlink(path);
+            if (r == 0) return 0;
+            if (r == -3) return ret_err(ENOENT);
+            if (r == -2) return ret_err(EPERM);
+            if (r == -1) return ret_err(EPERM);
+            return ret_err(r < 0 ? -r : EIO);
+        }
+        case 263: { /* unlinkat(dirfd, path, flags) */
+            int dirfd = (int)a1;
+            const char *path_u = (const char*)(uintptr_t)a2;
+            int flags = (int)a3;
+            (void)flags; /* we don't support AT_REMOVEDIR etc yet */
+            if (!path_u || (uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+            char path[256];
+            int rc = resolve_user_path_at(cur, dirfd, path_u, path, sizeof(path));
+            if (rc != 0) return ret_err(-rc);
+            int r = fs_unlink(path);
+            if (r == 0) return 0;
+            if (r == -3) return ret_err(ENOENT);
+            if (r == -2) return ret_err(EPERM);
+            if (r == -1) return ret_err(EPERM);
+            return ret_err(r < 0 ? -r : EIO);
+        }
+        case 265: { /* linkat(olddirfd, oldpath, newdirfd, newpath, flags) */
+            int olddirfd = (int)a1;
+            const char *oldpath_u = (const char*)(uintptr_t)a2;
+            int newdirfd = (int)a3;
+            const char *newpath_u = (const char*)(uintptr_t)a4;
+            int flags = (int)a5;
+            (void)flags;
+            if (!oldpath_u || !newpath_u) return ret_err(EFAULT);
+            if ((uintptr_t)oldpath_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+            if ((uintptr_t)newpath_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+            char oldpath[256], newpath[256];
+            int rc1 = resolve_user_path_at(cur, olddirfd, oldpath_u, oldpath, sizeof(oldpath));
+            if (rc1 != 0) return ret_err(-rc1);
+            int rc2 = resolve_user_path_at(cur, newdirfd, newpath_u, newpath, sizeof(newpath));
+            if (rc2 != 0) return ret_err(-rc2);
+            int r = fs_link(oldpath, newpath);
+            if (r == 0) return 0;
+            return ret_err(r < 0 ? -r : EIO);
+        }
         case SYS_rename: {
             /* rename(oldpath, newpath) - syscall 82; rpm needs this for move */
             const char *oldpath_u = (const char*)(uintptr_t)a1;
@@ -3243,6 +4273,27 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             int r = fs_rename(oldpath, newpath);
             if (r == 0) return 0;
             /* Map fs driver internal codes to Linux errno (ramfs uses -1,-2,-3,-5) */
+            if (r == -2) return ret_err(ENOENT);
+            if (r == -3) return ret_err(ENOTDIR);
+            if (r == -5) return ret_err(ENOMEM);
+            if (r == -17) return ret_err(EEXIST);
+            return ret_err(r < 0 ? -r : EIO);
+        }
+        case 264: { /* renameat(olddirfd, oldpath, newdirfd, newpath) */
+            int olddirfd = (int)a1;
+            const char *oldpath_u = (const char*)(uintptr_t)a2;
+            int newdirfd = (int)a3;
+            const char *newpath_u = (const char*)(uintptr_t)a4;
+            if (!oldpath_u || !newpath_u) return ret_err(EFAULT);
+            if ((uintptr_t)oldpath_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+            if ((uintptr_t)newpath_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+            char oldpath[256], newpath[256];
+            int rc1 = resolve_user_path_at(cur, olddirfd, oldpath_u, oldpath, sizeof(oldpath));
+            if (rc1 != 0) return ret_err(-rc1);
+            int rc2 = resolve_user_path_at(cur, newdirfd, newpath_u, newpath, sizeof(newpath));
+            if (rc2 != 0) return ret_err(-rc2);
+            int r = fs_rename(oldpath, newpath);
+            if (r == 0) return 0;
             if (r == -2) return ret_err(ENOENT);
             if (r == -3) return ret_err(ENOTDIR);
             if (r == -5) return ret_err(ENOMEM);
@@ -3318,16 +4369,37 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             int clk = (int)a1;
             void *tp = (void*)(uintptr_t)a2;
             if (!tp) return ret_err(EFAULT);
-            if ((uintptr_t)tp + sizeof(int64_t) * 2 > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-            /* We only provide monotonic-ish time since boot. */
-            enum { CLOCK_REALTIME = 0, CLOCK_MONOTONIC = 1 };
-            if (!(clk == CLOCK_REALTIME || clk == CLOCK_MONOTONIC)) return ret_err(EINVAL);
-            uint64_t ms = pit_get_time_ms();
-            int64_t sec = (int64_t)(ms / 1000ULL);
-            int64_t nsec = (int64_t)((ms % 1000ULL) * 1000000ULL);
-            /* struct timespec { long tv_sec; long tv_nsec; } on x86_64 */
-            ((int64_t*)tp)[0] = sec;
-            ((int64_t*)tp)[1] = nsec;
+            if (!user_range_ok(tp, 16)) return ret_err(EFAULT);
+            /* Linux clock ids (glibc wget uses MONOTONIC_RAW, COARSE, BOOTTIME, …). */
+            enum {
+                CLOCK_REALTIME = 0,
+                CLOCK_MONOTONIC = 1,
+                CLOCK_PROCESS_CPUTIME_ID = 2,
+                CLOCK_THREAD_CPUTIME_ID = 3,
+                CLOCK_MONOTONIC_RAW = 4,
+                CLOCK_REALTIME_COARSE = 5,
+                CLOCK_MONOTONIC_COARSE = 6,
+                CLOCK_BOOTTIME = 7
+            };
+            if (clk < 0 || clk > 15) return ret_err(EINVAL);
+            int64_t sec, nsec;
+            if (clk == CLOCK_REALTIME || clk == CLOCK_REALTIME_COARSE) {
+                rtc_datetime_t dt;
+                rtc_read_datetime(&dt);
+                uint64_t secs = rtc_datetime_to_epoch(&dt);
+                uint64_t sub = pit_get_time_ms() % 1000ULL;
+                sec = (int64_t)secs;
+                nsec = (int64_t)(sub * 1000000ULL);
+            } else {
+                /* Monotonic, raw, coarse, boottime, thread/process CPU: PIT since boot */
+                uint64_t ms = pit_get_time_ms();
+                sec = (int64_t)(ms / 1000ULL);
+                nsec = (int64_t)((ms % 1000ULL) * 1000000ULL);
+            }
+            struct timespec_k { int64_t tv_sec; int64_t tv_nsec; } ts;
+            ts.tv_sec = sec;
+            ts.tv_nsec = nsec;
+            if (copy_to_user_safe(tp, &ts, sizeof(ts)) != 0) return ret_err(EFAULT);
             return 0;
         }
         case 96: /* Linux uses 96 for gettimeofday; glibc may call it */
@@ -3456,11 +4528,42 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             size_t bytes = (size_t)iovcnt * sizeof(iov[0]);
             if (copy_from_user_raw(iov, iov_u, bytes) != 0) return ret_err(EFAULT);
 
+            if (f->type == SYSCALL_FTYPE_SOCKET && f->driver_private) {
+                ksock_net_t *s = (ksock_net_t *)f->driver_private;
+                uint64_t sum64 = 0;
+                for (int i = 0; i < iovcnt; i++) sum64 += (uint64_t)iov[i].len;
+                if (sum64 == 0) return 0;
+                if (sum64 > 65536u) return ret_err(EINVAL);
+                size_t sum = (size_t)sum64;
+                uint8_t *flat = (uint8_t *)kmalloc(sum);
+                if (!flat) return ret_err(ENOMEM);
+                size_t at = 0;
+                for (int i = 0; i < iovcnt; i++) {
+                    size_t len = (size_t)iov[i].len;
+                    if (len == 0) continue;
+                    const void *base = (const void *)(uintptr_t)iov[i].base;
+                    if (!user_range_ok(base, len)) {
+                        kfree(flat);
+                        return ret_err(EFAULT);
+                    }
+                    if (copy_from_user_raw(flat + at, base, len) != 0) {
+                        kfree(flat);
+                        return ret_err(EFAULT);
+                    }
+                    at += len;
+                }
+                ssize_t wr = net_sock_write_userspace(cur, fd, s, flat, sum);
+                kfree(flat);
+                if (wr < 0) return ret_err((int)-wr);
+                return (uint64_t)wr;
+            }
+
             uint64_t total = 0;
             for (int i = 0; i < iovcnt; i++) {
                 const void *base = (const void*)(uintptr_t)iov[i].base;
                 size_t len = (size_t)iov[i].len;
                 if (len == 0) continue;
+                if (!user_range_ok(base, len)) return (total > 0) ? (uint64_t)total : ret_err(EFAULT);
                 /* Clamp per-chunk to avoid huge kmalloc; write in pieces. */
                 size_t off = 0;
                 while (off < len) {
@@ -3470,10 +4573,15 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     void *tmp = copy_from_user_safe((const uint8_t*)base + off, chunk, 4096, &copied);
                     if (!tmp && chunk > 512) { chunk = 512; tmp = copy_from_user_safe((const uint8_t*)base + off, chunk, 512, &copied); }
                     if (!tmp) return (total > 0) ? (uint64_t)total : ret_err(EFAULT);
-                    ssize_t wr = fs_write(f, tmp, copied, f->pos);
+                    ssize_t wr;
+                    if (f->type == FS_TYPE_PIPE && f->fs_private == (void *)1 && f->driver_private) {
+                        wr = pipe_write_bytes((pipe_t *)f->driver_private, tmp, copied, cur);
+                    } else {
+                        wr = fs_write(f, tmp, copied, f->pos);
+                    }
                     kfree(tmp);
-                    if (wr <= 0) return (total > 0) ? total : ret_err(EINVAL);
-                    f->pos += (size_t)wr;
+                    if (wr <= 0) return (total > 0) ? total : ret_err((int)(-wr ? -wr : EINVAL));
+                    if (f->type != FS_TYPE_PIPE) f->pos += (size_t)wr;
                     total += (uint64_t)wr;
                     off += (size_t)wr;
                     if ((size_t)wr < copied) break;
@@ -3505,7 +4613,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 const void *base = (const void*)(uintptr_t)iov[i].base;
                 size_t len = (size_t)iov[i].len;
                 if (len == 0) continue;
-                if ((uintptr_t)base + len > (uintptr_t)MMIO_IDENTITY_LIMIT) return (total > 0) ? total : ret_err(EFAULT);
+                if (!user_range_ok(base, len)) return (total > 0) ? total : ret_err(EFAULT);
                 /* Clamp per-chunk to avoid huge kmalloc; write in pieces. */
                 size_t off = 0;
                 while (off < len) {
@@ -3697,26 +4805,190 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             uint64_t sig  = a3;
             uint64_t self = (uint64_t)(cur->tid ? cur->tid : 1);
             if (tgid == self && tid == self && sig == 6 /* SIGABRT */) {
-                return syscall_do(SYS_exit_group, 134, 0, 0, 0, 0, 0);  /* 134 = 128+SIGABRT */
+                return syscall_do_inner(SYS_exit_group, 134, 0, 0, 0, 0, 0);  /* 134 = 128+SIGABRT */
             }
             if (tgid == self && tid == self) return 0;
             return ret_err(ESRCH);
         }
         case SYS_select: { /* select(nfds, readfds, writefds, exceptfds, timeout) - minimal stub */
+            /* Minimal but functional select():
+               - supports readfds/writefds (exceptfds ignored)
+               - readiness model mirrors SYS_poll implementation (TTY/pipe/file/socket)
+               - services TCP (net_tcp_service) and polls e1000 while blocking */
             int nfds = (int)a1;
-            (void)a2; (void)a3; (void)a4;
-            void *timeout_u = (void*)(uintptr_t)a5;
-            if (nfds < 0) return ret_err(EINVAL);
+            void *readfds_u  = (void*)(uintptr_t)a2;
+            void *writefds_u = (void*)(uintptr_t)a3;
+            (void)a4; /* exceptfds */
+            void *timeout_u  = (void*)(uintptr_t)a5;
+            if (nfds < 0 || nfds > THREAD_MAX_FD) return ret_err(EINVAL);
+
+            /* fd_set is a bitset; assume Linux layout with 64-bit words. */
+            size_t nwords = (nfds <= 0) ? 0 : (size_t)((nfds + 63) / 64);
+            size_t bytes = nwords * sizeof(uint64_t);
+
+            uint64_t *rin = NULL, *win = NULL;
+            uint64_t *rout = NULL, *wout = NULL;
+            if (bytes) {
+                if (readfds_u)  { rin  = (uint64_t*)kmalloc(bytes); rout = (uint64_t*)kmalloc(bytes); }
+                if (writefds_u) { win  = (uint64_t*)kmalloc(bytes); wout = (uint64_t*)kmalloc(bytes); }
+                if ((readfds_u && (!rin || !rout)) || (writefds_u && (!win || !wout))) {
+                    if (rin) kfree(rin); if (rout) kfree(rout);
+                    if (win) kfree(win); if (wout) kfree(wout);
+                    return ret_err(ENOMEM);
+                }
+                if (readfds_u)  { if (copy_from_user_raw(rin,  readfds_u,  bytes) != 0) { kfree(rin); kfree(rout); if (win) kfree(win); if (wout) kfree(wout); return ret_err(EFAULT); } }
+                if (writefds_u) { if (copy_from_user_raw(win,  writefds_u, bytes) != 0) { if (rin) kfree(rin); if (rout) kfree(rout); kfree(win); kfree(wout); return ret_err(EFAULT); } }
+            }
+
+            int timeout_ms = -1; /* NULL => infinite */
             if (timeout_u && (uintptr_t)timeout_u < (uintptr_t)MMIO_IDENTITY_LIMIT) {
                 struct timeval_k { int64_t tv_sec; int64_t tv_usec; } tv;
-                if (copy_from_user_raw(&tv, timeout_u, sizeof(tv)) == 0 && (tv.tv_sec > 0 || tv.tv_usec > 0)) {
-                    uint64_t ms = (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)(tv.tv_usec / 1000ULL);
-                    if (ms == 0 && tv.tv_usec > 0) ms = 1;
-                    if (ms > 0) thread_sleep((uint32_t)(ms > 0xFFFFFFFFULL ? 0xFFFFFFFFU : (uint32_t)ms));
+                if (copy_from_user_raw(&tv, timeout_u, sizeof(tv)) != 0) {
+                    if (rin) kfree(rin); if (rout) kfree(rout);
+                    if (win) kfree(win); if (wout) kfree(wout);
+                    return ret_err(EFAULT);
                 }
+                if (tv.tv_sec < 0 || tv.tv_usec < 0) {
+                    if (rin) kfree(rin); if (rout) kfree(rout);
+                    if (win) kfree(win); if (wout) kfree(wout);
+                    return ret_err(EINVAL);
+                }
+                uint64_t ms = (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)(tv.tv_usec / 1000ULL);
+                if (ms == 0 && tv.tv_usec > 0) ms = 1;
+                if (ms > 0x7FFFFFFFULL) ms = 0x7FFFFFFFULL;
+                timeout_ms = (int)ms;
             }
-            /* No fd readiness; return 0 (timeout / no events) */
-            return 0;
+
+            thread_t *curth = thread_get_current_user();
+            if (!curth) curth = thread_current();
+
+            auto_select_check:
+            {
+                if (rout) memset(rout, 0, bytes);
+                if (wout) memset(wout, 0, bytes);
+                int ready = 0;
+                int has_net_socket = 0;
+
+                for (int fd = 0; fd < nfds; fd++) {
+                    int want_r = 0, want_w = 0;
+                    if (rin)  want_r = (int)((rin[fd / 64]  >> (fd % 64)) & 1ULL);
+                    if (win)  want_w = (int)((win[fd / 64]  >> (fd % 64)) & 1ULL);
+                    if (!want_r && !want_w) continue;
+
+                    struct fs_file *f = curth ? curth->fds[fd] : NULL;
+                    int can_r = 0, can_w = 0;
+                    if (!f) {
+                        /* invalid fd: POSIX would error via EBADF; keep it simple for now */
+                        continue;
+                    }
+
+                    if (want_r) {
+                        if (devfs_is_tty_file(f)) {
+                            int tidx = devfs_get_tty_index_from_file(f);
+                            if (tidx < 0) tidx = devfs_get_active();
+                            if (devfs_tty_available(tidx) > 0) can_r = 1;
+                        } else if (f->type == SYSCALL_FTYPE_SOCKET && f->driver_private) {
+                            ksock_net_t *s = (ksock_net_t *)f->driver_private;
+                            if ((s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) ||
+                                (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL))
+                                has_net_socket = 1;
+
+                            if (s->sock_domain == AF_NETLINK_LOCAL) {
+                                if (s->nl_rx_off < s->nl_rx_len) can_r = 1;
+                            } else if (s->unix_domain_stub && s->connected) {
+                                can_r = 1;
+                            } else if ((s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) ||
+                                       (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && s->dns_tcp_udp_bridge)) {
+                                if (s->rx_has_pending) can_r = 1;
+                                else {
+                                    uint32_t sip = 0;
+                                    uint16_t sport = 0;
+                                    int rn = net_recv_udp_datagram(s, s->rx_pending, sizeof(s->rx_pending), 0, &sip, &sport);
+                                    if (rn > 0) {
+                                        ksock_rx_pending_install(s, rn);
+                                        s->rx_pending_src_ip_be = sip;
+                                        s->rx_pending_src_port = sport;
+                                        can_r = 1;
+                                    }
+                                }
+                            } else if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
+                                net_tcp_ops_t ops;
+                                net_make_tcp_ops(&ops);
+                                (void)net_tcp_service(&s->tcp, &ops, 4);
+                                if (s->tcp.rx_len > 0 || s->tcp.peer_fin) can_r = 1;
+                            }
+                        } else if (f->type == FS_TYPE_PIPE && f->driver_private) {
+                            pipe_t *p = (pipe_t *)f->driver_private;
+                            unsigned long fl = 0;
+                            acquire_irqsave(&p->lock, &fl);
+                            size_t used = (p->head >= p->tail) ? (p->head - p->tail) : (p->size - p->tail + p->head);
+                            int is_write_end = (f->fs_private == (void *)1);
+                            release_irqrestore(&p->lock, fl);
+                            if (!is_write_end && used > 0) can_r = 1;
+                        } else {
+                            if (f->type == FS_TYPE_DIR) can_r = 1;
+                            else if ((size_t)f->pos < (size_t)f->size) can_r = 1;
+                        }
+                    }
+
+                    if (want_w) {
+                        if (f->type == SYSCALL_FTYPE_SOCKET && f->driver_private) {
+                            ksock_net_t *s = (ksock_net_t *)f->driver_private;
+                            if ((s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) ||
+                                (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL))
+                                has_net_socket = 1;
+                            if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && s->dns_tcp_udp_bridge) {
+                                can_w = 1;
+                            } else if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
+                                net_tcp_ops_t ops;
+                                net_make_tcp_ops(&ops);
+                                (void)net_tcp_service(&s->tcp, &ops, 4);
+                                if (s->tcp.established) can_w = 1;
+                            } else {
+                                can_w = 1;
+                            }
+                        } else if (f->type == FS_TYPE_PIPE && f->driver_private) {
+                            pipe_t *p = (pipe_t *)f->driver_private;
+                            unsigned long fl = 0;
+                            acquire_irqsave(&p->lock, &fl);
+                            size_t used = (p->head >= p->tail) ? (p->head - p->tail) : (p->size - p->tail + p->head);
+                            size_t free = (p->size > 1) ? ((p->size - 1) - used) : 0;
+                            int is_write_end = (f->fs_private == (void *)1);
+                            release_irqrestore(&p->lock, fl);
+                            if (is_write_end && free > 0) can_w = 1;
+                        } else {
+                            /* regular files: writable */
+                            can_w = 1;
+                        }
+                    }
+
+                    if (can_r && rout) { rout[fd / 64] |= (1ULL << (fd % 64)); ready++; }
+                    if (can_w && wout) { wout[fd / 64] |= (1ULL << (fd % 64)); if (!can_r) ready++; }
+                }
+
+                if (ready > 0) {
+                    if (readfds_u && rout)  { if (copy_to_user_safe(readfds_u,  rout, bytes) != 0) { if (rin) kfree(rin); if (rout) kfree(rout); if (win) kfree(win); if (wout) kfree(wout); return ret_err(EFAULT); } }
+                    if (writefds_u && wout) { if (copy_to_user_safe(writefds_u, wout, bytes) != 0) { if (rin) kfree(rin); if (rout) kfree(rout); if (win) kfree(win); if (wout) kfree(wout); return ret_err(EFAULT); } }
+                    if (rin) kfree(rin); if (rout) kfree(rout);
+                    if (win) kfree(win); if (wout) kfree(wout);
+                    return (uint64_t)ready;
+                }
+
+                if (timeout_ms == 0) {
+                    if (readfds_u && rout)  (void)copy_to_user_safe(readfds_u,  rout, bytes);
+                    if (writefds_u && wout) (void)copy_to_user_safe(writefds_u, wout, bytes);
+                    if (rin) kfree(rin); if (rout) kfree(rout);
+                    if (win) kfree(win); if (wout) kfree(wout);
+                    return 0;
+                }
+
+                int step = 10;
+                if (timeout_ms > 0 && timeout_ms < step) step = timeout_ms;
+                if (has_net_socket) e1000_poll();
+                thread_sleep((uint32_t)step);
+                if (timeout_ms > 0) timeout_ms -= step;
+                goto auto_select_check;
+            }
         }
         case SYS_nanosleep: { /* nanosleep(req, rem) - Linux 35 */
             const void *req_u = (const void*)(uintptr_t)a1;
@@ -3778,13 +5050,14 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             int domain = (int)a1;
             int type = (int)a2;
             int protocol = (int)a3;
+            int unix_stub = 0;
             int type_base = type & 0x0F; /* mask SOCK_NONBLOCK/CLOEXEC flags */
             if (domain == AF_INET_LOCAL) {
                 if (!(type_base == SOCK_RAW_LOCAL || type_base == SOCK_DGRAM_LOCAL || type_base == SOCK_STREAM_LOCAL)) return ret_err(ESOCKTNOSUPPORT);
                 if (type_base == SOCK_RAW_LOCAL) {
                     if (!(protocol == 0 || protocol == IPPROTO_ICMP_LOCAL)) return ret_err(EPROTONOSUPPORT);
                 } else if (type_base == SOCK_DGRAM_LOCAL) {
-                    if (!(protocol == 0 || protocol == IPPROTO_ICMP_LOCAL || protocol == IPPROTO_UDP_LOCAL)) return ret_err(EPROTONOSUPPORT);
+                    /* Protocol is normalized when storing s->protocol (glibc IPv6 path may pass 41, etc.). */
                 } else { /* SOCK_STREAM_LOCAL */
                     if (!(protocol == 0 || protocol == IPPROTO_TCP_LOCAL)) return ret_err(EPROTONOSUPPORT);
                 }
@@ -3799,8 +5072,9 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 /* getaddrinfo/glibc may pass AF_UNSPEC; treat as IPv4 */
                 domain = AF_INET_LOCAL;
             } else if (domain == 1) {
-                /* AF_UNIX: stub as AF_INET so socket() succeeds. connect() with sockaddr_un will fail,
-                   but wget/nss will fall back to /etc/hosts or other resolvers. Avoids errno=97 cascade. */
+                /* AF_UNIX: stub as AF_INET in the kernel, but emulate connect/send/recv so nss/glibc
+                   does not see ECONNREFUSED on nscd-style unix sockets (that breaks getaddrinfo). */
+                unix_stub = 1;
                 domain = AF_INET_LOCAL;
             } else {
                 /* Compatibility: map any other domain to IPv4 (AF_PACKET, odd values from getaddrinfo, etc).
@@ -3821,17 +5095,21 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (domain == AF_NETLINK_LOCAL) snprintf(p, 24, "socket:[netlink]");
             else snprintf(p, 24, "socket:[icmp]");
             s->sock_domain = domain;
+            s->unix_domain_stub = unix_stub;
             s->type_base = type_base;
             if (domain == AF_NETLINK_LOCAL) {
                 s->protocol = NETLINK_ROUTE_LOCAL;
             } else if (type_base == SOCK_RAW_LOCAL) s->protocol = (protocol == 0) ? IPPROTO_ICMP_LOCAL : protocol;
-            else if (type_base == SOCK_DGRAM_LOCAL) s->protocol = (protocol == 0) ? IPPROTO_UDP_LOCAL : protocol;
-            else s->protocol = (protocol == 0) ? IPPROTO_TCP_LOCAL : protocol;
+            else if (type_base == SOCK_DGRAM_LOCAL) {
+                /* Only SOCK_DGRAM + IPPROTO_ICMP is ping; everything else is UDP (DNS, resolver IPv6 sockets). */
+                s->protocol = (protocol == IPPROTO_ICMP_LOCAL) ? IPPROTO_ICMP_LOCAL : IPPROTO_UDP_LOCAL;
+            } else s->protocol = (protocol == 0) ? IPPROTO_TCP_LOCAL : protocol;
             s->connected = 0;
             s->peer_ip_be = 0;
             s->peer_port = 0;
             s->local_port = 0;
             s->next_echo_seq = 0;
+            s->nonblock = (type & O_NONBLOCK_LINUX) ? 1 : 0;
             f->path = p;
             f->type = SYSCALL_FTYPE_SOCKET;
             f->driver_private = s;
@@ -3882,40 +5160,84 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 if (s->nl_pid == 0) s->nl_pid = (uint32_t)((t && t->tid) ? t->tid : 1);
                 return 0;
             }
-            if (!addr_u || addrlen < sizeof(sockaddr_in_k) || !user_range_ok(addr_u, sizeof(sockaddr_in_k))) return ret_err(EFAULT);
+            if (s->unix_domain_stub) {
+                if (!addr_u || addrlen < sizeof(uint16_t) || !user_range_ok(addr_u, addrlen))
+                    return ret_err(EFAULT);
+                uint16_t fam = 0;
+                if (copy_from_user_raw(&fam, addr_u, sizeof(fam)) != 0) return ret_err(EFAULT);
+                if (fam == 1) { /* AF_UNIX */
+                    s->connected = 1;
+                    return 0;
+                }
+                /* Stub socket is backed by real IPv4 ksock; glibc may connect(AF_INET*) on this fd. */
+            }
             sockaddr_in_k to;
-            if (copy_from_user_raw(&to, addr_u, sizeof(to)) != 0) return ret_err(EFAULT);
-            /* AF_UNIX (1): return ECONNREFUSED so resolver falls back to /etc/hosts; EAFNOSUPPORT aborts */
-            if (to.sin_family == 1) return ret_err(ECONNREFUSED);
-            if (to.sin_family != AF_INET_LOCAL) return ret_err(EAFNOSUPPORT);
+            {
+                int pa = user_sockaddr_to_ipv4_peer(addr_u, addrlen, &to);
+                if (pa != 0) return ret_err(pa);
+            }
+            /* Inet peer: must not leave unix stub short-circuit in read/write/sendto paths. */
+            s->unix_domain_stub = 0;
             if (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) {
                 s->connected = 1;
-                s->peer_ip_be = be32(to.sin_addr);
-                s->peer_port = be16(to.sin_port);
-                if (s->local_port == 0) {
-                    uint16_t tid = (uint16_t)((t && t->tid) ? t->tid : 1);
-                    s->local_port = (uint16_t)(40000u + (tid % 20000u));
+                uint32_t pip = be32(to.sin_addr);
+                uint16_t pp = be16(to.sin_port);
+                /* resolv.conf on Linux often uses 127.0.0.53/127.0.0.1 — redirect to real DNS. */
+                if (pp == 53u && (pip & 0xFF000000u) == 0x7F000000u) {
+                    if (net_stack_init() == 0) {
+                        uint32_t ns = g_net.dns_be ? g_net.dns_be : g_net.gw_be;
+                        if (ns) pip = ns;
+                    }
                 }
+                s->peer_ip_be = pip;
+                s->peer_port = pp;
+                if (s->local_port == 0)
+                    s->local_port = net_alloc_ephemeral_port();
                 return 0;
             }
             if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
+                /* Userspace ABI: real Linux passes sin_addr in network byte order.
+                   Our historical userland (netdiag) passed a swapped value.
+                   To support both, try both interpretations on timeout. */
                 uint32_t dst_ip_be = be32(to.sin_addr);
+                uint32_t dst_ip_be_alt = to.sin_addr;
+                uint16_t dport = be16(to.sin_port);
+                /* glibc may try TCP to 127.0.0.1/127.0.0.53 :53 first; bridge to real nameserver over UDP. */
+                if (dport == 53u) {
+                    if (net_stack_init() != 0) return ret_err(ENETDOWN);
+                    uint32_t peer = dst_ip_be;
+                    if ((dst_ip_be & 0xFF000000u) == 0x7F000000u) {
+                        peer = g_net.dns_be ? g_net.dns_be : g_net.gw_be;
+                        if (peer == 0) return ret_err(ENETDOWN);
+                    }
+                    s->connected = 1;
+                    s->peer_ip_be = peer;
+                    s->peer_port = dport;
+                    if (s->local_port == 0)
+                        s->local_port = net_alloc_ephemeral_port();
+                    s->dns_tcp_udp_bridge = 1;
+                    memset(&s->tcp, 0, sizeof(s->tcp));
+                    return 0;
+                }
                 /* 127.0.0.1: loopback not implemented; return ECONNREFUSED immediately
                    instead of EIO timeout (no server listens on localhost). */
-                if (dst_ip_be == 0x7F000001u) /* 127.0.0.1 loopback - not implemented */
+                if (dst_ip_be == 0x7F000001u)
                     return ret_err(ECONNREFUSED);
                 if (net_stack_init() != 0) return ret_err(ENETDOWN);
                 { uint8_t drain[256]; for (int d = 0; d < 64; d++) { e1000_poll(); if (e1000_recv_frame(drain, sizeof(drain)) <= 0) break; } }
                 s->connected = 1;
                 s->peer_ip_be = dst_ip_be;
                 s->peer_port = be16(to.sin_port);
-                if (s->local_port == 0) {
-                    uint16_t tid = (uint16_t)((t && t->tid) ? t->tid : 1);
-                    s->local_port = (uint16_t)(45000u + (tid % 15000u));
-                }
+                if (s->local_port == 0)
+                    s->local_port = net_alloc_ephemeral_port();
                 net_tcp_ops_t ops;
                 net_make_tcp_ops(&ops);
-                int rc = net_tcp_connect(&s->tcp, &ops, s->peer_ip_be, s->peer_port, s->local_port, 90000);
+                int rc = net_tcp_connect(&s->tcp, &ops, s->peer_ip_be, s->peer_port, s->local_port, 45000);
+                if (rc == -2 && dst_ip_be_alt != dst_ip_be) {
+                    /* Retry with alternate byte order for glibc/wget sockaddr. */
+                    s->peer_ip_be = dst_ip_be_alt;
+                    rc = net_tcp_connect(&s->tcp, &ops, s->peer_ip_be, s->peer_port, s->local_port, 45000);
+                }
                 if (rc == -2) return ret_err(ETIMEDOUT);
                 if (rc != 0) return ret_err(EIO);
                 return 0;
@@ -4047,6 +5369,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             size_t tolen = (size_t)a6;
             thread_t *t = thread_get_current_user();
             if (!t) t = thread_current();
+            int dbg_wget = AXON_WGET_DNS_TRACE && t && t->name[0] && strstr(t->name, "wget");
             ksock_net_t *s = NULL;
             if (!socket_file_get(t, fd, &s) || !s) return ret_err(EBADF);
             if (s->sock_domain == AF_NETLINK_LOCAL) {
@@ -4061,26 +5384,55 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 (void)netlink_build_route_dump(s, h->nlmsg_type, h->nlmsg_seq);
                 return (uint64_t)len;
             }
+            if (s->unix_domain_stub) {
+                if (!buf_u || len == 0 || len > 2048) return ret_err(EINVAL);
+                if (!user_range_ok(buf_u, len)) return ret_err(EFAULT);
+                return (uint64_t)len;
+            }
             if (!buf_u || len == 0 || len > 2048) return ret_err(EINVAL);
             if (!user_range_ok(buf_u, len)) return ret_err(EFAULT);
             uint32_t dst_ip_be = 0;
             uint16_t dst_port = 0;
             if (to_u) {
-                if (tolen < sizeof(sockaddr_in_k) || !user_range_ok(to_u, sizeof(sockaddr_in_k))) return ret_err(EFAULT);
+                if (tolen < 2u || !user_range_ok(to_u, tolen)) return ret_err(EFAULT);
                 sockaddr_in_k to;
-                if (copy_from_user_raw(&to, to_u, sizeof(to)) != 0) return ret_err(EFAULT);
-                if (to.sin_family != AF_INET_LOCAL) return ret_err(EAFNOSUPPORT);
+                int pa = user_sockaddr_to_ipv4_peer(to_u, (size_t)tolen, &to);
+                if (pa != 0) return ret_err(pa);
                 dst_ip_be = be32(to.sin_addr); /* user sockaddr stores network-order bytes */
                 dst_port = be16(to.sin_port);
+                if (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) {
+                    if (dst_port == 53u && (dst_ip_be & 0xFF000000u) == 0x7F000000u && net_stack_init() == 0) {
+                        uint32_t ns = g_net.dns_be ? g_net.dns_be : g_net.gw_be;
+                        if (ns) dst_ip_be = ns;
+                    }
+                }
             } else if (s->connected) {
                 dst_ip_be = s->peer_ip_be;
                 dst_port = s->peer_port;
             } else {
                 return ret_err(EDESTADDRREQ);
             }
+            if (dbg_wget && s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL && dst_port == 53u) {
+                klogprintf("WGET-DNS: sendto fd=%d len=%u dst=%u.%u.%u.%u:%u\n",
+                    fd, (unsigned)len,
+                    (unsigned)((dst_ip_be >> 24) & 0xFF), (unsigned)((dst_ip_be >> 16) & 0xFF),
+                    (unsigned)((dst_ip_be >> 8) & 0xFF), (unsigned)(dst_ip_be & 0xFF),
+                    (unsigned)dst_port);
+            }
             uint8_t *icmp = (uint8_t *)kmalloc(len);
             if (!icmp) return ret_err(ENOMEM);
             if (copy_from_user_raw(icmp, buf_u, len) != 0) { kfree(icmp); return ret_err(EFAULT); }
+            if (dbg_wget && s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL && dst_port == 53u && len >= 12) {
+                uint16_t id = (uint16_t)(((uint16_t)icmp[0] << 8) | (uint16_t)icmp[1]);
+                uint16_t flags_d = (uint16_t)(((uint16_t)icmp[2] << 8) | (uint16_t)icmp[3]);
+                uint16_t qd = (uint16_t)(((uint16_t)icmp[4] << 8) | (uint16_t)icmp[5]);
+                uint16_t an = (uint16_t)(((uint16_t)icmp[6] << 8) | (uint16_t)icmp[7]);
+                uint16_t ns = (uint16_t)(((uint16_t)icmp[8] << 8) | (uint16_t)icmp[9]);
+                uint16_t ar = (uint16_t)(((uint16_t)icmp[10] << 8) | (uint16_t)icmp[11]);
+                klogprintf("WGET-DNS: qhdr id=0x%04x flags=0x%04x qd=%u an=%u ns=%u ar=%u\n",
+                    (unsigned)id, (unsigned)flags_d,
+                    (unsigned)qd, (unsigned)an, (unsigned)ns, (unsigned)ar);
+            }
             int r = -1;
             if (s->protocol == IPPROTO_ICMP_LOCAL) {
                 if (s->type_base == SOCK_RAW_LOCAL && len > 8) s->last_req_ts_fmt = net_detect_ping_ts_fmt(icmp + 8, len - 8);
@@ -4089,13 +5441,14 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 memcpy(s->last_req, icmp, len);
                 r = net_send_icmp_echo(s, dst_ip_be, icmp, len);
             } else if (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) {
-                if (s->local_port == 0) {
-                    uint16_t tid = (uint16_t)((t && t->tid) ? t->tid : 1);
-                    s->local_port = (uint16_t)(40000u + (tid % 20000u));
-                }
+                if (s->local_port == 0)
+                    s->local_port = net_alloc_ephemeral_port();
                 r = net_send_udp_datagram(dst_ip_be, s->local_port, dst_port, icmp, len);
             }
             kfree(icmp);
+            if (dbg_wget && s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL && dst_port == 53u) {
+                klogprintf("WGET-DNS: sendto result r=%d local_port=%u\n", r, (unsigned)s->local_port);
+            }
             if (r != 0) return ret_err(e1000_is_ready() ? EIO : ENETDOWN);
             return (uint64_t)len;
         }
@@ -4108,7 +5461,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             void *fromlen_u = (void *)(uintptr_t)a6;
             thread_t *t = thread_get_current_user();
             if (!t) t = thread_current();
-            int dbg_wget = (t && t->name[0] && strstr(t->name, "wget")) ? 1 : 0;
+            int dbg_wget = AXON_WGET_DNS_TRACE && t && t->name[0] && strstr(t->name, "wget");
             ksock_net_t *s = NULL;
             if (!socket_file_get(t, fd, &s) || !s) return ret_err(EBADF);
             if (s->sock_domain == AF_NETLINK_LOCAL) {
@@ -4136,6 +5489,11 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             /* Linux-compatible: zero-length recv is valid even with NULL buffer. */
             if (len == 0) return 0;
+            if (s->unix_domain_stub) {
+                if (!buf_u || !user_range_ok(buf_u, len)) return ret_err(EFAULT);
+                if (!s->connected) return ret_err(ENOTCONN);
+                return 0;
+            }
             if (!buf_u) {
                 if (dbg_wget) qemu_debug_printf("RECVFROM-EFAULT: null buf with len=%llu\n", (unsigned long long)len);
                 return ret_err(EFAULT);
@@ -4160,27 +5518,63 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     n = net_recv_icmp_echo_reply(s, tmp, cap, timeout_ms, &src_ip);
                 }
             } else if (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) {
-                if (!s->rx_has_pending) {
-                    int rn = net_recv_udp_datagram(s, s->rx_pending, sizeof(s->rx_pending), 3000, &src_ip, &src_port);
-                    if (rn > 0) {
-                        s->rx_has_pending = 1;
-                        s->rx_pending_len = (size_t)rn;
-                        s->rx_pending_src_ip_be = src_ip;
-                        s->rx_pending_src_port = src_port;
-                    } else {
-                        n = rn;
-                    }
+                if (dbg_wget && s->connected && s->peer_port == 53u) {
+                    klogprintf("WGET-DNS: recvfrom fd=%d want=%u nonblock=%d\n",
+                        fd, (unsigned)len, s->nonblock);
                 }
+                if (!s->rx_has_pending) {
+                    int pr = net_udp_recv_into_pending(s);
+                    if (pr != 1) n = (pr < 0) ? -1 : 0;
+                }
+                ksock_rx_pending_normalize(s);
                 if (s->rx_has_pending) {
                     src_ip = s->rx_pending_src_ip_be;
                     src_port = s->rx_pending_src_port;
                     if (len == 0) {
                         n = want_trunc_len ? (int)s->rx_pending_len : 0;
                     } else {
-                        n = (int)((s->rx_pending_len > cap) ? cap : s->rx_pending_len);
-                        if (n > 0) memcpy(tmp, s->rx_pending, (size_t)n);
+                        size_t avail = ksock_rx_pending_avail(s);
+                        n = (int)((avail > cap) ? cap : avail);
+                        if (n > 0) memcpy(tmp, s->rx_pending + s->rx_pending_off, (size_t)n);
                     }
-                    if (!is_peek) s->rx_has_pending = 0;
+                    if (!is_peek) {
+                        if (len == 0) {
+                            s->rx_has_pending = 0;
+                            s->rx_pending_off = 0;
+                            s->rx_pending_len = 0;
+                        } else {
+                            s->rx_pending_off += (size_t)n;
+                            if (s->rx_pending_off >= s->rx_pending_len) {
+                                s->rx_has_pending = 0;
+                                s->rx_pending_off = 0;
+                                s->rx_pending_len = 0;
+                            }
+                        }
+                    }
+                }
+                if (dbg_wget && s->connected && s->peer_port == 53u) {
+                    klogprintf("WGET-DNS: recvfrom got=%d src=%u.%u.%u.%u:%u\n",
+                        n,
+                        (unsigned)((src_ip >> 24) & 0xFF), (unsigned)((src_ip >> 16) & 0xFF),
+                        (unsigned)((src_ip >> 8) & 0xFF), (unsigned)(src_ip & 0xFF),
+                        (unsigned)src_port);
+                    if (n >= 12) {
+                        /* DNS header: id, flags, qd, an, ns, ar */
+                        uint16_t id = (uint16_t)(((uint16_t)tmp[0] << 8) | (uint16_t)tmp[1]);
+                        uint16_t flags_d = (uint16_t)(((uint16_t)tmp[2] << 8) | (uint16_t)tmp[3]);
+                        uint8_t rcode = (uint8_t)(flags_d & 0x0Fu);
+                        uint16_t qd = (uint16_t)(((uint16_t)tmp[4] << 8) | (uint16_t)tmp[5]);
+                        uint16_t an = (uint16_t)(((uint16_t)tmp[6] << 8) | (uint16_t)tmp[7]);
+                        uint16_t ns = (uint16_t)(((uint16_t)tmp[8] << 8) | (uint16_t)tmp[9]);
+                        uint16_t ar = (uint16_t)(((uint16_t)tmp[10] << 8) | (uint16_t)tmp[11]);
+                        klogprintf("WGET-DNS: hdr id=0x%04x flags=0x%04x rcode=%u qd=%u an=%u ns=%u ar=%u\n",
+                            (unsigned)id, (unsigned)flags_d, (unsigned)rcode,
+                            (unsigned)qd, (unsigned)an, (unsigned)ns, (unsigned)ar);
+                        int dump = (n < 32) ? n : 32;
+                        klogprintf("WGET-DNS: hex0..%d:", dump - 1);
+                        for (int i = 0; i < dump; i++) kprintf(" %02x", (unsigned)tmp[i]);
+                        kprintf("\n");
+                    }
                 }
             } else {
                 kfree(tmp);
@@ -4188,13 +5582,15 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             if (n == -4) {
                 kfree(tmp);
-                return syscall_do(SYS_exit_group, 130, 0, 0, 0, 0, 0);
+                return syscall_do_inner(SYS_exit_group, 130, 0, 0, 0, 0, 0);
             }
             if (n < 0) { kfree(tmp); return ret_err(EIO); }
             if (n == 0) {
                 kfree(tmp);
-                /* ICMP timeout: ETIMEDOUT gives "Request timeout" instead of "Resource temporarily unavailable" */
-                return ret_err((s->protocol == IPPROTO_ICMP_LOCAL) ? ETIMEDOUT : EAGAIN);
+                if (s->protocol == IPPROTO_ICMP_LOCAL) return ret_err(ETIMEDOUT);
+                if (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL)
+                    return ret_err(s->nonblock ? EAGAIN : ETIMEDOUT);
+                return ret_err(EAGAIN);
             }
             if (copy_to_user_recv_safe(buf_u, tmp, (size_t)n) != 0) {
                 if (dbg_wget) {
@@ -4257,14 +5653,21 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 return (uint64_t)iov.len;
             }
             if (!iov.base || iov.len == 0 || iov.len > 2048 || !user_range_ok(iov.base, (size_t)iov.len)) return ret_err(EFAULT);
+            if (s->unix_domain_stub)
+                return (uint64_t)iov.len;
             uint32_t dst_ip_be = 0;
             uint16_t dst_port = 0;
-            if (m.msg_name && m.msg_namelen >= sizeof(sockaddr_in_k) && user_range_ok(m.msg_name, sizeof(sockaddr_in_k))) {
+            if (m.msg_name && m.msg_namelen >= 2u && user_range_ok(m.msg_name, (size_t)m.msg_namelen)) {
                 sockaddr_in_k to;
-                if (copy_from_user_raw(&to, m.msg_name, sizeof(to)) != 0) return ret_err(EFAULT);
-                if (to.sin_family != AF_INET_LOCAL) return ret_err(EAFNOSUPPORT);
+                int pa = user_sockaddr_to_ipv4_peer(m.msg_name, (size_t)m.msg_namelen, &to);
+                if (pa != 0) return ret_err(pa);
                 dst_ip_be = be32(to.sin_addr);
                 dst_port = be16(to.sin_port);
+                if ((s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) &&
+                    dst_port == 53u && (dst_ip_be & 0xFF000000u) == 0x7F000000u && net_stack_init() == 0) {
+                    uint32_t ns = g_net.dns_be ? g_net.dns_be : g_net.gw_be;
+                    if (ns) dst_ip_be = ns;
+                }
             } else if (s->connected) {
                 dst_ip_be = s->peer_ip_be;
                 dst_port = s->peer_port;
@@ -4281,11 +5684,10 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 s->last_req_len = (size_t)iov.len;
                 memcpy(s->last_req, icmp, (size_t)iov.len);
                 r = net_send_icmp_echo(s, dst_ip_be, icmp, (size_t)iov.len);
-            } else if (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) {
-                if (s->local_port == 0) {
-                    uint16_t tid = (uint16_t)((t && t->tid) ? t->tid : 1);
-                    s->local_port = (uint16_t)(40000u + (tid % 20000u));
-                }
+            } else if ((s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) ||
+                       (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && s->dns_tcp_udp_bridge)) {
+                if (s->local_port == 0)
+                    s->local_port = net_alloc_ephemeral_port();
                 r = net_send_udp_datagram(dst_ip_be, s->local_port, dst_port, icmp, (size_t)iov.len);
             }
             kfree(icmp);
@@ -4325,15 +5727,38 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (!t) t = thread_current();
             ksock_net_t *s = NULL;
             if (!socket_file_get(t, fd, &s) || !s) return ret_err(EBADF);
+            if (s->sock_domain == AF_NETLINK_LOCAL) {
+                if (!iov.base || iov.len < sizeof(nlmsghdr_k) || !user_range_ok(iov.base, (size_t)iov.len)) return ret_err(EFAULT);
+                uint8_t pkt[256];
+                size_t cp = ((size_t)iov.len > sizeof(pkt)) ? sizeof(pkt) : (size_t)iov.len;
+                if (copy_from_user_raw(pkt, iov.base, cp) != 0) return ret_err(EFAULT);
+                nlmsghdr_k *h = (nlmsghdr_k *)pkt;
+                if (h->nlmsg_len < sizeof(*h) || h->nlmsg_len > (size_t)iov.len) return ret_err(EINVAL);
+                if (s->nl_pid == 0) s->nl_pid = (uint32_t)((t && t->tid) ? t->tid : 1);
+                (void)netlink_build_route_dump(s, h->nlmsg_type, h->nlmsg_seq);
+                mm.msg_len = (uint32_t)iov.len;
+                (void)copy_to_user_safe((void *)mmsg_u, &mm, sizeof(mm));
+                return 1;
+            }
+            if (s->unix_domain_stub) {
+                mm.msg_len = (uint32_t)iov.len;
+                (void)copy_to_user_safe((void *)mmsg_u, &mm, sizeof(mm));
+                return 1;
+            }
 
             uint32_t dst_ip_be = 0;
             uint16_t dst_port = 0;
-            if (mm.msg_hdr.msg_name && mm.msg_hdr.msg_namelen >= sizeof(sockaddr_in_k) && user_range_ok(mm.msg_hdr.msg_name, sizeof(sockaddr_in_k))) {
+            if (mm.msg_hdr.msg_name && mm.msg_hdr.msg_namelen >= 2u && user_range_ok(mm.msg_hdr.msg_name, (size_t)mm.msg_hdr.msg_namelen)) {
                 sockaddr_in_k to;
-                if (copy_from_user_raw(&to, mm.msg_hdr.msg_name, sizeof(to)) != 0) return ret_err(EFAULT);
-                if (to.sin_family != AF_INET_LOCAL) return ret_err(EAFNOSUPPORT);
+                int pa = user_sockaddr_to_ipv4_peer(mm.msg_hdr.msg_name, (size_t)mm.msg_hdr.msg_namelen, &to);
+                if (pa != 0) return ret_err(pa);
                 dst_ip_be = be32(to.sin_addr);
                 dst_port = be16(to.sin_port);
+                if ((s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) &&
+                    dst_port == 53u && (dst_ip_be & 0xFF000000u) == 0x7F000000u && net_stack_init() == 0) {
+                    uint32_t ns = g_net.dns_be ? g_net.dns_be : g_net.gw_be;
+                    if (ns) dst_ip_be = ns;
+                }
             } else if (s->connected) {
                 dst_ip_be = s->peer_ip_be;
                 dst_port = s->peer_port;
@@ -4346,14 +5771,14 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (copy_from_user_raw(pkt, iov.base, (size_t)iov.len) != 0) { kfree(pkt); return ret_err(EFAULT); }
 
             int r = -1;
-            if (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) {
-                if (s->local_port == 0) {
-                    uint16_t tid = (uint16_t)((t && t->tid) ? t->tid : 1);
-                    s->local_port = (uint16_t)(40000u + (tid % 20000u));
-                }
-                r = net_send_udp_datagram(dst_ip_be, s->local_port, dst_port, pkt, (size_t)iov.len);
-            } else if (s->protocol == IPPROTO_ICMP_LOCAL) {
+            /* ICMP first (sendmsg order); UDP for datagram != ICMP or DNS-over-UDP TCP bridge. */
+            if (s->protocol == IPPROTO_ICMP_LOCAL) {
                 r = net_send_icmp_echo(s, dst_ip_be, pkt, (size_t)iov.len);
+            } else if ((s->type_base == SOCK_DGRAM_LOCAL && s->protocol != IPPROTO_ICMP_LOCAL) ||
+                       (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && s->dns_tcp_udp_bridge)) {
+                if (s->local_port == 0)
+                    s->local_port = net_alloc_ephemeral_port();
+                r = net_send_udp_datagram(dst_ip_be, s->local_port, dst_port, pkt, (size_t)iov.len);
             }
             kfree(pkt);
             if (r != 0) return ret_err(e1000_is_ready() ? EIO : ENETDOWN);
@@ -4384,7 +5809,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (copy_from_user_raw(&iov, m.msg_iov, sizeof(iov)) != 0) return ret_err(EFAULT);
             thread_t *t = thread_get_current_user();
             if (!t) t = thread_current();
-            int dbg_wget = (t && t->name[0] && strstr(t->name, "wget")) ? 1 : 0;
+            int dbg_wget = AXON_WGET_DNS_TRACE && t && t->name[0] && strstr(t->name, "wget");
             ksock_net_t *s = NULL;
             if (!socket_file_get(t, fd, &s) || !s) return ret_err(EBADF);
             if (s->sock_domain == AF_NETLINK_LOCAL) {
@@ -4410,6 +5835,11 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             /* Linux-compatible: zero-length recvmsg iov is valid. */
             if (iov.len == 0) return 0;
+            if (s->unix_domain_stub) {
+                if (!iov.base || !user_range_ok(iov.base, (size_t)iov.len)) return ret_err(EFAULT);
+                if (!s->connected) return ret_err(ENOTCONN);
+                return 0;
+            }
             if (!iov.base) {
                 if (dbg_wget) qemu_debug_printf("RECVMSG-EFAULT: null base with len=%llu\n", (unsigned long long)iov.len);
                 return ret_err(EFAULT);
@@ -4433,28 +5863,48 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                         (void)net_send_icmp_echo_timer_compat(s);
                     n = net_recv_icmp_echo_reply(s, tmp, cap, timeout_ms, &src_ip);
                 }
-            } else if (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) {
-                if (!s->rx_has_pending) {
-                    int rn = net_recv_udp_datagram(s, s->rx_pending, sizeof(s->rx_pending), 3000, &src_ip, &src_port);
-                    if (rn > 0) {
-                        s->rx_has_pending = 1;
-                        s->rx_pending_len = (size_t)rn;
-                        s->rx_pending_src_ip_be = src_ip;
-                        s->rx_pending_src_port = src_port;
-                    } else {
-                        n = rn;
-                    }
+            } else if ((s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) ||
+                       (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && s->dns_tcp_udp_bridge)) {
+                if (dbg_wget && s->connected && s->peer_port == 53u) {
+                    klogprintf("WGET-DNS: recvmsg fd=%d want=%u nonblock=%d\n",
+                        fd, (unsigned)iov.len, s->nonblock);
                 }
+                if (!s->rx_has_pending) {
+                    int pr = net_udp_recv_into_pending(s);
+                    if (pr != 1) n = (pr < 0) ? -1 : 0;
+                }
+                ksock_rx_pending_normalize(s);
                 if (s->rx_has_pending) {
                     src_ip = s->rx_pending_src_ip_be;
                     src_port = s->rx_pending_src_port;
                     if (iov.len == 0) {
                         n = want_trunc_len ? (int)s->rx_pending_len : 0;
                     } else {
-                        n = (int)((s->rx_pending_len > cap) ? cap : s->rx_pending_len);
-                        if (n > 0) memcpy(tmp, s->rx_pending, (size_t)n);
+                        size_t avail = ksock_rx_pending_avail(s);
+                        n = (int)((avail > cap) ? cap : avail);
+                        if (n > 0) memcpy(tmp, s->rx_pending + s->rx_pending_off, (size_t)n);
                     }
-                    if (!is_peek) s->rx_has_pending = 0;
+                    if (!is_peek) {
+                        if (iov.len == 0) {
+                            s->rx_has_pending = 0;
+                            s->rx_pending_off = 0;
+                            s->rx_pending_len = 0;
+                        } else {
+                            s->rx_pending_off += (size_t)n;
+                            if (s->rx_pending_off >= s->rx_pending_len) {
+                                s->rx_has_pending = 0;
+                                s->rx_pending_off = 0;
+                                s->rx_pending_len = 0;
+                            }
+                        }
+                    }
+                }
+                if (dbg_wget && s->connected && s->peer_port == 53u) {
+                    klogprintf("WGET-DNS: recvmsg got=%d src=%u.%u.%u.%u:%u\n",
+                        n,
+                        (unsigned)((src_ip >> 24) & 0xFF), (unsigned)((src_ip >> 16) & 0xFF),
+                        (unsigned)((src_ip >> 8) & 0xFF), (unsigned)(src_ip & 0xFF),
+                        (unsigned)src_port);
                 }
             } else {
                 kfree(tmp);
@@ -4462,12 +5912,16 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             if (n == -4) {
                 kfree(tmp);
-                return syscall_do(SYS_exit_group, 130, 0, 0, 0, 0, 0);
+                return syscall_do_inner(SYS_exit_group, 130, 0, 0, 0, 0, 0);
             }
             if (n < 0) { kfree(tmp); return ret_err(EIO); }
             if (n == 0) {
                 kfree(tmp);
-                return ret_err((s->protocol == IPPROTO_ICMP_LOCAL) ? ETIMEDOUT : EAGAIN);
+                if (s->protocol == IPPROTO_ICMP_LOCAL) return ret_err(ETIMEDOUT);
+                if ((s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) ||
+                    (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && s->dns_tcp_udp_bridge))
+                    return ret_err(s->nonblock ? EAGAIN : ETIMEDOUT);
+                return ret_err(EAGAIN);
             }
             if (copy_to_user_recv_safe(iov.base, tmp, (size_t)n) != 0) {
                 if (dbg_wget) {
@@ -4495,6 +5949,22 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 (void)copy_to_user_safe(msg_u, &m, sizeof(m));
             }
             return (uint64_t)n;
+        }
+        case 299: { /* recvmmsg — Linux x86_64; glibc resolver may batch reads */
+            int fd = (int)a1;
+            void *mmsg_u = (void *)(uintptr_t)a2;
+            unsigned int vlen = (unsigned int)a3;
+            int flags = (int)a4;
+            (void)a5;
+            if (!mmsg_u || vlen == 0) return ret_err(EINVAL);
+            /* One struct mmsghdr: msghdr (matches our msghdr_k) + msg_len */
+            if (!user_range_ok(mmsg_u, 64)) return ret_err(EFAULT);
+            uint64_t r = syscall_do_inner(47, (uint64_t)fd, (uint64_t)mmsg_u, (uint64_t)flags, 0, 0, 0);
+            if ((int64_t)r < 0) return r;
+            uint32_t mlen = (uint32_t)r;
+            /* After Linux struct msghdr (56 bytes on x86_64) */
+            if (copy_to_user_safe((uint8_t *)mmsg_u + 56, &mlen, sizeof(mlen)) != 0) return ret_err(EFAULT);
+            return 1;
         }
         case SYS_sysinfo: { /* sysinfo(struct sysinfo *) - syscall 99; glibc allocatestack needs sane freeram */
             void *info_u = (void*)(uintptr_t)a1;
@@ -4706,11 +6176,18 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 (void)arg;
                 return 0;
             } else if (cmd == F_GETFL) {
-                /* return file status flags (blocking) */
+                if (f->type == SYSCALL_FTYPE_SOCKET && f->driver_private) {
+                    ksock_net_t *sk = (ksock_net_t *)f->driver_private;
+                    int fl = O_RDWR_LINUX;
+                    if (sk->nonblock) fl |= O_NONBLOCK_LINUX;
+                    return (uint64_t)(unsigned)fl;
+                }
                 return 0;
             } else if (cmd == F_SETFL) {
-                /* accept (e.g., O_NONBLOCK) but we don't implement it fully */
-                (void)arg;
+                if (f->type == SYSCALL_FTYPE_SOCKET && f->driver_private) {
+                    ksock_net_t *sk = (ksock_net_t *)f->driver_private;
+                    sk->nonblock = (arg & O_NONBLOCK_LINUX) ? 1 : 0;
+                }
                 return 0;
             } else if (cmd == F_DUPFD) {
                 /* simple duplicate to next available fd */
@@ -5325,15 +6802,15 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 {
                     const uintptr_t parent_lo = (uintptr_t)saved_rsp;
                     const uintptr_t parent_hi = parent_lo + (uintptr_t)copy_bytes;
-                    const uintptr_t delta = (uintptr_t)child_rsp - parent_lo;
                     uintptr_t pp = (uintptr_t)child_rsp;
                     uintptr_t end = (uintptr_t)child_rsp + (uintptr_t)copy_bytes;
                     for (; pp + 8 <= end; pp += 8) {
                         uint64_t v = 0;
                         if (user_read_u64((const void *)(uintptr_t)pp, &v) != 0) return ret_err(EFAULT);
                         uintptr_t vv = (uintptr_t)v;
-                        if (vv >= parent_lo && vv < parent_hi) {
-                            if (user_write_u64((void *)(uintptr_t)pp, (uint64_t)(vv + delta)) != 0)
+                        if ((vv & 7u) == 0 && vv >= parent_lo && vv < parent_hi) {
+                            uintptr_t nv = (uintptr_t)child_rsp + (uintptr_t)(vv - parent_lo);
+                            if (user_write_u64((void *)(uintptr_t)pp, (uint64_t)nv) != 0)
                                 return ret_err(EFAULT);
                         }
                     }
@@ -5372,6 +6849,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 child->user_brk_base = cur->user_brk_base;
                 child->user_brk_cur = cur->user_brk_cur;
                 if (cur->user_mmap_next) child->user_mmap_next = cur->user_mmap_next;
+                child->user_mmap_hi = cur->user_mmap_hi;
 
                 /* set up user entry and stack for the child (restore full regs, relocate stack pointers) */
                 {
@@ -5437,19 +6915,19 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             {
                 const uintptr_t base = (uintptr_t)0x00200000u;
                 uintptr_t used_end = (uintptr_t)cur->user_brk_cur;
-                if (cur->user_mmap_next > used_end) used_end = cur->user_mmap_next;
+                /* Extend to anon mmap high-water (real addr+len ends), not mmap_next alone:
+                   mmap_next is a bump cursor (often 32MiB on first mmap) and forced huge
+                   fork copies (mm_make_private_range per 4K) that look like a deadlock. */
+                if (cur->user_mmap_hi > used_end) used_end = cur->user_mmap_hi;
                 const uintptr_t min_copy_end = base + (1u * 1024u * 1024u);
                 if (used_end < min_copy_end || used_end == 0) used_end = min_copy_end;
                 if (used_end > (uintptr_t)USER_TLS_BASE) used_end = (uintptr_t)USER_TLS_BASE;
-                /* Cap copy size: deep copy is O(pages) and very slow in QEMU.
-                   Child gets 1MB heap copy; it can grow via brk() as needed. */
-                const uintptr_t max_copy_end = base + (1u * 1024u * 1024u);
-                if (used_end > max_copy_end) used_end = max_copy_end;
+                /* Deep-copy [base, used_end): must cover brk so child malloc isn't shared with parent. */
                 qemu_debug_printf("fork: copying heap 0x%lx..0x%lx (%lu pages)\n",
                                  (unsigned long)base, (unsigned long)used_end,
                                  (unsigned long)((used_end - base) / 4096));
                 if (used_end > base) {
-                    if (mm_make_private_range(child->mm, (uint64_t)base, (uint64_t)used_end, 1) != 0) {
+                    if (mm_make_private_range(child->mm, (uint64_t)base, (uint64_t)used_end, 1, cur->mm) != 0) {
                         return ret_err(ENOMEM);
                     }
                 }
@@ -5457,17 +6935,21 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 uintptr_t c_top = user_stack_top_for_tid_like_exec(child->tid ? child->tid : 1);
                 uintptr_t c_stack_base = (c_top - (uintptr_t)USER_STACK_SIZE) & ~0xFFFULL;
                 uintptr_t c_tls_base = c_top - (uintptr_t)USER_STACK_SIZE - (uintptr_t)USER_TLS_SIZE;
-                if (mm_make_private_range(child->mm, (uint64_t)c_stack_base, (uint64_t)c_top, 1) != 0) {
+                if (mm_make_private_range(child->mm, (uint64_t)c_stack_base, (uint64_t)c_top, 1, cur->mm) != 0) {
                     return ret_err(ENOMEM);
                 }
-                if (mm_make_private_range(child->mm, (uint64_t)c_tls_base, (uint64_t)(c_tls_base + 0x3000u), 1) != 0) {
+                if (mm_make_private_range(child->mm, (uint64_t)c_tls_base, (uint64_t)(c_tls_base + 0x3000u), 1, cur->mm) != 0) {
                     return ret_err(ENOMEM);
                 }
-                if (mm_make_private_range(child->mm, (uint64_t)USER_VFORK_TRAMP, (uint64_t)(USER_VFORK_TRAMP + 0x1000u), 1) != 0) {
+                if (mm_make_private_range(child->mm, (uint64_t)USER_VFORK_TRAMP, (uint64_t)(USER_VFORK_TRAMP + 0x1000u), 1, cur->mm) != 0) {
                     return ret_err(ENOMEM);
                 }
                 qemu_debug_printf("fork: private ranges done, unblocking child\n");
             }
+            /* Retain parent mm for mm_make_private_range COW table splits (e.g. exec); cleared in elf enter_user_mode. */
+            if (child->mm_ptemplate)
+                mm_release(child->mm_ptemplate);
+            child->mm_ptemplate = mm_retain(cur->mm);
             /* inherit credentials */
             child->uid = cur->uid;
             child->euid = cur->euid;
@@ -5552,6 +7034,17 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                         return ret_err(ECHILD);
                     }
                 }
+                /* Trace selection for debugging hangs (limited by global trace budget anyway). */
+                if (g_syscall_trace_on && g_syscall_trace_budget > 0 && is_watch_proc(tcur)) {
+                    kprintf("wait4: parent=%llu name=%s pid_arg=%d -> child=%llu state=%d exit_status=0x%x reaped=%d\n",
+                        (unsigned long long)(tcur->tid ? tcur->tid : 1),
+                        (tcur->name[0] ? tcur->name : "(noname)"),
+                        pid,
+                        (unsigned long long)(found->tid ? found->tid : 1),
+                        (int)found->state,
+                        (unsigned)found->exit_status,
+                        (found->exit_status == 0x80000000));
+                }
                 /* If child was already reaped, behave like Linux: ECHILD */
                 if (found->state == THREAD_TERMINATED && found->exit_status == 0x80000000) {
                     if (options & WNOHANG) {
@@ -5577,6 +7070,12 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 }
                 /* block current thread and set waiter on child */
                 found->waiter_tid = (int)tcur->tid;
+                /* Unconditional marker when we really block in wait4. */
+                kprintf("wait4: block parent=%llu name=%s child=%llu child_state=%d\n",
+                    (unsigned long long)(tcur->tid ? tcur->tid : 1),
+                    (tcur->name[0] ? tcur->name : "(noname)"),
+                    (unsigned long long)(found->tid ? found->tid : 1),
+                    (int)found->state);
                 /* block current and yield */
                 thread_block((int)tcur->tid);
                 thread_yield();
@@ -5819,8 +7318,37 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 }
                 if (req == FIONREAD) {
                     if (!argp || !user_range_ok(argp, sizeof(uint32_t))) return ret_err(EFAULT);
-                    uint32_t n = 0;
-                    if (copy_to_user_safe(argp, &n, sizeof(n)) != 0) return ret_err(EFAULT);
+                    ksock_net_t *s = (ksock_net_t *)f->driver_private;
+                    uint32_t nb = 0;
+                    if (s) {
+                        if (s->sock_domain == AF_NETLINK_LOCAL) {
+                            if (s->nl_rx_off < s->nl_rx_len)
+                                nb = (uint32_t)(s->nl_rx_len - s->nl_rx_off);
+                        } else if (s->unix_domain_stub && s->connected) {
+                            /* libc may ioctl before recv on nscd stub; >0 nudges read path (recv returns 0). */
+                            nb = 1u;
+                        } else if (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) {
+                            ksock_rx_pending_normalize(s);
+                            size_t a = ksock_rx_pending_avail(s);
+                            if (a > 0) nb = (uint32_t)((a > 0xFFFFFFFFu) ? 0xFFFFFFFFu : a);
+                            else {
+                                int pl = net_rxq_peek_udp_payload_for_sock(s);
+                                if (pl > 0) nb = (uint32_t)pl;
+                            }
+                        } else if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL &&
+                                   s->dns_tcp_udp_bridge) {
+                            ksock_rx_pending_normalize(s);
+                            size_t a = ksock_rx_pending_avail(s);
+                            if (a > 0) nb = (uint32_t)((a > 0xFFFFFFFFu) ? 0xFFFFFFFFu : a);
+                            else {
+                                int pl = net_rxq_peek_udp_payload_for_sock(s);
+                                if (pl > 0) nb = (uint32_t)pl;
+                            }
+                        } else if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
+                            nb = (s->tcp.rx_len > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)s->tcp.rx_len;
+                        }
+                    }
+                    if (copy_to_user_safe(argp, &nb, sizeof(nb)) != 0) return ret_err(EFAULT);
                     return 0;
                 }
                 /* Network interface ioctls (SIOCxxx) - used by ip, ifconfig, etc. */
@@ -6054,40 +7582,9 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             if (!f) return ret_err(EBADF);
             if (f->type == SYSCALL_FTYPE_SOCKET && f->driver_private) {
                 ksock_net_t *s = (ksock_net_t *)f->driver_private;
-                if (s->sock_domain == AF_NETLINK_LOCAL) {
-                    if (!bufp || cnt == 0) return ret_err(EINVAL);
-                    if (cnt < sizeof(nlmsghdr_k) || !user_range_ok(bufp, cnt)) return ret_err(EFAULT);
-                    uint8_t pkt[256];
-                    size_t cp = (cnt > sizeof(pkt)) ? sizeof(pkt) : cnt;
-                    if (copy_from_user_raw(pkt, bufp, cp) != 0) return ret_err(EFAULT);
-                    nlmsghdr_k *h = (nlmsghdr_k *)pkt;
-                    if (h->nlmsg_len < sizeof(*h) || h->nlmsg_len > cnt) return ret_err(EINVAL);
-                    if (s->nl_pid == 0) s->nl_pid = (uint32_t)((cur && cur->tid) ? cur->tid : 1);
-                    (void)netlink_build_route_dump(s, h->nlmsg_type, h->nlmsg_seq);
-                    return (uint64_t)cnt;
-                }
-                if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
-                    if (!bufp || cnt == 0 || !user_range_ok(bufp, cnt)) return ret_err(EFAULT);
-                    size_t total = 0;
-                    net_tcp_ops_t ops;
-                    net_make_tcp_ops(&ops);
-                    while (total < cnt) {
-                        size_t chunk = cnt - total;
-                        if (chunk > 4096) chunk = 4096;
-                        uint8_t *tmp = (uint8_t *)kmalloc(chunk);
-                        if (!tmp) return (total > 0) ? (uint64_t)total : ret_err(ENOMEM);
-                        if (copy_from_user_raw(tmp, (const uint8_t *)bufp + total, chunk) != 0) {
-                            kfree(tmp);
-                            return (total > 0) ? (uint64_t)total : ret_err(EFAULT);
-                        }
-                        int wr = net_tcp_send(&s->tcp, &ops, tmp, chunk, 30000);
-                        kfree(tmp);
-                        if (wr < 0) return (total > 0) ? (uint64_t)total : ret_err(EIO);
-                        total += (size_t)wr;
-                        if ((size_t)wr < chunk) break;
-                    }
-                    return (uint64_t)total;
-                }
+                ssize_t wr = net_sock_write_userspace(cur, fd, s, bufp, cnt);
+                if (wr < 0) return ret_err((int)-wr);
+                return (uint64_t)wr;
             }
             if (f->type == FS_TYPE_PIPE && f->fs_private == (void *)1) {
                 pipe_t *p = (pipe_t *)f->driver_private;
@@ -6135,26 +7632,57 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             size_t bytes = (size_t)iovcnt * sizeof(iov[0]);
             if (copy_from_user_raw(iov, iov_u, bytes) != 0) return ret_err(EFAULT);
 
+            if (f->type == SYSCALL_FTYPE_SOCKET && f->driver_private) {
+                ksock_net_t *s = (ksock_net_t *)f->driver_private;
+                uint64_t total = 0;
+                for (int i = 0; i < iovcnt; i++) {
+                    void *base = (void *)(uintptr_t)iov[i].base;
+                    size_t len = (size_t)iov[i].len;
+                    if (len == 0) continue;
+                    if (!user_range_ok(base, len)) return (total > 0) ? total : ret_err(EFAULT);
+                    size_t pos = 0;
+                    while (pos < len) {
+                        size_t chunk = len - pos;
+                        if (chunk > 4096) chunk = 4096;
+                        ssize_t rr = net_sock_read_userspace(cur, s, (uint8_t *)base + pos, chunk);
+                        if (rr < 0) return (total > 0) ? total : ret_err((int)-rr);
+                        if (rr == 0) return total;
+                        total += (uint64_t)rr;
+                        pos += (size_t)rr;
+                    }
+                }
+                return total;
+            }
+
             uint64_t total = 0;
             for (int i = 0; i < iovcnt; i++) {
                 void *base = (void*)(uintptr_t)iov[i].base;
                 size_t len = (size_t)iov[i].len;
                 if (len == 0) continue;
-                if ((uintptr_t)base + len > (uintptr_t)MMIO_IDENTITY_LIMIT) return (total > 0) ? total : ret_err(EFAULT);
+                if (!user_range_ok(base, len)) return (total > 0) ? total : ret_err(EFAULT);
                 size_t off = 0;
                 while (off < len) {
                     size_t chunk = len - off;
                     if (chunk > 4096) chunk = 4096;
                     void *tmp = kmalloc(chunk);
                     if (!tmp) return (total > 0) ? total : ret_err(ENOMEM);
-                    ssize_t rr = fs_read(f, tmp, chunk, f->pos);
-                    if (rr <= 0) {
-                        kfree(tmp);
-                        return (total > 0) ? total : ret_err(EINVAL);
+                    ssize_t rr;
+                    if (f->type == FS_TYPE_PIPE && !f->fs_private && f->driver_private) {
+                        rr = pipe_read_bytes((pipe_t *)f->driver_private, tmp, chunk, cur);
+                    } else {
+                        rr = fs_read(f, tmp, chunk, f->pos);
                     }
-                    memcpy((char*)base + off, tmp, (size_t)rr);
+                    if (rr < 0) {
+                        kfree(tmp);
+                        return (total > 0) ? total : ret_err((int)-rr);
+                    }
+                    if (rr == 0) {
+                        kfree(tmp);
+                        return total;
+                    }
+                    if (copy_to_user_safe((uint8_t*)base + off, tmp, (size_t)rr) != 0) { kfree(tmp); return (total > 0) ? total : ret_err(EFAULT); }
                     kfree(tmp);
-                    f->pos += (size_t)rr;
+                    if (f->type != FS_TYPE_PIPE) f->pos += (size_t)rr;
                     total += (uint64_t)rr;
                     off += (size_t)rr;
                     if ((size_t)rr < chunk) return total;
@@ -6186,7 +7714,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 void *base = (void*)(uintptr_t)iov[i].base;
                 size_t len = (size_t)iov[i].len;
                 if (len == 0) continue;
-                if ((uintptr_t)base + len > (uintptr_t)MMIO_IDENTITY_LIMIT) return (total > 0) ? total : ret_err(EFAULT);
+                if (!user_range_ok(base, len)) return (total > 0) ? total : ret_err(EFAULT);
                 size_t pos = 0;
                 while (pos < len) {
                     size_t chunk = len - pos;
@@ -6194,11 +7722,15 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     void *tmp = kmalloc(chunk);
                     if (!tmp) return (total > 0) ? total : ret_err(ENOMEM);
                     ssize_t rr = fs_read(f, tmp, chunk, cur_off);
-                    if (rr <= 0) {
+                    if (rr < 0) {
                         kfree(tmp);
-                        return total; /* EOF or error -> return what we have */
+                        return (total > 0) ? total : ret_err((int)-rr);
                     }
-                    memcpy((char*)base + pos, tmp, (size_t)rr);
+                    if (rr == 0) {
+                        kfree(tmp);
+                        return total;
+                    }
+                    if (copy_to_user_safe((uint8_t*)base + pos, tmp, (size_t)rr) != 0) { kfree(tmp); return (total > 0) ? total : ret_err(EFAULT); }
                     kfree(tmp);
                     cur_off += (size_t)rr;
                     total += (uint64_t)rr;
@@ -6216,35 +7748,9 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             struct fs_file *f = cur->fds[fd];
             if (!f) return ret_err(EBADF);
             if (f->type == SYSCALL_FTYPE_SOCKET && f->driver_private) {
-                ksock_net_t *s = (ksock_net_t *)f->driver_private;
-                if (s->sock_domain == AF_NETLINK_LOCAL) {
-                    if (cnt == 0) return 0;
-                    if (!bufp || !user_range_ok(bufp, cnt)) return ret_err(EFAULT);
-                    if (s->nl_rx_off >= s->nl_rx_len) return ret_err(EAGAIN);
-                    size_t avail = s->nl_rx_len - s->nl_rx_off;
-                    size_t ncopy = (avail > cnt) ? cnt : avail;
-                    if (copy_to_user_safe(bufp, s->nl_rx + s->nl_rx_off, ncopy) != 0) return ret_err(EFAULT);
-                    s->nl_rx_off += ncopy;
-                    return (uint64_t)ncopy;
-                }
-                if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
-                    if (!bufp || cnt == 0 || !user_range_ok(bufp, cnt)) return ret_err(EFAULT);
-                    net_tcp_ops_t ops;
-                    net_make_tcp_ops(&ops);
-                    size_t chunk = cnt;
-                    if (chunk > 4096) chunk = 4096;
-                    uint8_t *tmp = (uint8_t *)kmalloc(chunk);
-                    if (!tmp) return ret_err(ENOMEM);
-                    int rr = net_tcp_recv(&s->tcp, &ops, tmp, chunk, 60000);
-                    if (rr > 0) {
-                        if (copy_to_user_safe(bufp, tmp, (size_t)rr) != 0) { kfree(tmp); return ret_err(EFAULT); }
-                        kfree(tmp);
-                        return (uint64_t)rr;
-                    }
-                    kfree(tmp);
-                    if (rr == 0) return 0; /* EOF */
-                    return ret_err((rr == -2) ? ETIMEDOUT : EAGAIN);
-                }
+                ssize_t r = net_sock_read_userspace(cur, (ksock_net_t *)f->driver_private, bufp, cnt);
+                if (r < 0) return ret_err((int)-r);
+                return (uint64_t)r;
             }
             if (f->type == FS_TYPE_PIPE && !f->fs_private) {
                 pipe_t *p = (pipe_t *)f->driver_private;
@@ -6474,18 +7980,32 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                                 if ((events & POLLIN) && devfs_tty_available(tidx) > 0) revents |= POLLIN;
                             } else if (f->type == SYSCALL_FTYPE_SOCKET && f->driver_private) {
                                 ksock_net_t *s = (ksock_net_t *)f->driver_private;
-                                if (events & POLLOUT) revents |= POLLOUT;
+                                if (events & POLLOUT) {
+                                    if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && s->dns_tcp_udp_bridge) {
+                                        revents |= POLLOUT;
+                                    } else if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
+                                        net_tcp_ops_t ops;
+                                        net_make_tcp_ops(&ops);
+                                        (void)net_tcp_service(&s->tcp, &ops, 4);
+                                        if (s->tcp.established) revents |= POLLOUT;
+                                    } else {
+                                        revents |= POLLOUT;
+                                    }
+                                }
                                 if ((events & POLLIN) && s->sock_domain == AF_NETLINK_LOCAL) {
                                     if (s->nl_rx_off < s->nl_rx_len) revents |= POLLIN;
-                                } else if ((events & POLLIN) && s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) {
+                                } else if ((events & POLLIN) && s->unix_domain_stub && s->connected) {
+                                    revents |= POLLIN;
+                                } else if ((events & POLLIN) &&
+                                           ((s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) ||
+                                            (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && s->dns_tcp_udp_bridge))) {
                                     if (s->rx_has_pending) revents |= POLLIN;
                                     else {
                                         uint32_t sip = 0;
                                         uint16_t sport = 0;
-                                        int rn = net_recv_udp_datagram(s, s->rx_pending, sizeof(s->rx_pending), 1, &sip, &sport);
+                                        int rn = net_recv_udp_datagram(s, s->rx_pending, sizeof(s->rx_pending), 0, &sip, &sport);
                                         if (rn > 0) {
-                                            s->rx_has_pending = 1;
-                                            s->rx_pending_len = (size_t)rn;
+                                            ksock_rx_pending_install(s, rn);
                                             s->rx_pending_src_ip_be = sip;
                                             s->rx_pending_src_port = sport;
                                             revents |= POLLIN;
@@ -6676,7 +8196,14 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             const int O_TRUNC_MASK = 0x200;
             const int O_APPEND_MASK = 0x400;
-            if (f && (flags & O_TRUNC_MASK)) { f->size = 0; f->pos = 0; }
+            if (f && (flags & O_TRUNC_MASK)) {
+                f->pos = 0;
+                if (f->type == FS_TYPE_REG) {
+                    if (vfs_ftruncate(f, 0) != 0) f->size = 0;
+                } else {
+                    f->size = 0;
+                }
+            }
             if (f && (flags & O_APPEND_MASK)) { f->pos = (off_t)(size_t)f->size; }
             int fd = thread_fd_alloc(f);
             if (fd < 0) { fs_file_free(f); return ret_err(EBADF); }
@@ -6718,7 +8245,14 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             const int O_TRUNC_MASK = 0x200;
             const int O_APPEND_MASK = 0x400;
-            if (f && (flags & O_TRUNC_MASK)) { f->size = 0; f->pos = 0; }
+            if (f && (flags & O_TRUNC_MASK)) {
+                f->pos = 0;
+                if (f->type == FS_TYPE_REG) {
+                    if (vfs_ftruncate(f, 0) != 0) f->size = 0;
+                } else {
+                    f->size = 0;
+                }
+            }
             if (f && (flags & O_APPEND_MASK)) { f->pos = (off_t)(size_t)f->size; }
             int fd = thread_fd_alloc(f);
             if (fd < 0) { fs_file_free(f); return ret_err(EBADF); }
@@ -6729,7 +8263,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             void *sv_u = (void*)(uintptr_t)a4;
             if (domain != 1 || !sv_u || (uintptr_t)sv_u + 8 > (uintptr_t)MMIO_IDENTITY_LIMIT)
                 return ret_err(EAFNOSUPPORT);
-            return syscall_do(SYS_pipe2, (uint64_t)(uintptr_t)sv_u, 0, 0, 0, 0, 0);
+            return syscall_do_inner(SYS_pipe2, (uint64_t)(uintptr_t)sv_u, 0, 0, 0, 0, 0);
         }
         case SYS_pipe:
         case SYS_pipe2: {
@@ -6781,7 +8315,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 /* Free socket private state only on final close of shared fs_file. */
                 if (f && f->type == SYSCALL_FTYPE_SOCKET && f->driver_private && f->refcount <= 1) {
                     ksock_net_t *s = (ksock_net_t *)f->driver_private;
-                    if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
+                    if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && !s->dns_tcp_udp_bridge) {
                         net_tcp_ops_t ops;
                         net_make_tcp_ops(&ops);
                         (void)net_tcp_close(&s->tcp, &ops, 1000);
@@ -7046,13 +8580,38 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             struct fs_file *f = cur->fds[fd];
             if (!f) return ret_err(EBADF);
             off_t newpos = 0;
-            if (whence == 0) newpos = (off_t)off;
-            else if (whence == 1) newpos = (off_t)((int64_t)f->pos + off);
-            else if (whence == 2) newpos = (off_t)((int64_t)f->size + off);
-            else return ret_err(EINVAL);
+            /* 0=SET 1=CUR 2=END; 3=SEEK_DATA 4=SEEK_HOLE (Linux) — glibc/wget use 3/4 on regular files */
+            if (whence == 0)
+                newpos = (off_t)off;
+            else if (whence == 1)
+                newpos = (off_t)((int64_t)f->pos + off);
+            else if (whence == 2)
+                newpos = (off_t)((int64_t)f->size + off);
+            else if (whence == 3)
+                newpos = (off_t)off;
+            else if (whence == 4) { /* SEEK_HOLE: no sparse files; hole begins at EOF */
+                if ((off_t)off >= (off_t)f->size)
+                    newpos = (off_t)off;
+                else
+                    newpos = (off_t)f->size;
+            } else
+                return ret_err(EINVAL);
             if (newpos < 0) return ret_err(EINVAL);
             f->pos = newpos;
             return (uint64_t)(uint64_t)f->pos;
+        }
+        case SYS_ftruncate: {
+            int fd = (int)a1;
+            int64_t len64 = (int64_t)a2;
+            if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
+            struct fs_file *f = cur->fds[fd];
+            if (!f) return ret_err(EBADF);
+            if (f->type == SYSCALL_FTYPE_SOCKET) return ret_err(EINVAL);
+            if (len64 < 0) return ret_err(EINVAL);
+            int r = vfs_ftruncate(f, (off_t)len64);
+            if (r == 0) return 0;
+            if (r < 0) return ret_err(-r);
+            return ret_err(EINVAL);
         }
         case SYS_getdents: /* historic getdents syscall (78) */
         case SYS_getdents64: {
@@ -7336,6 +8895,12 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             if (req == 0) return (uint64_t)(*p_cur);
             req = align_up_u(req, 16);
+            if (req >= (uintptr_t)MMIO_IDENTITY_LIMIT || *p_cur >= (uintptr_t)MMIO_IDENTITY_LIMIT ||
+                *p_base >= (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                *p_base = 8u * 1024u * 1024u;
+                *p_cur = *p_base;
+                return (uint64_t)(*p_cur);
+            }
             /* Don't allow brk to collide with reserved TLS/stack area. */
             uintptr_t top_limit = (uintptr_t)USER_TLS_BASE;
             if (tcur) {
@@ -7353,10 +8918,12 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     top_limit = (heap_lo > guard) ? (heap_lo - guard) : heap_lo;
                 }
             }
-            if (req < *p_base || req >= top_limit) return ret_err(ENOMEM);
+            /* Linux brk(2) semantics: on failure, return current brk (no -errno). */
+            if (req < *p_base || req >= top_limit) return (uint64_t)(*p_cur);
             /* mark and zero new range */
             if (req > *p_cur) {
-                if (mark_user_identity_range_2m_sys((uint64_t)(*p_cur), (uint64_t)req) != 0) return ret_err(ENOMEM);
+                if (mark_user_identity_range_2m_sys((uint64_t)(*p_cur), (uint64_t)req) != 0)
+                    return (uint64_t)(*p_cur);
                 memset((void*)(*p_cur), 0, req - (*p_cur));
             }
             *p_cur = req;
@@ -7559,6 +9126,14 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             qemu_debug_printf("mmap: ok return 0x%llx\n", (unsigned long long)addr);
             *p_mmap_next = addr + len;
+            {
+                uintptr_t he = (uintptr_t)(addr + len);
+                if (tcur) {
+                    if (he > tcur->user_mmap_hi) tcur->user_mmap_hi = he;
+                } else {
+                    if (he > user_mmap_hi) user_mmap_hi = he;
+                }
+            }
             return (uint64_t)addr;
         }
         case SYS_munmap: {
@@ -7644,6 +9219,12 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                 }
                 /* wake arbitrary waiter if present */
                 if (cur->waiter_tid >= 0) {
+                    if (is_watch_proc(cur)) {
+                        kprintf("exit: pid=%llu (%s) waking waiter=%d\n",
+                            (unsigned long long)(cur->tid ? cur->tid : 1),
+                            cur->name,
+                            cur->waiter_tid);
+                    }
                     thread_unblock(cur->waiter_tid);
                 }
                 /* glibc pthread_join waits on clear_child_tid; write 0 and FUTEX_WAKE so parent wakes */
@@ -7671,6 +9252,14 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             /* mark terminated */
             if (cur) {
                 cur->state = THREAD_TERMINATED;
+                if (is_watch_proc(cur)) {
+                    kprintf("exit: tid=%llu name=%s exit_status=0x%x waiter_tid=%d parent_tid=%d\n",
+                        (unsigned long long)(cur->tid ? cur->tid : 1),
+                        (cur->name[0] ? cur->name : "(noname)"),
+                        (unsigned)cur->exit_status,
+                        cur->waiter_tid,
+                        cur->parent_tid);
+                }
                 /* Release private address space on task exit. */
                 if (cur->mm && cur->mm != mm_kernel()) {
                     mm_release(cur->mm);
@@ -7698,6 +9287,8 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                               cur && cur->name ? cur->name : "(null)",
                               (unsigned long long)a1);
             if (cur) {
+                devfs_tty_remove_waiter_from_all_ttys((int)(cur->tid ? cur->tid : 1));
+                exit_group_reap_peer_threads(cur);
                 int code = (int)a1;
                 cur->exit_status = (code & 0xFF) << 8;
                 /* close all FDs so pipes/sockets release (reader gets EOF, wait4 can proceed) */
@@ -7749,6 +9340,18 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
                     }
                 }
                 cur->state = THREAD_TERMINATED;
+                if (is_watch_proc(cur)) {
+                    kprintf("exit_group: tid=%llu name=%s exit_status=0x%x waiter_tid=%d parent_tid=%d\n",
+                        (unsigned long long)(cur->tid ? cur->tid : 1),
+                        (cur->name[0] ? cur->name : "(noname)"),
+                        (unsigned)cur->exit_status,
+                        cur->waiter_tid,
+                        cur->parent_tid);
+                }
+                if (cur->mm_ptemplate) {
+                    mm_release(cur->mm_ptemplate);
+                    cur->mm_ptemplate = NULL;
+                }
                 if (cur->mm && cur->mm != mm_kernel()) {
                     mm_release(cur->mm);
                     cur->mm = mm_kernel();
@@ -7803,6 +9406,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             uint32_t *out_u = (uint32_t *)(uintptr_t)a2;
             if (!host_u || !out_u || !user_range_ok(host_u, 1) || !user_range_ok(out_u, 4))
                 return ret_err(EFAULT);
+            static int resolve_dbg_left = 8;
             char host[256];
             size_t i = 0;
             for (; i < sizeof(host) - 1; i++) {
@@ -7813,11 +9417,32 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             }
             host[sizeof(host) - 1] = '\0';
             if (i >= sizeof(host) - 1) return ret_err(ENAMETOOLONG);
+
+            /* Ensure net stack is initialized before reading dns/gw fields.
+               Otherwise g_net.{dns_be,gw_be} can be 0 and resolver returns EIO. */
+            if (net_stack_init() != 0) return ret_err(ENETDOWN);
             uint32_t dns_be = g_net.dns_be ? g_net.dns_be : g_net.gw_be;
+            if (!dns_be) return ret_err(ENETDOWN);
+            if (resolve_dbg_left-- > 0) {
+                klogprintf("resolve: host=%s ip=%u.%u.%u.%u gw=%u.%u.%u.%u dns=%u.%u.%u.%u use_dns=%u.%u.%u.%u\n",
+                    host,
+                    (unsigned)((g_net.ip_be >> 24) & 0xFF), (unsigned)((g_net.ip_be >> 16) & 0xFF),
+                    (unsigned)((g_net.ip_be >> 8) & 0xFF), (unsigned)(g_net.ip_be & 0xFF),
+                    (unsigned)((g_net.gw_be >> 24) & 0xFF), (unsigned)((g_net.gw_be >> 16) & 0xFF),
+                    (unsigned)((g_net.gw_be >> 8) & 0xFF), (unsigned)(g_net.gw_be & 0xFF),
+                    (unsigned)((g_net.dns_be >> 24) & 0xFF), (unsigned)((g_net.dns_be >> 16) & 0xFF),
+                    (unsigned)((g_net.dns_be >> 8) & 0xFF), (unsigned)(g_net.dns_be & 0xFF),
+                    (unsigned)((dns_be >> 24) & 0xFF), (unsigned)((dns_be >> 16) & 0xFF),
+                    (unsigned)((dns_be >> 8) & 0xFF), (unsigned)(dns_be & 0xFF));
+            }
             /* No 10.0.2.3 fallback: bridged/NAT would use wrong DNS */
             uint32_t ip_be;
             if (kernel_resolve_full(host, dns_be, &ip_be) != 0) return ret_err(EIO);
-            if (copy_to_user_safe(out_u, &ip_be, 4) != 0) return ret_err(EFAULT);
+            /* User ABI: same as sockaddr_in.sin_addr / in_addr_t on x86_64 (LE memory = wire order). */
+            {
+                uint32_t ip_user = be32(ip_be);
+                if (copy_to_user_safe(out_u, &ip_user, 4) != 0) return ret_err(EFAULT);
+            }
             return 0;
         }
         default:
@@ -7825,6 +9450,12 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
             (void)a4; (void)a5; (void)a6;
             return ret_err(ENOSYS);
     }
+}
+
+uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
+    uint64_t r = syscall_do_inner(num, a1, a2, a3, a4, a5, a6);
+    //axon_wget_sc_log(num, r, a1, a2, a3);
+    return r;
 }
 
 void isr_syscall(cpu_registers_t* regs) {
@@ -7858,7 +9489,7 @@ void syscall_init(void) {
        IF bit = 9, DF bit = 10 in RFLAGS. */
     msr_write_u64(MSR_FMASK, (1ULL << 9) | (1ULL << 10));
 
-    klogprintf("syscall: int0x80 handler registered; SYSCALL enabled\n");
+    klogprintf("syscall: int0x80 handler registered; SYSCALL enabled (build=2026-03-31-wget-sc)\n");
 }
 
 

@@ -57,6 +57,24 @@ int pvscsi_init(void);
 static char g_cwd[256] = "/";
 
 extern uint8_t _end[]; /* kernel end symbol from linker */
+extern const char nss_dns_so_blob_start[];
+extern const char nss_dns_so_blob_end[];
+
+static void ramfs_install_libnss_dns(void)
+{
+    size_t len = (size_t)(nss_dns_so_blob_end - nss_dns_so_blob_start);
+    if (len == 0U)
+        return;
+    (void)ramfs_mkdir("/lib");
+    (void)fs_unlink("/lib/libnss_dns.so.2");
+    struct fs_file *lf = fs_create_file("/lib/libnss_dns.so.2");
+    if (!lf)
+        lf = fs_open("/lib/libnss_dns.so.2");
+    if (lf) {
+        fs_write(lf, nss_dns_so_blob_start, len, 0);
+        fs_file_free(lf);
+    }
+}
 
 static inline uintptr_t align_up_uintptr(uintptr_t v, uintptr_t a) {
     return (v + (a - 1)) & ~(a - 1);
@@ -253,7 +271,6 @@ static int boot_try_run_init(void) {
         if (!((st.st_mode & S_IFREG) == S_IFREG || (st.st_mode & S_IFLNK) == S_IFLNK)) continue;
         const char *argv0[2] = { p, NULL };
         static const char *init_env[] = { "PS1=\\[\\033[1;31m\\]\\u\\033[0m@\\h \e[0;37m\\w\\033[0m\\$ ", NULL };
-        klogprintf("boot: starting init candidate %s\n", p);
         int rc = kernel_execve_from_path(p, argv0, init_env);
         if (rc == 0) return 0;
         klogprintf("boot: init %s returned rc=%d\n", p, rc);
@@ -596,7 +613,65 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         if (!wf) wf = fs_open("/var/log/wtmp");
         if (wf) fs_file_free(wf);
     }
+    /* glibc getaddrinfo: без nsswitch часто тянет mdns/systemd и connect() на 127.0.0.1 -> ECONNREFUSED. */
+    {
+        static const char nsswitch[] =
+            "passwd: files\n"
+            "group: files\n"
+            "shadow: files\n"
+            "gshadow: files\n"
+            "hosts: files dns\n"
+            "networks: files\n"
+            "protocols: files\n"
+            "services: files\n"
+            "ethers: files\n"
+            "rpc: files\n"
+            "netgroup: files\n";
+        (void)fs_unlink("/etc/nsswitch.conf");
+        struct fs_file *nf = fs_create_file("/etc/nsswitch.conf");
+        if (!nf) nf = fs_open("/etc/nsswitch.conf");
+        if (nf) {
+            fs_write(nf, nsswitch, sizeof(nsswitch) - 1, 0);
+            fs_file_free(nf);
+        }
+    }
+    {
+        static const char hosts_min[] = "127.0.0.1\tlocalhost\n";
+        (void)fs_unlink("/etc/hosts");
+        struct fs_file *hf = fs_create_file("/etc/hosts");
+        if (!hf) hf = fs_open("/etc/hosts");
+        if (hf) {
+            fs_write(hf, hosts_min, sizeof(hosts_min) - 1, 0);
+            fs_file_free(hf);
+        }
+    }
+    /* glibc resolver trad: order hosts then DNS; avoids surprise open(2) ENOENT on some setups. */
+    {
+        static const char host_conf[] = "order hosts,bind\nmulti on\n";
+        (void)fs_unlink("/etc/host.conf");
+        struct fs_file *cf = fs_create_file("/etc/host.conf");
+        if (!cf) cf = fs_open("/etc/host.conf");
+        if (cf) {
+            fs_write(cf, host_conf, sizeof(host_conf) - 1, 0);
+            fs_file_free(cf);
+        }
+    }
+    /* Prefer IPv4 / IPv4-mapped addresses so tools are not stuck on bare IPv6 path. */
+    {
+        static const char gai_conf[] =
+            "precedence  ::1/128       50\n"
+            "precedence  ::/0          40\n"
+            "precedence  ::ffff:0:0/96 100\n";
+        (void)fs_unlink("/etc/gai.conf");
+        struct fs_file *gf = fs_create_file("/etc/gai.conf");
+        if (!gf) gf = fs_open("/etc/gai.conf");
+        if (gf) {
+            fs_write(gf, gai_conf, sizeof(gai_conf) - 1, 0);
+            fs_file_free(gf);
+        }
+    }
     syscall_net_ensure_resolv();
+    ramfs_install_libnss_dns();
     /* Programs (mount, sh) open /etc/localtime; create so open doesn't fail. */
     {
         struct fs_file *lt = fs_create_file("/etc/localtime");

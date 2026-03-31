@@ -7,6 +7,8 @@ typedef int (*net_tcp_send_l4_fn)(uint32_t dst_ip_be, uint8_t proto, const void 
 typedef int (*net_tcp_recv_frame_fn)(void *buf, size_t cap);
 typedef uint64_t (*net_tcp_time_ms_fn)(void);
 typedef void (*net_tcp_yield_fn)(void);
+/* Shared RX queue: put back a frame that does not belong to this TCP connection (Linux: other sockets still see it). */
+typedef void (*net_tcp_return_frame_fn)(const void *frame, size_t n);
 
 typedef struct {
     uint32_t local_ip_be;
@@ -14,6 +16,7 @@ typedef struct {
     net_tcp_recv_frame_fn recv_frame;
     net_tcp_time_ms_fn time_ms;
     net_tcp_yield_fn yield;
+    net_tcp_return_frame_fn return_frame;
 } net_tcp_ops_t;
 
 typedef struct {

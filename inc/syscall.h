@@ -48,6 +48,7 @@
 #define SYS_setpgid 109
 #define SYS_gettid  186
 #define SYS_mmap    9
+#define SYS_ftruncate 77
 #define SYS_munmap  11
 #define SYS_madvise 28
 #define SYS_brk     12

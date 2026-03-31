@@ -257,6 +257,14 @@ static uint64_t user_image_limit_bytes(void) {
     return (uint64_t)hb;
 }
 
+/* Fork gives a new mm_t with a copied PML4; boot/init on BSP shares the kernel root.
+ * Compare page-table roots — not mm struct pointers — so early exec never takes the
+ * private-mm path when still on the kernel address space. */
+static int elf_needs_private_user_pages(thread_t *tc) {
+    mm_t *k = mm_kernel();
+    return tc && tc->mm && tc->mm->pml4 && k && k->pml4 && tc->mm->pml4 != k->pml4;
+}
+
 /* Mark an identity-mapped VA range as user-accessible and writable, and clear NX
    on the relevant page table entries. This is required for instruction fetch and
    data access in ring3. We best-effort handle existing 1GiB/2MiB mappings without
@@ -567,8 +575,9 @@ int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk
         /* If current task has a private mm, make destination pages private before writing ELF. */
         {
             thread_t *tc = thread_current();
-            if (tc && tc->mm && tc->mm != mm_kernel()) {
-                if (mm_make_private_range(tc->mm, vstart, vend, 0) != 0) {
+            if (elf_needs_private_user_pages(tc)) {
+                mm_t *share = tc->mm_ptemplate ? tc->mm_ptemplate : mm_kernel();
+                if (mm_make_private_range(tc->mm, vstart, vend, 0, share) != 0) {
                     kfree(phdrs);
                     fs_file_free(f);
                     return -1;
@@ -883,9 +892,10 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     }
     {
         thread_t *tc = thread_current();
-        if (tc && tc->mm && tc->mm != mm_kernel()) {
+        if (elf_needs_private_user_pages(tc)) {
+            mm_t *share = tc->mm_ptemplate ? tc->mm_ptemplate : mm_kernel();
             uintptr_t stack_base = (stack_top - USER_STACK_SIZE) & ~0xFFFULL;
-            if (mm_make_private_range(tc->mm, (uint64_t)stack_base, (uint64_t)stack_top, 0) != 0) {
+            if (mm_make_private_range(tc->mm, (uint64_t)stack_base, (uint64_t)stack_top, 0, share) != 0) {
                 kprintf("execve: failed to private-map user stack\n");
                 return -1;
             }
@@ -960,8 +970,9 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     const uintptr_t pthread_fake = tls_region_base + 0x2000u; /* within first few pages */
     {
         thread_t *tc = thread_current();
-        if (tc && tc->mm && tc->mm != mm_kernel()) {
-            if (mm_make_private_range(tc->mm, (uint64_t)tls_region_base, (uint64_t)(pthread_fake + 0x1000u), 0) != 0) {
+        if (elf_needs_private_user_pages(tc)) {
+            mm_t *share = tc->mm_ptemplate ? tc->mm_ptemplate : mm_kernel();
+            if (mm_make_private_range(tc->mm, (uint64_t)tls_region_base, (uint64_t)(pthread_fake + 0x1000u), 0, share) != 0) {
                 kprintf("execve: failed to private-map TLS range\n");
                 return -1;
             }
@@ -1184,6 +1195,13 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     (void)map_page_2m(0x634000, 0x634000, PG_US | PG_RW);
 
     /* Transfer to user mode (does not return on success). */
+    {
+        thread_t *tc = thread_current();
+        if (tc && tc->mm_ptemplate) {
+            mm_release(tc->mm_ptemplate);
+            tc->mm_ptemplate = NULL;
+        }
+    }
     enter_user_mode(entry, final_stack);
     return 0; /* not reached */
 }

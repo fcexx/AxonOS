@@ -67,6 +67,9 @@ typedef struct thread {
         uintptr_t user_brk_base;
         uintptr_t user_brk_cur;
         uintptr_t user_mmap_next;
+        /* High-water end of anon/file-private mmap (max addr+len). Fork uses this — not
+         * mmap_next, which is only a bump cursor and can sit at 32MiB before any map. */
+        uintptr_t user_mmap_hi;
         /* exec trampoline support: when set, kernel will patch the saved syscall return
            frame so that on syscall return the thread resumes at exec_trampoline_rip/rsp
            with RAX=exec_trampoline_rax. Used to implement vfork-by-reusing-current-thread. */
@@ -114,6 +117,8 @@ typedef struct thread {
         int exit_status;
         /* process address space descriptor (CR3 + page-table root). */
         mm_t *mm;
+        /* Parent (or AS baseline) mm retained at fork for mm_make_private_range COW compare; exec clears. */
+        mm_t *mm_ptemplate;
         /* Unix-like static scheduling weight: -20 (high) .. 19 (low). Default 0. */
         int nice;
         /* Monotonic ticket when entering THREAD_READY; lower runs earlier at same priority. */

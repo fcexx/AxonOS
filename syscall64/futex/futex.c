@@ -15,6 +15,8 @@
 #include <spinlock.h>
 #include <mmio.h>
 #include <syscall.h>
+#include <string.h>
+#include <vga.h>
 
 #define FUTEX_WAIT           0
 #define FUTEX_WAKE           1
@@ -111,6 +113,12 @@ int futex_syscall(uintptr_t uaddr, int op, int val, const void *timeout, uintptr
         release(&futex_lock);
 
         /* block current thread until woken */
+        kprintf("futex: block tid=%llu name=%s uaddr=0x%llx val=%d op=%d\n",
+            (unsigned long long)(cur->tid ? cur->tid : 1),
+            (cur->name && cur->name[0]) ? cur->name : "(noname)",
+            (unsigned long long)uaddr,
+            val,
+            cmd);
         thread_block((int)cur->tid);
         thread_yield();
 

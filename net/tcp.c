@@ -97,26 +97,62 @@ int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget) {
     for (int i = 0; i < budget; i++) {
         int n = ops->recv_frame(frame, TCP_FRAME_BUF);
         if (n <= 0) break;
-        if ((size_t)n < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t) + sizeof(tcp_hdr_t)) continue;
+        if ((size_t)n < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t) + sizeof(tcp_hdr_t)) {
+            if (ops->return_frame) ops->return_frame(frame, (size_t)n);
+            if (ops->yield) ops->yield();
+            continue;
+        }
         const eth_hdr_t *eth = (const eth_hdr_t *)frame;
-        if (be16(eth->ethertype) != ETH_TYPE_IPV4) continue;
+        if (be16(eth->ethertype) != ETH_TYPE_IPV4) {
+            if (ops->return_frame) ops->return_frame(frame, (size_t)n);
+            if (ops->yield) ops->yield();
+            continue;
+        }
         const ipv4_hdr_t *ip = (const ipv4_hdr_t *)(frame + sizeof(eth_hdr_t));
         size_t ihl = (size_t)((ip->ver_ihl & 0x0Fu) * 4u);
-        if (ip->proto != IPPROTO_TCP_LOCAL || ihl < sizeof(ipv4_hdr_t)) continue;
-        if ((size_t)n < sizeof(eth_hdr_t) + ihl + sizeof(tcp_hdr_t)) continue;
+        if (ip->proto != IPPROTO_TCP_LOCAL || ihl < sizeof(ipv4_hdr_t)) {
+            if (ops->return_frame) ops->return_frame(frame, (size_t)n);
+            if (ops->yield) ops->yield();
+            continue;
+        }
+        if ((size_t)n < sizeof(eth_hdr_t) + ihl + sizeof(tcp_hdr_t)) {
+            if (ops->return_frame) ops->return_frame(frame, (size_t)n);
+            if (ops->yield) ops->yield();
+            continue;
+        }
         uint32_t src_ip_be = be32(ip->src);
         uint32_t dst_ip_be = be32(ip->dst);
-        if (dst_ip_be != ops->local_ip_be || src_ip_be != c->dst_ip_be) continue;
+        if (dst_ip_be != ops->local_ip_be || src_ip_be != c->dst_ip_be) {
+            if (ops->return_frame) ops->return_frame(frame, (size_t)n);
+            if (ops->yield) ops->yield();
+            continue;
+        }
         const tcp_hdr_t *th = (const tcp_hdr_t *)(frame + sizeof(eth_hdr_t) + ihl);
         uint16_t sport = be16(th->src_port), dport = be16(th->dst_port);
-        if (sport != c->dst_port || dport != c->src_port) continue;
+        if (sport != c->dst_port || dport != c->src_port) {
+            if (ops->return_frame) ops->return_frame(frame, (size_t)n);
+            if (ops->yield) ops->yield();
+            continue;
+        }
         uint32_t seq = be32(th->seq);
         uint32_t ack = be32(th->ack);
         size_t doff = (size_t)((th->doff_res >> 4) * 4u);
-        if (doff < sizeof(tcp_hdr_t)) continue;
-        if ((size_t)n < sizeof(eth_hdr_t) + ihl + doff) continue;
+        if (doff < sizeof(tcp_hdr_t)) {
+            if (ops->return_frame) ops->return_frame(frame, (size_t)n);
+            if (ops->yield) ops->yield();
+            continue;
+        }
+        if ((size_t)n < sizeof(eth_hdr_t) + ihl + doff) {
+            if (ops->return_frame) ops->return_frame(frame, (size_t)n);
+            if (ops->yield) ops->yield();
+            continue;
+        }
         size_t ip_tot = (size_t)be16(ip->total_len);
-        if (ip_tot < ihl + doff) continue;
+        if (ip_tot < ihl + doff) {
+            if (ops->return_frame) ops->return_frame(frame, (size_t)n);
+            if (ops->yield) ops->yield();
+            continue;
+        }
         size_t payload_len = ip_tot - ihl - doff;
         const uint8_t *payload = frame + sizeof(eth_hdr_t) + ihl + doff;
 
@@ -164,19 +200,33 @@ int net_tcp_connect(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t dst_ip
     c->dst_ip_be = dst_ip_be;
     c->dst_port = dst_port;
     c->src_port = src_port;
-    c->snd_una = (uint32_t)(ops->time_ms() ^ 0x71A9C33Du);
-    c->snd_nxt = c->snd_una + 1;
+    /* ISN: start sequence number for SYN. */
+    uint32_t isn = (uint32_t)(ops->time_ms() ^ 0x71A9C33Du);
+    c->snd_una = isn;
+    c->snd_nxt = isn;
     c->rcv_nxt = 0;
     if (tcp_send_seg(c, ops, 0x02u, NULL, 0) != 0) return -1; /* SYN */
+    c->snd_nxt = isn + 1;
     ops->yield();
     ops->yield();
     ops->yield();
     ops->yield();
     ops->yield(); /* give VMware/NAT time to deliver SYN-ACK */
     uint64_t start = ops->time_ms();
+    uint64_t last_syn = start;
     while ((ops->time_ms() - start) < timeout_ms) {
         (void)net_tcp_service(c, ops, 16);
         if (c->established) return 0;
+        /* Retransmit SYN every ~1000ms until established. */
+        uint64_t now = ops->time_ms();
+        if (now - last_syn >= 1000) {
+            /* Re-send SYN with same initial sequence number (snd_nxt-1). */
+            uint32_t save = c->snd_nxt;
+            c->snd_nxt = save - 1;
+            (void)tcp_send_seg(c, ops, 0x02u, NULL, 0);
+            c->snd_nxt = save;
+            last_syn = now;
+        }
         ops->yield();
     }
     return -2; /* timeout: callers map to ETIMEDOUT */

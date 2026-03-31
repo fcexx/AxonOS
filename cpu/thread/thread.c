@@ -289,6 +289,8 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->user_brk_base = 0;
         t->user_brk_cur = 0;
         t->user_mmap_next = 0;
+        t->user_mmap_hi = 0;
+        t->mm_ptemplate = NULL;
         t->rseq_ptr = NULL;
         t->parent_tid = -1;
         t->saved_user_rip = 0;
@@ -413,6 +415,8 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         t->user_brk_base = 0;
         t->user_brk_cur = 0;
         t->user_mmap_next = 0;
+        t->user_mmap_hi = 0;
+        t->mm_ptemplate = NULL;
         t->rseq_ptr = NULL;
         t->parent_tid = -1;
         t->saved_user_rip = 0;
