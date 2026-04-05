@@ -1058,7 +1058,8 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         ut->user_stack_limit = stack_top;
         ut->user_fs_base = (uint64_t)fs_base;
         /* Mark PID 1 only for kernel-launched init candidates */
-        if (strcmp(path, "/init") == 0 || strcmp(path, "/sbin/init") == 0) {
+        if (strcmp(path, "/linuxrc") == 0 || strcmp(path, "/init") == 0 ||
+            strcmp(path, "/sbin/init") == 0) {
             thread_mark_init_user(ut);
         }
         /* inherit basic POSIX-ish attributes and stdio from caller (usually tid0 osh) */

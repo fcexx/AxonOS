@@ -522,15 +522,33 @@ struct fs_file *fs_create_file(const char *path) {
 
 struct fs_file *fs_open(const char *path) {
     if (!path) return NULL;
+    int dbg = 0;
 
     /* Fast path: most paths have no symlinks. Try direct open first. */
     struct fs_file *f = fs_open_no_resolve(path);
     if (f) {
         struct stat st;
-        if (vfs_fstat(f, &st) == 0 && (st.st_mode & S_IFLNK) != S_IFLNK) {
+        int sr = vfs_fstat(f, &st);
+        /* Be conservative: if stat fails (driver didn't fill), do NOT attempt full symlink
+           resolution — it can hang if namespace structures are temporarily inconsistent.
+           Returning the handle is still useful for callers that just need "exists". */
+        if (sr != 0) {
+            return f;
+        }
+        /* Git's .git/ paths should never need symlink resolution; avoid heavy resolve path. */
+        if (strstr(path, "/.git/") != NULL) {
+            return f;
+        }
+        if ((st.st_mode & S_IFLNK) != S_IFLNK) {
             return f;  /* regular file or dir, no resolution needed */
         }
         fs_file_free(f);  /* symlink or error, need full resolve */
+    }
+
+    /* Git's .git/ paths should never need symlink resolution; if not found directly,
+       treat as missing instead of walking prefixes (can hang under concurrent ops). */
+    if (strstr(path, "/.git/") != NULL) {
+        return NULL;
     }
 
     char *resolved_path = fs_resolve_symlinks(path);

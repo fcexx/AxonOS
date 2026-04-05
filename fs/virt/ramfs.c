@@ -44,6 +44,17 @@ static struct fs_driver ramfs_driver;
 static struct fs_driver_ops ramfs_ops;
 static struct ramfs_node *ramfs_root = NULL;
 static uint32_t ramfs_next_inode = 10;
+/* Serialize ramfs namespace operations (children lists, rename/remove/create).
+   Git performs parallel file operations; without a global lock the singly-linked
+   children lists can corrupt and make lookups/stat/rename hang. */
+static spinlock_t ramfs_tree_lock = { 0 };
+
+static inline void ramfs_tree_lock_acquire(unsigned long *flags) {
+    acquire_irqsave(&ramfs_tree_lock, flags);
+}
+static inline void ramfs_tree_lock_release(unsigned long flags) {
+    release_irqrestore(&ramfs_tree_lock, flags);
+}
 
 static struct ramfs_node *ramfs_alloc_node(const char *name, int is_dir) {
     if (!name) name = "";
@@ -185,7 +196,9 @@ static void ramfs_free_node_shallow(struct ramfs_node *n) {
 static struct ramfs_node *ramfs_find_child(struct ramfs_node *parent, const char *name) {
     if (!parent || !parent->children) return NULL;
     struct ramfs_node *c = parent->children;
-    while (c) {
+    /* Guard against list corruption (cycles) — never hang in directory traversal. */
+    int guard = 0;
+    while (c && guard++ < 65536) {
         if (strcmp(c->name, name) == 0) return c;
         c = c->next;
     }
@@ -306,10 +319,8 @@ static struct ramfs_node *ramfs_lookup(const char *path) {
                     strcpy(newpath, child->data);
                 } else {
                     /* relative to parent directory of symlink */
-                    /* build parent path */
-                    char parentbuf[512];
+                    char parentbuf[2048];
                     parentbuf[0] = '\0';
-                    /* compute absolute directory path of the symlink's parent */
                     if (ramfs_build_path(child->parent ? child->parent : ramfs_root, parentbuf, sizeof(parentbuf)) != 0) {
                         strcpy(parentbuf, "/");
                     }
@@ -368,16 +379,27 @@ static int ramfs_create(const char *path, struct fs_file **out_file) {
     struct ramfs_node *parent = ramfs_lookup(parent_path);
     if (!parent) { kfree(tmp); return -2; }
     if (!parent->is_dir) { kfree(tmp); return -3; }
-    if (ramfs_find_child(parent, name)) { kfree(tmp); return -4; }
+    {
+        unsigned long irqf = 0;
+        ramfs_tree_lock_acquire(&irqf);
+        int exists = (ramfs_find_child(parent, name) != NULL);
+        ramfs_tree_lock_release(irqf);
+        if (exists) { kfree(tmp); return -4; }
+    }
     struct ramfs_node *n = ramfs_alloc_node(name, 0);
     if (!n) { kfree(tmp); return -5; }
     /* set owner to current thread euid/egid */
     thread_t* ct = thread_current();
     if (ct) { n->uid = ct->euid; n->gid = ct->egid; }
-    n->parent = parent;
-    /* insert at head */
-    n->next = parent->children;
-    parent->children = n;
+    {
+        unsigned long irqf = 0;
+        ramfs_tree_lock_acquire(&irqf);
+        n->parent = parent;
+        /* insert at head */
+        n->next = parent->children;
+        parent->children = n;
+        ramfs_tree_lock_release(irqf);
+    }
     /* create fs_file */
     struct fs_file *f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
     if (!f) {
@@ -776,17 +798,23 @@ int ramfs_mkdir(const char *path) {
 /* Unlink node from its parent's children list without freeing the node. */
 static void ramfs_unlink_from_parent(struct ramfs_node *n) {
     if (!n || !n->parent) return;
+    unsigned long irqf = 0;
+    ramfs_tree_lock_acquire(&irqf);
     struct ramfs_node **pp = &n->parent->children;
-    while (*pp) {
+    /* Guard against list corruption (cycles). */
+    int guard = 0;
+    while (*pp && guard++ < 65536) {
         if (*pp == n) { *pp = n->next; n->next = NULL; break; }
         pp = &(*pp)->next;
     }
+    ramfs_tree_lock_release(irqf);
 }
 
 /* rename(oldpath, newpath) - move/overwrite. Same fs only. */
 int ramfs_rename(const char *oldpath, const char *newpath) {
     if (!oldpath || oldpath[0] != '/' || !newpath || newpath[0] != '/') return -1;
     if (strcmp(oldpath, newpath) == 0) return 0;
+    int dbg = 0;
     struct ramfs_node *old_node = ramfs_lookup(oldpath);
     if (!old_node) return -2; /* ENOENT */
     if (old_node->link_target) old_node = old_node->link_target; /* resolve symlink target for move */
@@ -821,9 +849,14 @@ int ramfs_rename(const char *oldpath, const char *newpath) {
     old_node->name = (char *)kmalloc(nlen);
     if (!old_node->name) { kfree(tmp); return -5; }
     memcpy(old_node->name, new_name, nlen);
-    old_node->parent = new_parent;
-    old_node->next = new_parent->children;
-    new_parent->children = old_node;
+    {
+        unsigned long irqf = 0;
+        ramfs_tree_lock_acquire(&irqf);
+        old_node->parent = new_parent;
+        old_node->next = new_parent->children;
+        new_parent->children = old_node;
+        ramfs_tree_lock_release(irqf);
+    }
     kfree(tmp);
     return 0;
 }
@@ -845,7 +878,9 @@ int ramfs_remove(const char *path) {
     stack[sp++] = n;
     while (sp) {
         struct ramfs_node *cur = stack[--sp];
-        for (struct ramfs_node *c = cur->children; c; c = c->next) {
+        /* Guard against list corruption (cycles) in children/sibling lists. */
+        int guard = 0;
+        for (struct ramfs_node *c = cur->children; c && guard++ < 65536; c = c->next) {
             if (sp < 64) stack[sp++] = c;
         }
         if (cur->name) kfree(cur->name);

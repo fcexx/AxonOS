@@ -302,6 +302,7 @@ void apic_timer_stop(void) {
     apic_set_lvt_timer(0, 0, true); // Mask timer
     apic_write(LAPIC_TIMER_INIT_REG, 0); // Stop counter
     apic_timer_state.running = false;
+    apic_timer_state.frequency = 0; /* no time base while stopped (avoids stale Hz after PIT fallback) */
 }
 
 void apic_timer_set_frequency(uint32_t freq_hz) {

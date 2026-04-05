@@ -3459,7 +3459,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
     /* record last syscall for debug logging of ENOSYS */
     last_syscall_debug = num;
 
-    //if (num != 1) klogprintf("syscall: num=%llu\n", (unsigned long long)num);
+    //if (num != 1) kprintf("syscall: num=%llu\n", (unsigned long long)num);
 
     switch (num) {
         case SYS_clone: {
@@ -4339,6 +4339,23 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (r == 0) return 0;
             return ret_err(EPERM);
         }
+        case 268: { /* fchmodat(dirfd, pathname, mode, flags) */
+            int dirfd = (int)a1;
+            const char *path_u = (const char*)(uintptr_t)a2;
+            mode_t mode = (mode_t)a3;
+            int flags = (int)a4;
+            (void)flags; /* AT_SYMLINK_NOFOLLOW not supported yet */
+            if (!path_u) return ret_err(EFAULT);
+            if ((uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+            char path[256];
+            int rc = resolve_user_path_at(cur, dirfd, path_u, path, sizeof(path));
+            if (rc != 0) return ret_err(-rc);
+            struct stat st;
+            if (vfs_stat(path, &st) != 0) return ret_err(ENOENT);
+            int r = fs_chmod(path, mode);
+            if (r == 0) return 0;
+            return ret_err(EPERM);
+        }
         case SYS_chown: {
             /* chown(path, uid, gid) - syscall 92; rpm may set ownership; stub success */
             (void)a1; (void)a2; (void)a3;
@@ -4500,7 +4517,15 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             resolve_user_path(cur, path_u, path, sizeof(path));
             struct fs_file *f = fs_open(path);
             if (!f) return ret_err(ENOENT);
-            int is_dir = (f->type == FS_TYPE_DIR);
+            /* Don't trust f->type: some drivers don't set it consistently.
+               Use stat mode to decide directory-ness so chdir("/") never regresses. */
+            struct stat st;
+            int is_dir = 0;
+            if (vfs_fstat(f, &st) == 0) {
+                is_dir = ((st.st_mode & S_IFDIR) == S_IFDIR);
+            } else {
+                is_dir = (f->type == FS_TYPE_DIR);
+            }
             fs_file_free(f);
             if (!is_dir) return ret_err(EINVAL);
             size_t n = strlen(path);
@@ -6182,7 +6207,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (sk->nonblock) fl |= O_NONBLOCK_LINUX;
                     return (uint64_t)(unsigned)fl;
                 }
-                return 0;
+                /* For regular files/dirs/pipes: we don't track flags yet; return accmode only so fdopen() works. */
+                return (uint64_t)(unsigned)O_RDWR_LINUX;
             } else if (cmd == F_SETFL) {
                 if (f->type == SYSCALL_FTYPE_SOCKET && f->driver_private) {
                     ksock_net_t *sk = (ksock_net_t *)f->driver_private;
@@ -7912,6 +7938,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (!tcur_poll_cfg) tcur_poll_cfg = thread_current();
             int is_wget_proc = (tcur_poll_cfg && tcur_poll_cfg->name[0] && strstr(tcur_poll_cfg->name, "wget")) ? 1 : 0;
             int is_apm_proc = (tcur_poll_cfg && tcur_poll_cfg->name[0] && strstr(tcur_poll_cfg->name, "apm")) ? 1 : 0;
+            int is_git_proc = (tcur_poll_cfg && tcur_poll_cfg->name[0] && strstr(tcur_poll_cfg->name, "git")) ? 1 : 0;
             if (num == 271) {
                 /* Minimal ppoll: ignore sigmask/sigsetsize, translate timespec->ms for poll(). */
                 const void *tmo_u = (const void*)(uintptr_t)a3;
@@ -7925,13 +7952,13 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (ms > 0x7FFFFFFFULL) ms = 0x7FFFFFFFULL;
                     timeout = (int)ms;
                 } else {
-                    /* Cap NULL-timeout ppoll for wget/apm so they don't block forever on network. */
-                    if (is_wget_proc || is_apm_proc) timeout = 1000;
+                    /* Cap NULL-timeout ppoll so userland can't block forever on network. */
+                    if (is_wget_proc || is_apm_proc || is_git_proc) timeout = 1000;
                 }
                 } else {
                     timeout = (int)a3; /* milliseconds, -1 means infinite */
-                    /* wget/apm can block forever on network poll(-1); cap so process can progress. */
-                    if (timeout < 0 && (is_wget_proc || is_apm_proc)) timeout = 1000;
+                    /* Some tools can block forever on network poll(-1); cap so process can progress. */
+                    if (timeout < 0 && (is_wget_proc || is_apm_proc || is_git_proc)) timeout = 1000;
                 }
             if (nfds < 0 || nfds > 1024) return ret_err(EINVAL);
             volatile int elapsed = 0;
@@ -8172,13 +8199,19 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (!path_u || (uintptr_t)path_u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
             char *path = kmalloc(256);
             if (!path) return ret_err(ENOMEM);
-            resolve_user_path(cur, path_u, path, sizeof(path));
+            /* path is a heap buffer; sizeof(path) would be sizeof(char*) (8) and truncate paths */
+            resolve_user_path(cur, path_u, path, 256);
             if (strcmp(path, "/etc/inittab") == 0) {
                 struct stat st;
                 if (vfs_stat(path, &st) == 0 && st.st_size == 0) {
+                    kfree(path);
                     return ret_err(ENOENT);
                 }
             }
+            const int O_CREAT_MASK = 0x40;
+            const int O_EXCL_MASK  = 0x80;
+
+            /* POSIX: O_CREAT|O_EXCL must fail if file already exists. */
             struct fs_file *f = fs_open(path);
             if (!f) {
                 if (strcmp(path, "/console") == 0) f = fs_open("/dev/console");
@@ -8186,12 +8219,18 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 else if (strcmp(path, "/tty0") == 0) f = fs_open("/dev/tty0");
             }
             if (!f) {
-                const int O_CREAT_MASK = 0x40;
                 if (flags & O_CREAT_MASK) {
                     f = fs_create_file(path);
-                    if (!f) return ret_err(ENOENT);
+                    if (!f) { kfree(path); return ret_err(ENOENT); }
                 } else {
+                    kfree(path);
                     return ret_err(ENOENT);
+                }
+            } else {
+                if ((flags & O_CREAT_MASK) && (flags & O_EXCL_MASK)) {
+                    fs_file_free(f);
+                    kfree(path);
+                    return ret_err(EEXIST);
                 }
             }
             const int O_TRUNC_MASK = 0x200;
@@ -8206,6 +8245,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
             if (f && (flags & O_APPEND_MASK)) { f->pos = (off_t)(size_t)f->size; }
             int fd = thread_fd_alloc(f);
+            kfree(path);
             if (fd < 0) { fs_file_free(f); return ret_err(EBADF); }
             return (uint64_t)(unsigned)fd;
         }
@@ -8226,6 +8266,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     return ret_err(ENOENT);
                 }
             }
+            const int O_CREAT_MASK = 0x40;
+            const int O_EXCL_MASK  = 0x80;
+
+            /* POSIX: O_CREAT|O_EXCL must fail if file already exists. */
             struct fs_file *f = fs_open(path);
             if (!f) {
                 /* chvt: "console"->/console, "tty"->/tty, "tty0"->/tty0, "vc/0"->/dev/vc/0 (handled by devfs) */
@@ -8234,13 +8278,17 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 else if (strcmp(path, "/tty0") == 0) f = fs_open("/dev/tty0");
             }
             if (!f) {
-                const int O_CREAT_MASK = 0x40;
                 if (flags & O_CREAT_MASK) {
                     f = fs_create_file(path);
-                    if (!f) {/*klogprintf("openat() returned ENOENT for %s\n", path);*/return ret_err(ENOENT);}
+                    if (!f) return ret_err(ENOENT);
                 } else {
                     //klogprintf("openat() returned ENOENT for %s\n", path);
                     return ret_err(ENOENT);
+                }
+            } else {
+                if ((flags & O_CREAT_MASK) && (flags & O_EXCL_MASK)) {
+                    fs_file_free(f);
+                    return ret_err(EEXIST);
                 }
             }
             const int O_TRUNC_MASK = 0x200;
@@ -8449,6 +8497,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if ((uintptr_t)st_u + STAT_COPY_SIZE > (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
             struct stat st;
             enum { AT_FDCWD = -100 };
+            /* Linux AT_* flags */
+            enum { AT_SYMLINK_NOFOLLOW = 0x100 };
             int st_ready = 0;
             /* AT_EMPTY_PATH (0x1000): stat the file given by dirfd when path is empty (or NULL). */
             char first = '\0';
@@ -8521,7 +8571,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             if (rc_resolve == -ENOENT) return ret_err(ENOENT);
                             return ret_err(EFAULT);
                         }
-                        if (vfs_stat(path, &st) != 0) return ret_err(ENOENT);
+                        /* Respect AT_SYMLINK_NOFOLLOW: behave like lstat() when requested. */
+                        int sr = (flags & AT_SYMLINK_NOFOLLOW) ? vfs_lstat(path, &st) : vfs_stat(path, &st);
+                        if (sr != 0) return ret_err(ENOENT);
                         st_ready = 1;
                     }
                 }

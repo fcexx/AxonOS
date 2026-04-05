@@ -1,14 +1,14 @@
-/* initfs.h - parse multiboot2 module named "initfs" and unpack cpio newc into VFS */
+/* initfs.h — initrd via Linux boot_params (ramdisk_image/size), cpio newc → VFS */
 #pragma once
 
 #include <stdint.h>
+#include <stddef.h>
 
-/* Scan multiboot2 tags for a module with name `module_name`.
-   If found, unpack cpio newc archive from the module into the VFS.
-   Returns 0 on success, negative on error, 1 if module not found. */
-int initfs_process_multiboot_module(uint32_t multiboot_magic, uint64_t multiboot_info, const char *module_name);
+/* Unpack initrd described in Linux zeropage at boot_params_phys (identity-mapped).
+ * Returns 0 on success, negative on unpack error, 2/3 on missing/invalid boot_params. */
+int initfs_process_linux_bootparams(uint64_t boot_params_phys);
 
-/* Debug: list VFS contents via qemu_debug_printf (call after unpack). */
+/* First physical byte after the initrd region (4 KiB aligned), or 0 if none / invalid. */
+uintptr_t initfs_linux_ramdisk_exclusive_end(uint64_t boot_params_phys);
+
 void initfs_debug_list_vfs(void);
-
-
