@@ -19,6 +19,8 @@ extern "C" {
 #endif
 /* Fill stat for an open ramfs file (driver-specific) */
 int ramfs_fill_stat(struct fs_file *file, struct stat *st);
+/* Set regular file length (ftruncate). Returns 0 or negative -errno. */
+int ramfs_ftruncate(struct fs_file *file, off_t length);
 int ramfs_chmod(const char *path, mode_t mode);
 #ifdef __cplusplus
 }

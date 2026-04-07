@@ -24,20 +24,43 @@
 
 static struct devfs_tty dev_ttys[DEVFS_TTY_COUNT];
 static int devfs_active = 0;
+static int devfs_ready = 0;
 
 static struct fs_driver devfs_driver;
 static struct fs_driver_ops devfs_ops;
 static void *devfs_driver_data = NULL;
 
+/* forward declarations (used by devfs_unlink) */
+static int devfs_open(const char *path, struct fs_file **out_file);
+static void devfs_release(struct fs_file *file);
+
+/* devfs is a virtual filesystem: device nodes are not removable from userspace.
+   However we must implement unlink() so tools like BusyBox rm report EPERM
+   instead of ENOENT (which happens when VFS falls through to other drivers). */
+static int devfs_unlink(const char *path) {
+    if (!path) return -3; /* ENOENT */
+    /* If this path is a valid devfs node, deny removal (EPERM). */
+    struct fs_file *f = NULL;
+    if (devfs_open(path, &f) == 0 && f) {
+        devfs_release(f);
+        return -1; /* EPERM */
+    }
+    return -3; /* ENOENT */
+}
+
 static inline uint32_t devfs_tty_cols(void) {
     int c = console_max_cols();
     if (c <= 0) c = MAX_COLS;
+    /* vmwgfx/VBE can report a very large character grid; uncapped cols*rows*2
+     * makes devfs_register() kmalloc and clear loop effectively hang boot. */
+    if (c > 512) c = 512;
     return (uint32_t)c;
 }
 
 static inline uint32_t devfs_tty_rows(void) {
     int r = console_max_rows();
     if (r <= 0) r = MAX_ROWS;
+    if (r > 512) r = 512;
     return (uint32_t)r;
 }
 
@@ -1289,12 +1312,15 @@ int devfs_register(void) {
     devfs_ops.open = devfs_open;
     devfs_ops.read = devfs_read;
     devfs_ops.write = devfs_write;
+    devfs_ops.unlink = devfs_unlink;
     devfs_ops.release = devfs_release;
     devfs_driver.ops = &devfs_ops;
     /* set a unique non-NULL driver_data so VFS dispatch finds this driver for our files */
     devfs_driver_data = &devfs_driver; /* unique pointer */
     devfs_driver.driver_data = &devfs_driver_data;
-    return fs_register_driver(&devfs_driver);
+    int r = fs_register_driver(&devfs_driver);
+    if (r == 0) devfs_ready = 1;
+    return r;
 }
 
 void devfs_tty_realloc_for_console(void) {
@@ -1394,8 +1420,11 @@ int devfs_unregister(void) {
     for (int i = 0; i < DEVFS_TTY_COUNT; i++) {
         if (dev_ttys[i].screen) kfree(dev_ttys[i].screen);
     }
+    devfs_ready = 0;
     return fs_unregister_driver(&devfs_driver);
 }
+
+int devfs_is_ready(void) { return devfs_ready; }
 
 static int devfs_tty_try_erase(struct devfs_tty *t, int tty) {
     if (!t || t->in_count <= 0) return 0;
@@ -1572,6 +1601,28 @@ void devfs_tty_remove_waiter(int tty, int tid) {
         }
     }
     release_irqrestore(&t->in_lock, flags);
+}
+
+void devfs_tty_remove_waiter_from_all_ttys(int tid) {
+    if (tid < 0) return;
+    for (int tty = 0; tty < DEVFS_TTY_COUNT; tty++) {
+        for (;;) {
+            struct devfs_tty *t = &dev_ttys[tty];
+            unsigned long flags = 0;
+            int found = 0;
+            acquire_irqsave(&t->in_lock, &flags);
+            for (int i = 0; i < t->waiters_count; i++) {
+                if (t->waiters[i] == tid) {
+                    t->waiters[i] = t->waiters[t->waiters_count - 1];
+                    t->waiters_count--;
+                    found = 1;
+                    break;
+                }
+            }
+            release_irqrestore(&t->in_lock, flags);
+            if (!found) break;
+        }
+    }
 }
 
 /* Helpers exposed to other kernel components */

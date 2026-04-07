@@ -6,6 +6,7 @@
 #include <fonts/default_8x16.h>
 #include <vga.h>
 #include <klog.h>
+#include <pit.h>
 
 /* Simple framebuffer console built on top of vbe double-buffer */
 extern int vbe_is_available(void);
@@ -37,7 +38,7 @@ static int esc_mode = 0;
 static char esc_buf[32];
 static int esc_len = 0;
 static int cursor_visible = 1; /* cursor blink state */
-static uint32_t cursor_blink_counter = 0;
+static uint64_t cursor_blink_last_phase = 0;
 
 void draw_cursor(void);
 void erase_cursor(void);
@@ -343,17 +344,18 @@ void erase_cursor(void) {
 
 void vbefb_update_cursor(void) {
 	if (!vbe_is_available()) return;
-	/* Keep blink perceptible on both 100Hz and 1000Hz timer setups. */
-	cursor_blink_counter++;
-	if (cursor_blink_counter >= 120) {
-		cursor_blink_counter = 0;
-		cursor_visible = !cursor_visible;
-		if (cursor_visible) {
-			draw_cursor();
-		} else {
-			erase_cursor();
-		}
-	}
+	/* Blink based on absolute monotonic time so it remains stable even if
+	   timer IRQs are delayed by load/exception handling (catch-up on next tick). */
+	const uint64_t period_ticks = 500; /* ~500ms when timer_ticks is 1ms */
+	uint64_t phase = (period_ticks != 0) ? (timer_ticks / period_ticks) : 0;
+	if (phase == cursor_blink_last_phase) return;
+	cursor_blink_last_phase = phase;
+	/* even phase => visible; odd => hidden */
+	int want_visible = ((phase & 1ULL) == 0ULL) ? 1 : 0;
+	if (want_visible == cursor_visible) return;
+	cursor_visible = want_visible;
+	if (cursor_visible) draw_cursor();
+	else erase_cursor();
 }
 
 void vbefb_putn(char ch, int count, uint8_t attr) {
@@ -404,7 +406,7 @@ int vbefb_init(uint32_t width, uint32_t height, uint32_t pitch, uint32_t bpp) {
 	memset(textbuf, 0, (size_t)cols * rows * sizeof(cell_t));
 	cursor_x = 0; cursor_y = 0;
 	cursor_visible = 1;
-	cursor_blink_counter = 0;
+	cursor_blink_last_phase = 0;
 	current_attr = 0x07;
 	esc_mode = 0;
 	esc_len = 0;

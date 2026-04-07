@@ -21,9 +21,13 @@ SECTIONS
         *(.data)
     }
 
-    .bss : {
-        *(.bss)
+    /* Must include COMMON and .bss.* or _end sits before real BSS end; RAM past _end
+     * still belongs to the kernel and will overwrite the low initrd module (GRUB ~0x103000). */
+    .bss : ALIGN(16) {
+        *(.bss .bss.*)
+        *(COMMON)
     }
 
+    . = ALIGN(16);
     _end = .; PROVIDE(end = .);
 }

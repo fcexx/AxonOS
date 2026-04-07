@@ -11,6 +11,7 @@
 #include <ramfs.h>
 #include <procfs.h>
 #include <devfs.h>
+#include <fat32.h>
 
 #define MAX_FS_DRIVERS 8
 #define MAX_FS_MOUNTS 8
@@ -233,7 +234,7 @@ int fs_mkdir(const char *path) {
     if (mount_drv && mount_drv->ops && mount_drv->ops->mkdir) {
         int r = mount_drv->ops->mkdir(path);
         if (r == 0) return 0;
-        if (r < 0) return -1;
+        if (r < 0) return r;
     }
     /* fallback: try drivers' create if they accept directories */
     for (int i = 0; i < g_drivers_count; i++) {
@@ -241,7 +242,7 @@ int fs_mkdir(const char *path) {
         if (!drv || !drv->ops || !drv->ops->mkdir) continue;
         int r = drv->ops->mkdir(path);
         if (r == 0) return 0;
-        if (r < 0) return -1;
+        if (r < 0 && r != -1) return r;
     }
     return -1;
 }
@@ -521,15 +522,33 @@ struct fs_file *fs_create_file(const char *path) {
 
 struct fs_file *fs_open(const char *path) {
     if (!path) return NULL;
+    int dbg = 0;
 
     /* Fast path: most paths have no symlinks. Try direct open first. */
     struct fs_file *f = fs_open_no_resolve(path);
     if (f) {
         struct stat st;
-        if (vfs_fstat(f, &st) == 0 && (st.st_mode & S_IFLNK) != S_IFLNK) {
+        int sr = vfs_fstat(f, &st);
+        /* Be conservative: if stat fails (driver didn't fill), do NOT attempt full symlink
+           resolution — it can hang if namespace structures are temporarily inconsistent.
+           Returning the handle is still useful for callers that just need "exists". */
+        if (sr != 0) {
+            return f;
+        }
+        /* Git's .git/ paths should never need symlink resolution; avoid heavy resolve path. */
+        if (strstr(path, "/.git/") != NULL) {
+            return f;
+        }
+        if ((st.st_mode & S_IFLNK) != S_IFLNK) {
             return f;  /* regular file or dir, no resolution needed */
         }
         fs_file_free(f);  /* symlink or error, need full resolve */
+    }
+
+    /* Git's .git/ paths should never need symlink resolution; if not found directly,
+       treat as missing instead of walking prefixes (can hang under concurrent ops). */
+    if (strstr(path, "/.git/") != NULL) {
+        return NULL;
     }
 
     char *resolved_path = fs_resolve_symlinks(path);
@@ -670,6 +689,24 @@ int fs_rename(const char *oldpath, const char *newpath) {
     return -1;
 }
 
+int fs_unlink(const char *path) {
+    if (!path) return -1;
+    struct fs_driver *mount_drv = fs_match_mount(path);
+    if (mount_drv && mount_drv->ops && mount_drv->ops->unlink) {
+        int r = mount_drv->ops->unlink(path);
+        if (r == 0) return 0;
+        if (r < 0) return r;
+    }
+    for (int i = 0; i < g_drivers_count; i++) {
+        struct fs_driver *drv = g_drivers[i];
+        if (!drv || !drv->ops || !drv->ops->unlink) continue;
+        int r = drv->ops->unlink(path);
+        if (r == 0) return 0;
+        if (r < 0 && r != -1) return r;
+    }
+    return -1;
+}
+
 ssize_t fs_readdir_next(struct fs_file *file, void *buf, size_t size) {
     if (!file) return -1;
     ssize_t r = fs_read(file, buf, size, file->pos);
@@ -736,6 +773,23 @@ done:
     st->st_size = (off_t)file->size;
     st->st_nlink = 1;
     return 0;
+}
+
+int vfs_ftruncate(struct fs_file *file, off_t length) {
+    if (!file) return -9; /* EBADF */
+    for (int i = 0; i < g_drivers_count; i++) {
+        struct fs_driver *drv = g_drivers[i];
+        if (!drv) continue;
+        if (!fs_file_matches_driver(drv, file)) continue;
+        const char *name = drv->ops ? drv->ops->name : NULL;
+        if (name && strcmp(name, "ramfs") == 0)
+            return ramfs_ftruncate(file, length);
+        if (name && strcmp(name, "fat32") == 0)
+            return fat32_ftruncate(file, length);
+        /* Open file belongs to a driver we do not truncate yet */
+        return -95; /* EOPNOTSUPP */
+    }
+    return -95; /* EOPNOTSUPP */
 }
 
 int vfs_stat(const char *path, struct stat *st) {

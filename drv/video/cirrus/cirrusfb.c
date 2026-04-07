@@ -5,6 +5,7 @@
 #include <vga.h>
 #include <klog.h>
 #include <video.h>
+#include <pit.h>
 
 /* VGA Sequencer registers for Cirrus hardware cursor */
 #define VGA_SEQ_INDEX   0x3C4
@@ -51,7 +52,7 @@ static uint8_t g_current_attr = 0x07;
    Uses "save-under by redraw": cursor draws an underscore on the bottom scanlines,
    and erase restores the original cell by redrawing its glyph from g_textbuf. */
 static int g_swcursor_visible = 1;
-static uint32_t g_swcursor_blink_counter = 0;
+static uint64_t g_swcursor_last_phase = 0;
 
 /* ANSI: kputchar() goes straight here when Cirrus is active — devfs may not see all output. */
 enum { CIR_ESC_NONE = 0, CIR_ESC_ESC = 1, CIR_ESC_CSI = 2, CIR_ESC_SS3 = 3 };
@@ -312,7 +313,7 @@ int cirrusfb_init(void *fb, uint32_t width, uint32_t height, uint32_t pitch, uin
 	g_cursor_y = 0;
 	g_current_attr = 0x07;
 	g_swcursor_visible = 1;
-	g_swcursor_blink_counter = 0;
+	g_swcursor_last_phase = 0;
 	g_ready = 1;
 
 	cirrusfb_clear(WHITE_ON_BLACK);
@@ -575,22 +576,24 @@ static void cirrusfb_csi_dispatch(uint8_t fb) {
 	}
 	if (fb == 'A' || fb == 'B' || fb == 'C' || fb == 'D') {
 		int n = (np > 0 && p[0] > 0) ? p[0] : 1;
+		uint32_t nx = g_cursor_x;
+		uint32_t ny = g_cursor_y;
 		if (fb == 'A') {
-			if (g_cursor_y >= (uint32_t)n) g_cursor_y -= (uint32_t)n;
-			else g_cursor_y = 0;
+			if (ny >= (uint32_t)n) ny -= (uint32_t)n;
+			else ny = 0;
 		} else if (fb == 'B') {
-			if (g_cursor_y + (uint32_t)n < g_rows) g_cursor_y += (uint32_t)n;
-			else g_cursor_y = g_rows - 1;
+			if (ny + (uint32_t)n < g_rows) ny += (uint32_t)n;
+			else ny = g_rows - 1;
 		} else if (fb == 'C') {
-			if (g_cursor_x + (uint32_t)n < g_cols) g_cursor_x += (uint32_t)n;
-			else g_cursor_x = g_cols - 1;
+			if (nx + (uint32_t)n < g_cols) nx += (uint32_t)n;
+			else nx = g_cols - 1;
 		} else {
-			if (g_cursor_x >= (uint32_t)n) g_cursor_x -= (uint32_t)n;
-			else g_cursor_x = 0;
+			if (nx >= (uint32_t)n) nx -= (uint32_t)n;
+			else nx = 0;
 		}
-		if (g_hwcursor_ok) {
-			hwcursor_set_pos(g_cursor_x, g_cursor_y);
-		}
+		/* Keep cursor stable for both HW and SW cursor modes:
+		   set_cursor handles erase/draw and preserves blink state. */
+		cirrusfb_set_cursor(nx, ny);
 	}
 }
 
@@ -654,12 +657,15 @@ void cirrusfb_update_cursor(void) {
 		/* Hardware cursor blinks automatically. */
 		return;
 	}
-	/* Keep blink perceptible on both 100Hz and 1000Hz timer setups. */
-	g_swcursor_blink_counter++;
-	if (g_swcursor_blink_counter >= 120) {
-		g_swcursor_blink_counter = 0;
-		g_swcursor_visible = !g_swcursor_visible;
-		if (g_swcursor_visible) swcursor_draw_at(g_cursor_x, g_cursor_y);
-		else swcursor_erase_at(g_cursor_x, g_cursor_y);
-	}
+	/* Blink based on absolute monotonic time so it remains stable even if
+	   timer IRQs are delayed by load/exception handling (catch-up on next tick). */
+	const uint64_t period_ticks = 500; /* ~500ms when timer_ticks is 1ms */
+	uint64_t phase = (period_ticks != 0) ? (timer_ticks / period_ticks) : 0;
+	if (phase == g_swcursor_last_phase) return;
+	g_swcursor_last_phase = phase;
+	int want_visible = ((phase & 1ULL) == 0ULL) ? 1 : 0;
+	if (want_visible == g_swcursor_visible) return;
+	g_swcursor_visible = want_visible;
+	if (g_swcursor_visible) swcursor_draw_at(g_cursor_x, g_cursor_y);
+	else swcursor_erase_at(g_cursor_x, g_cursor_y);
 }

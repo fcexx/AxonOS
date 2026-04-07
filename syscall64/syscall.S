@@ -2,6 +2,7 @@
 
 .extern syscall_do
 .extern syscall_kernel_rsp0
+.extern syscall_kernel_rsp0_by_apic
 .extern syscall_user_rsp_saved
 .extern syscall_user_return_rax
 .extern syscall_user_saved_rbx
@@ -28,7 +29,7 @@
 // Assumptions/constraints (current AxonOS design):
 // - Kernel and user share one address space (identity-mapped below 4GiB)
 // - We return to ring3 via IRETQ (not SYSRET), so we can use existing USER_CS/USER_DS
-// - syscall_kernel_rsp0 is maintained by tss_set_rsp0() before entering user mode
+// - tss_set_rsp0() updates per-CPU rsp0 table (indexed by local APIC ID)
 //
 // Syscall ABI:
 //   rax = nr
@@ -37,23 +38,28 @@
 //
 // We preserve all GPRs and only change rax (return value), rcx/r11 are restored and used for iret frame
 //
-// NOTE: This is single-core / non-reentrant with respect to syscall_user_rsp_saved
-//       Good enough for current AxonOS; we can make it per-thread/per-cpu later
 syscall_entry64:
     cld
-    // Save user RIP (return address) for SYSCALL path (rcx contains return RIP)
-    movq    %rcx, syscall_user_return_rip(%rip)
+    // Save user RFLAGS image from r11 before using it as scratch.
+    movq    %r11, syscall_user_saved_r11(%rip)
     // Save user RSP and switch to kernel syscall stack (only if set).
     movq    %rsp, syscall_user_rsp_saved(%rip)
-    // Check syscall_kernel_rsp0 without clobbering registers and switch if non-zero.
-    cmpq    $0, syscall_kernel_rsp0(%rip)
+    // Choose kernel stack by local APIC ID first; fallback to legacy global.
+    movabsq $0xFEE00020, %r11       // LAPIC ID register
+    movl    (%r11), %r11d
+    shrl    $24, %r11d               // APIC ID in bits 31:24
+    movq    syscall_kernel_rsp0_by_apic(,%r11,8), %r11
+    testq   %r11, %r11
+    jnz     .have_syscall_rsp0
+    movq    syscall_kernel_rsp0(%rip), %r11
+.have_syscall_rsp0:
+    testq   %r11, %r11
     je      .no_switch_syscall_stack
-    movq    syscall_kernel_rsp0(%rip), %rsp
+    movq    %r11, %rsp
 .no_switch_syscall_stack:
 
     // Store this syscall's user RSP on the kernel stack too.
-    // Using a global is racy when multiple user threads make syscalls (vfork/exec),
-    // but storing it on each thread's kernel stack keeps it per-thread.
+    // Frame consumers in C expect frame[15] = saved user RSP.
     pushq   syscall_user_rsp_saved(%rip)
 
     // Save registers (order matches our offset math below).
@@ -67,7 +73,7 @@ syscall_entry64:
     pushq   %r8
     pushq   %r9
     pushq   %r10
-    pushq   %r11
+    pushq   syscall_user_saved_r11(%rip)
     pushq   %r12
     pushq   %r13
     pushq   %r14

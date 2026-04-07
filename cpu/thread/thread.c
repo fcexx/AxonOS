@@ -289,6 +289,8 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->user_brk_base = 0;
         t->user_brk_cur = 0;
         t->user_mmap_next = 0;
+        t->user_mmap_hi = 0;
+        t->mm_ptemplate = NULL;
         t->rseq_ptr = NULL;
         t->parent_tid = -1;
         t->saved_user_rip = 0;
@@ -413,6 +415,8 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         t->user_brk_base = 0;
         t->user_brk_cur = 0;
         t->user_mmap_next = 0;
+        t->user_mmap_hi = 0;
+        t->mm_ptemplate = NULL;
         t->rseq_ptr = NULL;
         t->parent_tid = -1;
         t->saved_user_rip = 0;
@@ -612,26 +616,48 @@ void thread_stop(int pid) {
 }
 
 void thread_block(int pid) {
+        unsigned long irqf;
+        acquire_irqsave(&sched_lock, &irqf);
         for (int i = 0; i < thread_count; ++i) {
                 if (threads[i] && threads[i]->tid == pid && threads[i]->state != THREAD_BLOCKED) {
                         threads[i]->state = THREAD_BLOCKED;
                         threads[i]->sleep_until = 0; /* no timeout */
+                        release_irqrestore(&sched_lock, irqf);
                         return;
                 }
         }
+        release_irqrestore(&sched_lock, irqf);
         klogprintf("<(0c)>thread_block: thread %d not found or already blocked\n", pid);
+}
+
+int thread_block_current_atomic(void) {
+        unsigned long irqf;
+        int blocked = 0;
+        acquire_irqsave(&sched_lock, &irqf);
+        thread_t *cur = thread_current();
+        if (cur && cur->state == THREAD_RUNNING) {
+                cur->state = THREAD_BLOCKED;
+                cur->sleep_until = 0;
+                blocked = 1;
+        }
+        release_irqrestore(&sched_lock, irqf);
+        return blocked;
 }
 
 void thread_block_with_timeout(int pid, uint32_t timeout_ms) {
         extern volatile uint64_t timer_ticks;
         uint32_t now = (uint32_t)timer_ticks;
+        unsigned long irqf;
+        acquire_irqsave(&sched_lock, &irqf);
         for (int i = 0; i < thread_count; ++i) {
                 if (threads[i] && threads[i]->tid == pid && threads[i]->state != THREAD_BLOCKED) {
                         threads[i]->state = THREAD_BLOCKED;
                         threads[i]->sleep_until = now + (timeout_ms ? timeout_ms : 0xFFFFFFFFu);
+                        release_irqrestore(&sched_lock, irqf);
                         return;
                 }
         }
+        release_irqrestore(&sched_lock, irqf);
 }
 
 void thread_sleep(uint32_t ms) {

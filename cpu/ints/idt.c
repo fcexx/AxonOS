@@ -13,6 +13,7 @@
 #include <apic.h>
 #include <debug.h>
 #include <mmio.h>
+#include <klog.h>
 #include <paging.h>
 // Avoid including <cstdint> because cross-toolchain headers may not provide it; use uint64_t instead
 
@@ -237,6 +238,38 @@ static void page_fault_handler(cpu_registers_t* regs) {
             }
         }
         dump("page fault", user ? "user" : "kernel", regs, cr2, regs->error_code, user);
+        /* If the fault happened inside libc memset/memmove, print caller return RIPs.
+           We repeatedly see crashes at RIP=0x158c94 (payload memset byte-store). */
+        if (!user) {
+            uint64_t rip = regs->rip;
+            /* Also print when CR2 is clearly non-user (upper half), regardless of RIP range. */
+            int want_bt = 0;
+            if (rip >= 0x158c40ULL && rip < 0x159000ULL) want_bt = 1; /* libc/string area */
+            if (cr2 >= (uint64_t)MMIO_IDENTITY_LIMIT) want_bt = 1;    /* bogus pointer like 0xffff... */
+            if (want_bt) {
+                uint64_t rbp = regs->rbp;
+                klogprintf("pf: in libc/string area, rbp=0x%llx\n", (unsigned long long)rbp);
+                qemu_debug_printf("pf: in libc/string area, rbp=0x%llx\n", (unsigned long long)rbp);
+                for (int depth = 0; depth < 6; depth++) {
+                    if (rbp == 0) break;
+                    if (rbp + 16 > (uint64_t)MMIO_IDENTITY_LIMIT) break;
+                    uint64_t next_rbp = *(uint64_t*)(uintptr_t)(rbp + 0);
+                    uint64_t ret_rip  = *(uint64_t*)(uintptr_t)(rbp + 8);
+                    klogprintf("pf: bt[%d] rbp=0x%llx ret=0x%llx next_rbp=0x%llx\n",
+                               depth,
+                               (unsigned long long)rbp,
+                               (unsigned long long)ret_rip,
+                               (unsigned long long)next_rbp);
+                    qemu_debug_printf("pf: bt[%d] rbp=0x%llx ret=0x%llx next_rbp=0x%llx\n",
+                                      depth,
+                                      (unsigned long long)rbp,
+                                      (unsigned long long)ret_rip,
+                                      (unsigned long long)next_rbp);
+                    if (next_rbp <= rbp) break;
+                    rbp = next_rbp;
+                }
+            }
+        }
         // Read MSR_FS_BASE to help diagnose faults caused by missing TLS base
         uint64_t fsbase_lo = 0, fsbase_hi = 0;
         asm volatile("rdmsr" : "=a"(fsbase_lo), "=d"(fsbase_hi) : "c"(0xC0000100u));

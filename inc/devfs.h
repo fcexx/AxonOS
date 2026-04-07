@@ -60,6 +60,8 @@ int devfs_register(void);
 /* Reallocate all virtual-console screen buffers to match current console_max_cols/rows (call after fbcon init). */
 void devfs_tty_realloc_for_console(void);
 int devfs_unregister(void);
+/* True after devfs_register() succeeded; safe to use tty cursor state then. */
+int devfs_is_ready(void);
 int devfs_mount(const char *path);
 /* Open a devfs node directly without requiring a VFS mount. */
 struct fs_file *devfs_open_direct(const char *path);
@@ -92,6 +94,8 @@ int devfs_tty_available(int tty);
 int devfs_tty_add_waiter(int tty, int tid);
 /* Remove thread from waiters (call when poll wakes so we are not woken again by other ttys) */
 void devfs_tty_remove_waiter(int tty, int tid);
+/* Remove tid from every tty waiter list (fixes slot exhaustion after exit_group). */
+void devfs_tty_remove_waiter_from_all_ttys(int tid);
 /* Check whether an fs_file is a devfs tty device */
 int devfs_is_tty_file(struct fs_file *file);
 

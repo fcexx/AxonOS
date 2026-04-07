@@ -15,6 +15,8 @@
 #include <spinlock.h>
 #include <mmio.h>
 #include <syscall.h>
+#include <string.h>
+#include <vga.h>
 
 #define FUTEX_WAIT           0
 #define FUTEX_WAKE           1
@@ -99,7 +101,8 @@ int futex_syscall(uintptr_t uaddr, int op, int val, const void *timeout, uintptr
         /* FUTEX_WAIT_BITSET: timeout handled as infinite for now; val3 is bitset (ignored) */
         (void)val3;
 
-        /* enqueue */
+        /* Enqueue and transition current thread to BLOCKED atomically enough to avoid
+           lost wakeup between queue publication and thread state transition. */
         acquire(&futex_lock);
         futex_node_t *node = futex_find_node(uaddr, 1);
         if (!node) { release(&futex_lock); return -ENOMEM; }
@@ -108,11 +111,12 @@ int futex_syscall(uintptr_t uaddr, int op, int val, const void *timeout, uintptr
         w->tid = (int)(cur->tid ? cur->tid : 1);
         w->next = node->waiters;
         node->waiters = w;
+        int blocked = thread_block_current_atomic();
         release(&futex_lock);
 
-        /* block current thread until woken */
-        thread_block((int)cur->tid);
-        thread_yield();
+        /* If a waker raced and already moved us to READY, do not yield. */
+        if (blocked)
+            thread_yield();
 
         /* when woken, return 0 */
         return 0;

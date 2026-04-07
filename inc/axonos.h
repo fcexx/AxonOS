@@ -19,7 +19,7 @@ int syscall_try_handle_uaccess_fault(uint64_t fault_addr, uint64_t *resume_rip_o
 /* Populate default sysfs tree and /etc (called from SYS_mount when userspace mounts sysfs). */
 void kernel_sysfs_populate_default(void);
 
-/* Re-create /etc/resolv.conf and /etc/hosts from current net config. */
+/* Write /etc/resolv.conf from current kernel net config (DHCP DNS or gateway). */
 void syscall_net_ensure_resolv(void);
 
 /* SYS_resolve (1000): resolve hostname via DNS. See inc/syscall.h. */

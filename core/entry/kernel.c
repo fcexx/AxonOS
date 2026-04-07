@@ -31,6 +31,8 @@
 #include <sysfs.h>
 #include <procfs.h>
 #include <initfs.h>
+#include <bootparam.h>
+#include <mb2_linux_shim.h>
 #include <ramfs.h>
 #include <fat32.h>
 #include <intel_chipset.h>
@@ -57,73 +59,27 @@ int pvscsi_init(void);
 static char g_cwd[256] = "/";
 
 extern uint8_t _end[]; /* kernel end symbol from linker */
+extern const char nss_dns_so_blob_start[];
+extern const char nss_dns_so_blob_end[];
+
+static void ramfs_install_libnss_dns(void)
+{
+    size_t len = (size_t)(nss_dns_so_blob_end - nss_dns_so_blob_start);
+    if (len == 0U)
+        return;
+    (void)ramfs_mkdir("/lib");
+    (void)fs_unlink("/lib/libnss_dns.so.2");
+    struct fs_file *lf = fs_create_file("/lib/libnss_dns.so.2");
+    if (!lf)
+        lf = fs_open("/lib/libnss_dns.so.2");
+    if (lf) {
+        fs_write(lf, nss_dns_so_blob_start, len, 0);
+        fs_file_free(lf);
+    }
+}
 
 static inline uintptr_t align_up_uintptr(uintptr_t v, uintptr_t a) {
     return (v + (a - 1)) & ~(a - 1);
-}
-
-/* Multiboot2: find the maximum module end address. This is critical to place
-   the kernel heap ABOVE modules; otherwise heap headers can overwrite initfs
-   (this is exactly what happens on VMware when archive size changes).
-   Uses the same parsing strategies as initfs (standard, alt layout, loose scan)
-   so heap placement matches where initfs will find the module. */
-static uintptr_t mb2_modules_max_end(uint32_t multiboot_magic, uint64_t multiboot_info) {
-    if (multiboot_magic != 0x36d76289u || multiboot_info == 0) return 0;
-
-    uint8_t *p = (uint8_t*)(uintptr_t)multiboot_info;
-    uint32_t total_size = *(uint32_t*)p;
-    uintptr_t max_end = 0;
-
-    /* Standard layout: total_size at p+0, tags start at p+8 */
-    if (total_size >= 16 && total_size <= (256u * 1024u * 1024u)) {
-        uint32_t off = 8;
-        while (off + 8 <= total_size) {
-            uint32_t type = *(uint32_t*)(p + off);
-            uint32_t size = *(uint32_t*)(p + off + 4);
-            if (size < 8) break;
-            if ((uint64_t)off + (uint64_t)size > (uint64_t)total_size) break;
-            if (type == 0) break;
-            if (type == 3 && size >= 16) {
-                uint32_t mod_end = *(uint32_t*)(p + off + 12);
-                if ((uintptr_t)mod_end > max_end) max_end = (uintptr_t)mod_end;
-            }
-            off += (size + 7) & ~7u;
-        }
-    }
-
-    /* Alt layout (VMware etc.): p+0 is first tag, not header. Try fixed window. */
-    if (max_end == 0) {
-        const uint32_t alt_max = 65536u;
-        uint32_t alt_off = 0;
-        while (alt_off + 16 <= alt_max) {
-            uint32_t tag_type = *(uint32_t*)(p + alt_off);
-            uint32_t tag_size = *(uint32_t*)(p + alt_off + 4);
-            if (tag_size < 8 || tag_size > alt_max) break;
-            if (tag_type == 0) break;
-            if (tag_type == 3 && tag_size >= 16) {
-                uint32_t mod_end = *(uint32_t*)(p + alt_off + 12);
-                if ((uintptr_t)mod_end > max_end) max_end = (uintptr_t)mod_end;
-            }
-            alt_off += (tag_size + 7) & ~7u;
-        }
-    }
-
-    /* Loose scan: look for module tags in first 64 KiB */
-    if (max_end == 0) {
-        const uint32_t meta_scan = 65536u;
-        for (uint32_t off = 0; off + 16u <= meta_scan; off += 4u) {
-            if (*(uint32_t*)(p + off) != 3u) continue;
-            uint32_t tag_size = *(uint32_t*)(p + off + 4);
-            if (tag_size < 16u || tag_size > 4096u) continue;
-            if (off + tag_size > meta_scan) continue;
-            uint32_t ms32 = *(uint32_t*)(p + off + 8);
-            uint32_t me32 = *(uint32_t*)(p + off + 12);
-            if (me32 <= ms32) continue;
-            if ((uintptr_t)me32 > max_end) max_end = (uintptr_t)me32;
-        }
-    }
-
-    return max_end;
 }
 
 ssize_t sysfs_show_const(char *buf, size_t size, void *priv) {
@@ -253,7 +209,6 @@ static int boot_try_run_init(void) {
         if (!((st.st_mode & S_IFREG) == S_IFREG || (st.st_mode & S_IFLNK) == S_IFLNK)) continue;
         const char *argv0[2] = { p, NULL };
         static const char *init_env[] = { "PS1=\\[\\033[1;31m\\]\\u\\033[0m@\\h \e[0;37m\\w\\033[0m\\$ ", NULL };
-        klogprintf("boot: starting init candidate %s\n", p);
         int rc = kernel_execve_from_path(p, argv0, init_env);
         if (rc == 0) return 0;
         klogprintf("boot: init %s returned rc=%d\n", p, rc);
@@ -267,11 +222,20 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     enable_cursor();
     sysinfo_init(multiboot_magic, multiboot_info);
 
-    /* Initialize heap EARLY and place it above kernel + multiboot modules.
-       Otherwise heap metadata can overwrite initfs module (seen on VMware). */
+    /* Linux boot_params (zeropage): filled by real linux+initrd loaders, or synthesized
+     * from Multiboot2 module2 by mb2_linux_shim (GRUB does not pass boot_params with multiboot2). */
+    static __attribute__((aligned(4096))) uint8_t axon_synth_bootparams[LINUX_BOOTPARAM_MIN_SIZE];
+    uint64_t axon_boot_params_phys = 0;
+    if (multiboot_magic == 0x36d76289u && multiboot_info != 0) {
+        if (mb2_linux_shim_fill_bootparams(multiboot_magic, multiboot_info, axon_synth_bootparams,
+                                           sizeof axon_synth_bootparams, "initfs") == 0)
+            axon_boot_params_phys = (uint64_t)(uintptr_t)axon_synth_bootparams;
+    }
+
+    /* Initialize heap EARLY and place it above kernel + initrd (Linux boot_params). */
     {
         uintptr_t heap_start = align_up_uintptr((uintptr_t)_end, 0x1000);
-        uintptr_t mods_end = mb2_modules_max_end(multiboot_magic, multiboot_info);
+        uintptr_t mods_end = initfs_linux_ramdisk_exclusive_end(axon_boot_params_phys);
         uintptr_t mods_end_aligned = 0;
         if (mods_end) {
             mods_end_aligned = align_up_uintptr(mods_end, 0x1000);
@@ -291,6 +255,14 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
                 want = mods_end_aligned;
             if (heap_start < want)
                 heap_start = want;
+        }
+        /* kzip_stub may have filled [AXON_MB2_MODULE_RELOC_BASE, AXON_MB2_MODULE_RELOC_CEIL) even when
+         * synthesized boot_params do not describe a ramdisk (mods_end unknown). Keep heap above that
+         * arena so a late in-place initfs unpack is not clobbered by kmalloc (net/pci/… before initfs). */
+        if (multiboot_magic == 0x36d76289u && mods_end_aligned == 0u) {
+            uintptr_t reloc_ceiling = (uintptr_t)AXON_MB2_MODULE_RELOC_CEIL;
+            if (heap_start < reloc_ceiling)
+                heap_start = reloc_ceiling;
         }
         /* Heap size must not exceed installed RAM. The heap implementation is a
            simple identity-mapped arena; if we size it past RAM we will scribble
@@ -478,7 +450,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 
     
     /* If an initfs module was provided by the bootloader, unpack it into ramfs */
-    int r = initfs_process_multiboot_module(multiboot_magic, multiboot_info, "initfs");
+    int r = initfs_process_linux_bootparams(axon_boot_params_phys);
     if (r == 0) {
         klogprintf("initfs: unpacked successfully\n");
         initfs_debug_list_vfs();
@@ -498,13 +470,13 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         for (;;);
     }
 
+    klogprintf("boot: post-initfs setup (devfs, disks, /etc)...\n");
+
     /* register devfs and mount at /dev so /dev/tty0, /dev/console etc. exist before init/getty */
     if (devfs_register() == 0) {
         klogprintf("devfs: registering devfs\n");
         if (devfs_mount("/dev") == 0) {
             klogprintf("devfs: mounted at /dev\n");
-            /* /console -> /dev/console for chvt and tools that open "console" */
-            (void)ramfs_symlink("/console", "/dev/console");
             scsi_init();
             ata_dma_init();
             (void)pvscsi_init();
@@ -590,13 +562,75 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     (void)ramfs_mkdir("/var/run");
     (void)ramfs_mkdir("/var/log");  /* ensure exists for wtmp (klog also creates it) */
     (void)ramfs_mkdir("/tmp");  /* passwd uses mkstemp in /tmp for shadow update */
+    (void)ramfs_mkdir("/var/tmp");
+    /* tmux and many POSIX tools expect sticky tmp dirs (01777). */
+    (void)fs_chmod("/tmp", S_IFDIR | 01777);
+    (void)fs_chmod("/var/tmp", S_IFDIR | 01777);
     /* /var/log/wtmp: login history for last(1). Empty at boot; login appends utmp records. */
     {
         struct fs_file *wf = fs_create_file("/var/log/wtmp");
         if (!wf) wf = fs_open("/var/log/wtmp");
         if (wf) fs_file_free(wf);
     }
+    /* glibc getaddrinfo: без nsswitch часто тянет mdns/systemd и connect() на 127.0.0.1 -> ECONNREFUSED. */
+    {
+        static const char nsswitch[] =
+            "passwd: files\n"
+            "group: files\n"
+            "shadow: files\n"
+            "gshadow: files\n"
+            "hosts: files dns\n"
+            "networks: files\n"
+            "protocols: files\n"
+            "services: files\n"
+            "ethers: files\n"
+            "rpc: files\n"
+            "netgroup: files\n";
+        (void)fs_unlink("/etc/nsswitch.conf");
+        struct fs_file *nf = fs_create_file("/etc/nsswitch.conf");
+        if (!nf) nf = fs_open("/etc/nsswitch.conf");
+        if (nf) {
+            fs_write(nf, nsswitch, sizeof(nsswitch) - 1, 0);
+            fs_file_free(nf);
+        }
+    }
+    {
+        static const char hosts_min[] = "127.0.0.1\tlocalhost\n";
+        (void)fs_unlink("/etc/hosts");
+        struct fs_file *hf = fs_create_file("/etc/hosts");
+        if (!hf) hf = fs_open("/etc/hosts");
+        if (hf) {
+            fs_write(hf, hosts_min, sizeof(hosts_min) - 1, 0);
+            fs_file_free(hf);
+        }
+    }
+    /* glibc resolver trad: order hosts then DNS; avoids surprise open(2) ENOENT on some setups. */
+    {
+        static const char host_conf[] = "order hosts,bind\nmulti on\n";
+        (void)fs_unlink("/etc/host.conf");
+        struct fs_file *cf = fs_create_file("/etc/host.conf");
+        if (!cf) cf = fs_open("/etc/host.conf");
+        if (cf) {
+            fs_write(cf, host_conf, sizeof(host_conf) - 1, 0);
+            fs_file_free(cf);
+        }
+    }
+    /* Prefer IPv4 / IPv4-mapped addresses so tools are not stuck on bare IPv6 path. */
+    {
+        static const char gai_conf[] =
+            "precedence  ::1/128       50\n"
+            "precedence  ::/0          40\n"
+            "precedence  ::ffff:0:0/96 100\n";
+        (void)fs_unlink("/etc/gai.conf");
+        struct fs_file *gf = fs_create_file("/etc/gai.conf");
+        if (!gf) gf = fs_open("/etc/gai.conf");
+        if (gf) {
+            fs_write(gf, gai_conf, sizeof(gai_conf) - 1, 0);
+            fs_file_free(gf);
+        }
+    }
     syscall_net_ensure_resolv();
+    ramfs_install_libnss_dns();
     /* Programs (mount, sh) open /etc/localtime; create so open doesn't fail. */
     {
         struct fs_file *lt = fs_create_file("/etc/localtime");
@@ -616,7 +650,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     }
     /* /etc/issue: getty prints this before login prompt. \l = tty name (tty1, tty2, ...) */
     {
-        static const char issue[] = "AxonOS v" OS_VERSION " for servers (\\l)\n\n";
+        static const char issue[] = "AxonOS " OS_VERSION " for servers (\\l)\n\n";
         struct fs_file *ifile = fs_create_file("/etc/issue");
         if (!ifile) ifile = fs_open("/etc/issue");
         if (ifile) {
@@ -636,8 +670,11 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     }
     /* /etc/motd: message of the day, shown after successful login */
     {
-        static const char motd[] = "Welcome to " OS_NAME " v" OS_VERSION "!\n"
-                                   "Official site: https://axont.ru\n\n";
+        static const char motd[] = "\nWelcome to " OS_NAME " " OS_VERSION "\n"
+                                   "  * Website: https://axont.ru\n"
+                                   "  * GitHub: https://github.com/fcexx/AxonOS.git\n"
+                                   "  * AxonHub: https://axont.ru/axonhub\n"
+                                   "Feedback on axont@axont.ru\n\n";
         struct fs_file *mf = fs_create_file("/etc/motd");
         if (!mf) mf = fs_open("/etc/motd");
         if (mf) {
@@ -684,7 +721,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     kclear();
     // Prefer linuxrc/init if present; fallback to kernel shell.
     if (boot_try_run_init() != 0) {
-        kprintf("fatal: nothing to run.");
+        klogprintf("fatal: There's nothing to run. Download the correct initfs from https://apm.axont.ru/Packages/initfs.cpio and place it in the root of the boot device.");
     }
     
     for(;;) {
