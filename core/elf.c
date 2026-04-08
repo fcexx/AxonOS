@@ -257,12 +257,28 @@ static uint64_t user_image_limit_bytes(void) {
     return (uint64_t)hb;
 }
 
+static int elf_ptr_identity_ok(const void *p, size_t sz) {
+    uintptr_t a = (uintptr_t)p;
+    if (a < 0x1000u) return 0;
+    if (a >= (uintptr_t)MMIO_IDENTITY_LIMIT) return 0;
+    if (sz > 0 && a > ((uintptr_t)MMIO_IDENTITY_LIMIT - sz)) return 0;
+    return 1;
+}
+
 /* Fork gives a new mm_t with a copied PML4; boot/init on BSP shares the kernel root.
  * Compare page-table roots — not mm struct pointers — so early exec never takes the
  * private-mm path when still on the kernel address space. */
 static int elf_needs_private_user_pages(thread_t *tc) {
     mm_t *k = mm_kernel();
-    return tc && tc->mm && tc->mm->pml4 && k && k->pml4 && tc->mm->pml4 != k->pml4;
+    if (!tc || !k) return 0;
+    if (!elf_ptr_identity_ok(tc, sizeof(*tc))) return 0;
+    if (!elf_ptr_identity_ok(k, sizeof(*k))) return 0;
+    if (!tc->mm) return 0;
+    if (!elf_ptr_identity_ok(tc->mm, sizeof(mm_t))) return 0;
+    if (!tc->mm->pml4 || !k->pml4) return 0;
+    if (!elf_ptr_identity_ok(tc->mm->pml4, PAGE_SIZE_4K)) return 0;
+    if (!elf_ptr_identity_ok(k->pml4, PAGE_SIZE_4K)) return 0;
+    return tc->mm->pml4 != k->pml4;
 }
 
 /* Mark an identity-mapped VA range as user-accessible and writable, and clear NX
@@ -668,6 +684,141 @@ static char *kstrdup_local(const char *s) {
     return p;
 }
 
+/* Rebuild userspace stack/TLS layout for a specific target tid.
+   Used as a recovery path when the final created thread tid differs from the
+   initially planned slot (rare concurrent thread creation race). */
+static int exec_prepare_layout_for_tid(uint64_t target_tid,
+                                       const char *const argv[],
+                                       const char *const envp[],
+                                       uint64_t aux_phdr,
+                                       uint64_t aux_phent,
+                                       uint64_t aux_phnum,
+                                       uint64_t aux_entry,
+                                       uintptr_t *out_final_stack,
+                                       uintptr_t *out_stack_top,
+                                       uintptr_t *out_fs_base) {
+    if (!out_final_stack || !out_stack_top || !out_fs_base) return -1;
+
+    int argc = 0;
+    while (argv && argv[argc]) argc++;
+    size_t strings_size = 0;
+    for (int i = 0; i < argc; i++) strings_size += strlen(argv[i]) + 1;
+
+    int envc = 0;
+    while (envp && envp[envc]) envc++;
+    size_t env_strings_size = 0;
+    for (int i = 0; i < envc; i++) env_strings_size += strlen(envp[i]) + 1;
+
+    enum { AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_PAGESZ = 6, AT_ENTRY = 9, AT_RANDOM = 25 };
+    const size_t aux_pairs = 7;
+    const size_t aux_qwords = aux_pairs * 2;
+    size_t ptrs = (size_t)(argc + 1 + envc + 1) + aux_qwords;
+    size_t ptrs_bytes = ptrs * sizeof(uint64_t);
+
+    const size_t random_bytes = 16;
+    size_t total = ptrs_bytes + strings_size + env_strings_size + random_bytes + 32;
+    if (total > USER_STACK_SIZE - 128) return -1;
+
+    uintptr_t stack_top = user_stack_top_for_tid(target_tid);
+    stack_top &= ~((uintptr_t)0xFULL);
+    uintptr_t base = stack_top - total;
+    uintptr_t final_stack = (base - 8) & ~((uintptr_t)0xFULL);
+    base = final_stack + 8;
+
+    uintptr_t ptrs_addr = base;
+    uintptr_t strings_addr = base + ptrs_bytes;
+    uintptr_t random_addr = strings_addr + strings_size + env_strings_size;
+    if (strings_addr + strings_size + env_strings_size > (uintptr_t)MMIO_IDENTITY_LIMIT) return -1;
+
+    {
+        thread_t *tc = thread_current();
+        if (elf_needs_private_user_pages(tc)) {
+            mm_t *share = tc->mm_ptemplate ? tc->mm_ptemplate : mm_kernel();
+            uintptr_t stack_base = (stack_top - USER_STACK_SIZE) & ~0xFFFULL;
+            if (mm_make_private_range(tc->mm, (uint64_t)stack_base, (uint64_t)stack_top, 0, share) != 0) {
+                return -1;
+            }
+        }
+    }
+
+    char *str_dst = (char*)(uintptr_t)strings_addr;
+    uint64_t *sp64 = (uint64_t*)(uintptr_t)ptrs_addr;
+    for (int i = 0; i < argc; i++) {
+        size_t l = strlen(argv[i]) + 1;
+        memcpy(str_dst, argv[i], l);
+        sp64[i] = (uint64_t)(uintptr_t)str_dst;
+        str_dst += l;
+    }
+    sp64[argc] = 0;
+    for (int i = 0; i < envc; i++) {
+        size_t l = strlen(envp[i]) + 1;
+        memcpy(str_dst, envp[i], l);
+        sp64[argc + 1 + i] = (uint64_t)(uintptr_t)str_dst;
+        str_dst += l;
+    }
+    sp64[argc + 1 + envc] = 0;
+
+    {
+        uint8_t *rp = (uint8_t*)(uintptr_t)random_addr;
+        for (size_t i = 0; i < 16; i++) rp[i] = (uint8_t)(0xA5u ^ (uint8_t)(i * 17u));
+    }
+
+    size_t ax = (size_t)argc + 2 + (size_t)envc;
+    sp64[ax + 0] = (uint64_t)AT_PHDR;   sp64[ax + 1] = aux_phdr;
+    sp64[ax + 2] = (uint64_t)AT_PHENT;  sp64[ax + 3] = aux_phent ? aux_phent : (uint64_t)sizeof(Elf64_Phdr);
+    sp64[ax + 4] = (uint64_t)AT_PHNUM;  sp64[ax + 5] = aux_phnum;
+    sp64[ax + 6] = (uint64_t)AT_ENTRY;  sp64[ax + 7] = aux_entry;
+    sp64[ax + 8] = (uint64_t)AT_PAGESZ; sp64[ax + 9] = 4096ULL;
+    sp64[ax +10] = (uint64_t)AT_RANDOM; sp64[ax +11] = (uint64_t)random_addr;
+    sp64[ax +12] = (uint64_t)AT_NULL;   sp64[ax +13] = 0;
+    *((uint64_t*)(uintptr_t)final_stack) = (uint64_t)argc;
+
+    {
+        uintptr_t stack_base = (stack_top - USER_STACK_SIZE) & ~0xFFFULL;
+        if (mark_user_identity_range_2m((uint64_t)stack_base, (uint64_t)stack_top) != 0) {
+            return -1;
+        }
+    }
+
+    enum { MSR_FS_BASE_LOCAL = 0xC0000100u };
+    const uintptr_t tls_region_base = user_tls_base_for_stack_top(stack_top);
+    const uintptr_t fs_base = tls_region_base + 0x1000u;
+    const uintptr_t pthread_fake = tls_region_base + 0x2000u;
+    {
+        thread_t *tc = thread_current();
+        if (elf_needs_private_user_pages(tc)) {
+            mm_t *share = tc->mm_ptemplate ? tc->mm_ptemplate : mm_kernel();
+            if (mm_make_private_range(tc->mm, (uint64_t)tls_region_base, (uint64_t)(pthread_fake + 0x1000u), 0, share) != 0) {
+                return -1;
+            }
+        }
+        if (pthread_fake + 0x1000u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return -1;
+        if (mark_user_identity_range_2m((uint64_t)tls_region_base, (uint64_t)(pthread_fake + 0x1000u)) != 0) return -1;
+        memset((void*)tls_region_base, 0, 0x3000u);
+        uint64_t guard = 0;
+        if (random_addr + 16 <= (uintptr_t)MMIO_IDENTITY_LIMIT) guard = *(uint64_t*)(uintptr_t)random_addr;
+        else guard = 0x8b13f00d2a11c0deULL;
+        guard &= ~0xFFULL;
+        *(volatile uint64_t*)(uintptr_t)(fs_base + 0x28u) = guard;
+        *(volatile uint64_t*)(uintptr_t)(fs_base - 0x78u) = (uint64_t)pthread_fake;
+        {
+            const uintptr_t c_str = tls_region_base + 0x2800u;
+            if (c_str + 2 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                *(volatile uint8_t*)(uintptr_t)(c_str + 0) = (uint8_t)'C';
+                *(volatile uint8_t*)(uintptr_t)(c_str + 1) = 0;
+                const uintptr_t specific5_slot = pthread_fake + 0x80u + (uintptr_t)(5u * 8u);
+                *(volatile uint64_t*)(uintptr_t)specific5_slot = (uint64_t)c_str;
+            }
+        }
+        msr_write_u64_local(MSR_FS_BASE_LOCAL, (uint64_t)fs_base);
+    }
+
+    *out_final_stack = final_stack;
+    *out_stack_top = stack_top;
+    *out_fs_base = fs_base;
+    return 0;
+}
+
 /* If `path` is a script with shebang, exec its interpreter. */
 static int try_exec_shebang(const char *resolved_path,
                             const char *orig_path,
@@ -814,24 +965,14 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
        Using tid0 here causes all user programs spawned from osh to share the same stack
        slot, which breaks vfork/exec and leads to user-mode #GP after child exit. */
     thread_t *cur_user = thread_get_current_user();
-    thread_t *planned_ut = NULL;
     uint64_t planned_tid = 0;
     if (cur_user) {
         planned_tid = (uint64_t)cur_user->tid;
     } else {
-        /* Create the user thread early (BLOCKED) to reserve a unique tid for layout. */
-        extern void user_thread_entry(void);
-        planned_ut = thread_create_blocked(user_thread_entry, path ? path : "user");
-        if (!planned_ut) return -1;
-        planned_tid = (uint64_t)planned_ut->tid;
-        /* Exec from kernel: current thread is not the one that will run; set brk on planned_ut. */
-        if (loaded_brk_end != 0) {
-            uintptr_t base = loaded_brk_end;
-            if (base < (8u * 1024u * 1024u)) base = 8u * 1024u * 1024u;
-            base = (base + 4095u) & ~(uintptr_t)4095u;
-            planned_ut->user_brk_base = base;
-            planned_ut->user_brk_cur = base;
-        }
+        /* Kernel-launched exec: use next tid hint for per-thread stack slot calculation.
+           The actual blocked thread is created later, after all fallible setup is done,
+           to avoid leaking half-initialized threads on early execve failures. */
+        planned_tid = (uint64_t)thread_get_count();
     }
 
     /* Build argv strings and pointers in kernel, then copy into user stack area.
@@ -966,7 +1107,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
          instead of crashing, which is enough for glibc/busybox to continue bootstrap. */
     enum { MSR_FS_BASE_LOCAL = 0xC0000100u };
     const uintptr_t tls_region_base = user_tls_base_for_stack_top(stack_top);
-    const uintptr_t fs_base = tls_region_base + 0x1000u;      /* keep -0x78 and +0x28 in-range */
+    uintptr_t fs_base = tls_region_base + 0x1000u;      /* keep -0x78 and +0x28 in-range */
     const uintptr_t pthread_fake = tls_region_base + 0x2000u; /* within first few pages */
     {
         thread_t *tc = thread_current();
@@ -1047,16 +1188,38 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
             tss_set_rsp0(cur_user->kernel_stack);
         }
     } else {
-        /* spawn a scheduled user thread (already created as planned_ut) and block the caller until it terminates */
+        /* Spawn a scheduled user thread and block caller until it exits.
+           Create it only now (late), so earlier execve failures do not consume thread slots. */
         thread_t *caller = thread_current();
-        thread_t *ut = planned_ut;
+        extern void user_thread_entry(void);
+        thread_t *ut = thread_create_blocked(user_thread_entry, path ? path : "user");
         if (!ut) return -1;
+        if ((uint64_t)ut->tid != planned_tid) {
+            qemu_debug_printf("execve: warning: planned tid=%llu, actual tid=%llu\n",
+                              (unsigned long long)planned_tid,
+                              (unsigned long long)ut->tid);
+            /* Rebuild layout for actual tid to avoid per-thread region overlap. */
+            if (exec_prepare_layout_for_tid((uint64_t)ut->tid,
+                                            argv, envp,
+                                            aux_phdr, aux_phent, aux_phnum, aux_entry,
+                                            &final_stack, &stack_top, &fs_base) != 0) {
+                ut->state = THREAD_TERMINATED;
+                return -3; /* transient exec setup race; caller may retry */
+            }
+        }
         ut->ring = 3;
         ut->user_rip = entry;
         ut->user_stack = final_stack;
         ut->user_stack_base = (stack_top - USER_STACK_SIZE) & ~0xFFFULL;
         ut->user_stack_limit = stack_top;
         ut->user_fs_base = (uint64_t)fs_base;
+        if (loaded_brk_end != 0) {
+            uintptr_t brk_base = loaded_brk_end;
+            if (brk_base < (8u * 1024u * 1024u)) brk_base = 8u * 1024u * 1024u;
+            brk_base = (brk_base + 4095u) & ~(uintptr_t)4095u;
+            ut->user_brk_base = brk_base;
+            ut->user_brk_cur = brk_base;
+        }
         /* Mark PID 1 only for kernel-launched init candidates */
         if (strcmp(path, "/linuxrc") == 0 || strcmp(path, "/init") == 0 ||
             strcmp(path, "/sbin/init") == 0) {

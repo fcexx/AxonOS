@@ -210,6 +210,10 @@ static int boot_try_run_init(void) {
         const char *argv0[2] = { p, NULL };
         static const char *init_env[] = { "PS1=\\[\\033[1;31m\\]\\u\\033[0m@\\h \e[0;37m\\w\\033[0m\\$ ", NULL };
         int rc = kernel_execve_from_path(p, argv0, init_env);
+        if (rc == -3) {
+            /* Transient exec layout race: one bounded retry for early boot init path. */
+            rc = kernel_execve_from_path(p, argv0, init_env);
+        }
         if (rc == 0) return 0;
         klogprintf("boot: init %s returned rc=%d\n", p, rc);
 

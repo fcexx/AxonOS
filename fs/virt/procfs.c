@@ -16,6 +16,7 @@
 #include <usb.h>
 #include <scsi.h>
 #include <pci.h>
+#include <devfs.h>
 #include <vga.h>
 #include <pit.h>
 #include <loadavg.h>
@@ -23,7 +24,7 @@
 struct procfs_handle {
 	int kind; /* 1=root, 2=pid_dir, 3=pid_file, 4=symlink, 5=pid_fd_dir, 6=pid_fd_link, 7=plain, 8=proc_sys_dir, 9=proc_sys_file */
 	int pid;
-	int file_id; /* for pid_file: 0=cmdline, 1=stat; for sys files: ids; for pid_fd_link: fd number */
+	int file_id; /* pid_file: 0=cmdline,1=stat,2=status,3=statm; sys/plain: ids; pid_fd_link: fd number */
 	size_t pos;
 };
 
@@ -36,11 +37,26 @@ static ssize_t procfs_show_cmdline(char *buf, size_t size, void *priv) {
     if (!buf || size == 0) return 0;
     thread_t *t = thread_get(pid);
     if (!t) return 0;
-    size_t len = strlen(t->name);
-    if (len > size) len = size;
-    memcpy(buf, t->name, len);
-    if (len < size) buf[len++] = '\n';
+    char comm[sizeof(t->name)];
+    memcpy(comm, t->name, sizeof(comm));
+    comm[sizeof(comm) - 1] = '\0';
+    size_t len = strlen(comm);
+    if (len + 1 > size) len = (size > 0) ? (size - 1) : 0;
+    memcpy(buf, comm, len);
+    if (len < size) buf[len++] = '\0';
     return (ssize_t)len;
+}
+
+static char procfs_state_char(const thread_t *t) {
+    if (!t) return 'Z';
+    switch (t->state) {
+        case THREAD_RUNNING:
+        case THREAD_READY: return 'R';
+        case THREAD_BLOCKED:
+        case THREAD_SLEEPING: return 'S';
+        case THREAD_TERMINATED: return 'Z';
+        default: return 'S';
+    }
 }
 
 static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
@@ -48,9 +64,90 @@ static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
     if (!buf || size == 0) return 0;
     thread_t *t = thread_get(pid);
     if (!t) return 0;
-    /* Simple key-value style */
-    int written = snprintf(buf, size, "pid %d\nname %s\nstate %d\nppid %d\ncwd %s\n",
-                           (int)t->tid, t->name, (int)t->state, (int)t->parent_tid, t->cwd);
+    char comm[sizeof(t->name)];
+    memcpy(comm, t->name, sizeof(comm));
+    comm[sizeof(comm) - 1] = '\0';
+    int ppid = (t->parent_tid >= 0) ? t->parent_tid : 0;
+    int pgrp = (t->pgid >= 0) ? t->pgid : (int)t->tid;
+    int sid = (t->sid >= 0) ? t->sid : pgrp;
+    int tty_nr = 0;
+    int tpgid = pgrp;
+    int prio = 20 + t->nice;
+    if (prio < 1) prio = 1;
+    if (prio > 39) prio = 39;
+    uint64_t now_ticks = timer_ticks;
+    uint64_t hz = pit_get_frequency();
+    if (hz == 0) hz = 1000;
+    uint64_t elapsed_ticks = (now_ticks >= t->start_ticks) ? (now_ticks - t->start_ticks) : 0;
+    /* /proc/<pid>/stat expects USER_HZ units (typically 100). */
+    uint64_t utime = (elapsed_ticks * 100ull) / hz;
+    uint64_t stime = 0;
+    uint64_t starttime = (t->start_ticks * 100ull) / hz;
+    int written = snprintf(
+        buf, size,
+        "%d (%s) %c %d %d %d %d %d "
+        "%u %llu %llu %llu %llu %llu %llu %lld %lld "
+        "%d %d %d %d %llu %llu %d\n",
+        (int)t->tid, comm, procfs_state_char(t), ppid, pgrp, sid, tty_nr, tpgid,
+        0u,                  /* flags */
+        0ull, 0ull, 0ull, 0ull, /* minflt cminflt majflt cmajflt */
+        (unsigned long long)utime,
+        (unsigned long long)stime,
+        0ll, 0ll,            /* cutime cstime */
+        prio, t->nice,
+        1,                   /* num_threads */
+        0,                   /* itrealvalue */
+        (unsigned long long)starttime,
+        0ull,                /* vsize */
+        0                    /* rss */
+    );
+    if (written < 0) return 0;
+    size_t w = (size_t)written;
+    if (w > size) w = size;
+    return (ssize_t)w;
+}
+
+static ssize_t procfs_show_status(char *buf, size_t size, void *priv) {
+    int pid = (int)(uintptr_t)priv;
+    if (!buf || size == 0) return 0;
+    thread_t *t = thread_get(pid);
+    if (!t) return 0;
+    char comm[sizeof(t->name)];
+    memcpy(comm, t->name, sizeof(comm));
+    comm[sizeof(comm) - 1] = '\0';
+    int ppid = (t->parent_tid >= 0) ? t->parent_tid : 0;
+    int pgrp = (t->pgid >= 0) ? t->pgid : (int)t->tid;
+    int sid = (t->sid >= 0) ? t->sid : pgrp;
+    int written = snprintf(
+        buf, size,
+        "Name:\t%s\n"
+        "State:\t%c\n"
+        "Pid:\t%d\n"
+        "PPid:\t%d\n"
+        "Uid:\t%u\t%u\t%u\t%u\n"
+        "Gid:\t%u\t%u\t%u\t%u\n"
+        "Threads:\t1\n"
+        "NSpgid:\t%d\n"
+        "NSsid:\t%d\n",
+        comm, procfs_state_char(t), (int)t->tid, ppid,
+        (unsigned)t->uid, (unsigned)t->euid, (unsigned)t->suid, (unsigned)t->euid,
+        (unsigned)t->gid, (unsigned)t->egid, (unsigned)t->sgid, (unsigned)t->egid,
+        pgrp, sid
+    );
+    if (written < 0) return 0;
+    size_t w = (size_t)written;
+    if (w > size) w = size;
+    return (ssize_t)w;
+}
+
+static ssize_t procfs_show_statm(char *buf, size_t size, void *priv) {
+    int pid = (int)(uintptr_t)priv;
+    if (!buf || size == 0) return 0;
+    thread_t *t = thread_get(pid);
+    if (!t) return 0;
+    (void)t;
+    /* size resident shared text lib data dt (pages) */
+    int written = snprintf(buf, size, "0 0 0 0 0 0 0\n");
     if (written < 0) return 0;
     size_t w = (size_t)written;
     if (w > size) w = size;
@@ -556,6 +653,9 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
                 else if (strcmp(rest, "raw") == 0) fid = 54;
                 else if (strcmp(rest, "raw6") == 0) fid = 55;
                 else if (strcmp(rest, "unix") == 0) fid = 56;
+                else if (strcmp(rest, "arp") == 0) fid = 57;
+                else if (strcmp(rest, "dev") == 0) fid = 58;
+                else if (strcmp(rest, "route") == 0) fid = 59;
                 if (fid >= 0) {
                     h->kind = 7;
                     h->file_id = fid;
@@ -611,11 +711,15 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 					}
 				}
 			} else {
-				/* other pid children: cmdline, stat */
-			if (strncmp(rest, "cmdline", 7) == 0) {
+				/* other pid children: cmdline, stat, status, statm */
+			if (strncmp(rest, "cmdline", 7) == 0 && rest[7] == '\0') {
 					h->kind = 3; h->pid = pid; h->file_id = 0; f->type = FS_TYPE_REG;
-				} else if (strncmp(rest, "stat", 4) == 0) {
+				} else if (strncmp(rest, "stat", 4) == 0 && rest[4] == '\0') {
 					h->kind = 3; h->pid = pid; h->file_id = 1; f->type = FS_TYPE_REG;
+				} else if (strncmp(rest, "status", 6) == 0 && rest[6] == '\0') {
+					h->kind = 3; h->pid = pid; h->file_id = 2; f->type = FS_TYPE_REG;
+				} else if (strncmp(rest, "statm", 5) == 0 && rest[5] == '\0') {
+					h->kind = 3; h->pid = pid; h->file_id = 3; f->type = FS_TYPE_REG;
 				} else {
 					kfree(h); kfree(pp); kfree(f); return -1;
 				}
@@ -623,8 +727,11 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 				size_t cap = 4096;
 				char *tmpbuf = (char*)kmalloc(cap);
 				if (tmpbuf) {
-					ssize_t full = (h->file_id == 0) ? procfs_show_cmdline(tmpbuf, cap, (void*)(uintptr_t)h->pid)
-													 : procfs_show_stat(tmpbuf, cap, (void*)(uintptr_t)h->pid);
+					ssize_t full = 0;
+					if (h->file_id == 0) full = procfs_show_cmdline(tmpbuf, cap, (void*)(uintptr_t)h->pid);
+					else if (h->file_id == 1) full = procfs_show_stat(tmpbuf, cap, (void*)(uintptr_t)h->pid);
+					else if (h->file_id == 2) full = procfs_show_status(tmpbuf, cap, (void*)(uintptr_t)h->pid);
+					else if (h->file_id == 3) full = procfs_show_statm(tmpbuf, cap, (void*)(uintptr_t)h->pid);
 					if (full > 0) f->size = (size_t)full;
 					kfree(tmpbuf);
 				}
@@ -715,8 +822,8 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
     }
 
     if (h->kind == 2) {
-        /* /proc/<pid> dir: entries cmdline and stat */
-        const char *names[2] = { "cmdline", "stat" };
+        /* /proc/<pid> dir: entries cmdline/stat/status/statm */
+        const char *names[4] = { "cmdline", "stat", "status", "statm" };
         size_t pos = 0;
         size_t written = 0;
         uint8_t *out = (uint8_t*)buf;
@@ -755,9 +862,10 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
             }
             pos += rec_len;
         }
-        for (int idx = 0; idx < 2; idx++) {
+        for (int idx = 0; idx < 4; idx++) {
             size_t namelen = strlen(names[idx]);
             size_t rec_len = 8 + namelen;
+            rec_len = (rec_len + 3) & ~3u;
             if (pos + rec_len <= offset) { pos += rec_len; continue; }
             if (written >= size) break;
             size_t entry_off = 0;
@@ -851,7 +959,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 
     /* /proc/net directory listing */
     if (h->kind == 14) {
-        static const char *names[] = { "tcp", "tcp6", "udp", "udp6", "raw", "raw6", "unix" };
+        static const char *names[] = { "tcp", "tcp6", "udp", "udp6", "raw", "raw6", "unix", "arp", "dev", "route" };
         size_t pos = 0;
         size_t written = 0;
         uint8_t *out = (uint8_t *)buf;
@@ -987,7 +1095,10 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
         char *tmp = (char*)kmalloc(cap);
         if (!tmp) return -1;
         if (h->file_id == 0) full = procfs_show_cmdline(tmp, cap, (void*)(uintptr_t)h->pid);
-        else full = procfs_show_stat(tmp, cap, (void*)(uintptr_t)h->pid);
+        else if (h->file_id == 1) full = procfs_show_stat(tmp, cap, (void*)(uintptr_t)h->pid);
+        else if (h->file_id == 2) full = procfs_show_status(tmp, cap, (void*)(uintptr_t)h->pid);
+        else if (h->file_id == 3) full = procfs_show_statm(tmp, cap, (void*)(uintptr_t)h->pid);
+        else full = -1;
         if (full < 0) { kfree(tmp); return -1; }
         size_t len = (size_t)full;
         if ((size_t)offset >= len) { kfree(tmp); return 0; }
@@ -1080,6 +1191,9 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
         else if (h->file_id == 54) full = procfs_net_snap_raw(tmpbuf, cap);
         else if (h->file_id == 55) full = procfs_net_snap_raw6(tmpbuf, cap);
         else if (h->file_id == 56) full = procfs_net_snap_unix(tmpbuf, cap);
+        else if (h->file_id == 57) full = procfs_net_snap_arp(tmpbuf, cap);
+        else if (h->file_id == 58) full = procfs_net_snap_dev(tmpbuf, cap);
+        else if (h->file_id == 59) full = procfs_net_snap_route(tmpbuf, cap);
 		if (full < 0) { kfree(tmpbuf); return -1; }
 		size_t len = (size_t)full;
 		if ((size_t)offset >= len) { kfree(tmpbuf); return 0; }

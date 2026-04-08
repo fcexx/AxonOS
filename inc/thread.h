@@ -29,6 +29,8 @@ typedef struct thread {
         struct thread* next;
         uint64_t tid;
         char name[32];                 // thread name (urmomissofaturmomissofaturmomiss)
+        /* Process start tick for /proc/<pid>/stat starttime and utime approximation. */
+        uint64_t start_ticks;
 
         /* POSIX-ish job control identifiers */
         int pgid;                      // process group id

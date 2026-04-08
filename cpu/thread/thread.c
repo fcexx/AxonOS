@@ -168,6 +168,7 @@ void thread_init() {
         main_thread.tid = 0;
         main_thread.nice = 0;
         main_thread.sched_fifo_seq = 0;
+        main_thread.start_ticks = timer_ticks;
         main_thread.context.rflags = 0x202; // ensure IF set for idle/main thread
         main_thread.sleep_until = 0;
         //for (int i=0;i<THREAD_MAX_FD;i++) main_thread.fds[i]=NULL;
@@ -175,6 +176,7 @@ void thread_init() {
         threads[0] = &main_thread;
         thread_count = 1;
         strncpy(main_thread.name, "idle", sizeof(main_thread.name));
+        main_thread.name[sizeof(main_thread.name) - 1] = '\0';
         /* default credentials: root */
         main_thread.uid = main_thread.euid = main_thread.suid = 0;
         main_thread.gid = main_thread.egid = main_thread.sgid = 0;
@@ -272,8 +274,10 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->state = st;
         t->nice = 0;
         t->sched_fifo_seq = 0;
+        t->start_ticks = timer_ticks;
         t->sleep_until = 0;
         strncpy(t->name, name, sizeof(t->name));
+        t->name[sizeof(t->name) - 1] = '\0';
         /* default credentials (root) */
         t->uid = t->euid = t->suid = 0;
         t->gid = t->egid = t->sgid = 0;
@@ -371,9 +375,11 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         t->state = THREAD_RUNNING; // уже выполняется как текущее user‑задача
         t->nice = 0;
         t->sched_fifo_seq = 0;
+        t->start_ticks = timer_ticks;
         t->sleep_until = 0;
         t->tid = thread_count;
         strncpy(t->name, name ? name : "user", sizeof(t->name));
+        t->name[sizeof(t->name) - 1] = '\0';
         /* initialize POSIX-ish job control ids */
         t->pgid = (int)t->tid;
         t->sid = (int)t->tid;
@@ -815,7 +821,8 @@ void thread_schedule() {
 
 void thread_unblock(int pid) {
         for (int i = 0; i < thread_count; ++i) {
-                if (threads[i] && threads[i]->tid == pid && threads[i]->state == THREAD_BLOCKED) {
+                if (threads[i] && threads[i]->tid == pid &&
+                    (threads[i]->state == THREAD_BLOCKED || threads[i]->state == THREAD_SLEEPING)) {
                         threads[i]->sleep_until = 0;
                         thread_note_ready(threads[i]);
                         return;

@@ -404,6 +404,7 @@ static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, siz
 #define EPIPE   32
 #define EIO     5
 #define EEXIST  17
+#define EBUSY   16
 #define ENOTDIR 20
 #define EAFNOSUPPORT 97
 #define EPROTONOSUPPORT 93
@@ -599,6 +600,10 @@ typedef struct {
     uint16_t last_echo_id;
     uint16_t last_echo_seq;
     uint16_t next_echo_seq;
+    uint32_t last_rx_src_ip_be;
+    uint16_t last_rx_echo_id;
+    uint16_t last_rx_echo_seq;
+    uint64_t last_rx_echo_ms;
     int last_req_ts_fmt;
     size_t last_req_len;
     uint8_t last_req[2048];
@@ -1694,21 +1699,37 @@ static int net_try_parse_icmp_reply(const uint8_t *frame, size_t n, ksock_net_t 
     uint16_t id = (uint16_t)((icmp[4] << 8) | icmp[5]);
     uint16_t seq = (uint16_t)((icmp[6] << 8) | icmp[7]);
     if (id != s->last_echo_id || seq != s->last_echo_seq) return 0;
+    uint32_t src_ip_be = be32(ip->src);
+    {
+        uint64_t now_ms = pit_get_time_ms();
+        /* Drop immediate duplicates of the same ICMP echo-reply tuple.
+           Helps with NIC/drain races where the same frame is observed repeatedly. */
+        if (s->last_rx_echo_ms != 0 &&
+            s->last_rx_src_ip_be == src_ip_be &&
+            s->last_rx_echo_id == id &&
+            s->last_rx_echo_seq == seq &&
+            (now_ms - s->last_rx_echo_ms) < 1500u) {
+            return 0;
+        }
+        s->last_rx_src_ip_be = src_ip_be;
+        s->last_rx_echo_id = id;
+        s->last_rx_echo_seq = seq;
+        s->last_rx_echo_ms = now_ms;
+    }
     size_t copy_len = 0;
     if (s->type_base == SOCK_DGRAM_LOCAL) {
-        /* For datagram ICMP sockets return only ICMP payload. */
+        /* For datagram ICMP sockets, return full ICMP message (header+payload).
+           Busybox ping expects to parse id/seq from the received buffer. */
         size_t icmp_len = (size_t)tot - ihl;
         if (icmp_len < 8) return 0;
-        size_t payload_len = icmp_len - 8;
-        copy_len = (payload_len > out_cap) ? out_cap : payload_len;
-        if (copy_len > 0) memcpy(out, icmp + 8, copy_len);
-        else { out[0] = 0; copy_len = 1; } /* empty payload: still report success */
+        copy_len = (icmp_len > out_cap) ? out_cap : icmp_len;
+        memcpy(out, icmp, copy_len);
     } else {
         /* Raw ICMP sockets expect IPv4 header included. */
         copy_len = (tot > out_cap) ? out_cap : tot;
         memcpy(out, ip, copy_len);
     }
-    if (out_src_ip_be) *out_src_ip_be = be32(ip->src);
+    if (out_src_ip_be) *out_src_ip_be = src_ip_be;
     return (int)copy_len;
 }
 
@@ -1959,6 +1980,59 @@ ssize_t procfs_net_snap_unix(char *buf, size_t size) {
     if (!buf || size < 64) return 0;
     return (ssize_t)snprintf((char *)buf, size,
         "Num       RefCount Protocol Flags    Type St Inode Path\n");
+}
+
+ssize_t procfs_net_snap_arp(char *buf, size_t size) {
+    if (!buf || size < 64) return 0;
+    size_t w = 0;
+    int n = snprintf((char *)buf + w, size - w,
+                     "IP address       HW type     Flags       HW address            Mask     Device\n");
+    if (n < 0) return 0;
+    w += (size_t)n;
+    if (!g_net.ready) return (ssize_t)w;
+    if (g_net.gw_be != 0 && g_net.gw_mac_valid) {
+        n = snprintf((char *)buf + w, (w < size) ? (size - w) : 0,
+                     "%u.%u.%u.%u   0x1         0x2         %02x:%02x:%02x:%02x:%02x:%02x     *        eth0\n",
+                     (unsigned)((g_net.gw_be >> 24) & 0xFF), (unsigned)((g_net.gw_be >> 16) & 0xFF),
+                     (unsigned)((g_net.gw_be >> 8) & 0xFF), (unsigned)(g_net.gw_be & 0xFF),
+                     g_net.gw_mac[0], g_net.gw_mac[1], g_net.gw_mac[2],
+                     g_net.gw_mac[3], g_net.gw_mac[4], g_net.gw_mac[5]);
+        if (n > 0) w += (size_t)n;
+    }
+    return (ssize_t)w;
+}
+
+ssize_t procfs_net_snap_dev(char *buf, size_t size) {
+    if (!buf || size < 64) return 0;
+    size_t w = 0;
+    int n = snprintf((char *)buf + w, size - w,
+                     "Inter-|   Receive                                                |  Transmit\n"
+                     " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
+    if (n < 0) return 0;
+    w += (size_t)n;
+    n = snprintf((char *)buf + w, (w < size) ? (size - w) : 0,
+                 "  lo: 0        0       0    0    0    0     0          0         0        0       0    0    0    0     0       0\n");
+    if (n > 0) w += (size_t)n;
+    n = snprintf((char *)buf + w, (w < size) ? (size - w) : 0,
+                 "eth0: 0        0       0    0    0    0     0          0         0        0       0    0    0    0     0       0\n");
+    if (n > 0) w += (size_t)n;
+    return (ssize_t)w;
+}
+
+ssize_t procfs_net_snap_route(char *buf, size_t size) {
+    if (!buf || size < 64) return 0;
+    size_t w = 0;
+    int n = snprintf((char *)buf + w, size - w,
+                     "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n");
+    if (n < 0) return 0;
+    w += (size_t)n;
+    if (!g_net.ready) return (ssize_t)w;
+    /* default route via gateway */
+    n = snprintf((char *)buf + w, (w < size) ? (size - w) : 0,
+                 "eth0\t%08X\t%08X\t0003\t0\t0\t0\t%08X\t0\t0\t0\n",
+                 0u, ip_be_to_proc_net_hex(g_net.gw_be), ip_be_to_proc_net_hex(g_net.mask_be));
+    if (n > 0) w += (size_t)n;
+    return (ssize_t)w;
 }
 
 typedef struct __attribute__((packed)) {
@@ -2287,11 +2361,17 @@ static int netlink_build_route_dump(ksock_net_t *s, uint16_t req_type, uint32_t 
 }
 
 static uint64_t last_syscall_debug = 0;
+/* P0 execve reliability counters: transient layout race recovery. */
+static uint64_t g_execve_retry_eagain = 0;
+static uint64_t g_execve_retry_ok = 0;
+static uint64_t g_execve_retry_fail = 0;
+static uint64_t g_execve_retry_last_log_ms = 0;
 static inline int is_watch_proc(thread_t *t) {
     if (!t || !t->name[0]) return 0;
     const char *nm = t->name;
     /* BusyBox is a multicall binary: applets often run with name "busybox". */
-    return (strstr(nm, "busybox") || strstr(nm, "wget") || strstr(nm, "adduser") || strstr(nm, "addgroup")) ? 1 : 0;
+    return (strstr(nm, "busybox") || strstr(nm, "wget") || strstr(nm, "uget") ||
+            strstr(nm, "adduser") || strstr(nm, "addgroup")) ? 1 : 0;
 }
 
 static inline int path_is_passwdish(const char *p) {
@@ -2358,6 +2438,7 @@ static inline uint64_t ret_err(int e) {
         const char *nm = t->name;
         int watch = 0;
         if (strstr(nm, "wget")) watch = 1;
+        else if (strstr(nm, "uget")) watch = 1;
         else if (strstr(nm, "addgroup")) watch = 1;
         else if (strstr(nm, "adduser")) watch = 1;
         if (watch) {
@@ -3163,6 +3244,73 @@ static uintptr_t user_mmap_hi = 0;
 static uintptr_t user_brk_base = 0;
 static uintptr_t user_brk_cur = 0;
 static inline uintptr_t align_up_u(uintptr_t v, uintptr_t a);
+
+/* CLONE_VM threads share one address space, so brk/mmap cursors must be kept in sync
+   across all threads that reference the same mm. Keeping per-thread cursors causes
+   overlapping mmaps and allocator metadata corruption in multithreaded userland. */
+static uintptr_t mm_shared_max_mmap_next(thread_t *cur, uintptr_t fallback) {
+    uintptr_t v = fallback;
+    if (!cur || !cur->mm) return v;
+    int n = thread_get_count();
+    for (int i = 0; i < n; i++) {
+        thread_t *t = thread_get_by_index(i);
+        if (!t || t->ring != 3) continue;
+        if (t->mm != cur->mm) continue;
+        if (t->user_mmap_next > v) v = t->user_mmap_next;
+    }
+    return v;
+}
+
+static uintptr_t mm_shared_max_brk_cur(thread_t *cur, uintptr_t fallback) {
+    uintptr_t v = fallback;
+    if (!cur || !cur->mm) return v;
+    int n = thread_get_count();
+    for (int i = 0; i < n; i++) {
+        thread_t *t = thread_get_by_index(i);
+        if (!t || t->ring != 3) continue;
+        if (t->mm != cur->mm) continue;
+        if (t->user_brk_cur > v) v = t->user_brk_cur;
+    }
+    return v;
+}
+
+static uintptr_t mm_shared_pick_brk_base(thread_t *cur, uintptr_t fallback) {
+    uintptr_t v = fallback;
+    if (!cur || !cur->mm) return v;
+    int n = thread_get_count();
+    for (int i = 0; i < n; i++) {
+        thread_t *t = thread_get_by_index(i);
+        if (!t || t->ring != 3) continue;
+        if (t->mm != cur->mm) continue;
+        if (t->user_brk_base > 0 && (v == 0 || t->user_brk_base < v))
+            v = t->user_brk_base;
+    }
+    return v;
+}
+
+static void mm_shared_publish_brk(thread_t *cur, uintptr_t base, uintptr_t cur_brk) {
+    if (!cur || !cur->mm) return;
+    int n = thread_get_count();
+    for (int i = 0; i < n; i++) {
+        thread_t *t = thread_get_by_index(i);
+        if (!t || t->ring != 3) continue;
+        if (t->mm != cur->mm) continue;
+        if (t->user_brk_base == 0) t->user_brk_base = base;
+        if (t->user_brk_cur < cur_brk) t->user_brk_cur = cur_brk;
+    }
+}
+
+static void mm_shared_publish_mmap(thread_t *cur, uintptr_t next, uintptr_t hi) {
+    if (!cur || !cur->mm) return;
+    int n = thread_get_count();
+    for (int i = 0; i < n; i++) {
+        thread_t *t = thread_get_by_index(i);
+        if (!t || t->ring != 3) continue;
+        if (t->mm != cur->mm) continue;
+        if (t->user_mmap_next < next) t->user_mmap_next = next;
+        if (t->user_mmap_hi < hi) t->user_mmap_hi = hi;
+    }
+}
 static inline uintptr_t user_tls_base_for_tid_local(uint64_t tid) {
     uintptr_t stack_top = user_stack_top_for_tid_like_exec(tid);
     return (uintptr_t)stack_top - (uintptr_t)USER_STACK_SIZE - (uintptr_t)USER_TLS_SIZE;
@@ -3226,6 +3374,15 @@ int fault_try_grow_user_heap(uint64_t cr2) {
         memset((void*)old_brk, 0, (size_t)(new_brk - old_brk));
     if (new_brk > brk_cur)
         tcur->user_brk_cur = new_brk;
+    mm_shared_publish_brk(tcur, tcur->user_brk_base, tcur->user_brk_cur);
+    if (is_watch_proc(tcur)) {
+        kprintf("heap-grow: pid=%s cr2=0x%llx page=0x%llx old_brk=0x%llx new_brk=0x%llx\n",
+            tcur->name,
+            (unsigned long long)cr2,
+            (unsigned long long)page_va,
+            (unsigned long long)brk_cur,
+            (unsigned long long)tcur->user_brk_cur);
+    }
     return 1;
 }
 
@@ -6740,6 +6897,25 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 
             /* call kernel execve (does not return on success) */
             int rc = kernel_execve_from_path(resolved_path, (const char *const *)kargv, (const char *const *)kenvp);
+            if (rc == -3) {
+                /* One bounded retry for transient tid/layout race in exec path. */
+                g_execve_retry_eagain++;
+                rc = kernel_execve_from_path(resolved_path, (const char *const *)kargv, (const char *const *)kenvp);
+                if (rc == 0) {
+                    g_execve_retry_ok++;
+                } else {
+                    g_execve_retry_fail++;
+                    uint64_t now_ms = pit_get_time_ms();
+                    if (now_ms - g_execve_retry_last_log_ms >= 2000ULL) {
+                        g_execve_retry_last_log_ms = now_ms;
+                        klogprintf("execve: retry stats eagain=%llu ok=%llu fail=%llu last_rc=%d path=%s\n",
+                                   (unsigned long long)g_execve_retry_eagain,
+                                   (unsigned long long)g_execve_retry_ok,
+                                   (unsigned long long)g_execve_retry_fail,
+                                   rc, resolved_path);
+                    }
+                }
+            }
 
             /* cleanup on failure */
             if (kenvp) { for (int i=0;i<envc;i++) if (kenvp[i]) kfree((void*)kenvp[i]); kfree(kenvp); }
@@ -6747,6 +6923,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (kargv) kfree((void*)kargv);
             kfree(path);
             if (rc == -2) return ret_err(ENOEXEC);
+            if (rc == -3) return ret_err(EAGAIN);
             return (rc == 0) ? 0 : ret_err(ENOENT);
         }
         case SYS_rt_sigprocmask: {
@@ -7748,6 +7925,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         kfree(tmp);
                         return total;
                     }
+                    if (rr > (ssize_t)chunk) {
+                        kfree(tmp);
+                        return (total > 0) ? total : ret_err(EIO);
+                    }
                     if (copy_to_user_safe((uint8_t*)base + off, tmp, (size_t)rr) != 0) { kfree(tmp); return (total > 0) ? total : ret_err(EFAULT); }
                     kfree(tmp);
                     if (f->type != FS_TYPE_PIPE) f->pos += (size_t)rr;
@@ -7798,6 +7979,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         kfree(tmp);
                         return total;
                     }
+                    if (rr > (ssize_t)chunk) {
+                        kfree(tmp);
+                        return (total > 0) ? total : ret_err(EIO);
+                    }
                     if (copy_to_user_safe((uint8_t*)base + pos, tmp, (size_t)rr) != 0) { kfree(tmp); return (total > 0) ? total : ret_err(EFAULT); }
                     kfree(tmp);
                     cur_off += (size_t)rr;
@@ -7834,12 +8019,14 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 kfree(tmp);
                 return (rr >= 0) ? (uint64_t)rr : ret_err((int)-rr);
             }
+            if (!bufp || !user_range_ok(bufp, cnt)) return ret_err(EFAULT);
             size_t to_read = cnt < 4096 ? cnt : 4096;
             void *tmp = kmalloc(to_read);
             if (!tmp) return ret_err(ENOMEM);
             ssize_t rr = fs_read(f, tmp, to_read, f->pos);
 
             if (rr > 0) {
+                if (rr > (ssize_t)to_read) { kfree(tmp); return ret_err(EIO); }
                 if (f->path && strcmp(f->path, "/etc/inittab") == 0) {
                     /* Normalize CRLF -> LF for busybox init parser. */
                     for (ssize_t i = 0; i < rr; i++) {
@@ -7888,14 +8075,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         }
                     }
                 }
-                if ((uintptr_t)bufp + (size_t)rr <= (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                    memcpy(bufp, tmp, (size_t)rr);
-                    f->pos += (size_t)rr;
-                    kfree(tmp);
-                    return (uint64_t)rr;
-                }
+                if (copy_to_user_safe(bufp, tmp, (size_t)rr) != 0) { kfree(tmp); return ret_err(EFAULT); }
+                f->pos += (size_t)rr;
                 kfree(tmp);
-                return ret_err(EFAULT);
+                return (uint64_t)rr;
             }
             if (f->path && strcmp(f->path, "/etc/inittab") == 0 && f->pos == 0) {
             }
@@ -7952,6 +8135,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     return ret_err(EINVAL);
                 }
                 if (rr == 0) break;
+                if (rr > (ssize_t)chunk) {
+                    kfree(tmp);
+                    return (total > 0) ? (uint64_t)total : ret_err(EIO);
+                }
                 /* write to fout at its current position */
                 ssize_t wr = fs_write(fout, tmp, (size_t)rr, fout->pos);
                 if (wr <= 0) {
@@ -8560,65 +8747,41 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (vfs_fstat(f, &st) != 0) return ret_err(EINVAL);
                 st_ready = 1;
             } else {
-                if (!path_u) {
-                    /* Be permissive for userland quirks: NULL path -> stat dirfd/cwd instead of hard fault. */
-                    if (dirfd == AT_FDCWD) {
-                        if (vfs_stat(cur->cwd[0] ? cur->cwd : "/", &st) != 0) return ret_err(ENOENT);
-                        st_ready = 1;
-                    } else if (dirfd >= 0 && dirfd < THREAD_MAX_FD && cur->fds[dirfd]) {
-                        if (vfs_fstat(cur->fds[dirfd], &st) != 0) return ret_err(EINVAL);
-                        st_ready = 1;
-                    } else {
-                        return ret_err(EFAULT);
-                    }
+                if (!path_u) return ret_err(EFAULT);
+                char *kpath = copy_user_cstr(path_u, 256);
+                if (!kpath) return ret_err(EFAULT);
+                char path[256];
+                int rc_resolve = 0;
+                if (kpath[0] == '/') {
+                    resolve_user_path(cur, kpath, path, sizeof(path));
+                } else if (dirfd == AT_FDCWD) {
+                    resolve_user_path(cur, kpath, path, sizeof(path));
                 } else {
-                    char *kpath = copy_user_cstr(path_u, 256);
-                    if (!kpath) {
-                        /* Avoid tight retry loops in userspace on EFAULT; fallback to dirfd/cwd stat. */
-                        if (dirfd == AT_FDCWD) {
-                            if (vfs_stat(cur->cwd[0] ? cur->cwd : "/", &st) != 0) return ret_err(ENOENT);
-                            st_ready = 1;
-                        } else if (dirfd >= 0 && dirfd < THREAD_MAX_FD && cur->fds[dirfd]) {
-                            if (vfs_fstat(cur->fds[dirfd], &st) != 0) return ret_err(EINVAL);
-                            st_ready = 1;
-                        } else {
-                            return ret_err(EFAULT);
+                    if (dirfd < 0 || dirfd >= THREAD_MAX_FD) rc_resolve = -EBADF;
+                    else {
+                        struct fs_file *df = cur->fds[dirfd];
+                        if (!df) rc_resolve = -EBADF;
+                        else if (df->type != FS_TYPE_DIR) rc_resolve = -ENOTDIR;
+                        else {
+                            const char *base = df->path ? df->path : "/";
+                            if (strcmp(base, "/") == 0) snprintf(path, sizeof(path), "/%s", kpath);
+                            else snprintf(path, sizeof(path), "%s/%s", base, kpath);
+                            path[sizeof(path) - 1] = '\0';
+                            if (path_needs_normalize(path)) normalize_path(path, sizeof(path));
                         }
-                    } else {
-                        char path[256];
-                        int rc_resolve = 0;
-                        if (kpath[0] == '/') {
-                            resolve_user_path(cur, kpath, path, sizeof(path));
-                        } else if (dirfd == AT_FDCWD) {
-                            resolve_user_path(cur, kpath, path, sizeof(path));
-                        } else {
-                            if (dirfd < 0 || dirfd >= THREAD_MAX_FD) rc_resolve = -EBADF;
-                            else {
-                                struct fs_file *df = cur->fds[dirfd];
-                                if (!df) rc_resolve = -EBADF;
-                                else if (df->type != FS_TYPE_DIR) rc_resolve = -ENOTDIR;
-                                else {
-                                    const char *base = df->path ? df->path : "/";
-                                    if (strcmp(base, "/") == 0) snprintf(path, sizeof(path), "/%s", kpath);
-                                    else snprintf(path, sizeof(path), "%s/%s", base, kpath);
-                                    path[sizeof(path) - 1] = '\0';
-                                    if (path_needs_normalize(path)) normalize_path(path, sizeof(path));
-                                }
-                            }
-                        }
-                        kfree(kpath);
-                        if (rc_resolve != 0) {
-                            if (rc_resolve == -EBADF) return ret_err(EBADF);
-                            if (rc_resolve == -ENOTDIR) return ret_err(ENOTDIR);
-                            if (rc_resolve == -ENOENT) return ret_err(ENOENT);
-                            return ret_err(EFAULT);
-                        }
-                        /* Respect AT_SYMLINK_NOFOLLOW: behave like lstat() when requested. */
-                        int sr = (flags & AT_SYMLINK_NOFOLLOW) ? vfs_lstat(path, &st) : vfs_stat(path, &st);
-                        if (sr != 0) return ret_err(ENOENT);
-                        st_ready = 1;
                     }
                 }
+                kfree(kpath);
+                if (rc_resolve != 0) {
+                    if (rc_resolve == -EBADF) return ret_err(EBADF);
+                    if (rc_resolve == -ENOTDIR) return ret_err(ENOTDIR);
+                    if (rc_resolve == -ENOENT) return ret_err(ENOENT);
+                    return ret_err(EFAULT);
+                }
+                /* Respect AT_SYMLINK_NOFOLLOW: behave like lstat() when requested. */
+                int sr = (flags & AT_SYMLINK_NOFOLLOW) ? vfs_lstat(path, &st) : vfs_stat(path, &st);
+                if (sr != 0) return ret_err(ENOENT);
+                st_ready = 1;
             }
             if (!st_ready) return ret_err(EFAULT);
 
@@ -8905,21 +9068,28 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (target[0] == '\0') { kfree(k_type); return ret_err(EINVAL); }
 
             int rc = -1;
+            int errno_out = EINVAL;
             if (strcmp(k_type, "proc") == 0 || strcmp(k_type, "procfs") == 0) {
                 (void)procfs_register();
                 ramfs_mkdir(target);
                 rc = procfs_mount(target);
+                if (rc != 0) errno_out = EBUSY;
             } else if (strcmp(k_type, "sysfs") == 0) {
                 if (sysfs_register() == 0) {
                     ramfs_mkdir(target);
                     rc = sysfs_mount(target);
                     if (rc == 0)
                         kernel_sysfs_populate_default();
+                    else
+                        errno_out = EBUSY;
+                } else {
+                    errno_out = EBUSY;
                 }
             } else if (strcmp(k_type, "devfs") == 0 || strcmp(k_type, "devtmpfs") == 0 || strcmp(k_type, "tmpfs") == 0) {
                 /* tmpfs as mount type for /dev: treat same as devtmpfs (init inittab fallback) */
                 ramfs_mkdir(target);
                 rc = devfs_mount(target);
+                if (rc != 0) errno_out = EBUSY;
             } else if (strcmp(k_type, "fat32") == 0 || strcmp(k_type, "vfat") == 0 || strcmp(k_type, "msdos") == 0 || strcmp(k_type, "auto") == 0) {
                 if (!src_u) { kfree(k_type); return ret_err(EINVAL); }
                 char *k_src_raw = copy_user_cstr(src_u, 256);
@@ -8935,16 +9105,18 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 /* Ensure FAT32 state is initialized for this device. */
                 if (fat32_probe_and_mount(dev_id) != 0) { kfree(k_type); return ret_err(EINVAL); }
                 struct fs_driver *drv = fat32_get_driver();
-                if (!drv) { kfree(k_type); return ret_err(ENOSYS); }
+                if (!drv) { kfree(k_type); return ret_err(EINVAL); }
 
                 ramfs_mkdir(target);
                 rc = fs_mount(target, drv);
+                if (rc != 0) errno_out = EBUSY;
             } else {
                 rc = -1;
+                errno_out = EINVAL;
             }
 
             kfree(k_type);
-            return (rc == 0) ? 0 : ret_err(ENOSYS);
+            return (rc == 0) ? 0 : ret_err(errno_out);
         }
         case SYS_umount2: {
             /* umount2(target, flags) */
@@ -8982,6 +9154,14 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (!tcur) tcur = thread_current();
             uintptr_t *p_base = tcur ? &tcur->user_brk_base : &user_brk_base;
             uintptr_t *p_cur = tcur ? &tcur->user_brk_cur : &user_brk_cur;
+            if (tcur) {
+                uintptr_t shared_base = mm_shared_pick_brk_base(tcur, *p_base);
+                uintptr_t shared_cur = mm_shared_max_brk_cur(tcur, *p_cur);
+                if (shared_base != 0 && (*p_base == 0 || *p_base > shared_base))
+                    *p_base = shared_base;
+                if (shared_cur > *p_cur)
+                    *p_cur = shared_cur;
+            }
             if (*p_base == 0) {
                 /* initialize lazy: place brk after 8MiB by default */
                 *p_base = 8u * 1024u * 1024u;
@@ -9012,10 +9192,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     top_limit = (heap_lo > guard) ? (heap_lo - guard) : heap_lo;
                 }
             }
-            /* Keep brk below mmap bump cursor. Our mmap is monotonic/no-op munmap,
-               so user_mmap_next acts as an upper frontier for user heap growth. */
+            /* Keep brk below mmap frontier in shared-mm threads. */
             {
-                uintptr_t mmap_ceiling = tcur ? tcur->user_mmap_next : user_mmap_next;
+                uintptr_t mmap_ceiling = tcur ? mm_shared_max_mmap_next(tcur, tcur->user_mmap_next) : user_mmap_next;
                 if (mmap_ceiling > *p_base && mmap_ceiling < top_limit) {
                     uintptr_t guard = 0x10000u;
                     top_limit = (mmap_ceiling > guard) ? (mmap_ceiling - guard) : mmap_ceiling;
@@ -9030,6 +9209,16 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 memset((void*)(*p_cur), 0, req - (*p_cur));
             }
             *p_cur = req;
+            mm_shared_publish_brk(tcur, *p_base, *p_cur);
+            if (is_watch_proc(tcur)) {
+                kprintf("brk: pid=%s base=0x%llx cur=0x%llx req=0x%llx top=0x%llx mmap_next=0x%llx\n",
+                    tcur->name,
+                    (unsigned long long)*p_base,
+                    (unsigned long long)*p_cur,
+                    (unsigned long long)req,
+                    (unsigned long long)top_limit,
+                    (unsigned long long)(tcur ? tcur->user_mmap_next : user_mmap_next));
+            }
             return (uint64_t)(*p_cur);
         }
         case SYS_mmap: {
@@ -9056,13 +9245,20 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 tcur ? (int)tcur->tid : -1,
                 tcur ? (unsigned long long)tcur->user_stack_base : 0,
                 tcur ? (unsigned long long)tcur->user_stack_limit : 0);
-            /* Cap huge mmaps for clone3: 128MB zeroing causes reboot (bad phys range / overwrite) */
+            /* Never silently change requested mmap length: libc/allocators assume the full
+               requested span is valid after success. Truncating here corrupts userspace heaps
+               when code legitimately touches bytes past the reduced mapping. */
             if (tcur && tcur->user_stack_base != 0 && len > 16u * 1024u * 1024u) {
-                len = 16u * 1024u * 1024u;
-                len = (size_t)align_up_u((uintptr_t)len, 4096);
-                qemu_debug_printf("mmap: clone3 len capped to 0x%llx\n", (unsigned long long)len);
+                qemu_debug_printf("mmap: ENOMEM clone3 len too large (len=0x%llx)\n",
+                    (unsigned long long)len);
+                return ret_err(ENOMEM);
             }
             uintptr_t *p_mmap_next = tcur ? &tcur->user_mmap_next : &user_mmap_next;
+            uintptr_t shared_next = tcur ? mm_shared_max_mmap_next(tcur, *p_mmap_next) : *p_mmap_next;
+            if (shared_next > *p_mmap_next) *p_mmap_next = shared_next;
+            uintptr_t brk_cur_for_mmap = tcur ? mm_shared_max_brk_cur(tcur, tcur->user_brk_cur) : user_brk_cur;
+            if (brk_cur_for_mmap == 0) brk_cur_for_mmap = 8u * 1024u * 1024u;
+            uintptr_t brk_guard_floor = align_up_u(brk_cur_for_mmap + 0x10000u, 4096);
             uintptr_t top_limit = (uintptr_t)USER_TLS_BASE;
             if (tcur) {
                 uintptr_t tls_base = user_tls_base_for_tid_local(tcur->tid);
@@ -9081,15 +9277,29 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
             qemu_debug_printf("mmap: top_limit=0x%llx heap_lo=0x%llx mmap_next=0x%llx\n",
                 (unsigned long long)top_limit, (unsigned long long)(uintptr_t)heap_base_addr(), (unsigned long long)*p_mmap_next);
+            if (is_watch_proc(tcur)) {
+                kprintf("mmap-enter: pid=%s tid=%llu next=0x%llx brk=0x%llx floor=0x%llx stk=[0x%llx..0x%llx] top=0x%llx\n",
+                    tcur->name,
+                    (unsigned long long)(tcur->tid ? tcur->tid : 1),
+                    (unsigned long long)*p_mmap_next,
+                    (unsigned long long)brk_cur_for_mmap,
+                    (unsigned long long)brk_guard_floor,
+                    (unsigned long long)(tcur ? tcur->user_stack_base : 0),
+                    (unsigned long long)(tcur ? tcur->user_stack_limit : 0),
+                    (unsigned long long)top_limit);
+            }
             if (*p_mmap_next == 0) {
                 uintptr_t def = 32u * 1024u * 1024u;
                 if (def >= top_limit && top_limit > (8u * 1024u * 1024u)) {
                     def = align_up_u(top_limit / 2u, 4096);
                     if (def < (8u * 1024u * 1024u)) def = 8u * 1024u * 1024u;
                 }
+                if (def < brk_guard_floor) def = brk_guard_floor;
                 *p_mmap_next = def;
                 qemu_debug_printf("mmap: init mmap_next=0x%llx\n", (unsigned long long)*p_mmap_next);
             }
+            if (*p_mmap_next < brk_guard_floor) *p_mmap_next = brk_guard_floor;
+            if (*p_mmap_next < brk_guard_floor) *p_mmap_next = brk_guard_floor;
             /* Clone3: keep mmap above stack when safe; but never above top_limit (heap_lo ~64 MiB).
                Otherwise mmap would ENOMEM and programs like wget fail with "out of memory". */
             if (tcur && tcur->user_stack_base != 0 && tcur->user_stack_limit > tcur->user_stack_base) {
@@ -9102,22 +9312,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (min_alloc < top_limit && *p_mmap_next < min_alloc)
                     *p_mmap_next = min_alloc;
                 else if (*p_mmap_next >= top_limit)
-                    *p_mmap_next = align_up_u(top_limit / 2u, 4096); /* clamp to valid range */
+                    *p_mmap_next = brk_guard_floor; /* never clamp down into low heap-adjacent area */
                 qemu_debug_printf("mmap: clone3 adj mmap_next=0x%llx (min_alloc 2MB-aligned)\n",
                     (unsigned long long)*p_mmap_next);
             }
             uintptr_t addr = align_up_u(*p_mmap_next, 4096);
-            /* Never place mmap inside current brk heap. */
-            {
-                uintptr_t brk_cur = tcur ? tcur->user_brk_cur : user_brk_cur;
-                if (brk_cur == 0) brk_cur = 8u * 1024u * 1024u;
-                uintptr_t guard = 0x10000u;
-                uintptr_t min_addr = align_up_u(brk_cur + guard, 4096);
-                if (addr < min_addr) {
-                    addr = min_addr;
-                    *p_mmap_next = min_addr;
-                }
-            }
             /* Clone3: place mmap on 2MB boundary above stack so munmap won't unmap the stack
                (unmap clears whole 2MB L2 entries; stack shares 0x2800000-0x2a00000 with 0x2804000).
                Only use above-stack placement if it fits within top_limit (VMware: heap/stack layout
@@ -9127,7 +9326,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 uintptr_t se = (uintptr_t)tcur->user_stack_limit;
                 if (!(addr + len <= sb || addr >= se)) {
                     uintptr_t above_stack = align_up_u(se, PAGE_SIZE_2M);
-                    if (above_stack + len < top_limit) {
+                    if (above_stack > addr && above_stack + len < top_limit) {
                         addr = above_stack;
                         *p_mmap_next = addr;
                         qemu_debug_printf("mmap: clone3 addr=0x%llx above stack (2MB aligned)\n", (unsigned long long)addr);
@@ -9135,6 +9334,16 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     /* else: keep addr below stack; above-stack would exceed top_limit */
                 }
             }
+            /* Final floor: never place mmap inside current brk heap, even after
+               clone3/stack adjustments above. */
+            {
+                uintptr_t min_addr = brk_guard_floor;
+                if (addr < min_addr) {
+                    addr = min_addr;
+                    *p_mmap_next = min_addr;
+                }
+            }
+            if (addr < brk_guard_floor) return ret_err(EINVAL);
             qemu_debug_printf("mmap: addr=0x%llx len=0x%llx addr+len=0x%llx\n",
                 (unsigned long long)addr, (unsigned long long)len, (unsigned long long)(addr + len));
             if (addr + len >= top_limit) { qemu_debug_printf("mmap: ENOMEM top_limit\n"); return ret_err(ENOMEM); }
@@ -9244,9 +9453,22 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 uintptr_t he = (uintptr_t)(addr + len);
                 if (tcur) {
                     if (he > tcur->user_mmap_hi) tcur->user_mmap_hi = he;
+                    mm_shared_publish_mmap(tcur, *p_mmap_next, he);
                 } else {
                     if (he > user_mmap_hi) user_mmap_hi = he;
                 }
+            }
+            if (is_watch_proc(tcur)) {
+                kprintf("mmap: pid=%s tid=%llu addr=0x%llx len=0x%llx next=0x%llx brk=0x%llx floor=0x%llx top=0x%llx hi=0x%llx\n",
+                    tcur->name,
+                    (unsigned long long)(tcur->tid ? tcur->tid : 1),
+                    (unsigned long long)addr,
+                    (unsigned long long)len,
+                    (unsigned long long)*p_mmap_next,
+                    (unsigned long long)(tcur ? tcur->user_brk_cur : user_brk_cur),
+                    (unsigned long long)brk_guard_floor,
+                    (unsigned long long)top_limit,
+                    (unsigned long long)(tcur ? tcur->user_mmap_hi : user_mmap_hi));
             }
             return (uint64_t)addr;
         }
@@ -9308,6 +9530,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     thread_t *pt = thread_get(cur->parent_tid);
                     if (pt) {
                         thread_set_pending_signal(pt, SIGCHLD);
+                        /* Parent may be blocked outside wait4 path (pipe/poll/read). */
+                        thread_unblock((int)(pt->tid ? pt->tid : 1));
                         if (cur->attached_tty >= 0 && pt->attached_tty == cur->attached_tty) {
                             devfs_set_tty_fg_pgrp(cur->attached_tty, pt->pgid);
                         }
@@ -9412,6 +9636,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     thread_t *pt = thread_get(cur->parent_tid);
                     if (pt) {
                         thread_set_pending_signal(pt, SIGCHLD);
+                        /* Parent may be blocked outside wait4 path (pipe/poll/read). */
+                        thread_unblock((int)(pt->tid ? pt->tid : 1));
                         if (cur->attached_tty >= 0 && pt->attached_tty == cur->attached_tty) {
                             devfs_set_tty_fg_pgrp(cur->attached_tty, pt->pgid);
                         }

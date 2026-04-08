@@ -17,5 +17,8 @@ ssize_t procfs_net_snap_udp6(char *buf, size_t size);
 ssize_t procfs_net_snap_raw(char *buf, size_t size);
 ssize_t procfs_net_snap_raw6(char *buf, size_t size);
 ssize_t procfs_net_snap_unix(char *buf, size_t size);
+ssize_t procfs_net_snap_arp(char *buf, size_t size);
+ssize_t procfs_net_snap_dev(char *buf, size_t size);
+ssize_t procfs_net_snap_route(char *buf, size_t size);
 
 
