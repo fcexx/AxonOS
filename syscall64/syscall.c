@@ -404,8 +404,11 @@ static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, siz
 #define EPIPE   32
 #define EIO     5
 #define EEXIST  17
+#define EACCES  13
 #define EBUSY   16
 #define ENOTDIR 20
+#define ENOSPC  28
+#define EIDRM   43
 #define EAFNOSUPPORT 97
 #define EPROTONOSUPPORT 93
 #define ESOCKTNOSUPPORT 94
@@ -414,6 +417,7 @@ static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, siz
 #define ENETDOWN 100
 #define ENETUNREACH 101
 #define ENOTCONN 107
+#define EISCONN 106
 #define ENODEV   19
 #define ETIMEDOUT 110
 #define ECONNREFUSED 111
@@ -538,6 +542,23 @@ static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t
 #define ETH_TYPE_IPV4         0x0800
 #define ETH_TYPE_ARP          0x0806
 
+typedef struct unix_stream_conn {
+    uint8_t q01[8192];
+    size_t q01_head;
+    size_t q01_tail;
+    size_t q01_count;
+    uint8_t q10[8192];
+    size_t q10_head;
+    size_t q10_tail;
+    size_t q10_count;
+    int closed[2];
+    int refs;
+    spinlock_t lock;
+} unix_stream_conn_t;
+
+/* Forward declaration: defined later in this file. */
+static int copy_to_user_safe(void *uptr, const void *kptr, size_t n);
+
 
 typedef struct __attribute__((packed)) {
     uint8_t dst[6];
@@ -584,6 +605,14 @@ typedef struct {
     int unix_bound;
     int unix_listening;
     char unix_path[108];
+    /* AF_UNIX stream endpoint/listener state */
+    struct unix_stream_conn *unix_conn;
+    int unix_end; /* 0 or 1 endpoint index inside unix_conn */
+    struct fs_file *unix_accept_q[16];
+    int unix_accept_head;
+    int unix_accept_tail;
+    int unix_accept_count;
+    spinlock_t unix_accept_lock;
     int type_base;
     int protocol;
     int connected;
@@ -641,17 +670,517 @@ static int unix_sockaddr_path_from_user(const void *addr_u, size_t addrlen, char
         if (is_abstract) *is_abstract = 1; /* Linux abstract AF_UNIX */
         return 0;
     }
-    /* Ensure NUL-terminated pathname is present in provided addrlen. */
-    int has_nul = 0;
-    for (size_t i = 0; i < path_len; i++) {
-        if (out[i] == '\0') {
-            has_nul = 1;
-            break;
-        }
-    }
-    if (!has_nul) return EINVAL;
+    /* Linux accepts addrlen without trailing NUL in sun_path.
+       We already terminate in-kernel buffer above, so treat it as valid. */
     return 0;
 }
+
+static int unix_acceptq_push(ksock_net_t *listener, struct fs_file *pending_f) {
+    if (!listener || !pending_f) return -1;
+    unsigned long fl = 0;
+    acquire_irqsave(&listener->unix_accept_lock, &fl);
+    if (listener->unix_accept_count >= (int)(sizeof(listener->unix_accept_q) / sizeof(listener->unix_accept_q[0]))) {
+        release_irqrestore(&listener->unix_accept_lock, fl);
+        return -1;
+    }
+    listener->unix_accept_q[listener->unix_accept_tail] = pending_f;
+    listener->unix_accept_tail = (listener->unix_accept_tail + 1) % (int)(sizeof(listener->unix_accept_q) / sizeof(listener->unix_accept_q[0]));
+    listener->unix_accept_count++;
+    release_irqrestore(&listener->unix_accept_lock, fl);
+    return 0;
+}
+
+static struct fs_file *unix_acceptq_pop(ksock_net_t *listener) {
+    if (!listener) return NULL;
+    struct fs_file *out = NULL;
+    unsigned long fl = 0;
+    acquire_irqsave(&listener->unix_accept_lock, &fl);
+    if (listener->unix_accept_count > 0) {
+        out = listener->unix_accept_q[listener->unix_accept_head];
+        listener->unix_accept_q[listener->unix_accept_head] = NULL;
+        listener->unix_accept_head = (listener->unix_accept_head + 1) % (int)(sizeof(listener->unix_accept_q) / sizeof(listener->unix_accept_q[0]));
+        listener->unix_accept_count--;
+    }
+    release_irqrestore(&listener->unix_accept_lock, fl);
+    return out;
+}
+
+static ksock_net_t *unix_find_listener_by_path(const char *path) {
+    if (!path || !path[0]) return NULL;
+    int tcnt = thread_get_count();
+    for (int ti = 0; ti < tcnt; ti++) {
+        thread_t *th = thread_get_by_index(ti);
+        if (!th) continue;
+        for (int fd = 0; fd < THREAD_MAX_FD; fd++) {
+            struct fs_file *f = th->fds[fd];
+            if (!f || f->type != SYSCALL_FTYPE_SOCKET || !f->driver_private) continue;
+            ksock_net_t *s = (ksock_net_t *)f->driver_private;
+            if (!s->unix_domain_stub || !s->unix_listening || !s->unix_bound) continue;
+            if (strncmp(s->unix_path, path, sizeof(s->unix_path)) == 0) return s;
+        }
+    }
+    return NULL;
+}
+
+static size_t unix_stream_avail_to_read(const ksock_net_t *s) {
+    if (!s || !s->unix_conn) return 0;
+    const unix_stream_conn_t *c = s->unix_conn;
+    return (s->unix_end == 0) ? c->q10_count : c->q01_count;
+}
+
+static size_t unix_stream_avail_to_write(const ksock_net_t *s) {
+    if (!s || !s->unix_conn) return 0;
+    const unix_stream_conn_t *c = s->unix_conn;
+    size_t cap = (s->unix_end == 0) ? sizeof(c->q01) : sizeof(c->q10);
+    size_t used = (s->unix_end == 0) ? c->q01_count : c->q10_count;
+    if (used >= cap) return 0;
+    return cap - used;
+}
+
+static int unix_stream_peer_closed(const ksock_net_t *s) {
+    if (!s || !s->unix_conn) return 1;
+    const unix_stream_conn_t *c = s->unix_conn;
+    int peer = (s->unix_end == 0) ? 1 : 0;
+    return c->closed[peer] ? 1 : 0;
+}
+
+static ssize_t unix_stream_write_from_user(ksock_net_t *s, const void *buf_u, size_t len) {
+    if (!s || !s->unix_conn) return -ENOTCONN;
+    if (len == 0) return 0;
+    if (!buf_u) return -EINVAL;
+    if (!user_range_ok(buf_u, len)) return -EFAULT;
+    unix_stream_conn_t *c = s->unix_conn;
+    int from = s->unix_end;
+    int to = (from == 0) ? 1 : 0;
+    uint8_t *q = (from == 0) ? c->q01 : c->q10;
+    size_t cap = (from == 0) ? sizeof(c->q01) : sizeof(c->q10);
+    size_t *head = (from == 0) ? &c->q01_head : &c->q10_head;
+    size_t *tail = (from == 0) ? &c->q01_tail : &c->q10_tail;
+    size_t *count = (from == 0) ? &c->q01_count : &c->q10_count;
+    size_t written = 0;
+    while (written < len) {
+        unsigned long fl = 0;
+        acquire_irqsave(&c->lock, &fl);
+        if (c->closed[to]) {
+            release_irqrestore(&c->lock, fl);
+            return written > 0 ? (ssize_t)written : -EPIPE;
+        }
+        size_t free = cap - *count;
+        if (free == 0) {
+            release_irqrestore(&c->lock, fl);
+            if (s->nonblock) return written > 0 ? (ssize_t)written : -EAGAIN;
+            thread_sleep(1);
+            continue;
+        }
+        size_t n = len - written;
+        if (n > free) n = free;
+        size_t h = *head;
+        size_t first = (h + n <= cap) ? n : (cap - h);
+        uint8_t tmp[256];
+        size_t off = 0;
+        while (off < n) {
+            size_t ch = n - off;
+            if (ch > sizeof(tmp)) ch = sizeof(tmp);
+            if (copy_from_user_raw(tmp, (const uint8_t *)buf_u + written + off, ch) != 0) {
+                release_irqrestore(&c->lock, fl);
+                return written > 0 ? (ssize_t)written : -EFAULT;
+            }
+            if (off < first) {
+                size_t p = first - off;
+                if (p > ch) p = ch;
+                memcpy(q + h + off, tmp, p);
+                if (p < ch) memcpy(q, tmp + p, ch - p);
+            } else {
+                memcpy(q + (off - first), tmp, ch);
+            }
+            off += ch;
+        }
+        *head = (h + n) % cap;
+        *count += n;
+        (void)tail;
+        release_irqrestore(&c->lock, fl);
+        written += n;
+    }
+    return (ssize_t)written;
+}
+
+static ssize_t unix_stream_read_to_user(ksock_net_t *s, void *buf_u, size_t len, int peek) {
+    if (!s || !s->unix_conn) return -ENOTCONN;
+    if (len == 0) return 0;
+    if (!buf_u) return -EINVAL;
+    if (!user_range_ok(buf_u, len)) return -EFAULT;
+    unix_stream_conn_t *c = s->unix_conn;
+    int from = (s->unix_end == 0) ? 1 : 0;
+    uint8_t *q = (from == 0) ? c->q01 : c->q10;
+    size_t cap = (from == 0) ? sizeof(c->q01) : sizeof(c->q10);
+    size_t *head = (from == 0) ? &c->q01_head : &c->q10_head;
+    size_t *tail = (from == 0) ? &c->q01_tail : &c->q10_tail;
+    size_t *count = (from == 0) ? &c->q01_count : &c->q10_count;
+    (void)head;
+    for (;;) {
+        unsigned long fl = 0;
+        acquire_irqsave(&c->lock, &fl);
+        if (*count > 0) {
+            size_t n = len;
+            if (n > *count) n = *count;
+            size_t t = *tail;
+            size_t first = (t + n <= cap) ? n : (cap - t);
+            uint8_t tmp[256];
+            size_t off = 0;
+            while (off < n) {
+                size_t ch = n - off;
+                if (ch > sizeof(tmp)) ch = sizeof(tmp);
+                if (off < first) {
+                    size_t p = first - off;
+                    if (p > ch) p = ch;
+                    memcpy(tmp, q + t + off, p);
+                    if (p < ch) memcpy(tmp + p, q, ch - p);
+                } else {
+                    memcpy(tmp, q + (off - first), ch);
+                }
+                if (copy_to_user_safe((uint8_t *)buf_u + off, tmp, ch) != 0) {
+                    release_irqrestore(&c->lock, fl);
+                    return -EFAULT;
+                }
+                off += ch;
+            }
+            if (!peek) {
+                *tail = (t + n) % cap;
+                *count -= n;
+            }
+            release_irqrestore(&c->lock, fl);
+            return (ssize_t)n;
+        }
+        if (c->closed[from]) {
+            release_irqrestore(&c->lock, fl);
+            return 0;
+        }
+        release_irqrestore(&c->lock, fl);
+        if (s->nonblock) return -EAGAIN;
+        thread_sleep(1);
+    }
+}
+
+static void unix_socket_cleanup(ksock_net_t *s) {
+    if (!s) return;
+    if (s->unix_listening) {
+        struct fs_file *pf = NULL;
+        while ((pf = unix_acceptq_pop(s)) != NULL) {
+            if (pf->driver_private) {
+                ksock_net_t *ps = (ksock_net_t *)pf->driver_private;
+                if (ps->unix_conn) {
+                    unix_stream_conn_t *c = ps->unix_conn;
+                    unsigned long fl = 0;
+                    acquire_irqsave(&c->lock, &fl);
+                    c->closed[ps->unix_end] = 1;
+                    c->refs--;
+                    int refs = c->refs;
+                    release_irqrestore(&c->lock, fl);
+                    if (refs <= 0) kfree(c);
+                    ps->unix_conn = NULL;
+                }
+                kfree(ps);
+            }
+            if (pf->path) kfree((void *)pf->path);
+            kfree(pf);
+        }
+    }
+    if (s->unix_conn) {
+        unix_stream_conn_t *c = s->unix_conn;
+        unsigned long fl = 0;
+        acquire_irqsave(&c->lock, &fl);
+        c->closed[s->unix_end] = 1;
+        c->refs--;
+        int refs = c->refs;
+        release_irqrestore(&c->lock, fl);
+        if (refs <= 0) kfree(c);
+        s->unix_conn = NULL;
+    }
+}
+
+/* ---------- SysV SHM (minimal real implementation) ---------- */
+#define SYSV_SHM_MAX_SEGMENTS 64
+#define SYSV_SHM_MAX_ATTACH   256
+#define SYSV_SHM_BASE         ((uintptr_t)0x0E000000ULL)
+
+typedef struct {
+    int used;
+    int shmid;
+    int key;
+    size_t size;
+    uintptr_t base;
+    uint32_t mode;
+    uid_t cuid;
+    gid_t cgid;
+    uid_t uid;
+    gid_t gid;
+    uint32_t cpid;
+    uint32_t lpid;
+    uint64_t atime;
+    uint64_t dtime;
+    uint64_t ctime;
+    uint32_t nattch;
+    int removed;
+} sysv_shm_seg_t;
+
+typedef struct {
+    int used;
+    int shmid;
+    uint64_t tid;
+    uintptr_t addr;
+    int readonly;
+} sysv_shm_attach_t;
+
+static sysv_shm_seg_t g_sysv_shm[SYSV_SHM_MAX_SEGMENTS];
+static sysv_shm_attach_t g_sysv_shm_attach[SYSV_SHM_MAX_ATTACH];
+static int g_sysv_shm_next_id = 1;
+static uintptr_t g_sysv_shm_next_addr = SYSV_SHM_BASE;
+static spinlock_t g_sysv_shm_lock = { 0 };
+
+static inline uint64_t sysv_shm_now_secs(void) {
+    return pit_get_time_ms() / 1000ull;
+}
+
+static sysv_shm_seg_t *sysv_shm_find_by_id_nolock(int shmid) {
+    for (int i = 0; i < SYSV_SHM_MAX_SEGMENTS; i++) {
+        if (g_sysv_shm[i].used && g_sysv_shm[i].shmid == shmid) return &g_sysv_shm[i];
+    }
+    return NULL;
+}
+
+static sysv_shm_seg_t *sysv_shm_find_by_key_nolock(int key) {
+    for (int i = 0; i < SYSV_SHM_MAX_SEGMENTS; i++) {
+        if (g_sysv_shm[i].used && !g_sysv_shm[i].removed && g_sysv_shm[i].key == key) return &g_sysv_shm[i];
+    }
+    return NULL;
+}
+
+static uintptr_t sysv_shm_alloc_va_nolock(size_t size) {
+    uintptr_t top = (uintptr_t)USER_TLS_BASE;
+    uintptr_t addr = (g_sysv_shm_next_addr + 4095u) & ~(uintptr_t)4095u;
+    if (addr < SYSV_SHM_BASE) addr = SYSV_SHM_BASE;
+    if (addr + size < addr) return 0;
+    if (addr + size >= top) return 0;
+    g_sysv_shm_next_addr = addr + size;
+    return addr;
+}
+
+static int sysv_shm_register_attach_nolock(int shmid, uint64_t tid, uintptr_t addr, int readonly) {
+    for (int i = 0; i < SYSV_SHM_MAX_ATTACH; i++) {
+        if (!g_sysv_shm_attach[i].used) {
+            g_sysv_shm_attach[i].used = 1;
+            g_sysv_shm_attach[i].shmid = shmid;
+            g_sysv_shm_attach[i].tid = tid;
+            g_sysv_shm_attach[i].addr = addr;
+            g_sysv_shm_attach[i].readonly = readonly;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int sysv_shm_detach_one_by_tid_addr_nolock(uint64_t tid, uintptr_t addr, int *out_shmid) {
+    for (int i = 0; i < SYSV_SHM_MAX_ATTACH; i++) {
+        if (!g_sysv_shm_attach[i].used) continue;
+        if (g_sysv_shm_attach[i].tid != tid) continue;
+        if (g_sysv_shm_attach[i].addr != addr) continue;
+        int shmid = g_sysv_shm_attach[i].shmid;
+        g_sysv_shm_attach[i].used = 0;
+        if (out_shmid) *out_shmid = shmid;
+        return 0;
+    }
+    return -1;
+}
+
+static void sysv_shm_cleanup_removed_nolock(sysv_shm_seg_t *seg) {
+    if (!seg) return;
+    if (seg->removed && seg->nattch == 0) {
+        seg->used = 0;
+    }
+}
+
+static void sysv_shm_detach_all_for_tid(uint64_t tid) {
+    unsigned long fl = 0;
+    acquire_irqsave(&g_sysv_shm_lock, &fl);
+    for (int i = 0; i < SYSV_SHM_MAX_ATTACH; i++) {
+        if (!g_sysv_shm_attach[i].used || g_sysv_shm_attach[i].tid != tid) continue;
+        int shmid = g_sysv_shm_attach[i].shmid;
+        g_sysv_shm_attach[i].used = 0;
+        sysv_shm_seg_t *seg = sysv_shm_find_by_id_nolock(shmid);
+        if (seg) {
+            if (seg->nattch > 0) seg->nattch--;
+            seg->dtime = sysv_shm_now_secs();
+            seg->lpid = (uint32_t)tid;
+            sysv_shm_cleanup_removed_nolock(seg);
+        }
+    }
+    release_irqrestore(&g_sysv_shm_lock, fl);
+}
+
+/* ---------- User VMA tracking (for mmap/munmap/mprotect semantics) ---------- */
+#define USER_VMA_MAX 4096
+enum { USER_VMA_KIND_MMAP = 1, USER_VMA_KIND_SHM = 2 };
+
+typedef struct {
+    int used;
+    uint64_t tid;
+    uintptr_t addr;
+    size_t len;
+    int prot;
+    int kind;
+} user_vma_t;
+
+static user_vma_t g_user_vmas[USER_VMA_MAX];
+static spinlock_t g_user_vma_lock = { 0 };
+
+static user_vma_t *user_vma_find_containing_nolock(uint64_t tid, uintptr_t va) {
+    for (int i = 0; i < USER_VMA_MAX; i++) {
+        if (!g_user_vmas[i].used || g_user_vmas[i].tid != tid) continue;
+        uintptr_t a = g_user_vmas[i].addr;
+        uintptr_t e = a + g_user_vmas[i].len;
+        if (va >= a && va < e) return &g_user_vmas[i];
+    }
+    return NULL;
+}
+
+static int user_vma_add_nolock(uint64_t tid, uintptr_t addr, size_t len, int prot, int kind) {
+    for (int i = 0; i < USER_VMA_MAX; i++) {
+        if (!g_user_vmas[i].used || g_user_vmas[i].tid != tid) continue;
+        if (g_user_vmas[i].addr == addr && g_user_vmas[i].len == len && g_user_vmas[i].kind == kind) {
+            g_user_vmas[i].prot = prot;
+            return 0;
+        }
+    }
+    for (int i = 0; i < USER_VMA_MAX; i++) {
+        if (!g_user_vmas[i].used) {
+            g_user_vmas[i].used = 1;
+            g_user_vmas[i].tid = tid;
+            g_user_vmas[i].addr = addr;
+            g_user_vmas[i].len = len;
+            g_user_vmas[i].prot = prot;
+            g_user_vmas[i].kind = kind;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int user_vma_split_at_nolock(uint64_t tid, uintptr_t split_va) {
+    user_vma_t *v = user_vma_find_containing_nolock(tid, split_va);
+    if (!v) return 0; /* nothing to split */
+    if (split_va == v->addr || split_va >= v->addr + v->len) return 0;
+    size_t left_len = (size_t)(split_va - v->addr);
+    size_t right_len = v->len - left_len;
+    uintptr_t right_addr = split_va;
+    int prot = v->prot;
+    int kind = v->kind;
+    if (user_vma_add_nolock(tid, right_addr, right_len, prot, kind) != 0) return -1;
+    v->len = left_len;
+    return 0;
+}
+
+static int user_vma_is_fully_mapped_nolock(uint64_t tid, uintptr_t addr, size_t len) {
+    uintptr_t end = addr + len;
+    uintptr_t cur = addr;
+    while (cur < end) {
+        user_vma_t *v = user_vma_find_containing_nolock(tid, cur);
+        if (!v) return 0;
+        uintptr_t ve = v->addr + v->len;
+        if (ve <= cur) return 0;
+        cur = ve;
+    }
+    return 1;
+}
+
+static int user_vma_set_prot_nolock(uint64_t tid, uintptr_t addr, size_t len, int prot) {
+    uintptr_t end = addr + len;
+    if (user_vma_split_at_nolock(tid, addr) != 0) return -1;
+    if (user_vma_split_at_nolock(tid, end) != 0) return -1;
+    for (int i = 0; i < USER_VMA_MAX; i++) {
+        if (!g_user_vmas[i].used || g_user_vmas[i].tid != tid) continue;
+        uintptr_t a = g_user_vmas[i].addr;
+        uintptr_t e = a + g_user_vmas[i].len;
+        if (e <= addr || a >= end) continue;
+        g_user_vmas[i].prot = prot;
+    }
+    return 0;
+}
+
+static void user_vma_unmap_range_nolock(uint64_t tid, uintptr_t addr, size_t len) {
+    uintptr_t end = addr + len;
+    (void)user_vma_split_at_nolock(tid, addr);
+    (void)user_vma_split_at_nolock(tid, end);
+    for (int i = 0; i < USER_VMA_MAX; i++) {
+        if (!g_user_vmas[i].used || g_user_vmas[i].tid != tid) continue;
+        uintptr_t a = g_user_vmas[i].addr;
+        uintptr_t e = a + g_user_vmas[i].len;
+        if (e <= addr || a >= end) continue;
+        g_user_vmas[i].used = 0;
+    }
+}
+
+static uintptr_t user_vma_max_end_for_kind_nolock(uint64_t tid, int kind) {
+    uintptr_t mx = 0;
+    for (int i = 0; i < USER_VMA_MAX; i++) {
+        if (!g_user_vmas[i].used || g_user_vmas[i].tid != tid || g_user_vmas[i].kind != kind) continue;
+        uintptr_t e = g_user_vmas[i].addr + g_user_vmas[i].len;
+        if (e > mx) mx = e;
+    }
+    return mx;
+}
+
+static void user_vma_remove_all_for_tid(uint64_t tid) {
+    unsigned long fl = 0;
+    acquire_irqsave(&g_user_vma_lock, &fl);
+    for (int i = 0; i < USER_VMA_MAX; i++) {
+        if (g_user_vmas[i].used && g_user_vmas[i].tid == tid) g_user_vmas[i].used = 0;
+    }
+    release_irqrestore(&g_user_vma_lock, fl);
+}
+
+static int user_vma_clone_for_tid(uint64_t from_tid, uint64_t to_tid) {
+    unsigned long fl = 0;
+    acquire_irqsave(&g_user_vma_lock, &fl);
+    for (int i = 0; i < USER_VMA_MAX; i++) {
+        if (!g_user_vmas[i].used || g_user_vmas[i].tid != from_tid) continue;
+        if (user_vma_add_nolock(to_tid, g_user_vmas[i].addr, g_user_vmas[i].len, g_user_vmas[i].prot, g_user_vmas[i].kind) != 0) {
+            for (int j = 0; j < USER_VMA_MAX; j++) {
+                if (g_user_vmas[j].used && g_user_vmas[j].tid == to_tid) g_user_vmas[j].used = 0;
+            }
+            release_irqrestore(&g_user_vma_lock, fl);
+            return -1;
+        }
+    }
+    release_irqrestore(&g_user_vma_lock, fl);
+    return 0;
+}
+
+struct sysv_ipc_perm_compat {
+    uint32_t key;
+    uint32_t uid;
+    uint32_t gid;
+    uint32_t cuid;
+    uint32_t cgid;
+    uint16_t mode;
+    uint16_t __pad1;
+    uint16_t seq;
+    uint16_t __pad2;
+    uint64_t __unused1;
+    uint64_t __unused2;
+};
+
+struct sysv_shmid_ds_compat {
+    struct sysv_ipc_perm_compat shm_perm;
+    uint64_t shm_segsz;
+    int64_t shm_atime;
+    int64_t shm_dtime;
+    int64_t shm_ctime;
+    int32_t shm_cpid;
+    int32_t shm_lpid;
+    uint64_t shm_nattch;
+    uint64_t __unused4;
+    uint64_t __unused5;
+};
 
 static inline size_t ksock_rx_pending_cap(void) {
     return (size_t)sizeof(((ksock_net_t *)0)->rx_pending);
@@ -2509,6 +3038,9 @@ static inline uint64_t ret_err(int e) {
 #ifndef SIGALRM
 #define SIGALRM 14
 #endif
+#ifndef ESPIPE
+#define ESPIPE 29
+#endif
 #ifndef SIGINT
 #define SIGINT 2
 #endif
@@ -2862,9 +3394,11 @@ static ssize_t net_sock_write_userspace(thread_t *cur, int fd, ksock_net_t *s, c
     static int tcp_wr_dbg_left = 16;
     if (!s) return -EINVAL;
     if (s->unix_domain_stub) {
-        if (!bufp || cnt == 0) return -EINVAL;
-        if (!user_range_ok(bufp, cnt)) return -EFAULT;
-        return (ssize_t)cnt;
+        (void)cur;
+        (void)fd;
+        if (!s->connected) return -ENOTCONN;
+        if (cnt == 0) return 0;
+        return unix_stream_write_from_user(s, bufp, cnt);
     }
     if (s->sock_domain == AF_NETLINK_LOCAL) {
         if (!bufp || cnt == 0) return -EINVAL;
@@ -2952,9 +3486,9 @@ static ssize_t net_sock_read_userspace(thread_t *cur, ksock_net_t *s, void *bufp
     (void)cur;
     if (!s) return -EINVAL;
     if (s->unix_domain_stub) {
+        if (!s->connected) return -ENOTCONN;
         if (cnt == 0) return 0;
-        if (!bufp || !user_range_ok(bufp, cnt)) return -EFAULT;
-        return 0;
+        return unix_stream_read_to_user(s, bufp, cnt, 0);
     }
     if (s->sock_domain == AF_NETLINK_LOCAL) {
         if (cnt == 0) return 0;
@@ -4649,7 +5183,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         }
         case SYS_clock_nanosleep: {
             /* clock_nanosleep(clockid, flags, req, rem) */
-            (void)a1;
+            uintptr_t req_addr = (uintptr_t)a1;
             uint64_t flags = a2;
             const void *req_u = (const void*)(uintptr_t)a3;
             void *rem_u = (void*)(uintptr_t)a4;
@@ -5132,8 +5666,12 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 
                             if (s->sock_domain == AF_NETLINK_LOCAL) {
                                 if (s->nl_rx_off < s->nl_rx_len) can_r = 1;
-                            } else if (s->unix_domain_stub && s->connected) {
-                                can_r = 1;
+                            } else if (s->unix_domain_stub) {
+                                if (s->unix_listening) {
+                                    if (s->unix_accept_count > 0) can_r = 1;
+                                } else if (s->connected) {
+                                    if (unix_stream_avail_to_read(s) > 0 || unix_stream_peer_closed(s)) can_r = 1;
+                                }
                             } else if ((s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) ||
                                        (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && s->dns_tcp_udp_bridge)) {
                                 if (s->rx_has_pending) can_r = 1;
@@ -5176,6 +5714,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                 has_net_socket = 1;
                             if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && s->dns_tcp_udp_bridge) {
                                 can_w = 1;
+                            } else if (s->unix_domain_stub) {
+                                if (!s->unix_listening && s->connected && !unix_stream_peer_closed(s) && unix_stream_avail_to_write(s) > 0)
+                                    can_w = 1;
                             } else if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
                                 net_tcp_ops_t ops;
                                 net_make_tcp_ops(&ops);
@@ -5403,6 +5944,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             ksock_net_t *s = NULL;
             if (!socket_file_get(t, fd, &s) || !s) return ret_err(EBADF);
             if (s->unix_domain_stub) {
+                if (s->type_base != SOCK_STREAM_LOCAL) return ret_err(EOPNOTSUPP);
                 if (!s->unix_bound) return ret_err(EINVAL);
                 s->unix_listening = 1;
                 return 0;
@@ -5433,13 +5975,30 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             ksock_net_t *s = (ksock_net_t *)f->driver_private;
             if (!s->unix_domain_stub) return ret_err(EOPNOTSUPP);
             if (!s->unix_listening) return ret_err(EINVAL);
-            /* Minimal compatibility: return a duplicated connected endpoint. */
-            s->connected = 1;
-            if (f->refcount <= 0) f->refcount = 1;
-            else f->refcount++;
-            int nfd = thread_fd_alloc(f);
+            struct fs_file *af = unix_acceptq_pop(s);
+            while (!af) {
+                if (s->nonblock) return ret_err(EAGAIN);
+                thread_sleep(1);
+                af = unix_acceptq_pop(s);
+            }
+            int nfd = thread_fd_alloc(af);
             if (nfd < 0) {
-                if (f->refcount > 1) f->refcount--;
+                if (af->driver_private) {
+                    ksock_net_t *as = (ksock_net_t *)af->driver_private;
+                    if (as->unix_conn) {
+                        unix_stream_conn_t *c = as->unix_conn;
+                        unsigned long fl = 0;
+                        acquire_irqsave(&c->lock, &fl);
+                        c->closed[as->unix_end] = 1;
+                        c->refs--;
+                        int refs = c->refs;
+                        release_irqrestore(&c->lock, fl);
+                        if (refs <= 0) kfree(c);
+                    }
+                    kfree(as);
+                }
+                if (af->path) kfree((void *)af->path);
+                kfree(af);
                 return ret_err(EMFILE);
             }
             if (addr_u && addrlen_u && user_range_ok(addrlen_u, 4)) {
@@ -5472,15 +6031,63 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return 0;
             }
             if (s->unix_domain_stub) {
-                if (!addr_u || addrlen < sizeof(uint16_t) || !user_range_ok(addr_u, addrlen))
-                    return ret_err(EFAULT);
-                uint16_t fam = 0;
-                if (copy_from_user_raw(&fam, addr_u, sizeof(fam)) != 0) return ret_err(EFAULT);
-                if (fam == 1) { /* AF_UNIX */
+                char upath[108];
+                int is_abs = 0;
+                int pr = unix_sockaddr_path_from_user(addr_u, addrlen, upath, sizeof(upath), &is_abs);
+                if (pr != 0) return ret_err(pr);
+                if (s->type_base != SOCK_STREAM_LOCAL) {
                     s->connected = 1;
                     return 0;
                 }
-                /* Stub socket is backed by real IPv4 ksock; glibc may connect(AF_INET*) on this fd. */
+                if (is_abs) return ret_err(ECONNREFUSED);
+                ksock_net_t *listener = unix_find_listener_by_path(upath);
+                if (!listener || !listener->unix_listening) return ret_err(ECONNREFUSED);
+                if (s->connected && s->unix_conn) return ret_err(EISCONN);
+
+                unix_stream_conn_t *conn = (unix_stream_conn_t *)kmalloc(sizeof(*conn));
+                ksock_net_t *srv = (ksock_net_t *)kmalloc(sizeof(*srv));
+                struct fs_file *srv_f = (struct fs_file *)kmalloc(sizeof(*srv_f));
+                char *srv_p = (char *)kmalloc(24);
+                if (!conn || !srv || !srv_f || !srv_p) {
+                    if (conn) kfree(conn);
+                    if (srv) kfree(srv);
+                    if (srv_f) kfree(srv_f);
+                    if (srv_p) kfree(srv_p);
+                    return ret_err(ENOMEM);
+                }
+                memset(conn, 0, sizeof(*conn));
+                conn->refs = 2;
+                memset(srv, 0, sizeof(*srv));
+                memset(srv_f, 0, sizeof(*srv_f));
+                snprintf(srv_p, 24, "socket:[unix]");
+                srv->sock_domain = AF_INET_LOCAL;
+                srv->unix_domain_stub = 1;
+                srv->type_base = SOCK_STREAM_LOCAL;
+                srv->protocol = 0;
+                srv->connected = 1;
+                srv->unix_conn = conn;
+                srv->unix_end = 1;
+                memset(srv->unix_path, 0, sizeof(srv->unix_path));
+                strncpy(srv->unix_path, upath, sizeof(srv->unix_path) - 1);
+                srv_f->path = srv_p;
+                srv_f->type = SYSCALL_FTYPE_SOCKET;
+                srv_f->driver_private = srv;
+                srv_f->refcount = 1;
+
+                if (unix_acceptq_push(listener, srv_f) != 0) {
+                    kfree(srv_p);
+                    kfree(srv_f);
+                    kfree(srv);
+                    kfree(conn);
+                    return ret_err(EAGAIN);
+                }
+
+                s->connected = 1;
+                s->unix_conn = conn;
+                s->unix_end = 0;
+                memset(s->unix_path, 0, sizeof(s->unix_path));
+                strncpy(s->unix_path, upath, sizeof(s->unix_path) - 1);
+                return 0;
             }
             sockaddr_in_k to;
             {
@@ -5566,6 +6173,17 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (!addr_u || !addrlen_u || !user_range_ok(addrlen_u, 4)) return ret_err(EFAULT);
             uint32_t ulen = 0;
             if (copy_from_user_raw(&ulen, addrlen_u, 4) != 0) return ret_err(EFAULT);
+            if (s->unix_domain_stub) {
+                uint16_t fam = 1;
+                uint32_t copy_len = (ulen < (uint32_t)sizeof(fam)) ? ulen : (uint32_t)sizeof(fam);
+                if (copy_len > 0) {
+                    if (!user_range_ok(addr_u, copy_len)) return ret_err(EFAULT);
+                    if (copy_to_user_safe(addr_u, &fam, copy_len) != 0) return ret_err(EFAULT);
+                }
+                ulen = (uint32_t)sizeof(fam);
+                if (copy_to_user_safe(addrlen_u, &ulen, 4) != 0) return ret_err(EFAULT);
+                return 0;
+            }
             if (s->sock_domain == AF_NETLINK_LOCAL) {
                 sockaddr_nl_k sa;
                 memset(&sa, 0, sizeof(sa));
@@ -5611,6 +6229,17 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (!addr_u || !addrlen_u || !user_range_ok(addrlen_u, 4)) return ret_err(EFAULT);
             uint32_t ulen = 0;
             if (copy_from_user_raw(&ulen, addrlen_u, 4) != 0) return ret_err(EFAULT);
+            if (s->unix_domain_stub) {
+                uint16_t fam = 1;
+                uint32_t copy_len = (ulen < (uint32_t)sizeof(fam)) ? ulen : (uint32_t)sizeof(fam);
+                if (copy_len > 0) {
+                    if (!user_range_ok(addr_u, copy_len)) return ret_err(EFAULT);
+                    if (copy_to_user_safe(addr_u, &fam, copy_len) != 0) return ret_err(EFAULT);
+                }
+                ulen = (uint32_t)sizeof(fam);
+                if (copy_to_user_safe(addrlen_u, &ulen, 4) != 0) return ret_err(EFAULT);
+                return 0;
+            }
             if (s->sock_domain == AF_NETLINK_LOCAL) {
                 sockaddr_nl_k sa;
                 memset(&sa, 0, sizeof(sa));
@@ -5696,9 +6325,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return (uint64_t)len;
             }
             if (s->unix_domain_stub) {
-                if (!buf_u || len == 0 || len > 2048) return ret_err(EINVAL);
-                if (!user_range_ok(buf_u, len)) return ret_err(EFAULT);
-                return (uint64_t)len;
+                if (!s->connected) return ret_err(ENOTCONN);
+                ssize_t wr = unix_stream_write_from_user(s, buf_u, len);
+                if (wr < 0) return ret_err((int)(-wr));
+                return (uint64_t)wr;
             }
             if (!buf_u || len == 0 || len > 2048) return ret_err(EINVAL);
             if (!user_range_ok(buf_u, len)) return ret_err(EFAULT);
@@ -5801,9 +6431,19 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             /* Linux-compatible: zero-length recv is valid even with NULL buffer. */
             if (len == 0) return 0;
             if (s->unix_domain_stub) {
-                if (!buf_u || !user_range_ok(buf_u, len)) return ret_err(EFAULT);
                 if (!s->connected) return ret_err(ENOTCONN);
-                return 0;
+                ssize_t rr = unix_stream_read_to_user(s, buf_u, len, (flags & 0x2) ? 1 : 0);
+                if (rr < 0) return ret_err((int)(-rr));
+                if (from_u && fromlen_u && user_range_ok(fromlen_u, 4)) {
+                    uint32_t flen = 0;
+                    if (copy_from_user_raw(&flen, fromlen_u, 4) == 0 && flen >= 2 && user_range_ok(from_u, 2)) {
+                        uint16_t fam = 1;
+                        (void)copy_to_user_safe(from_u, &fam, sizeof(fam));
+                        flen = 2;
+                        (void)copy_to_user_safe(fromlen_u, &flen, 4);
+                    }
+                }
+                return (uint64_t)rr;
             }
             if (!buf_u) {
                 if (dbg_wget) qemu_debug_printf("RECVFROM-EFAULT: null buf with len=%llu\n", (unsigned long long)len);
@@ -5964,8 +6604,12 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return (uint64_t)iov.len;
             }
             if (!iov.base || iov.len == 0 || iov.len > 2048 || !user_range_ok(iov.base, (size_t)iov.len)) return ret_err(EFAULT);
-            if (s->unix_domain_stub)
-                return (uint64_t)iov.len;
+            if (s->unix_domain_stub) {
+                if (!s->connected) return ret_err(ENOTCONN);
+                ssize_t wr = unix_stream_write_from_user(s, iov.base, (size_t)iov.len);
+                if (wr < 0) return ret_err((int)(-wr));
+                return (uint64_t)wr;
+            }
             uint32_t dst_ip_be = 0;
             uint16_t dst_port = 0;
             if (m.msg_name && m.msg_namelen >= 2u && user_range_ok(m.msg_name, (size_t)m.msg_namelen)) {
@@ -6070,9 +6714,16 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             /* Linux-compatible: zero-length recvmsg iov is valid. */
             if (iov.len == 0) return 0;
             if (s->unix_domain_stub) {
-                if (!iov.base || !user_range_ok(iov.base, (size_t)iov.len)) return ret_err(EFAULT);
                 if (!s->connected) return ret_err(ENOTCONN);
-                return 0;
+                ssize_t rr = unix_stream_read_to_user(s, iov.base, (size_t)iov.len, (flags & 0x2) ? 1 : 0);
+                if (rr < 0) return ret_err((int)(-rr));
+                if (m.msg_name && m.msg_namelen >= 2 && user_range_ok(m.msg_name, 2)) {
+                    uint16_t fam = 1;
+                    (void)copy_to_user_safe(m.msg_name, &fam, sizeof(fam));
+                    m.msg_namelen = 2;
+                    (void)copy_to_user_safe(msg_u, &m, sizeof(m));
+                }
+                return (uint64_t)rr;
             }
             if (!iov.base) {
                 if (dbg_wget) qemu_debug_printf("RECVMSG-EFAULT: null base with len=%llu\n", (unsigned long long)iov.len);
@@ -6922,9 +7573,14 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             for (int i=0;i<argc;i++) if (kargv[i]) kfree((void*)kargv[i]);
             if (kargv) kfree((void*)kargv);
             kfree(path);
+            if (rc == 0) {
+                sysv_shm_detach_all_for_tid((uint64_t)(cur && cur->tid ? cur->tid : 1));
+                user_vma_remove_all_for_tid((uint64_t)(cur && cur->tid ? cur->tid : 1));
+                return 0;
+            }
             if (rc == -2) return ret_err(ENOEXEC);
             if (rc == -3) return ret_err(EAGAIN);
-            return (rc == 0) ? 0 : ret_err(ENOENT);
+            return ret_err(ENOENT);
         }
         case SYS_rt_sigprocmask: {
             /* rt_sigprocmask(int how, const sigset_t *set, sigset_t *oldset, size_t sigsetsize)
@@ -7095,6 +7751,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 child->user_brk_cur = cur->user_brk_cur;
                 if (cur->user_mmap_next) child->user_mmap_next = cur->user_mmap_next;
                 child->user_mmap_hi = cur->user_mmap_hi;
+                if (user_vma_clone_for_tid((uint64_t)(cur->tid ? cur->tid : 1), (uint64_t)(child->tid ? child->tid : 1)) != 0) {
+                    return ret_err(ENOSPC);
+                }
 
                 /* set up user entry and stack for the child (restore full regs, relocate stack pointers) */
                 {
@@ -7570,8 +8229,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             if (s->nl_rx_off < s->nl_rx_len)
                                 nb = (uint32_t)(s->nl_rx_len - s->nl_rx_off);
                         } else if (s->unix_domain_stub && s->connected) {
-                            /* libc may ioctl before recv on nscd stub; >0 nudges read path (recv returns 0). */
-                            nb = 1u;
+                            size_t a = unix_stream_avail_to_read(s);
+                            if (a > 0xFFFFFFFFu) a = 0xFFFFFFFFu;
+                            nb = (uint32_t)a;
                         } else if (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) {
                             ksock_rx_pending_normalize(s);
                             size_t a = ksock_rx_pending_avail(s);
@@ -7993,6 +8653,51 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
             return total;
         }
+        case 17: { /* pread64(fd, buf, count, offset) */
+            int fd = (int)a1;
+            void *bufp = (void *)(uintptr_t)a2;
+            size_t cnt = (size_t)a3;
+            int64_t off_in = (int64_t)a4;
+            if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
+            if (off_in < 0) return ret_err(EINVAL);
+            if (cnt == 0) return 0;
+            struct fs_file *f = cur->fds[fd];
+            if (!f) return ret_err(EBADF);
+            /* pread on pipes/sockets is invalid (doesn't use/advance file position). */
+            if (f->type == SYSCALL_FTYPE_SOCKET || f->type == FS_TYPE_PIPE) return ret_err(ESPIPE);
+            if (!bufp || !user_range_ok(bufp, cnt)) return ret_err(EFAULT);
+
+            uint64_t total = 0;
+            size_t cur_off = (size_t)off_in;
+            while ((size_t)total < cnt) {
+                size_t chunk = cnt - (size_t)total;
+                if (chunk > 4096) chunk = 4096;
+                void *tmp = kmalloc(chunk);
+                if (!tmp) return (total > 0) ? total : ret_err(ENOMEM);
+                ssize_t rr = fs_read(f, tmp, chunk, cur_off);
+                if (rr < 0) {
+                    kfree(tmp);
+                    return (total > 0) ? total : ret_err((int)-rr);
+                }
+                if (rr == 0) {
+                    kfree(tmp);
+                    return total;
+                }
+                if ((size_t)rr > chunk) {
+                    kfree(tmp);
+                    return (total > 0) ? total : ret_err(EIO);
+                }
+                if (copy_to_user_safe((uint8_t *)bufp + total, tmp, (size_t)rr) != 0) {
+                    kfree(tmp);
+                    return (total > 0) ? total : ret_err(EFAULT);
+                }
+                kfree(tmp);
+                total += (uint64_t)rr;
+                cur_off += (size_t)rr;
+                if ((size_t)rr < chunk) return total;
+            }
+            return total;
+        }
         case SYS_read: {
             int fd = (int)a1;
             void *bufp = (void*)(uintptr_t)a2;
@@ -8237,7 +8942,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             } else if (f->type == SYSCALL_FTYPE_SOCKET && f->driver_private) {
                                 ksock_net_t *s = (ksock_net_t *)f->driver_private;
                                 if (events & POLLOUT) {
-                                    if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && s->dns_tcp_udp_bridge) {
+                                    if (s->unix_domain_stub) {
+                                        if (!s->unix_listening && s->connected && !unix_stream_peer_closed(s) && unix_stream_avail_to_write(s) > 0)
+                                            revents |= POLLOUT;
+                                    } else if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && s->dns_tcp_udp_bridge) {
                                         revents |= POLLOUT;
                                     } else if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
                                         net_tcp_ops_t ops;
@@ -8250,8 +8958,13 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                 }
                                 if ((events & POLLIN) && s->sock_domain == AF_NETLINK_LOCAL) {
                                     if (s->nl_rx_off < s->nl_rx_len) revents |= POLLIN;
-                                } else if ((events & POLLIN) && s->unix_domain_stub && s->connected) {
-                                    revents |= POLLIN;
+                                } else if (s->unix_domain_stub) {
+                                    if (s->unix_listening) {
+                                        if ((events & POLLIN) && s->unix_accept_count > 0) revents |= POLLIN;
+                                    } else if (s->connected) {
+                                        if ((events & POLLIN) && (unix_stream_avail_to_read(s) > 0 || unix_stream_peer_closed(s))) revents |= POLLIN;
+                                        if ((events & POLLOUT) && !unix_stream_peer_closed(s) && unix_stream_avail_to_write(s) > 0) revents |= POLLOUT;
+                                    }
                                 } else if ((events & POLLIN) &&
                                            ((s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) ||
                                             (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && s->dns_tcp_udp_bridge))) {
@@ -8592,6 +9305,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 /* Free socket private state only on final close of shared fs_file. */
                 if (f && f->type == SYSCALL_FTYPE_SOCKET && f->driver_private && f->refcount <= 1) {
                     ksock_net_t *s = (ksock_net_t *)f->driver_private;
+                    if (s->unix_domain_stub) {
+                        unix_socket_cleanup(s);
+                    }
                     if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && !s->dns_tcp_udp_bridge) {
                         net_tcp_ops_t ops;
                         net_make_tcp_ops(&ops);
@@ -9221,11 +9937,275 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
             return (uint64_t)(*p_cur);
         }
+        case SYS_shmget: {
+            int key = (int)a1;
+            size_t size = (size_t)a2;
+            int shmflg = (int)a3;
+            enum { IPC_PRIVATE_LOCAL = 0, IPC_CREAT_LOCAL = 01000, IPC_EXCL_LOCAL = 02000 };
+            if (size == 0) return ret_err(EINVAL);
+            size = (size_t)align_up_u((uintptr_t)size, 4096);
+            if (size < 4096) size = 4096;
+
+            thread_t *tcur = thread_get_current_user();
+            if (!tcur) tcur = thread_current();
+            uid_t uid = tcur ? tcur->euid : 0;
+            gid_t gid = tcur ? tcur->egid : 0;
+            uint32_t pid = (uint32_t)((tcur && tcur->tid) ? tcur->tid : 1);
+
+            unsigned long fl = 0;
+            acquire_irqsave(&g_sysv_shm_lock, &fl);
+            if (key != IPC_PRIVATE_LOCAL) {
+                sysv_shm_seg_t *seg = sysv_shm_find_by_key_nolock(key);
+                if (seg) {
+                    if ((shmflg & IPC_CREAT_LOCAL) && (shmflg & IPC_EXCL_LOCAL)) {
+                        release_irqrestore(&g_sysv_shm_lock, fl);
+                        return ret_err(EEXIST);
+                    }
+                    if (size > seg->size) {
+                        release_irqrestore(&g_sysv_shm_lock, fl);
+                        return ret_err(EINVAL);
+                    }
+                    int id = seg->shmid;
+                    release_irqrestore(&g_sysv_shm_lock, fl);
+                    return (uint64_t)id;
+                }
+                if (!(shmflg & IPC_CREAT_LOCAL)) {
+                    release_irqrestore(&g_sysv_shm_lock, fl);
+                    return ret_err(ENOENT);
+                }
+            }
+
+            int slot = -1;
+            for (int i = 0; i < SYSV_SHM_MAX_SEGMENTS; i++) {
+                if (!g_sysv_shm[i].used) { slot = i; break; }
+            }
+            if (slot < 0) {
+                release_irqrestore(&g_sysv_shm_lock, fl);
+                return ret_err(ENOSPC);
+            }
+            uintptr_t base = sysv_shm_alloc_va_nolock(size);
+            if (base == 0) {
+                release_irqrestore(&g_sysv_shm_lock, fl);
+                return ret_err(ENOMEM);
+            }
+
+            sysv_shm_seg_t *seg = &g_sysv_shm[slot];
+            memset(seg, 0, sizeof(*seg));
+            seg->used = 1;
+            seg->shmid = g_sysv_shm_next_id++;
+            if (g_sysv_shm_next_id < 1) g_sysv_shm_next_id = 1;
+            seg->key = key;
+            seg->size = size;
+            seg->base = base;
+            seg->mode = (uint32_t)(shmflg & 0777);
+            seg->uid = uid;
+            seg->gid = gid;
+            seg->cuid = uid;
+            seg->cgid = gid;
+            seg->cpid = pid;
+            seg->lpid = 0;
+            seg->atime = 0;
+            seg->dtime = 0;
+            seg->ctime = sysv_shm_now_secs();
+            seg->nattch = 0;
+            seg->removed = 0;
+            int shmid = seg->shmid;
+            release_irqrestore(&g_sysv_shm_lock, fl);
+
+            if (mark_user_identity_range_2m_sys((uint64_t)base, (uint64_t)(base + size)) != 0) {
+                acquire_irqsave(&g_sysv_shm_lock, &fl);
+                seg->used = 0;
+                release_irqrestore(&g_sysv_shm_lock, fl);
+                return ret_err(EFAULT);
+            }
+            memset((void *)base, 0, size);
+            return (uint64_t)shmid;
+        }
+        case SYS_shmat: {
+            int shmid = (int)a1;
+            uintptr_t req_addr = (uintptr_t)a2;
+            int shmflg = (int)a3;
+            enum { SHM_RDONLY_LOCAL = 010000, SHM_RND_LOCAL = 020000 };
+            (void)req_addr;
+            (void)shmflg;
+
+            thread_t *tcur = thread_get_current_user();
+            if (!tcur) tcur = thread_current();
+            uint64_t tid = (uint64_t)((tcur && tcur->tid) ? tcur->tid : 1);
+            uid_t uid = tcur ? tcur->euid : 0;
+
+            unsigned long fl = 0;
+            acquire_irqsave(&g_sysv_shm_lock, &fl);
+            sysv_shm_seg_t *seg = sysv_shm_find_by_id_nolock(shmid);
+            if (!seg || seg->removed) {
+                release_irqrestore(&g_sysv_shm_lock, fl);
+                return ret_err(EINVAL);
+            }
+            if (req_addr != 0) {
+                uintptr_t want = req_addr;
+                if (shmflg & SHM_RND_LOCAL) want &= ~0xFFFu;
+                if (want != seg->base) {
+                    release_irqrestore(&g_sysv_shm_lock, fl);
+                    return ret_err(EINVAL);
+                }
+            }
+            if ((shmflg & SHM_RDONLY_LOCAL) == 0) {
+                if (uid != 0 && uid != seg->uid && uid != seg->cuid && (seg->mode & 0222u) == 0) {
+                    release_irqrestore(&g_sysv_shm_lock, fl);
+                    return ret_err(EACCES);
+                }
+            } else {
+                if (uid != 0 && uid != seg->uid && uid != seg->cuid && (seg->mode & 0444u) == 0) {
+                    release_irqrestore(&g_sysv_shm_lock, fl);
+                    return ret_err(EACCES);
+                }
+            }
+            if (sysv_shm_register_attach_nolock(shmid, tid, seg->base, (shmflg & SHM_RDONLY_LOCAL) ? 1 : 0) != 0) {
+                release_irqrestore(&g_sysv_shm_lock, fl);
+                return ret_err(ENOSPC);
+            }
+            seg->nattch++;
+            seg->lpid = (uint32_t)tid;
+            seg->atime = sysv_shm_now_secs();
+            uintptr_t addr = seg->base;
+            size_t seg_size = seg->size;
+            release_irqrestore(&g_sysv_shm_lock, fl);
+            {
+                unsigned long vfl = 0;
+                acquire_irqsave(&g_user_vma_lock, &vfl);
+                if (user_vma_add_nolock(tid, addr, seg_size, (shmflg & SHM_RDONLY_LOCAL) ? 1 : 3, USER_VMA_KIND_SHM) != 0) {
+                    release_irqrestore(&g_user_vma_lock, vfl);
+                    acquire_irqsave(&g_sysv_shm_lock, &fl);
+                    int dshmid = -1;
+                    (void)sysv_shm_detach_one_by_tid_addr_nolock(tid, addr, &dshmid);
+                    sysv_shm_seg_t *dseg = sysv_shm_find_by_id_nolock(shmid);
+                    if (dseg) {
+                        if (dseg->nattch > 0) dseg->nattch--;
+                        dseg->dtime = sysv_shm_now_secs();
+                        dseg->lpid = (uint32_t)tid;
+                        sysv_shm_cleanup_removed_nolock(dseg);
+                    }
+                    release_irqrestore(&g_sysv_shm_lock, fl);
+                    return ret_err(ENOSPC);
+                }
+                release_irqrestore(&g_user_vma_lock, vfl);
+            }
+            return (uint64_t)addr;
+        }
+        case SYS_shmdt: {
+            uintptr_t addr = (uintptr_t)a1;
+            thread_t *tcur = thread_get_current_user();
+            if (!tcur) tcur = thread_current();
+            uint64_t tid = (uint64_t)((tcur && tcur->tid) ? tcur->tid : 1);
+
+            unsigned long fl = 0;
+            acquire_irqsave(&g_sysv_shm_lock, &fl);
+            int shmid = -1;
+            if (sysv_shm_detach_one_by_tid_addr_nolock(tid, addr, &shmid) != 0) {
+                release_irqrestore(&g_sysv_shm_lock, fl);
+                return ret_err(EINVAL);
+            }
+            sysv_shm_seg_t *seg = sysv_shm_find_by_id_nolock(shmid);
+            size_t seg_size = seg ? seg->size : 0;
+            if (seg) {
+                if (seg->nattch > 0) seg->nattch--;
+                seg->dtime = sysv_shm_now_secs();
+                seg->lpid = (uint32_t)tid;
+                sysv_shm_cleanup_removed_nolock(seg);
+            }
+            release_irqrestore(&g_sysv_shm_lock, fl);
+            if (seg_size > 0) {
+                unsigned long vfl = 0;
+                acquire_irqsave(&g_user_vma_lock, &vfl);
+                user_vma_unmap_range_nolock(tid, addr, seg_size);
+                release_irqrestore(&g_user_vma_lock, vfl);
+            }
+            return 0;
+        }
+        case SYS_shmctl: {
+            int shmid = (int)a1;
+            int cmd = (int)a2;
+            void *buf_u = (void *)(uintptr_t)a3;
+            enum { IPC_RMID_LOCAL = 0, IPC_SET_LOCAL = 1, IPC_STAT_LOCAL = 2 };
+
+            thread_t *tcur = thread_get_current_user();
+            if (!tcur) tcur = thread_current();
+            uint64_t tid = (uint64_t)((tcur && tcur->tid) ? tcur->tid : 1);
+            uid_t uid = tcur ? tcur->euid : 0;
+
+            unsigned long fl = 0;
+            acquire_irqsave(&g_sysv_shm_lock, &fl);
+            sysv_shm_seg_t *seg = sysv_shm_find_by_id_nolock(shmid);
+            if (!seg) {
+                release_irqrestore(&g_sysv_shm_lock, fl);
+                return ret_err(EINVAL);
+            }
+            if (cmd == IPC_RMID_LOCAL) {
+                if (uid != 0 && uid != seg->uid && uid != seg->cuid) {
+                    release_irqrestore(&g_sysv_shm_lock, fl);
+                    return ret_err(EPERM);
+                }
+                seg->removed = 1;
+                seg->key = 0;
+                seg->lpid = (uint32_t)tid;
+                seg->dtime = sysv_shm_now_secs();
+                sysv_shm_cleanup_removed_nolock(seg);
+                release_irqrestore(&g_sysv_shm_lock, fl);
+                return 0;
+            }
+            if (cmd == IPC_SET_LOCAL) {
+                if (!buf_u || !user_range_ok(buf_u, sizeof(struct sysv_shmid_ds_compat))) {
+                    release_irqrestore(&g_sysv_shm_lock, fl);
+                    return ret_err(EFAULT);
+                }
+                if (uid != 0 && uid != seg->uid && uid != seg->cuid) {
+                    release_irqrestore(&g_sysv_shm_lock, fl);
+                    return ret_err(EPERM);
+                }
+                struct sysv_shmid_ds_compat ds;
+                if (copy_from_user_raw(&ds, buf_u, sizeof(ds)) != 0) {
+                    release_irqrestore(&g_sysv_shm_lock, fl);
+                    return ret_err(EFAULT);
+                }
+                seg->mode = (seg->mode & ~0777u) | (uint32_t)(ds.shm_perm.mode & 0777u);
+                seg->uid = (uid_t)ds.shm_perm.uid;
+                seg->gid = (gid_t)ds.shm_perm.gid;
+                seg->ctime = sysv_shm_now_secs();
+                release_irqrestore(&g_sysv_shm_lock, fl);
+                return 0;
+            }
+            if (cmd == IPC_STAT_LOCAL) {
+                if (!buf_u || !user_range_ok(buf_u, sizeof(struct sysv_shmid_ds_compat))) {
+                    release_irqrestore(&g_sysv_shm_lock, fl);
+                    return ret_err(EFAULT);
+                }
+                struct sysv_shmid_ds_compat ds;
+                memset(&ds, 0, sizeof(ds));
+                ds.shm_perm.key = (uint32_t)seg->key;
+                ds.shm_perm.uid = (uint32_t)seg->uid;
+                ds.shm_perm.gid = (uint32_t)seg->gid;
+                ds.shm_perm.cuid = (uint32_t)seg->cuid;
+                ds.shm_perm.cgid = (uint32_t)seg->cgid;
+                ds.shm_perm.mode = (uint16_t)(seg->mode & 0777u);
+                ds.shm_segsz = (uint64_t)seg->size;
+                ds.shm_atime = (int64_t)seg->atime;
+                ds.shm_dtime = (int64_t)seg->dtime;
+                ds.shm_ctime = (int64_t)seg->ctime;
+                ds.shm_cpid = (int32_t)seg->cpid;
+                ds.shm_lpid = (int32_t)seg->lpid;
+                ds.shm_nattch = (uint64_t)seg->nattch;
+                release_irqrestore(&g_sysv_shm_lock, fl);
+                if (copy_to_user_safe(buf_u, &ds, sizeof(ds)) != 0) return ret_err(EFAULT);
+                return 0;
+            }
+            release_irqrestore(&g_sysv_shm_lock, fl);
+            return ret_err(EINVAL);
+        }
         case SYS_mmap: {
             /* mmap(addr,len,prot,flags,fd,off) - anonymous and file-backed MAP_PRIVATE */
             qemu_debug_printf("mmap: entry len=0x%llx prot=%d flags=0x%x\n",
                 (unsigned long long)a2, (int)a3, (int)a4);
-            (void)a1;
+            uintptr_t req_addr = (uintptr_t)a1;
             size_t len = (size_t)a2;
             int prot = (int)a3;
             int flags = (int)a4;
@@ -9234,8 +10214,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             len = (size_t)align_up_u((uintptr_t)len, 4096);
             enum { MAP_FIXED = 0x10, MAP_ANONYMOUS = 0x20, MAP_PRIVATE = 0x02,
                    MAP_SHARED = 0x01,
+                   MAP_FIXED_NOREPLACE = 0x100000,
                    MAP_STACK = 0x20000, MAP_GROWSDOWN = 0x0100, MAP_NORESERVE = 0x4000 };
-            if (flags & MAP_FIXED) { qemu_debug_printf("mmap: EINVAL MAP_FIXED\n"); return ret_err(EINVAL); }
+            int fixed_mapping = (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) ? 1 : 0;
             /* Many userspace tools (including xxd) use MAP_SHARED for read-only mmaps.
                We don't implement true shared mappings; treat MAP_SHARED like MAP_PRIVATE. */
             if (!(flags & (MAP_PRIVATE | MAP_SHARED))) { qemu_debug_printf("mmap: ENOSYS no priv/shared\n"); return ret_err(ENOSYS); }
@@ -9316,12 +10297,16 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 qemu_debug_printf("mmap: clone3 adj mmap_next=0x%llx (min_alloc 2MB-aligned)\n",
                     (unsigned long long)*p_mmap_next);
             }
-            uintptr_t addr = align_up_u(*p_mmap_next, 4096);
+            uintptr_t addr = fixed_mapping ? req_addr : align_up_u(*p_mmap_next, 4096);
+            if (fixed_mapping && (addr & 0xFFFu) != 0) {
+                qemu_debug_printf("mmap: EINVAL fixed addr unaligned 0x%llx\n", (unsigned long long)addr);
+                return ret_err(EINVAL);
+            }
             /* Clone3: place mmap on 2MB boundary above stack so munmap won't unmap the stack
                (unmap clears whole 2MB L2 entries; stack shares 0x2800000-0x2a00000 with 0x2804000).
                Only use above-stack placement if it fits within top_limit (VMware: heap/stack layout
                can leave top_limit below stack, causing ENOMEM and "out of memory" in wget). */
-            if (tcur && tcur->user_stack_base != 0 && tcur->user_stack_limit > tcur->user_stack_base) {
+            if (!fixed_mapping && tcur && tcur->user_stack_base != 0 && tcur->user_stack_limit > tcur->user_stack_base) {
                 uintptr_t sb = (uintptr_t)tcur->user_stack_base;
                 uintptr_t se = (uintptr_t)tcur->user_stack_limit;
                 if (!(addr + len <= sb || addr >= se)) {
@@ -9336,7 +10321,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
             /* Final floor: never place mmap inside current brk heap, even after
                clone3/stack adjustments above. */
-            {
+            if (!fixed_mapping) {
                 uintptr_t min_addr = brk_guard_floor;
                 if (addr < min_addr) {
                     addr = min_addr;
@@ -9390,7 +10375,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
 
             if (flags & MAP_ANONYMOUS) {
-                flags &= ~(MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED | MAP_STACK | MAP_GROWSDOWN | MAP_NORESERVE);
+                flags &= ~(MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED | MAP_FIXED | MAP_FIXED_NOREPLACE |
+                           MAP_STACK | MAP_GROWSDOWN | MAP_NORESERVE);
                 if (flags != 0) return ret_err(ENOSYS);
                 qemu_debug_printf("mmap: memset 0x%llx len=0x%llx\n", (unsigned long long)addr, (unsigned long long)len);
                 if (len > 4u * 1024u * 1024u) {
@@ -9448,7 +10434,21 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
             }
             qemu_debug_printf("mmap: ok return 0x%llx\n", (unsigned long long)addr);
-            *p_mmap_next = addr + len;
+            if (!fixed_mapping) {
+                *p_mmap_next = addr + len;
+            } else if (*p_mmap_next < addr + len) {
+                *p_mmap_next = addr + len;
+            }
+            {
+                uint64_t vtid = (uint64_t)(tcur ? (tcur->tid ? tcur->tid : 1) : 1);
+                unsigned long vfl = 0;
+                acquire_irqsave(&g_user_vma_lock, &vfl);
+                if (user_vma_add_nolock(vtid, addr, len, prot & 7, USER_VMA_KIND_MMAP) != 0) {
+                    release_irqrestore(&g_user_vma_lock, vfl);
+                    return ret_err(ENOSPC);
+                }
+                release_irqrestore(&g_user_vma_lock, vfl);
+            }
             {
                 uintptr_t he = (uintptr_t)(addr + len);
                 if (tcur) {
@@ -9480,11 +10480,22 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (addr < 0x200000) return ret_err(EINVAL);
             if (addr + len >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EINVAL);
             if ((addr & 0xFFF) != 0) return ret_err(EINVAL);
-            /* Temporary compatibility mode:
-               current VM mappings are coarse (2MB granularity), and real unmap can
-               accidentally drop executable code pages in static glibc processes.
-               Until fine-grained user page mappings are implemented, treat munmap
-               as successful no-op for stability. */
+            {
+                thread_t *tcur = thread_get_current_user();
+                if (!tcur) tcur = thread_current();
+                uint64_t tid = (uint64_t)(tcur ? (tcur->tid ? tcur->tid : 1) : 1);
+                unsigned long vfl = 0;
+                acquire_irqsave(&g_user_vma_lock, &vfl);
+                user_vma_unmap_range_nolock(tid, addr, len);
+                uintptr_t max_end = user_vma_max_end_for_kind_nolock(tid, USER_VMA_KIND_MMAP);
+                release_irqrestore(&g_user_vma_lock, vfl);
+                if (tcur) {
+                    uintptr_t floor = align_up_u((tcur->user_brk_cur ? tcur->user_brk_cur : (8u * 1024u * 1024u)) + 0x10000u, 4096);
+                    if (max_end < floor) max_end = floor;
+                    if (tcur->user_mmap_next > max_end) tcur->user_mmap_next = max_end;
+                    if (tcur->user_mmap_hi > tcur->user_mmap_next) tcur->user_mmap_hi = tcur->user_mmap_next;
+                }
+            }
             return 0;
         }
         case SYS_madvise: {
@@ -9502,9 +10513,32 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (addr + len >= (uintptr_t)MMIO_IDENTITY_LIMIT) return ret_err(EINVAL);
             if ((addr & 0xFFF) != 0) return ret_err(EINVAL);
             if ((prot & ~7) != 0) return ret_err(EINVAL);  /* PROT_READ|WRITE|EXEC only */
-            (void)prot;
-            /* Same rationale as munmap above: avoid destructive coarse permission
-               changes that can clear execute on active text mappings. */
+            {
+                thread_t *tcur = thread_get_current_user();
+                if (!tcur) tcur = thread_current();
+                uint64_t tid = (uint64_t)(tcur ? (tcur->tid ? tcur->tid : 1) : 1);
+                unsigned long vfl = 0;
+                acquire_irqsave(&g_user_vma_lock, &vfl);
+                int mapped = user_vma_is_fully_mapped_nolock(tid, addr, len);
+                if (!mapped) {
+                    /* Compatibility path:
+                       exec/loader mappings may exist in page tables but be absent from VMA tracker.
+                       Register this range lazily so ld.so mprotect(PROT_*) succeeds. */
+                    user_vma_unmap_range_nolock(tid, addr, len);
+                    if (user_vma_add_nolock(tid, addr, len, prot & 7, USER_VMA_KIND_MMAP) != 0) {
+                        /* Keep syscall successful to avoid breaking dynamic loader startup. */
+                        release_irqrestore(&g_user_vma_lock, vfl);
+                        return 0;
+                    }
+                    release_irqrestore(&g_user_vma_lock, vfl);
+                    return 0;
+                }
+                if (user_vma_set_prot_nolock(tid, addr, len, prot & 7) != 0) {
+                    release_irqrestore(&g_user_vma_lock, vfl);
+                    return ret_err(ENOSPC);
+                }
+                release_irqrestore(&g_user_vma_lock, vfl);
+            }
             return 0;
         }
         case SYS_exit: {
@@ -9517,6 +10551,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (cur) {
                 int code = (int)a1;
                 cur->exit_status = (code & 0xFF) << 8;
+                sysv_shm_detach_all_for_tid((uint64_t)(cur->tid ? cur->tid : 1));
+                user_vma_remove_all_for_tid((uint64_t)(cur->tid ? cur->tid : 1));
                 /* close all FDs so pipes/sockets release (reader gets EOF, wait4 can proceed) */
                 for (int i = 0; i < THREAD_MAX_FD; i++) {
                     if (cur->fds[i]) {
@@ -9623,6 +10659,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 exit_group_reap_peer_threads(cur);
                 int code = (int)a1;
                 cur->exit_status = (code & 0xFF) << 8;
+                sysv_shm_detach_all_for_tid((uint64_t)(cur->tid ? cur->tid : 1));
+                user_vma_remove_all_for_tid((uint64_t)(cur->tid ? cur->tid : 1));
                 /* close all FDs so pipes/sockets release (reader gets EOF, wait4 can proceed) */
                 for (int i = 0; i < THREAD_MAX_FD; i++) {
                     if (cur->fds[i]) {

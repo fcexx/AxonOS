@@ -27,6 +27,30 @@ struct mount_entry {
 static struct mount_entry g_mounts[MAX_FS_MOUNTS];
 static int g_mount_count = 0;
 
+int fs_mount_count(void) {
+    return g_mount_count;
+}
+
+int fs_mount_get(int index, char *out_path, size_t out_path_len, char *out_fs_name, size_t out_fs_name_len) {
+    if (index < 0 || index >= g_mount_count) return -1;
+    if (!out_path || out_path_len == 0 || !out_fs_name || out_fs_name_len == 0) return -1;
+
+    struct mount_entry *m = &g_mounts[index];
+    if (!m->driver || !m->driver->ops || !m->driver->ops->name) return -1;
+
+    size_t plen = strlen(m->path);
+    if (plen >= out_path_len) plen = out_path_len - 1;
+    memcpy(out_path, m->path, plen);
+    out_path[plen] = '\0';
+
+    const char *fsn = m->driver->ops->name;
+    size_t flen = strlen(fsn);
+    if (flen >= out_fs_name_len) flen = out_fs_name_len - 1;
+    memcpy(out_fs_name, fsn, flen);
+    out_fs_name[flen] = '\0';
+    return 0;
+}
+
 int fs_get_mount_children(const char *dir_path, char names[][64], int max_count) {
     if (!dir_path || !names || max_count <= 0) return 0;
 

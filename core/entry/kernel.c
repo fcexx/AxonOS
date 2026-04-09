@@ -6,6 +6,7 @@
 
 #include <axonos.h>
 #include <keyboard.h>
+#include <mouse.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <gdt.h>
@@ -190,6 +191,8 @@ void kernel_sysfs_populate_default(void) {
     }
     usb_sysfs_populate_default();
     pci_sysfs_init();  /* /sys/bus/pci/devices для lspci */
+    keyboard_publish_sysfs();
+    mouse_publish_sysfs();
 }
 
 static int boot_try_run_init(void) {
@@ -721,6 +724,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         }
     }
     ps2_keyboard_init();
+    ps2_mouse_init();
     rtc_init();
     kclear();
     // Prefer linuxrc/init if present; fallback to kernel shell.

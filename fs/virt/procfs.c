@@ -273,6 +273,27 @@ static ssize_t procfs_show_partitions(char *buf, size_t size, void *priv) {
 	return (ssize_t)w;
 }
 
+/* Linux-like /proc/mounts backed by VFS mount table */
+static ssize_t procfs_show_mounts(char *buf, size_t size, void *priv) {
+    (void)priv;
+    if (!buf || size == 0) return 0;
+    size_t w = 0;
+    int n = fs_mount_count();
+    for (int i = 0; i < n; i++) {
+        char mpath[64];
+        char fstype[32];
+        if (fs_mount_get(i, mpath, sizeof(mpath), fstype, sizeof(fstype)) != 0) continue;
+        /* source mountpoint fstype options dump pass */
+        int wr = snprintf(buf + w, (w < size) ? (size - w) : 0,
+                          "%s %s %s rw,relatime 0 0\n",
+                          fstype, mpath, fstype);
+        if (wr < 0) break;
+        w += (size_t)wr;
+        if (w >= size) { w = size; break; }
+    }
+    return (ssize_t)w;
+}
+
 /* Linux-like /proc/scsi/scsi: Host, Channel, Id, Lun, Type, Vendor, Model, Rev */
 static ssize_t procfs_show_scsi(char *buf, size_t size, void *priv) {
 	(void)priv;
@@ -565,6 +586,14 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
 				*out_file = f;
 				return 0;
 			}
+            if (first_len == 6 && strncmp(p, "mounts", 6) == 0) {
+                h->kind = 7; f->type = FS_TYPE_REG;
+                f->size = 0;
+                f->driver_private = h;
+                h->file_id = 16; /* mounts */
+                *out_file = f;
+                return 0;
+            }
 			if (first_len == 4 && strncmp(p, "stat", 4) == 0) {
 				h->kind = 7; f->type = FS_TYPE_REG;
 				f->size = 0;
@@ -756,7 +785,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
         size_t pos = 0;
         size_t written = 0;
         uint8_t *out = (uint8_t*)buf;
-        const char *top[] = { "meminfo", "cpuinfo", "uptime", "loadavg", "stat", "partitions", "sys", "bus", "tty", "net", "scsi" };
+        const char *top[] = { "meminfo", "cpuinfo", "uptime", "loadavg", "mounts", "stat", "partitions", "sys", "bus", "tty", "net", "scsi" };
         for (size_t ti = 0; ti < sizeof(top)/sizeof(top[0]); ti++) {
             const char *name = top[ti];
             size_t namelen = strlen(name);
@@ -1180,6 +1209,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 		else if (h->file_id == 13) full = procfs_show_partitions(tmpbuf, cap, NULL);
 		else if (h->file_id == 14) full = procfs_show_loadavg(tmpbuf, cap, NULL);
 		else if (h->file_id == 15) full = procfs_show_kernel_stat(tmpbuf, cap, NULL);
+        else if (h->file_id == 16) full = procfs_show_mounts(tmpbuf, cap, NULL);
 		else if (h->file_id == 40) full = procfs_show_scsi(tmpbuf, cap, NULL);
 		else if (h->file_id == 41) full = procfs_show_pci(tmpbuf, cap, NULL);
         else if (h->file_id == 30) full = usb_proc_bus_devices_show(tmpbuf, cap, NULL);

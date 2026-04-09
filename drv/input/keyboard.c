@@ -9,6 +9,7 @@
 #include <sysfs.h>
 #include <pic.h>
 #include <devfs.h>
+#include <mouse.h>
 
 // Вспомогательные функции для ожидания статусов контроллера PS/2
 static int ps2_wait_input_empty(void) {
@@ -57,9 +58,6 @@ static int ps2_kbd_send_ack(uint8_t byte) {
         }
         return -1;
 }
-
-// Прототип функции обработки байта сканкода (используется в handler и для polling)
-void keyboard_process_scancode(uint8_t scancode);
 
 // Размер буфера клавиатуры
 #define KEYBOARD_BUFFER_SIZE 256
@@ -121,16 +119,20 @@ static ssize_t keyboard_sysfs_show_ctrlc(char *buf, size_t size, void *priv) {
 
 static void keyboard_register_sysfs(void) {
         if (keyboard_sysfs_registered) return;
-        sysfs_mkdir("/sys/class");
-        sysfs_mkdir("/sys/class/input");
-        sysfs_mkdir("/sys/class/input/keyboard0");
+        if (sysfs_mkdir("/sys/class") != 0) return;
+        if (sysfs_mkdir("/sys/class/input") != 0) return;
+        if (sysfs_mkdir("/sys/class/input/keyboard0") != 0) return;
         struct sysfs_attr attr_name = { keyboard_sysfs_show_text, NULL, (void*)"AT PS/2 keyboard" };
         struct sysfs_attr attr_driver = { keyboard_sysfs_show_text, NULL, (void*)"ps2-keyboard" };
         struct sysfs_attr attr_ctrlc = { keyboard_sysfs_show_ctrlc, NULL, NULL };
-        sysfs_create_file("/sys/class/input/keyboard0/name", &attr_name);
-        sysfs_create_file("/sys/class/input/keyboard0/driver", &attr_driver);
-        sysfs_create_file("/sys/class/input/keyboard0/ctrlc_pending", &attr_ctrlc);
+        if (sysfs_create_file("/sys/class/input/keyboard0/name", &attr_name) != 0) return;
+        if (sysfs_create_file("/sys/class/input/keyboard0/driver", &attr_driver) != 0) return;
+        if (sysfs_create_file("/sys/class/input/keyboard0/ctrlc_pending", &attr_ctrlc) != 0) return;
         keyboard_sysfs_registered = true;
+}
+
+void keyboard_publish_sysfs(void) {
+        keyboard_register_sysfs();
 }
 
 // Добавить символ в буфер
@@ -141,11 +143,19 @@ static void add_to_buffer(char c) {
 
 // Обработчик прерывания клавиатуры
 void keyboard_handler(cpu_registers_t* regs) {
-        uint8_t scancode = inb(0x60);
-        thread_t* cur = thread_current();
-        int curid = cur ? cur->tid : -1;
-        //qemu_debug_printf("kbd: scancode=0x%02x (current tid=%d)\n", scancode, curid);
-        keyboard_process_scancode(scancode);
+        (void)regs;
+        /* Drain all pending controller bytes so stale AUX data can't block keyboard. */
+        for (int i = 0; i < 32; i++) {
+                uint8_t st = inb(0x64);
+                if ((st & 0x01u) == 0) break;
+                uint8_t data = inb(0x60);
+                if (st & 0x20u) {
+                        /* Some controllers/VMs can route AUX bytes through IRQ1. */
+                        mouse_process_byte(data);
+                } else {
+                        keyboard_process_scancode(data);
+                }
+        }
         // EOI отправляется центральным диспетчером прерываний в isr_dispatch
 }
 

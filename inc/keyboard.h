@@ -23,6 +23,8 @@ extern "C" {
 
 // initialize PS/2 keyboard
 void ps2_keyboard_init();
+/* Publish keyboard nodes to /sys/class/input/* (safe to call multiple times). */
+void keyboard_publish_sysfs(void);
 
 // get symbol (blocking function, like in Unix)
 char kgetc();
@@ -32,6 +34,9 @@ int kgetc_available();
 
 // get string with support for arrows and editing
 char* kgets(char* buffer, int max_length);
+
+/* Internal helper used by PS/2 routing code. */
+void keyboard_process_scancode(uint8_t scancode);
 
 // ctrl+C handling helpers
 int keyboard_ctrlc_pending(void);

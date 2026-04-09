@@ -58,6 +58,9 @@
 #define SYS_ftruncate 77
 #define SYS_munmap  11
 #define SYS_madvise 28
+#define SYS_shmget  29
+#define SYS_shmat   30
+#define SYS_shmctl  31
 #define SYS_brk     12
 #define SYS_pipe    22
 #define SYS_dup3    292
@@ -75,6 +78,7 @@
 #define SYS_newfstatat 262
 #define SYS_tgkill  234
 #define SYS_sendfile 40
+#define SYS_shmdt   67
 #define SYS_mount   165
 #define SYS_umount2 166
 #define SYS_rt_sigtimedwait 128

@@ -18,6 +18,7 @@
 #include <usb.h>
 #include <fbdev.h>
 #include <cirrusfb.h>
+#include <mouse.h>
 
 #define DEVFS_TTY_COUNT 6
 
@@ -274,6 +275,29 @@ static int devfs_open(const char *path, struct fs_file **out_file) {
         *out_file = f;
         return 0;
     }
+    /* directory /dev/input */
+    if (strcmp(path, "/dev/input") == 0 || strcmp(path, "/dev/input/") == 0) {
+        struct fs_file *f = (struct fs_file*)kmalloc(sizeof(struct fs_file));
+        if (!f) return -1;
+        memset(f, 0, sizeof(*f));
+        size_t plen = strlen(path) + 1;
+        char *pp = (char*)kmalloc(plen);
+        if (!pp) { kfree(f); return -1; }
+        memcpy(pp, path, plen);
+        f->path = (const char*)pp;
+        f->fs_private = NULL;
+        struct { int is_dir; int dir_count; } *h = kmalloc(sizeof(*h));
+        if (!h) { kfree((void*)f->path); kfree(f); return -1; }
+        h->is_dir = 1;
+        h->dir_count = 1; /* mice */
+        f->driver_private = (void*)h;
+        f->type = FS_TYPE_DIR;
+        f->size = 0;
+        f->pos = 0;
+        f->fs_private = &devfs_driver_data;
+        *out_file = f;
+        return 0;
+    }
     /* block device? */
     int bi = devfs_find_block_by_path(path);
     if (bi >= 0) {
@@ -353,6 +377,10 @@ struct fs_file *devfs_open_direct(const char *path) {
 
 static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t offset) {
     if (!file || !buf) return -1;
+    if (file->path && strcmp(file->path, "/dev/input/mice") == 0) {
+        (void)offset;
+        return mouse_read_stream(buf, size);
+    }
     if (usb_is_devfs_file(file)) return usb_devfs_read(file, buf, size, offset);
     if (file->path && strcmp(file->path, "/dev/fb0") == 0) {
         if (!fbdev_is_active()) return -1;
@@ -497,6 +525,39 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
     }
     /* directory read */
     if (file->type == FS_TYPE_DIR && file->driver_private) {
+        if (file->path && (strcmp(file->path, "/dev/input") == 0 || strcmp(file->path, "/dev/input/") == 0)) {
+            uint8_t *out = (uint8_t*)buf;
+            size_t pos = 0;
+            size_t written = 0;
+            static const char *const names[] = { ".", "..", "mice" };
+            for (int i = 0; i < 3; i++) {
+                const char *nm = names[i];
+                size_t namelen = strlen(nm);
+                size_t rec_len = 8 + namelen;
+                rec_len = (rec_len + 3) & ~3u;
+                if (rec_len < sizeof(struct ext2_dir_entry)) rec_len = sizeof(struct ext2_dir_entry);
+                if (pos + rec_len <= (size_t)offset) { pos += rec_len; continue; }
+                if (written >= size) break;
+                uint8_t tmp[64];
+                memset(tmp, 0, sizeof(tmp));
+                struct ext2_dir_entry de;
+                memset(&de, 0, sizeof(de));
+                de.inode = (uint32_t)(100 + i);
+                de.rec_len = (uint16_t)rec_len;
+                de.name_len = (uint8_t)namelen;
+                de.file_type = (i < 2) ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
+                memcpy(tmp, &de, 8);
+                memcpy(tmp + 8, nm, namelen);
+                size_t entry_off = ((size_t)offset > pos) ? (size_t)offset - pos : 0;
+                size_t avail = size - written;
+                size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
+                if (tocopy > avail) tocopy = avail;
+                memcpy(out + written, tmp + entry_off, tocopy);
+                written += tocopy;
+                pos += rec_len;
+            }
+            return (ssize_t)written;
+        }
         uint8_t *out = (uint8_t*)buf;
         size_t pos = 0;
         size_t written = 0;
@@ -529,7 +590,11 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             pos += rec_len;
         }
         /* include ttys + console + any registered block devices */
-        int total_with_special = (DEVFS_TTY_COUNT + 1) + devfs_special_count + dev_block_count + dev_char_count;
+        int has_input_dir = 0;
+        for (int ci = 0; ci < dev_char_count; ci++) {
+            if (strncmp(dev_chars[ci].path, "/dev/input/", 11) == 0) { has_input_dir = 1; break; }
+        }
+        int total_with_special = (DEVFS_TTY_COUNT + 1) + devfs_special_count + dev_block_count + dev_char_count + (has_input_dir ? 1 : 0);
         for (int i = 0; i < total_with_special; i++) {
             const char *nm;
             char tmpn[64];
@@ -544,6 +609,8 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                 int si = i - (DEVFS_TTY_COUNT + 1);
                 if (si >=0 && si < devfs_special_count) nm = devfs_special_names[si];
                 else nm = "";
+            } else if (has_input_dir && i == (DEVFS_TTY_COUNT + 1 + devfs_special_count + dev_block_count + dev_char_count)) {
+                nm = "input";
             } else {
                 /* block device entries stored in dev_blocks[] and character devices in dev_chars[] */
                 int bi = i - (DEVFS_TTY_COUNT + 1 + devfs_special_count);
@@ -605,7 +672,7 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
             de.inode = (uint32_t)(i + 1);
             de.rec_len = (uint16_t)rec_len;
             de.name_len = (uint8_t)namelen;
-            de.file_type = EXT2_FT_REG_FILE;
+            de.file_type = (strcmp(nm, "input") == 0) ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
             memcpy(tmp, &de, 8);
             memcpy(tmp + 8, nm, namelen);
             size_t entry_off = 0;
@@ -699,6 +766,10 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
 
 static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, size_t offset) {
     if (!file || !buf) return -1;
+    if (file->path && strcmp(file->path, "/dev/input/mice") == 0) {
+        (void)offset;
+        return (ssize_t)size;
+    }
     if (usb_is_devfs_file(file)) return usb_devfs_write(file, buf, size, offset);
     if (file->path && strcmp(file->path, "/dev/fb0") == 0) {
         if (!fbdev_is_active()) return -1;
