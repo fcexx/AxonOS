@@ -19,4 +19,7 @@ size_t heap_peak_bytes(void);
 /* Base virtual/physical address where the kernel heap starts (identity mapped). */
 uintptr_t heap_base_addr(void);
 
+/* One past the last byte of the kernel heap arena (identity mapped). */
+uintptr_t heap_region_end_exclusive(void);
+
 

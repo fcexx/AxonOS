@@ -30,6 +30,9 @@
 // - Kernel and user share one address space (identity-mapped below 4GiB)
 // - We return to ring3 via IRETQ (not SYSRET), so we can use existing USER_CS/USER_DS
 // - tss_set_rsp0() updates per-CPU rsp0 table (indexed by local APIC ID)
+// - syscall_do runs on one per-CPU kernel stack (syscall_kernel_rsp0_by_apic). Do not
+//   thread_yield()/schedule from inside syscall_do: another thread's syscall would
+//   clobber this CPU's syscall stack frame → double fault / triple fault.
 //
 // Syscall ABI:
 //   rax = nr

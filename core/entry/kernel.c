@@ -50,7 +50,9 @@
 #include <vbe.h>
 #include <cirrus.h>
 #include <vmwgfx.h>
+#include <vboxsvga.h>
 #include <cirrusfb.h>
+#include <acpi_powerbtn.h>
 #include <nvme.h>
 #include <e1000.h>
 void ata_dma_init(void);
@@ -295,6 +297,17 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         }
         if (heap_size == 0)
             heap_size = 64ULL * 1024ULL * 1024ULL; /* safe default when RAM unknown */
+        /* Identity-mapped heap must not cover user TLS/stack (USER_TLS_BASE..USER_STACK_TOP).
+           Otherwise kmalloc's arena overlaps userspace and mmap cannot use the gap without
+           clobbering heap metadata — wget/glibc then hit mmap ENOMEM and corrupt malloc. */
+        {
+            uint64_t tls = (uint64_t)USER_TLS_BASE;
+            const uint64_t tls_guard = 1ULL << 20; /* 1 MiB below TLS */
+            uint64_t max_heap_end = tls > tls_guard ? tls - tls_guard : tls;
+            uint64_t hs = (uint64_t)heap_start;
+            if (max_heap_end > hs && hs + (uint64_t)heap_size > max_heap_end)
+                heap_size = (size_t)(max_heap_end - hs);
+        }
         heap_init(heap_start, heap_size);
         kprintf("Kernel starting... heap_start: %p heap_size=%llu heap_total=%llu heap_base=%p ram_mb=%d kernel_end: %p mods_end: %p\n",
                 (void*)heap_start,
@@ -367,6 +380,9 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     sysinfo_print_e820(multiboot_magic, multiboot_info);
     if (vbe_is_available() == 1) klogprintf("screen: Set mode: %ux%u@%u.\n", vbe_get_width(), vbe_get_height(), vbe_get_bpp());
     else klogprintf("screen: Set VGA+ 80x25 16 colors\n");
+
+    /* ACPI fixed-feature power button (SCI). Best-effort: do not fail boot on errors. */
+    (void)acpi_powerbtn_init(multiboot_magic, multiboot_info);
     
     apic_init();
     apic_timer_init();
@@ -657,7 +673,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     }
     /* /etc/issue: getty prints this before login prompt. \l = tty name (tty1, tty2, ...) */
     {
-        static const char issue[] = "AxonOS " OS_VERSION " for servers (\\l)\n\n";
+        static const char issue[] = "AxonOS " OS_VERSION " (\\l)\n\n";
         struct fs_file *ifile = fs_create_file("/etc/issue");
         if (!ifile) ifile = fs_open("/etc/issue");
         if (ifile) {

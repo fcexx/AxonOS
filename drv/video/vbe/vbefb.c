@@ -40,8 +40,42 @@ static int esc_len = 0;
 static int cursor_visible = 1; /* cursor blink state */
 static uint64_t cursor_blink_last_phase = 0;
 
+static int g_vbe_dirty = 0;
+static uint32_t g_vbe_dx0 = 0, g_vbe_dy0 = 0, g_vbe_dx1 = 0, g_vbe_dy1 = 0;
+
 void draw_cursor(void);
 void erase_cursor(void);
+
+static void vbe_dirty_mark(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+	if (w == 0 || h == 0) return;
+	uint32_t x1 = x + w - 1;
+	uint32_t y1 = y + h - 1;
+	if (x1 >= fb_width) x1 = fb_width - 1;
+	if (y1 >= fb_height) y1 = fb_height - 1;
+	if (!g_vbe_dirty) {
+		g_vbe_dx0 = x;
+		g_vbe_dy0 = y;
+		g_vbe_dx1 = x1;
+		g_vbe_dy1 = y1;
+		g_vbe_dirty = 1;
+		return;
+	}
+	if (x < g_vbe_dx0) g_vbe_dx0 = x;
+	if (y < g_vbe_dy0) g_vbe_dy0 = y;
+	if (x1 > g_vbe_dx1) g_vbe_dx1 = x1;
+	if (y1 > g_vbe_dy1) g_vbe_dy1 = y1;
+}
+
+static void vbefb_flush_dirty(void) {
+	if (!g_vbe_dirty || !vbe_get_backbuffer()) {
+		g_vbe_dirty = 0;
+		return;
+	}
+	uint32_t w = g_vbe_dx1 - g_vbe_dx0 + 1;
+	uint32_t h = g_vbe_dy1 - g_vbe_dy0 + 1;
+	vbe_flush_region(g_vbe_dx0, g_vbe_dy0, w, h);
+	g_vbe_dirty = 0;
+}
 
 static uint32_t vga_palette[16] = {
 	0x00000000, 0x000000AA, 0x0000AA00, 0x0000AAAA,
@@ -63,15 +97,17 @@ static inline uint32_t vga_attr_bg_to_pixel(uint8_t attr) {
 	return vbe_pack_pixel(r, g, b);
 }
 
-static void draw_cell_to_backbuffer(uint32_t cx, uint32_t cy) {
+static void draw_cell_to_framebuffer(uint32_t cx, uint32_t cy) {
 	if (!textbuf) return;
 	uint8_t ch = textbuf[cy * cols + cx].ch;
 	uint8_t attr = textbuf[cy * cols + cx].attr;
 
-	uint32_t fg = vga_attr_to_rgb(attr, 1);
-	uint32_t bg = vga_attr_to_rgb(attr, 0);
+	uint32_t fg_rgb = vga_attr_to_rgb(attr, 1);
+	uint32_t bg_rgb = vga_attr_to_rgb(attr, 0);
+	uint32_t fg_pix = vbe_pack_pixel((uint8_t)(fg_rgb >> 16), (uint8_t)(fg_rgb >> 8), (uint8_t)fg_rgb);
+	uint32_t bg_pix = vbe_pack_pixel((uint8_t)(bg_rgb >> 16), (uint8_t)(bg_rgb >> 8), (uint8_t)bg_rgb);
 
-	uint8_t *front = (uint8_t*)vbe_get_frontbuffer();
+	uint8_t *front = (uint8_t *)vbe_get_frontbuffer();
 	if (!front) return;
 
 	uint32_t px = cx * font_w;
@@ -79,29 +115,37 @@ static void draw_cell_to_backbuffer(uint32_t cx, uint32_t cy) {
 	uint32_t pitch = vbe_get_pitch();
 	uint32_t bytespp = (vbe_get_bpp() + 7) / 8;
 
-	for (uint32_t row = 0; row < font_h; row++) {
-		uint8_t glyph = font8x16[(uint8_t)ch][row];
-		uint8_t *line = front + (size_t)( (py + row) * pitch + px * bytespp );
-		for (uint32_t bit = 0; bit < font_w; bit++) {
-			uint32_t pal = (glyph & (1 << (7 - bit))) ? fg : bg; /* 0x00RRGGBB */
-			/* map pal (8-bit per channel) into framebuffer's RGB fields */
-			uint32_t r = (pal >> 16) & 0xFF;
-			uint32_t g = (pal >> 8) & 0xFF;
-			uint32_t b = pal & 0xFF;
-			uint32_t pixel = vbe_pack_pixel((uint8_t)r, (uint8_t)g, (uint8_t)b);
-			/* write pixel as little-endian bytes */
-			if (bytespp == 4) {
-				*(uint32_t*)(line + bit * 4) = pixel;
-			} else if (bytespp == 3) {
-				line[bit*3 + 0] = (uint8_t)(pixel & 0xFF);
-				line[bit*3 + 1] = (uint8_t)((pixel >> 8) & 0xFF);
-				line[bit*3 + 2] = (uint8_t)((pixel >> 16) & 0xFF);
-			} else if (bytespp == 2) {
-				line[bit*2 + 0] = (uint8_t)(pixel & 0xFF);
-				line[bit*2 + 1] = (uint8_t)((pixel >> 8) & 0xFF);
+	if (bytespp == 4) {
+		for (uint32_t row = 0; row < font_h; row++) {
+			uint8_t glyph = font8x16[(uint8_t)ch][row];
+			uint32_t *line = (uint32_t *)(front + (size_t)(py + row) * pitch + px * 4);
+			for (uint32_t bit = 0; bit < font_w; bit++)
+				line[bit] = (glyph & (1u << (7 - bit))) ? fg_pix : bg_pix;
+		}
+	} else {
+		for (uint32_t row = 0; row < font_h; row++) {
+			uint8_t glyph = font8x16[(uint8_t)ch][row];
+			uint8_t *line = front + (size_t)(py + row) * pitch + px * bytespp;
+			for (uint32_t bit = 0; bit < font_w; bit++) {
+				uint32_t pixel = (glyph & (1u << (7 - bit))) ? fg_pix : bg_pix;
+				if (bytespp == 3) {
+					line[bit * 3 + 0] = (uint8_t)(pixel & 0xFF);
+					line[bit * 3 + 1] = (uint8_t)((pixel >> 8) & 0xFF);
+					line[bit * 3 + 2] = (uint8_t)((pixel >> 16) & 0xFF);
+				} else if (bytespp == 2) {
+					line[bit * 2 + 0] = (uint8_t)(pixel & 0xFF);
+					line[bit * 2 + 1] = (uint8_t)((pixel >> 8) & 0xFF);
+				}
 			}
 		}
 	}
+	vbe_dirty_mark(px, py, font_w, font_h);
+}
+
+static void draw_text_row(uint32_t row) {
+	if (!textbuf || row >= rows) return;
+	for (uint32_t x = 0; x < cols; x++)
+		draw_cell_to_framebuffer(x, row);
 }
 
 void vbefb_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
@@ -109,8 +153,10 @@ void vbefb_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
 	if (x >= cols || y >= rows) return;
 	textbuf[y * cols + x].ch = ch;
 	textbuf[y * cols + x].attr = attr;
-	draw_cell_to_backbuffer(x, y);
-	vbe_flush_region(x * font_w, y * font_h, font_w, font_h);
+	draw_cell_to_framebuffer(x, y);
+	vbefb_flush_dirty();
+	if (!vbe_get_backbuffer())
+		vbe_flush_region(x * font_w, y * font_h, font_w, font_h);
 }
 
 static void vbefb_erase_cells(uint32_t x0, uint32_t x1, uint32_t y) {
@@ -120,8 +166,9 @@ static void vbefb_erase_cells(uint32_t x0, uint32_t x1, uint32_t y) {
 	for (uint32_t x = x0; x <= x1; x++) {
 		textbuf[y * cols + x].ch = ' ';
 		textbuf[y * cols + x].attr = current_attr;
-		draw_cell_to_backbuffer(x, y);
+		draw_cell_to_framebuffer(x, y);
 	}
+	vbefb_flush_dirty();
 }
 
 static void vbefb_emit_tty_char(uint8_t ch) {
@@ -172,14 +219,16 @@ static void vbefb_emit_tty_char(uint8_t ch) {
 		}
 		cursor_y = rows - 1;
 		vbe_scroll_up_pixels(font_h);
-		vbe_clear_region(0, last_row * font_h, fb_width, font_h, vga_attr_bg_to_pixel(current_attr));
+		draw_text_row(last_row);
 		if (cursor_visible)
 			draw_cursor();
-		vbe_flush_region(0, last_row * font_h, fb_width, font_h);
+		vbe_dirty_mark(0, 0, fb_width, fb_height);
+		vbefb_flush_dirty();
 	} else {
-		draw_cell_to_backbuffer(ox, oy);
+		draw_cell_to_framebuffer(ox, oy);
 		if (cursor_visible)
 			draw_cursor();
+		vbefb_flush_dirty();
 	}
 }
 
@@ -309,9 +358,7 @@ void draw_cursor(void) {
 	/* get cell colors */
 	uint8_t attr = textbuf[cursor_y * cols + cursor_x].attr;
 	uint32_t fg = vga_attr_to_rgb(attr, 1);
-	uint32_t bg = vga_attr_to_rgb(attr, 0);
-	
-	/* cursor: draw foreground color on bottom 2 scanlines (like VGA hardware cursor) */
+
 	uint32_t cursor_start_row = font_h - 2;
 	for (uint32_t row = cursor_start_row; row < font_h; row++) {
 		uint8_t *line = front + (size_t)( (py + row) * pitch + px * bytespp );
@@ -333,13 +380,15 @@ void draw_cursor(void) {
 			}
 		}
 	}
+	vbe_dirty_mark(px, py + cursor_start_row, font_w, font_h - cursor_start_row);
 }
 
 void erase_cursor(void) {
 	if (!vbe_is_available() || !textbuf) return;
 	if (cursor_x >= cols || cursor_y >= rows) return;
 	/* redraw cell normally (restores original appearance) */
-	draw_cell_to_backbuffer(cursor_x, cursor_y);
+	draw_cell_to_framebuffer(cursor_x, cursor_y);
+	vbefb_flush_dirty();
 }
 
 void vbefb_update_cursor(void) {
@@ -356,6 +405,7 @@ void vbefb_update_cursor(void) {
 	cursor_visible = want_visible;
 	if (cursor_visible) draw_cursor();
 	else erase_cursor();
+	vbefb_flush_dirty();
 }
 
 void vbefb_putn(char ch, int count, uint8_t attr) {
@@ -370,11 +420,10 @@ void vbefb_get_cursor(uint32_t *x, uint32_t *y) {
 void vbefb_set_cursor(uint32_t x, uint32_t y) {
 	if (x >= cols) x = cols - 1;
 	if (y >= rows) y = rows - 1;
-	/* erase old cursor */
 	if (cursor_visible) erase_cursor();
 	cursor_x = x; cursor_y = y;
-	/* draw new cursor */
 	if (cursor_visible) draw_cursor();
+	vbefb_flush_dirty();
 }
 
 void vbefb_clear(uint8_t attr) {
@@ -385,8 +434,10 @@ void vbefb_clear(uint8_t attr) {
 		textbuf[i].attr = attr;
 	}
 	for (uint32_t ry = 0; ry < rows; ry++)
-		for (uint32_t rx = 0; rx < cols; rx++)
-			draw_cell_to_backbuffer(rx, ry);
+		draw_text_row(ry);
+	g_vbe_dirty = 0;
+	vbe_dirty_mark(0, 0, fb_width, fb_height);
+	vbefb_flush_dirty();
 	vbefb_set_cursor(0, 0);
 }
 
@@ -407,6 +458,7 @@ int vbefb_init(uint32_t width, uint32_t height, uint32_t pitch, uint32_t bpp) {
 	cursor_x = 0; cursor_y = 0;
 	cursor_visible = 1;
 	cursor_blink_last_phase = 0;
+	g_vbe_dirty = 0;
 	current_attr = 0x07;
 	esc_mode = 0;
 	esc_len = 0;

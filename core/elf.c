@@ -522,10 +522,16 @@ int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk
     ssize_t rp = fs_read(f, phdrs, phsz, (size_t)eh.e_phoff);
     if (rp != (ssize_t)phsz) { kfree(phdrs); fs_file_free(f); return -1; }
 
-    /* Reject dynamically linked binaries (PT_INTERP) until we have a loader. */
+    /* Reject dynamically linked binaries (PT_INTERP / PT_DYNAMIC) until we have ld.so. */
     for (int i = 0; i < (int)eh.e_phnum; i++) {
         if (phdrs[i].p_type == 3 /* PT_INTERP */) {
             qemu_debug_printf("elf: refusing PT_INTERP (dynamic) binary: %s\n", path ? path : "(null)");
+            kfree(phdrs);
+            fs_file_free(f);
+            return -2;
+        }
+        if (phdrs[i].p_type == 2 /* PT_DYNAMIC */) {
+            qemu_debug_printf("elf: refusing PT_DYNAMIC (needs ld.so) binary: %s\n", path ? path : "(null)");
             kfree(phdrs);
             fs_file_free(f);
             return -2;
@@ -721,11 +727,11 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
 
     uintptr_t stack_top = user_stack_top_for_tid(target_tid);
     stack_top &= ~((uintptr_t)0xFULL);
-    uintptr_t base = stack_top - total;
-    uintptr_t final_stack = (base - 8) & ~((uintptr_t)0xFULL);
-    base = final_stack + 8;
-
-    uintptr_t ptrs_addr = base;
+    uintptr_t final_stack = (stack_top - total - 8u) & ~((uintptr_t)0xFULL);
+    while ((final_stack & 0xFULL) != 8u)
+        final_stack -= 8u;
+    uintptr_t ptrs_addr = final_stack + 8u;
+    uintptr_t base = ptrs_addr;
     uintptr_t strings_addr = base + ptrs_bytes;
     uintptr_t random_addr = strings_addr + strings_size + env_strings_size;
     if (strings_addr + strings_size + env_strings_size > (uintptr_t)MMIO_IDENTITY_LIMIT) return -1;
@@ -1014,15 +1020,16 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     uintptr_t stack_top = user_stack_top_for_tid(planned_tid);
     stack_top &= ~((uintptr_t)0xFULL);
 
-    /* provisional base then align final_stack (base-8) to 16 */
-    uintptr_t base = stack_top - total;
-    uintptr_t final_stack = (base - 8) & ~((uintptr_t)0xFULL); /* final RSP aligned */
-    /* recompute base relative to aligned final_stack */
-    base = final_stack + 8;
+    /* SysV: argc at RSP; argv at RSP+8. Align argv block to 16B so RSP in main (after
+       crt0 call) is 16-byte aligned — axon-harness checks (rsp & 0xF) == 0 in main(). */
+    uintptr_t final_stack = (stack_top - total - 8u) & ~((uintptr_t)0xFULL);
+    while ((final_stack & 0xFULL) != 8u)
+        final_stack -= 8u;
+    uintptr_t ptrs_addr = final_stack + 8u;
+    uintptr_t base = ptrs_addr;
 
-    /* layout: pointers at [base .. base+ptrs_bytes), strings at [base+ptrs_bytes .. ),
+    /* layout: pointers at [ptrs_addr .. ptrs_addr+ptrs_bytes), strings follow,
        then 16 bytes for AT_RANDOM. */
-    uintptr_t ptrs_addr = base;
     uintptr_t strings_addr = base + ptrs_bytes;
     uintptr_t random_addr = strings_addr + strings_size + env_strings_size;
 
@@ -1126,6 +1133,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         if (mark_user_identity_range_2m((uint64_t)tls_region_base, (uint64_t)(pthread_fake + 0x1000u)) != 0) {
             kprintf("execve: failed to mark TLS range user-accessible\n");
             return -1;
+
         }
         /* Clear the first 3 pages we use */
         memset((void*)tls_region_base, 0, 0x3000u);

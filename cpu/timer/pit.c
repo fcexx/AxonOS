@@ -9,6 +9,7 @@
 #include <cirrusfb.h>
 #include <smp.h>
 #include <loadavg.h>
+#include <power.h>
 
 // Global variables
 volatile uint64_t pit_ticks = 0;
@@ -20,6 +21,11 @@ volatile uint64_t timer_ticks = 0;
 void pit_handler(cpu_registers_t* regs) {
         pit_ticks++;
         timer_ticks++;
+
+        /* Ensure ACPI/power requests progress even when system is otherwise idle at a prompt. */
+        if (power_is_pending() && (!regs || ((regs->cs & 3) == 0))) {
+                power_poll();
+        }
 
         if (init && smp_sched_cpu_id() == 0 && pit_ticks > 0 &&
             pit_frequency > 0 && (pit_ticks % pit_frequency) == 0)

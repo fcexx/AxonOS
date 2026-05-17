@@ -11,6 +11,7 @@
 #include <gdt.h>
 #include <mm.h>
 #include <paging.h>
+#include <power.h>
 #include <exec.h>
 #include <spinlock.h>
 #include <smp.h>
@@ -680,6 +681,9 @@ void thread_sleep(uint32_t ms) {
 }
 
 void thread_schedule() {
+        /* Run pending power actions in normal thread context (not IRQ-only idle). */
+        power_poll();
+
         unsigned long irqf;
         acquire_irqsave(&sched_lock, &irqf);
 

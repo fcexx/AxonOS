@@ -3,7 +3,10 @@
 #include <stdint.h>
 
 typedef struct mm_struct {
-    /* Top-level page table (virtual pointer to identity-mapped physical page). */
+    /* Top-level page table (virtual pointer to identity-mapped physical page).
+     * Linux separates mm_struct (page tables, refcount) from the VMA rb_tree in
+     * struct mm_struct; AxonOS keeps user VMAs in mm/user_vma.c and mmap/brk cursors
+     * in mm/user_as.c (per-thread fields + CLONE_VM publish). */
     uint64_t *pml4;
     /* CR3 value used for this address space. */
     uint64_t cr3;

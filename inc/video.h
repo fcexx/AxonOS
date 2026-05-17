@@ -11,6 +11,8 @@ typedef struct video_ops {
 	int (*init)(video_device_t *dev); /* initialize device; return 0 on success */
 	void (*shutdown)(video_device_t *dev);
 	void (*flush_region)(video_device_t *dev, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+	/* Optional: commit queued FIFO updates (e.g. VMware SVGA SYNC). */
+	void (*display_sync)(video_device_t *dev);
 	int (*set_mode)(video_device_t *dev, uint32_t width, uint32_t height, uint32_t bpp);
 } video_ops_t;
 
@@ -39,6 +41,8 @@ video_device_t *video_find_by_name(const char *name);
 
 /* Notify video drivers of a dirty rectangle in pixel space (e.g. VMware SVGA FIFO UPDATE). */
 void video_flush_region_pixels(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+/* Commit display updates after one or more flush_region calls (SVGA SYNC, etc.). */
+void video_display_sync(void);
 
 #endif /* VIDEO_H */
 

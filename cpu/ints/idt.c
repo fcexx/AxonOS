@@ -229,6 +229,10 @@ static void page_fault_handler(cpu_registers_t* regs) {
         uint64_t cr2;
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
         int user = (regs->cs & 3) == 3;
+        /* Large anonymous mmap: PTEs were installed then removed so we do not memset
+         * hundreds of MiB in syscall; fill each 2MiB chunk on first access. */
+        if (user && (regs->error_code & 1u) == 0u && fault_try_mmap_lazy_anon(cr2))
+                return;
         if (user && fault_try_grow_user_heap(cr2)) return;
         if (!user) {
             uint64_t resume_rip = 0;

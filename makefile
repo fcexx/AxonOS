@@ -141,7 +141,7 @@ iso: $(KERNEL_ELF) $(GRUB_DIR)/grub.cfg archive
 	}
 
 run: archive iso userland
-	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 1024M -smp 2 -serial stdio -boot d -hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0 -vga vmware
+	@qemu-system-x86_64 -cdrom $(ISO_IMAGE) -m 2048M -smp 2 -serial stdio -boot d -hda ../disk.img -device e1000,netdev=net0 -netdev user,id=net0 -vga vmware
 
 # Run with bridged networking (real IP from router) - requires sudo and br0 bridge
 run-bridge: iso

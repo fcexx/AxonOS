@@ -367,6 +367,16 @@ size_t heap_peak_bytes(void)  { return heap_peak; }
 
 uintptr_t heap_base_addr(void) { return (uintptr_t)heap_base; }
 
+uintptr_t heap_region_end_exclusive(void) {
+    if (!heap_base || heap_capacity == 0)
+        return (uintptr_t)heap_base;
+    uintptr_t lo = (uintptr_t)heap_base;
+    uintptr_t hi = lo + (uintptr_t)heap_capacity;
+    if (hi < lo)
+        return (uintptr_t)-1;
+    return hi;
+}
+
 /* Return largest single free payload size currently available (doesn't include header). */
 static size_t heap_largest_free_block(void) {
     size_t max = 0;
