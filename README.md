@@ -1,95 +1,77 @@
----
-<h1 align="center">🐊 <b>Axon OS</b></h1>
-
-<p align="center">
-  <b>Minimal. Fast. Open.</b><br>
-  Российская POSIX-совместимая операционная система, написанная на C & ASM<br>
-  <i>Отечественная разработка</i>
-</p>
-
----
-<p align="center">
-AxonOS - первая, разработанная в России операционная система, построенная на современных POSIX стандартах.
-Цель этого проекта - создать в России свою независимую от иностранных сервисов ОС (РедОС - это линукс).
-</p>
-<p align="center">
-  Для большей информации заходите на сайт <a href="https://axont.ru">axont.ru</a>!
-</p>
-
-<p align="center">
-  <a href="https://github.com/fcexx/AxonOS/stargazers">
-    <img src="https://img.shields.io/github/stars/fcexx/AxonOS?style=for-the-badge&color=yellow" alt="Stars">
-  </a>
-  <a href="https://github.com/fcexx/AxonOS/network/members">
-    <img src="https://img.shields.io/github/forks/fcexx/AxonOS?style=for-the-badge&color=orange" alt="Forks">
-  </a>
-  <a href="https://github.com/fcexx/AxonOS/commits/main">
-    <img src="https://img.shields.io/github/last-commit/fcexx/AxonOS?style=for-the-badge&color=brightgreen" alt="Last Commit">
-  </a>
-  <a href="https://github.com/fcexx/AxonOS/issues">
-    <img src="https://img.shields.io/github/issues/fcexx/AxonOS?style=for-the-badge&color=blue" alt="Issues">
-  </a>
-  <a href="https://github.com/fcexx/AxonOS/blob/main/LICENSE">
-    <img src="https://img.shields.io/github/license/fcexx/AxonOS?style=for-the-badge&color=red" alt="License">
-  </a>
-</p>
-
----
-
-<h2 align="center">✨ Features</h2>
-
 <div align="center">
 
-| Category | Description |
-|---------|-------------|
-| ⚙️ Kernel | Custom kernel fully written in C |
-| 🧩 Architecture | GDT, IDT, PIC, PIT, RTC, Paging |
-| 🧠 Memory | Dynamic heap allocator + virtual memory manager |
-| 🧵 Threads | Threading system with full context switching |
-| ⌨️ Drivers | Keyboard, Serial, PCI, RTC, PIT |
-| 🌐 Networking | Experimental Intel E1000 driver + ARP/ICMP |
-| 🖥 UI | VGA text-mode UI with built-in apps |
-| 💻 Shell | Built-in Ring0 shell with core commands |
-| 📝 Interpreter | Integrated OSH interpreter (Axon Shell) |
-| 🏃 Scheduler | Task management & lightweight scheduler |
-| 🚀 Boot | Fast boot and clean modular codebase |
-| 🐍 Build | Cross-platform build support |
-| 🧩 Open | Fully open-source — learn, modify, improve |
+# AXON OS
+
+### The operating system built for speed, simplicity and full control.
+
+<p align="center">
+<img src="https://img.shields.io/github/stars/fcexx/AxonOS?style=for-the-badge&color=6C63FF">
+<img src="https://img.shields.io/github/issues/fcexx/AxonOS?style=for-the-badge&color=9D4EDD">
+<img src="https://img.shields.io/github/issues-pr/fcexx/AxonOS?style=for-the-badge&color=C77DFF">
+<img src="https://img.shields.io/github/license/fcexx/AxonOS?style=for-the-badge&color=5D3FD3">
+<img src="https://img.shields.io/github/last-commit/fcexx/AxonOS?style=for-the-badge&color=836FFF">
+<img src="https://img.shields.io/github/commit-activity/m/fcexx/AxonOS?style=for-the-badge&color=7F00FF">
+<img src="https://img.shields.io/badge/Platform-x86__64-7B68EE?style=for-the-badge">
+<img src="https://img.shields.io/badge/Made%20with-C%20%2F%20ASM-9D4EDD?style=for-the-badge">
+</p>
+
+<img src="https://capsule-render.vercel.app/api?type=waving&color=6C63FF&height=180&section=header&text=AXON%20OS&fontSize=48&fontColor=ffffff&animation=fadeIn"/>
+
+<a href="https://axont.ru">
+<img src="https://readme-typing-svg.herokuapp.com?font=Orbitron&size=28&duration=3000&color=6C63FF&center=true&vCenter=true&width=700&lines=Visit+AXON+OS+Official+Website;axont.ru">
+</a>
 
 </div>
 
 ---
 
-### ⚙️ Installation
+## What is AxonOS?
 
-#### 🐧 Linux / macOS
-```bash
-git clone https://github.com/fcexx/AxonOS.git
-cd AxonOS && make run
-```
+AxonOS is not just a repository.
+It is a real operating system project focused on performance, stability and modern design.
 
-#### 🪟 Windows (via WSL or MSYS2)
-```bash
-git clone https://github.com/fcexx/AxonOS.git
-cd AxonOS && make run
-```
+Built from the ground up with a clean architecture and a vision for the future, AxonOS is designed for people who want more than a standard environment. Fast boot, lightweight core, flexible development and full customization — everything is made to feel smooth and powerful.
 
-#### 💡 Requirements
-`qemu, nasm, gcc, binutils, grub-tools, xorriso, grub-pc-bin`
-
+Whether you are exploring low-level systems, building your own environment or simply following the development of a modern OS project, AxonOS represents the idea of freedom and control.
 
 ---
 
-<h2 align="center">⭐ Star Us!</h2>
+## Vision
 
-<p align="center">
-  If you like <b>Axon OS</b>, don’t forget to <b>⭐ star the repo</b> — it really helps visibility!  
-  <br><br>
-  ⭐⭐⭐⭐⭐  
-</p>
+* Minimal and clean system architecture
+* High performance and lightweight behavior
+* Modern interface and ecosystem
+* Full developer control
+* Open development philosophy
+* Built to evolve
 
 ---
 
-<p align="center">
-  © 2025-2026 Axon Team
-</p>
+## Technologies
+
+```txt
+• Kernel Development
+• Low-Level Programming
+• System Architecture
+• Hardware Interaction
+• Open Source Infrastructure
+```
+
+---
+
+## Repository
+
+```bash
+git clone https://github.com/fcexx/AxonOS
+```
+---
+
+<div align="center">
+
+### AXON OS
+
+#### Build the system. Control the machine.
+
+<img src="https://capsule-render.vercel.app/api?type=waving&color=6C63FF&height=120&section=footer"/>
+
+</div>
