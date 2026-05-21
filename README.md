@@ -9,7 +9,6 @@
 <img src="https://img.shields.io/github/issues-pr/fcexx/AxonOS?style=for-the-badge&color=C77DFF">
 <img src="https://img.shields.io/github/license/fcexx/AxonOS?style=for-the-badge&color=5D3FD3">
 <img src="https://img.shields.io/github/last-commit/fcexx/AxonOS?style=for-the-badge&color=836FFF">
-<img src="https://img.shields.io/github/commit-activity/m/fcexx/AxonOS?style=for-the-badge&color=7F00FF">
 <img src="https://img.shields.io/badge/Platform-x86__64-7B68EE?style=for-the-badge">
 <img src="https://img.shields.io/badge/Made%20with-C%20%2F%20ASM-9D4EDD?style=for-the-badge">
 </p>
