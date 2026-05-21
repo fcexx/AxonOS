@@ -55,22 +55,3 @@ Whether you are exploring low-level systems, building your own environment or si
 • Hardware Interaction
 • Open Source Infrastructure
 ```
-
----
-
-## Repository
-
-```bash
-git clone https://github.com/fcexx/AxonOS
-```
----
-
-<div align="center">
-
-### AXON OS
-
-#### Build the system. Control the machine.
-
-<img src="https://capsule-render.vercel.app/api?type=waving&color=6C63FF&height=120&section=footer"/>
-
-</div>
