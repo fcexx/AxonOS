@@ -23,9 +23,47 @@
 
 extern uint8_t _end[]; /* kernel end symbol from linker */
 
-/* Fixed base to load ET_DYN (PIE) style executables when full relocation/loader
-   support isn't available. */
-static const uint64_t ELF_ET_DYN_BASE = 0x00400000ULL; /* 4MiB */
+uint64_t elf_et_dyn_base(void) {
+    uintptr_t ke = (uintptr_t)_end;
+    uint64_t base = ((uint64_t)ke + (uint64_t)(PAGE_SIZE_2M - 1)) & ~((uint64_t)PAGE_SIZE_2M - 1);
+    if (base < 0x00800000ULL)
+        base = 0x00800000ULL;
+    return base;
+}
+
+/* ET_EXEC linked at 0x400000 overlaps a grown kernel (_end past 4MiB). Slide load base. */
+static uint64_t elf_load_base_for_image(const Elf64_Ehdr *eh, const Elf64_Phdr *phdrs, int nph) {
+    const uintptr_t kernel_start = (uintptr_t)0x100000;
+    const uintptr_t kernel_end = (uintptr_t)_end;
+
+    if (eh->e_type == 3)
+        return elf_et_dyn_base();
+
+    uint64_t min_v = UINT64_MAX;
+    uint64_t max_v = 0;
+    int nload = 0;
+    for (int i = 0; i < nph; i++) {
+        if (phdrs[i].p_type != 1)
+            continue;
+        uint64_t v = phdrs[i].p_vaddr;
+        uint64_t ve = v + phdrs[i].p_memsz;
+        if (v < min_v)
+            min_v = v;
+        if (ve > max_v)
+            max_v = ve;
+        nload++;
+    }
+    if (nload == 0)
+        return 0;
+    if (min_v >= kernel_end || max_v <= kernel_start)
+        return 0;
+    {
+        uint64_t base = elf_et_dyn_base();
+        if (min_v >= base)
+            return 0;
+        return base - min_v;
+    }
+}
 
 /* In AxonOS, user programs currently run as kernel threads in a shared identity-mapped
    address space. That means user stacks and TLS must not overlap between threads,
@@ -281,17 +319,13 @@ static int elf_needs_private_user_pages(thread_t *tc) {
     return tc->mm->pml4 != k->pml4;
 }
 
-/* Mark an identity-mapped VA range as user-accessible and writable, and clear NX
-   on the relevant page table entries. This is required for instruction fetch and
-   data access in ring3. We best-effort handle existing 1GiB/2MiB mappings without
-   splitting; for 4KiB mappings we update the leaf entry. */
+/* Mark range user-accessible, writable, executable (2MiB walk; no map_page_2m). */
 static int mark_user_range_exec(uint64_t va_begin, uint64_t va_end) {
     if (va_end < va_begin) return -1;
-    /* Clamp to identity-mapped region; va >= 4GB would fault on invlpg. */
     if (va_end > MMIO_IDENTITY_LIMIT) va_end = MMIO_IDENTITY_LIMIT;
     if (va_begin >= va_end) return 0;
     uint64_t cr3 = paging_read_cr3();
-    uint64_t *active_l4 = (uint64_t*)(uintptr_t)(cr3 & ~0xFFFULL);
+    uint64_t *active_l4 = (uint64_t *)(uintptr_t)(cr3 & ~0xFFFULL);
     if (!active_l4) return -1;
 
     uint64_t begin = va_begin & ~(PAGE_SIZE_2M - 1);
@@ -306,32 +340,30 @@ static int mark_user_range_exec(uint64_t va_begin, uint64_t va_end) {
         l4[l4i] |= PG_US | PG_RW;
         l4[l4i] &= ~PG_NX;
 
-        uint64_t *l3 = (uint64_t*)(uintptr_t)(l4[l4i] & ~0xFFFULL);
+        uint64_t *l3 = (uint64_t *)(uintptr_t)(l4[l4i] & ~0xFFFULL);
         if (!(l3[l3i] & PG_PRESENT)) return -1;
         l3[l3i] |= PG_US | PG_RW;
         l3[l3i] &= ~PG_NX;
         uint64_t l3e = l3[l3i];
         if (l3e & PG_PS_2M) {
-            /* 1GiB mapping */
-            invlpg((void*)(uintptr_t)va);
+            invlpg((void *)(uintptr_t)va);
             continue;
         }
 
-        uint64_t *l2 = (uint64_t*)(uintptr_t)(l3e & ~0xFFFULL);
+        uint64_t *l2 = (uint64_t *)(uintptr_t)(l3e & ~0xFFFULL);
         if (!(l2[l2i] & PG_PRESENT)) return -1;
         uint64_t l2e = l2[l2i];
         if (l2e & PG_PS_2M) {
-            /* 2MiB mapping */
             l2[l2i] |= PG_US | PG_RW;
             l2[l2i] &= ~PG_NX;
-            invlpg((void*)(uintptr_t)va);
+            invlpg((void *)(uintptr_t)va);
             continue;
         }
 
-        uint64_t *l1 = (uint64_t*)(uintptr_t)(l2e & ~0xFFFULL);
+        uint64_t *l1 = (uint64_t *)(uintptr_t)(l2e & ~0xFFFULL);
         l1[l1i] |= PG_US | PG_RW;
         l1[l1i] &= ~PG_NX;
-        invlpg((void*)(uintptr_t)va);
+        invlpg((void *)(uintptr_t)va);
     }
     return 0;
 }
@@ -342,20 +374,20 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
     if (!elf_validate_header(eh, len)) return -2;
     if (eh->e_phoff == 0 || eh->e_phnum == 0) return -3;
 
-    /* For ET_DYN (PIE) load at a fixed base within identity-mapped region. */
-    uint64_t load_base = 0;
-    if (eh->e_type == 3) load_base = ELF_ET_DYN_BASE;
+    const Elf64_Phdr *phdrs_mem = (const Elf64_Phdr*)((const char*)buf + eh->e_phoff);
+    uint64_t load_base = elf_load_base_for_image(eh, phdrs_mem, (int)eh->e_phnum);
 
     /* Basic safety: do not allow loading segments that overlap kernel image */
     uintptr_t kernel_start = (uintptr_t)0x100000; /* from linker.ld */
     uintptr_t kernel_end = (uintptr_t)_end;
 
     uint64_t brk_end = 0;
-    /* iterate program headers */
-    const Elf64_Phdr *ph = (const Elf64_Phdr*)((const char*)buf + eh->e_phoff);
+    const uint64_t image_entry = eh->e_entry + load_base;
+    /* Pass 1: copy all PT_LOAD; pass 2: mark PTE flags (see elf_load_from_path). */
     for (int i = 0; i < eh->e_phnum; i++) {
+        const Elf64_Phdr *ph = &phdrs_mem[i];
         if ((const char*)ph + sizeof(Elf64_Phdr) > (const char*)buf + len) return -4;
-        if (ph->p_type != 1) { ph++; continue; } /* PT_LOAD */
+        if (ph->p_type != 1) continue; /* PT_LOAD */
 
         /* Check bounds */
         uint64_t vstart = ph->p_vaddr + load_base;
@@ -393,17 +425,19 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
         if (ph->p_memsz > ph->p_filesz) {
             memset((char*)dst + ph->p_filesz, 0, (size_t)(ph->p_memsz - ph->p_filesz));
         }
-
-        /* Ensure pages are user-accessible (include load_base for ET_DYN). */
-        uint64_t ua_begin = (ph->p_vaddr + load_base);
-        uint64_t ua_end = (ph->p_vaddr + load_base + ph->p_memsz);
-        if (mark_user_range_exec(ua_begin, ua_end) != 0) return -9;
         if (vend > brk_end) brk_end = vend;
-        ph++;
+    }
+
+    for (int i = 0; i < eh->e_phnum; i++) {
+        const Elf64_Phdr *ph = &phdrs_mem[i];
+        if (ph->p_type != 1) continue;
+        uint64_t vstart = ph->p_vaddr + load_base;
+        uint64_t vend = ph->p_vaddr + load_base + ph->p_memsz;
+        if (mark_user_range_exec(vstart, vend) != 0) return -9;
     }
 
     if (brk_end) syscall_set_user_brk((uintptr_t)brk_end);
-    if (out_entry) *out_entry = eh->e_entry + load_base;
+    if (out_entry) *out_entry = image_entry;
     return 0;
 }
 
@@ -431,44 +465,33 @@ static int mark_user_identity_range_2m(uint64_t va_begin, uint64_t va_end) {
         l3[l3i] |= PG_US;
         uint64_t l3e = l3[l3i];
         if (l3e & PG_PS_2M) {
-            /* 1GiB mapping */
+            l3[l3i] |= PG_US;
+            invlpg((void *)(uintptr_t)va);
             continue;
         }
         uint64_t *l2 = (uint64_t*)(uintptr_t)(l3e & ~0xFFFULL);
         if (!(l2[l2i] & PG_PRESENT)) return -1;
-        l2[l2i] |= PG_US;
+        uint64_t l2e = l2[l2i];
+        if (l2e & PG_PS_2M) {
+            l2[l2i] |= PG_US;
+        } else {
+            l2[l2i] |= PG_US;
+        }
         invlpg((void*)(uintptr_t)va);
     }
     return 0;
 }
 
-/* Temporary broad user-mark helper used during execve to avoid missing mappings.
-   This is a defensive measure: mark a large low address range user-accessible/writable
-   to avoid spurious PFs during early userspace bootstrap (e.g. GOT at ~0x634000).
-   After mm_make_private_range (COW), some L2 entries may be missing; fall back to
-   map_page_2m to create mappings. */
+/* Init thread: mark low user VA user-accessible (PG_US only on existing 2MiB maps). */
 static void mark_broad_user_ranges_for_exec(void) {
-    uintptr_t begin = 0x200000; /* 2MiB, below kernel */
-    uintptr_t end = (uintptr_t)USER_STACK_TOP;
+    uintptr_t begin = 0x200000;
+    uintptr_t end = (uintptr_t)USER_TLS_BASE;
     if (end > (uintptr_t)MMIO_IDENTITY_LIMIT) end = (uintptr_t)MMIO_IDENTITY_LIMIT;
-    if (mark_user_identity_range_2m((uint64_t)begin, (uint64_t)end) != 0) {
-        /* L2/L3 may be sparse after COW; create missing mappings with map_page_2m. */
-        for (uintptr_t va = begin; va < end; va += (uintptr_t)PAGE_SIZE_2M) {
-            if (map_page_2m((uint64_t)va, (uint64_t)va, PG_PRESENT | PG_RW | PG_US) != 0)
-                break; /* stop on first failure to avoid excessive allocs */
-        }
-    }
-    /* Explicitly mark GOT/data region 0x600000..0x700000; static busybox GOT ~0x634098 */
-    if (mark_user_range_exec(0x600000, 0x700000) != 0) {
-        (void)map_page_2m(0x600000, 0x600000, PG_PRESENT | PG_RW | PG_US);
-        (void)map_page_2m(0x602000, 0x602000, PG_PRESENT | PG_RW | PG_US);
-    }
+    (void)mark_user_identity_range_2m((uint64_t)begin, (uint64_t)end);
 }
 
 void exec_ensure_user_mappings(void) {
     mark_broad_user_ranges_for_exec();
-    (void)mark_user_identity_range_2m(0, ELF_ET_DYN_BASE);
-    (void)map_page_2m(0x634000, 0x634000, PG_US | PG_RW);
 }
 
 int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk_end,
@@ -508,8 +531,6 @@ int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk
         return -2;
     }
 
-    uint64_t load_base = 0;
-
     /* Basic safety: do not allow loading segments that overlap kernel image */
     uintptr_t kernel_start = (uintptr_t)0x100000; /* from linker.ld */
     uintptr_t kernel_end = (uintptr_t)_end;
@@ -521,6 +542,8 @@ int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk
     if (!phdrs) { fs_file_free(f); return -1; }
     ssize_t rp = fs_read(f, phdrs, phsz, (size_t)eh.e_phoff);
     if (rp != (ssize_t)phsz) { kfree(phdrs); fs_file_free(f); return -1; }
+
+    uint64_t load_base = elf_load_base_for_image(&eh, phdrs, (int)eh.e_phnum);
 
     /* Reject dynamically linked binaries (PT_INTERP / PT_DYNAMIC) until we have ld.so. */
     for (int i = 0; i < (int)eh.e_phnum; i++) {
@@ -551,6 +574,9 @@ int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk
     }
 
     uint64_t brk_end = 0;
+    uint64_t loaded_lo = UINT64_MAX;
+    uint64_t loaded_hi = 0;
+    const uint64_t image_entry = (uint64_t)eh.e_entry + load_base;
     /* Load PT_LOAD segments directly from file into their target VAs */
     for (int i = 0; i < (int)eh.e_phnum; i++) {
         Elf64_Phdr *ph = &phdrs[i];
@@ -617,23 +643,31 @@ int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk
         if (ph->p_memsz > ph->p_filesz) {
             memset((char*)dst + ph->p_filesz, 0, (size_t)(ph->p_memsz - ph->p_filesz));
         }
-        /* Round vend up to 2MB boundary to cover GOT at segment tail */
+        if (vstart < loaded_lo) loaded_lo = vstart;
+        if (vend > loaded_hi) loaded_hi = vend;
+        /* Round vend for brk only — never mark PTEs past p_memsz (unmapped 2MiB tail). */
         {
             uint64_t vend_rounded = (vend + PAGE_SIZE_2M - 1) & ~(PAGE_SIZE_2M - 1);
-            if (vend_rounded > vend && vend_rounded <= USER_IMAGE_LIMIT) {
+            if (vend_rounded > vend && vend_rounded <= USER_IMAGE_LIMIT)
                 vend = vend_rounded;
-            }
-        }
-        if (mark_user_range_exec(vstart, vend) != 0) {
-            kfree(phdrs);
-            fs_file_free(f);
-            return -1;
         }
         if (vend > brk_end) brk_end = vend;
     }
 
+    /* Pass 2: mark user-accessible after all segments are copied (avoid RO before memset). */
+    if (loaded_lo < loaded_hi) {
+        if (mark_user_range_exec(loaded_lo, loaded_hi) != 0) {
+            kprintf("elf: mark user range failed %s [0x%llx..0x%llx)\n",
+                    path ? path : "(null)",
+                    (unsigned long long)loaded_lo, (unsigned long long)loaded_hi);
+            kfree(phdrs);
+            fs_file_free(f);
+            return -1;
+        }
+    }
+
     if (brk_end) syscall_set_user_brk((uintptr_t)brk_end);
-    if (out_entry) *out_entry = (uint64_t)eh.e_entry + load_base;
+    if (out_entry) *out_entry = image_entry;
     if (out_brk_end) *out_brk_end = (uintptr_t)brk_end;
     kfree(phdrs);
     fs_file_free(f);
@@ -958,8 +992,9 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
             Elf64_Ehdr eh3;
             ssize_t r3 = fs_read(f3, &eh3, sizeof(eh3), 0);
             if (r3 == (ssize_t)sizeof(eh3) && eh3.e_type == 3) {
-                aux_phdr += ELF_ET_DYN_BASE;
-                aux_entry += ELF_ET_DYN_BASE;
+                uint64_t dyn_base = elf_et_dyn_base();
+                aux_phdr += dyn_base;
+                aux_entry += dyn_base;
             }
             fs_file_free(f3);
         }
@@ -1195,6 +1230,13 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         if (cur_user->kernel_stack) {
             tss_set_rsp0(cur_user->kernel_stack);
         }
+        if (loaded_brk_end != 0) {
+            uintptr_t brk_base = loaded_brk_end;
+            if (brk_base < (8u * 1024u * 1024u)) brk_base = 8u * 1024u * 1024u;
+            brk_base = (brk_base + 4095u) & ~(uintptr_t)4095u;
+            cur_user->user_brk_base = brk_base;
+            cur_user->user_brk_cur = brk_base;
+        }
     } else {
         /* Spawn a scheduled user thread and block caller until it exits.
            Create it only now (late), so earlier execve failures do not consume thread slots. */
@@ -1355,16 +1397,6 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     } else {
         qemu_debug_printf("execve: DEBUG entry outside identity map: 0x%llx\n", (unsigned long long)entry);
     }
-
-    /* Temporary diagnostic: ensure low memory and broad user ranges are marked
-       user-accessible to test whether PFs are caused by missing PG_US. */
-    mark_broad_user_ranges_for_exec();
-    /* Mark 0..ELF_ET_DYN_BASE (0..4MiB) as user-accessible for diagnostic */
-    (void)mark_user_identity_range_2m(0, ELF_ET_DYN_BASE);
-
-    /* Force 2MiB mapping for GOT region (CR2=0x634098): ensure present+user+rw.
-       Bootstrap may have correct mapping, but something could have split/corrupted it. */
-    (void)map_page_2m(0x634000, 0x634000, PG_US | PG_RW);
 
     /* Transfer to user mode (does not return on success). */
     {

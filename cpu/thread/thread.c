@@ -140,10 +140,7 @@ static int thread_context_valid(thread_t *t) {
         return 1;
 }
 
-/* Kernel stack size per thread.
-   8KiB was too small for our very large syscall handler (`syscall_do`) and led to
-   kernel stack overflows, corrupting thread structs / saved user registers and
-   manifesting as user-mode #GP with non-canonical RBP/RDI after heavy syscalls (e.g. busybox ls). */
+/* 8KiB was too small for syscall_do; 64KiB avoids kstack overflow corrupting thread state. */
 #define KERNEL_STACK_SIZE (64 * 1024)
 
 /* A real idle task: used when all other threads are BLOCKED/SLEEPING/TERMINATED.
@@ -263,7 +260,7 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->bound_cpu = -1;
         t->sched_target_cpu = -1;
         void *stack_mem = kmalloc(KERNEL_STACK_SIZE + 16);
-        if (!stack_mem) { kprintf("OOM thread: kmalloc(stack %u) failed\n", (unsigned)(KERNEL_STACK_SIZE+16)); kfree(t); return NULL; }
+        if (!stack_mem) { kprintf("OOM thread: kmalloc(stack %u) failed\n", (unsigned)(KERNEL_STACK_SIZE + 16)); kfree(t); return NULL; }
         t->kernel_stack = (uint64_t)stack_mem + KERNEL_STACK_SIZE;
         uint64_t* stack = (uint64_t*)t->kernel_stack;
         // Ensure 16-byte alignment for the stack pointer before ret
@@ -479,6 +476,23 @@ void user_thread_entry(void) {
 	// mark as user thread
 	self->ring = 3;
 	thread_set_current_user(self);
+	if (!self->kernel_stack) {
+		void *ks = kmalloc(KERNEL_STACK_SIZE + 16);
+		if (ks)
+			self->kernel_stack = (uint64_t)ks + KERNEL_STACK_SIZE;
+	}
+	/* Keep stack metadata consistent with the RSP we are about to run (exec layout vs live use). */
+	if (self->user_stack) {
+		uintptr_t us = (uintptr_t)self->user_stack;
+		uintptr_t sb = (us > (uintptr_t)USER_STACK_SIZE) ? (us - (uintptr_t)USER_STACK_SIZE) : 0x200000u;
+		uintptr_t se = sb + (uintptr_t)USER_STACK_SIZE + (uintptr_t)USER_TLS_SIZE;
+		if (se > (uintptr_t)USER_STACK_TOP)
+			se = (uintptr_t)USER_STACK_TOP;
+		if (self->user_stack_base == 0 || self->user_stack < self->user_stack_base)
+			self->user_stack_base = sb;
+		if (self->user_stack_limit == 0 || self->user_stack_limit < us + 0x1000u)
+			self->user_stack_limit = se;
+	}
 	// set TSS RSP0 to this thread's kernel stack so syscalls use its stack
 	tss_set_rsp0(self->kernel_stack);
 	// restore user FS base (TLS) so user code can access fs-relative data like stack-protector
@@ -505,24 +519,15 @@ void user_thread_entry(void) {
 			                  (unsigned long long)after, (int)self->tid);
 		}
 	}
-	// ensure return value from fork is 0 in child: clear RAX
 	asm volatile("xor %%rax, %%rax" ::: "rax");
-	// Debug: report the user entry we're about to jump to
 	qemu_debug_printf("user_thread_entry: entering user mode rip=0x%llx rsp=0x%llx tid=%d\n",
 			  (unsigned long long)self->user_rip,
 			  (unsigned long long)self->user_stack,
 			  (int)self->tid);
-	/* Diagnostic: dump first bytes at user RIP before entering user mode */
-	if ((uintptr_t)self->user_rip + 32 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-		qemu_debug_printf("user_thread_entry: bytes at user RIP 0x%llx:\n", (unsigned long long)self->user_rip);
-		for (int i = 0; i < 32; i++) qemu_debug_printf("%02x", *((unsigned char*)(uintptr_t)(self->user_rip + i)));
-		qemu_debug_printf("\n");
-	} else {
-		qemu_debug_printf("user_thread_entry: user RIP outside identity map, skipping bytes dump\n");
-	}
 	/* Init path never calls mark_broad_user_ranges; ensure full user mappings before user mode.
-	   Clone3 children (user_stack_base != 0) already have mappings; re-marking causes #PF/triple fault. */
-	if (self->user_stack_base == 0)
+	   fork/vfork/clone3 children set user_stack_base; re-marking their private mm causes #PF. */
+	if (self->user_stack_base == 0 &&
+	    (uintptr_t)self->user_rip != (uintptr_t)USER_VFORK_TRAMP)
 		exec_ensure_user_mappings();
 	// Jump to user mode
 	enter_user_mode(self->user_rip, self->user_stack);
@@ -849,6 +854,22 @@ void thread_send_sigint_to_pgrp(int pgrp) {
                                 t->sleep_until = 0;
                                 thread_note_ready(t);
                         }
+                }
+        }
+}
+
+/* SIGHUP: used when activating an empty VT so init respawns getty on the visible console. */
+void thread_send_sighup_to_pgrp(int pgrp) {
+        if (pgrp < 0) return;
+        for (int i = 0; i < thread_count; ++i) {
+                thread_t *t = threads[i];
+                if (!t) continue;
+                if (t->pgid != pgrp) continue;
+                if (t->state == THREAD_TERMINATED) continue;
+                t->pending_signals |= (1ULL << (1 - 1)); /* SIGHUP */
+                if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING) {
+                        t->sleep_until = 0;
+                        thread_note_ready(t);
                 }
         }
 }

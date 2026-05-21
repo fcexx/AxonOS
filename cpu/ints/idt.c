@@ -15,6 +15,8 @@
 #include <mmio.h>
 #include <klog.h>
 #include <paging.h>
+#include <keyboard.h>
+#include <serial.h>
 // Avoid including <cstdint> because cross-toolchain headers may not provide it; use uint64_t instead
 
 // Forward declare C-linkage helpers from other compilation units
@@ -207,6 +209,14 @@ static void ud_fault_handler(cpu_registers_t* regs) {
                 qemu_debug_printf("syscall_kernel_rsp0 not set or out of range\n");
             }
         }
+        char choice;
+        for (;;) {
+            kprint("Reboot? [Y/N]: ");
+            choice = kgetc();
+            if (choice == 'Y' | choice == 'y') reboot_system(); 
+            if (choice == 'N' | choice == 'n') break;
+        }        
+        kprint("Halt.");
         for(;;){ asm volatile("sti; hlt":::"memory"); }
 }
 

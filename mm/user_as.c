@@ -1,6 +1,7 @@
 #include <user_as.h>
 #include <user_map.h>
 #include <user_mm.h>
+#include <axonos.h>
 #include <exec.h>
 #include <heap.h>
 #include <klog.h>
@@ -36,6 +37,9 @@ uintptr_t user_as_mmap_brk_top_limit(thread_t *tcur) {
     if (tls_slot > 0x200000 && tls_slot < (uintptr_t)MMIO_IDENTITY_LIMIT && tls_slot < top_limit)
         top_limit = tls_slot;
     if (tcur->user_stack_base != 0u && tcur->user_stack_limit > tcur->user_stack_base) {
+        uintptr_t sb = (uintptr_t)tcur->user_stack_base;
+        if (sb > 0x200000u && sb < top_limit)
+            top_limit = sb;
         uintptr_t st = (uintptr_t)tcur->user_stack_limit;
         if (st > (uintptr_t)USER_STACK_SIZE + (uintptr_t)USER_TLS_SIZE + 0x200000u) {
             uintptr_t tls_exec = st - (uintptr_t)USER_STACK_SIZE - (uintptr_t)USER_TLS_SIZE;
@@ -43,8 +47,25 @@ uintptr_t user_as_mmap_brk_top_limit(thread_t *tcur) {
                 top_limit = tls_exec;
         }
     }
-    if (top_limit > (uintptr_t)USER_STACK_TOP)
-        top_limit = (uintptr_t)USER_STACK_TOP;
+    {
+        uintptr_t rsp = (uintptr_t)syscall_user_rsp_saved;
+        if (rsp >= 0x200000u && rsp < (uintptr_t)USER_STACK_TOP) {
+            uintptr_t live_cap = rsp & ~0xFFFULL;
+            if (live_cap > 0x200000u && live_cap < top_limit)
+                top_limit = live_cap;
+        }
+    }
+    if (top_limit > (uintptr_t)USER_TLS_BASE)
+        top_limit = (uintptr_t)USER_TLS_BASE;
+    {
+        uintptr_t hlo = (uintptr_t)heap_base_addr();
+        if (hlo > 0x200000u && hlo < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+            uintptr_t guard = 0x20000u;
+            uintptr_t heap_cap = (hlo > guard) ? (hlo - guard) : hlo;
+            if (heap_cap < top_limit)
+                top_limit = heap_cap;
+        }
+    }
     return top_limit;
 }
 
@@ -129,20 +150,76 @@ void user_as_shared_publish_mmap(thread_t *cur, uintptr_t next, uintptr_t hi) {
     }
 }
 
+int user_as_mmap_overlaps_user_stack(thread_t *t, uintptr_t addr, uintptr_t len,
+    uintptr_t *above_stack_out) {
+    if (above_stack_out)
+        *above_stack_out = 0;
+    uintptr_t map_end = addr + len;
+    if (len && map_end < addr)
+        return 1;
+
+    uintptr_t lo = 0;
+    uintptr_t hi = 0;
+    uintptr_t rsp = (uintptr_t)syscall_user_rsp_saved;
+    if (rsp >= 0x200000u && rsp < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+        lo = (rsp > (uintptr_t)USER_STACK_SIZE) ? (rsp - (uintptr_t)USER_STACK_SIZE) : 0x200000u;
+        hi = rsp + 0x10000u;
+    }
+    if (t && t->user_stack_limit > t->user_stack_base) {
+        uintptr_t sb = (uintptr_t)t->user_stack_base;
+        uintptr_t se = (uintptr_t)t->user_stack_limit;
+        if (lo == 0 || sb < lo)
+            lo = sb;
+        if (hi < se)
+            hi = se;
+    }
+    if (t && t->user_stack && lo == 0) {
+        uintptr_t us = (uintptr_t)t->user_stack;
+        if (us >= 0x200000u) {
+            lo = (us > (uintptr_t)USER_STACK_SIZE) ? (us - (uintptr_t)USER_STACK_SIZE) : 0x200000u;
+            hi = us + 0x10000u;
+        }
+    }
+    if (lo == 0 || hi <= lo)
+        return 0;
+    if (map_end <= lo || addr >= hi)
+        return 0;
+    if (above_stack_out)
+        *above_stack_out = user_mm_align_up(hi, (uintptr_t)PAGE_SIZE_2M);
+    return 1;
+}
+
 int user_as_mmap_overlaps_kernel_heap(uintptr_t addr, uintptr_t len) {
+    uintptr_t map_end = addr + len;
+    if (len && map_end < addr)
+        return 1;
     uintptr_t hlo = (uintptr_t)heap_base_addr();
     uintptr_t hhi = heap_region_end_exclusive();
     if (hlo <= 0x200000 || !(hhi > hlo))
         return 0;
-    uintptr_t map_end = addr + len;
-    if (map_end < addr)
-        return 1;
     if (map_end <= hlo || addr >= hhi)
         return 0;
     return 1;
 }
 
 void user_as_mmap_memset_zero_chunked(uintptr_t addr, size_t len) {
+    thread_t *t = thread_get_current_user();
+    if (!t) t = thread_current();
+    if (user_as_mmap_overlaps_kernel_heap(addr, len)) {
+        klogprintf("user_as: refuse memset on kernel region addr=0x%llx len=0x%llx\n",
+            (unsigned long long)addr, (unsigned long long)(uint64_t)len);
+        return;
+    }
+    if (addr >= (uintptr_t)USER_TLS_BASE) {
+        klogprintf("user_as: refuse memset above TLS addr=0x%llx len=0x%llx\n",
+            (unsigned long long)addr, (unsigned long long)(uint64_t)len);
+        return;
+    }
+    if (t && user_as_mmap_overlaps_user_stack(t, addr, len, NULL)) {
+        klogprintf("user_as: refuse memset on stack overlap addr=0x%llx len=0x%llx\n",
+            (unsigned long long)addr, (unsigned long long)(uint64_t)len);
+        return;
+    }
     const size_t chunk = 4u * 1024u * 1024u;
     if (len <= chunk) {
         memset((void *)addr, 0, len);

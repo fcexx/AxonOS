@@ -7,7 +7,7 @@
  * much larger TASK_SIZE; we intentionally keep a low fixed bound — glibc arenas above
  * this size get ENOMEM from mmap, same class of failure as Linux under RLIMIT_AS. */
 #define USER_STACK_TOP ((uintptr_t)0x10000000ULL) /* 256MiB; heap 8..~252MiB; was 128MiB */
-#define USER_STACK_SIZE (2 * 1024 * 1024) /* 2MiB */
+#define USER_STACK_SIZE (8 * 1024 * 1024) /* 8MiB; linuxrc/glibc need >2MiB stack */
 
 /* Reserve a separate user TLS region just below the stack guard area.
    This prevents brk()/mmap() from overwriting TLS canary at fs:0x28 which would trigger
@@ -22,6 +22,9 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
 
 /* Fixed user-space trampoline for safe vfork child entry (must be in low identity map). */
 #define USER_VFORK_TRAMP ((uintptr_t)0x00201000ULL) /* 2MiB + 4KiB */
+
+/* ET_DYN (PIE) load base: 2MiB-aligned above kernel _end (grows with BSS e.g. kstack pool). */
+uint64_t elf_et_dyn_base(void);
 
 /* Ensure user mappings (PG_US) for low memory and GOT region before entering user mode.
    Must be called from user_thread_entry for init path (elf exec path may skip it). */

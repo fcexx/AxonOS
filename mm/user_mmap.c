@@ -13,6 +13,7 @@
 #include <klog.h>
 #include <fbdev.h>
 #include <string.h>
+#include <axonos.h>
 
 extern void kprintf(const char *fmt, ...);
 
@@ -126,17 +127,19 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     if (fixed_mapping && user_as_mmap_overlaps_kernel_heap(addr, len))
         return user_mm_ret_err(USER_MM_EINVAL);
 
-    if (!fixed_mapping && tcur && tcur->user_stack_base != 0 && tcur->user_stack_limit > tcur->user_stack_base) {
-        uintptr_t sb = (uintptr_t)tcur->user_stack_base;
-        uintptr_t se = (uintptr_t)tcur->user_stack_limit;
-        uint64_t span_lo = (uint64_t)addr + len_u64;
-        if (!(span_lo <= (uint64_t)sb || (uint64_t)addr >= (uint64_t)se)) {
-            uintptr_t above_stack = user_mm_align_up(se, PAGE_SIZE_2M);
-            if ((uint64_t)above_stack > (uint64_t)addr &&
-                (uint64_t)above_stack + len_u64 < (uint64_t)top_limit) {
-                addr = above_stack;
-                *p_mmap_next = addr;
-            }
+    if (!fixed_mapping && tcur && user_as_mmap_overlaps_user_stack(tcur, addr, (uintptr_t)len_u64, NULL)) {
+        uintptr_t above_stack = 0;
+        (void)user_as_mmap_overlaps_user_stack(tcur, addr, (uintptr_t)len_u64, &above_stack);
+        if (above_stack > addr && user_mm_range_fits(above_stack, len_u64, top_limit)) {
+            addr = above_stack;
+            *p_mmap_next = addr;
+        } else {
+            kprintf("mmap: ENOMEM overlaps user stack rsp=0x%llx stk=[0x%llx..0x%llx] addr=0x%llx len=0x%llx\n",
+                (unsigned long long)(uint64_t)syscall_user_rsp_saved,
+                (unsigned long long)tcur->user_stack_base,
+                (unsigned long long)tcur->user_stack_limit,
+                (unsigned long long)addr, (unsigned long long)len_u64);
+            return user_mm_ret_err(USER_MM_ENOMEM);
         }
     }
     if (!fixed_mapping) {
@@ -149,20 +152,22 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     if (!fixed_mapping && user_as_mmap_overlaps_kernel_heap(addr, len)) {
         const uintptr_t hgap = 0x10000u;
         uintptr_t hhi = heap_region_end_exclusive();
-        addr = user_mm_align_up(hhi + hgap, 4096);
+        uintptr_t skip = user_mm_align_up(hhi + hgap, 4096);
+        if (skip >= top_limit || skip >= (uintptr_t)USER_TLS_BASE) {
+            kprintf("mmap: ENOMEM overlap kernel heap (heap above user VA cap)\n");
+            return user_mm_ret_err(USER_MM_ENOMEM);
+        }
+        addr = skip;
         *p_mmap_next = addr;
         if ((uint64_t)addr + len_u64 < (uint64_t)addr) return user_mm_ret_err(USER_MM_ENOMEM);
-        if (tcur && tcur->user_stack_base != 0 && tcur->user_stack_limit > tcur->user_stack_base) {
-            uintptr_t se = (uintptr_t)tcur->user_stack_limit;
-            uintptr_t sb = (uintptr_t)tcur->user_stack_base;
-            uint64_t span2 = (uint64_t)addr + len_u64;
-            if (!(span2 <= (uint64_t)sb || (uint64_t)addr >= (uint64_t)se)) {
-                uintptr_t above_stack = user_mm_align_up(se, PAGE_SIZE_2M);
-                if ((uint64_t)above_stack > (uint64_t)addr &&
-                    (uint64_t)above_stack + len_u64 < (uint64_t)top_limit) {
-                    addr = above_stack;
-                    *p_mmap_next = addr;
-                }
+        if (tcur && user_as_mmap_overlaps_user_stack(tcur, addr, (uintptr_t)len_u64, NULL)) {
+            uintptr_t above_stack = 0;
+            (void)user_as_mmap_overlaps_user_stack(tcur, addr, (uintptr_t)len_u64, &above_stack);
+            if (above_stack > addr && user_mm_range_fits(above_stack, len_u64, top_limit)) {
+                addr = above_stack;
+                *p_mmap_next = addr;
+            } else {
+                return user_mm_ret_err(USER_MM_ENOMEM);
             }
         }
         if (addr < brk_guard_floor) return user_mm_ret_err(USER_MM_EINVAL);
@@ -179,8 +184,18 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     }
     if (user_mm_len_exceeds_cap(len_u64)) return user_mm_ret_err(USER_MM_ENOMEM);
 
+    if (tcur && user_as_mmap_overlaps_user_stack(tcur, addr, (uintptr_t)len_u64, NULL)) {
+        kprintf("mmap: ENOMEM still overlaps user stack addr=0x%llx len=0x%llx\n",
+            (unsigned long long)addr, (unsigned long long)len_u64);
+        return user_mm_ret_err(USER_MM_ENOMEM);
+    }
+
     uintptr_t map_hwm = top_limit & ~((uintptr_t)PAGE_SIZE_2M - 1);
     if (addr < 0x200000 || (uint64_t)addr + len_u64 > (uint64_t)USER_STACK_TOP) {
+        if (addr >= (uintptr_t)USER_TLS_BASE ||
+            (uint64_t)addr + len_u64 > (uint64_t)USER_TLS_BASE ||
+            user_as_mmap_overlaps_kernel_heap(addr, len))
+            return user_mm_ret_err(USER_MM_ENOMEM);
         if (user_map_mark_identity_2m((uint64_t)addr, (uint64_t)addr + len_u64) != 0)
             return user_mm_ret_err(USER_MM_EFAULT);
     } else if (tcur && tcur->user_stack_base != 0) {
@@ -275,6 +290,8 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     }
     if (!user_mm_range_fits(addr, len_u64, top_limit))
         return user_mm_ret_err(USER_MM_ENOMEM);
+    if (user_as_mmap_overlaps_kernel_heap(addr, len))
+        return user_mm_ret_err(USER_MM_EFAULT);
     return (uint64_t)addr;
 }
 

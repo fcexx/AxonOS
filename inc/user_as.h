@@ -19,6 +19,9 @@ void user_as_shared_publish_brk(thread_t *cur, uintptr_t base, uintptr_t cur_brk
 void user_as_shared_publish_mmap(thread_t *cur, uintptr_t next, uintptr_t hi);
 
 int user_as_mmap_overlaps_kernel_heap(uintptr_t addr, uintptr_t len);
+/* True if [addr,addr+len) hits the thread stack (including live RSP..stack_top). */
+int user_as_mmap_overlaps_user_stack(thread_t *t, uintptr_t addr, uintptr_t len,
+    uintptr_t *above_stack_out);
 void user_as_mmap_memset_zero_chunked(uintptr_t addr, size_t len);
 void user_as_mmap_lazy_drop_present_pages(uintptr_t addr, size_t len);
 

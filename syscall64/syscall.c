@@ -234,8 +234,6 @@ void syscall_snapshot_user_regs(uint64_t *frame) {
 
 static void rebuild_syscall_frame(thread_t *t) {
     if (!t || !t->saved_syscall_frame) return;
-    uintptr_t base = (uintptr_t)t->saved_syscall_frame;
-    if (base + (16u * 8u) > (uintptr_t)MMIO_IDENTITY_LIMIT) return;
     uint64_t *frame = t->saved_syscall_frame;
     frame[0]  = t->saved_user_r15;
     frame[1]  = t->saved_user_r14;
@@ -268,6 +266,34 @@ static uintptr_t user_stack_top_for_tid_like_exec(uint64_t tid) {
     if (top <= min_room) return top;
     if (off >= (top - min_room)) return top;
     return top - off;
+}
+
+/* Relocate user pointers from parent stack slice/slot into the child's copy. */
+static uint64_t fork_reloc_user_ptr(uint64_t val,
+    uintptr_t slice_lo, uintptr_t slice_hi, uintptr_t child_slice_base,
+    uintptr_t slot_lo, uintptr_t slot_hi, uintptr_t child_slot_base) {
+    uintptr_t vv = (uintptr_t)val;
+    if ((vv & 7u) != 0) return val;
+    if (vv >= slice_lo && vv < slice_hi)
+        return (uint64_t)(child_slice_base + (vv - slice_lo));
+    if (slot_hi > slot_lo && vv >= slot_lo && vv < slot_hi)
+        return (uint64_t)(child_slot_base + (vv - slot_lo));
+    return val;
+}
+
+static void fork_reloc_range_u64(uintptr_t base, uintptr_t nbytes,
+    uintptr_t slice_lo, uintptr_t slice_hi, uintptr_t child_slice_base,
+    uintptr_t slot_lo, uintptr_t slot_hi, uintptr_t child_slot_base) {
+    if (nbytes < 8) return;
+    uintptr_t end = base + nbytes;
+    if (end < base || end > (uintptr_t)MMIO_IDENTITY_LIMIT) return;
+    for (uintptr_t pp = base; pp + 8 <= end; pp += 8) {
+        uint64_t v = *(uint64_t *)(uintptr_t)pp;
+        uint64_t nv = fork_reloc_user_ptr(v, slice_lo, slice_hi, child_slice_base,
+            slot_lo, slot_hi, child_slot_base);
+        if (nv != v)
+            *(uint64_t *)(uintptr_t)pp = nv;
+    }
 }
 
 /* Restore parent's userspace stack snapshot for a vfork child.
@@ -483,7 +509,7 @@ static ssize_t pipe_read_bytes(pipe_t *p, void *buf, size_t cnt, thread_t *cur) 
             return (ssize_t)n;
         }
         if (p->refcount < 2) { release_irqrestore(&p->lock, fl); return 0; } /* EOF */
-        p->reader_waiter_tid = (int)(cur && cur->tid ? cur->tid : 0);
+        p->reader_waiter_tid = cur ? (int)cur->tid : -1;
         release_irqrestore(&p->lock, fl);
         if (p->reader_waiter_tid >= 0) {
             thread_block(p->reader_waiter_tid);
@@ -518,7 +544,7 @@ static ssize_t pipe_write_bytes(pipe_t *p, const void *buf, size_t cnt, thread_t
             continue;
         }
         if (p->refcount < 2) { release_irqrestore(&p->lock, fl); return written > 0 ? (ssize_t)written : -EPIPE; }
-        p->writer_waiter_tid = (int)(cur && cur->tid ? cur->tid : 0);
+        p->writer_waiter_tid = cur ? (int)cur->tid : -1;
         release_irqrestore(&p->lock, fl);
         if (p->writer_waiter_tid >= 0) {
             thread_block(p->writer_waiter_tid);
@@ -4054,6 +4080,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 child_stack_top &= ~((uintptr_t)0xFULL);
                 uintptr_t child_rsp = (child_stack_top - copy_bytes);
+                uintptr_t parent_stack_top = user_stack_top_for_tid_like_exec(p->tid ? p->tid : 1);
+                const uintptr_t parent_slot_lo =
+                    (parent_stack_top - (uintptr_t)USER_STACK_SIZE) & ~0xFFFULL;
+                const uintptr_t child_slot_lo =
+                    (child_stack_top - (uintptr_t)USER_STACK_SIZE) & ~0xFFFULL;
                 /* Preserve original stack alignment (SSE movdqa expects this). */
                 uintptr_t align_mask = (uintptr_t)0xFULL;
                 uintptr_t want = (uintptr_t)saved_rsp & align_mask;
@@ -4071,9 +4102,6 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 /* copy active stack slice */
                 memcpy((void*)child_rsp, (void*)(uintptr_t)saved_rsp, (size_t)copy_bytes);
-                /* Relocate pointers inside the copied stack slice itself.
-                   Use nv = child_rsp + (vv - parent_lo) so a lower child_rsp than parent_lo
-                   never triggers unsigned wrap (was: vv + (uintptr_t)(child - parent)). */
                 {
                     const uintptr_t parent_lo = (uintptr_t)saved_rsp;
                     const uintptr_t parent_hi = parent_lo + (uintptr_t)copy_bytes;
@@ -4082,12 +4110,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     for (; pp + 8 <= end; pp += 8) {
                         uint64_t v = 0;
                         if (user_read_u64((const void *)(uintptr_t)pp, &v) != 0) return ret_err(EFAULT);
-                        uintptr_t vv = (uintptr_t)v;
-                        if ((vv & 7u) == 0 && vv >= parent_lo && vv < parent_hi) {
-                            uintptr_t nv = (uintptr_t)child_rsp + (uintptr_t)(vv - parent_lo);
-                            if (user_write_u64((void *)(uintptr_t)pp, (uint64_t)nv) != 0)
-                                return ret_err(EFAULT);
-                        }
+                        uint64_t nv = fork_reloc_user_ptr(v, parent_lo, parent_hi,
+                            (uintptr_t)child_rsp, parent_slot_lo, parent_stack_top, child_slot_lo);
+                        if (nv != v && user_write_u64((void *)(uintptr_t)pp, nv) != 0)
+                            return ret_err(EFAULT);
                     }
                 }
 
@@ -4136,9 +4162,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     const uintptr_t parent_lo = (uintptr_t)saved_rsp;
                     const uintptr_t parent_hi = parent_lo + (uintptr_t)copy_bytes;
                     #define VFORK_RELOC(val64) \
-                        ((((uintptr_t)(val64) >= parent_lo) && ((uintptr_t)(val64) < parent_hi)) ? \
-                         (uint64_t)((uintptr_t)child_rsp + ((uintptr_t)(val64) - parent_lo)) : \
-                         (uint64_t)(val64))
+                        fork_reloc_user_ptr((uint64_t)(val64), parent_lo, parent_hi, \
+                            (uintptr_t)child_rsp, parent_slot_lo, parent_stack_top, child_slot_lo)
                     /* Build a vfork trampoline that restores a full user register snapshot
                        (as if we returned from a real SYSCALL instruction):
                          - restore caller-saved regs: RDI,RSI,RDX,R8,R9,R10,RCX,R11
@@ -4210,6 +4235,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     child->user_rip = saved_rcx;
                 }
                 child->user_stack = (uint64_t)child_rsp;
+                child->user_stack_base = (uint64_t)((child_stack_top - (uintptr_t)USER_STACK_SIZE) & ~0xFFFULL);
+                child->user_stack_limit = (uint64_t)child_stack_top;
                 child->ring = 3;
             }
             child->parent_tid = (int)(p->tid ? p->tid : 1);
@@ -4287,6 +4314,22 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 child->vfork_parent_mem_backup_len = len64;
                 child->vfork_parent_mem_backup_base = (uint64_t)base;
                 child->vfork_parent_brk_saved = (uint64_t)p->user_brk_cur;
+                /* Snapshot parent stack from saved RSP to stack top (child shares address space). */
+                {
+                    uintptr_t parent_top = user_stack_top_for_tid_like_exec(p->tid ? p->tid : 1);
+                    uintptr_t lo = (uintptr_t)saved_rsp;
+                    if (lo > 0 && lo < parent_top && lo < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                        size_t slen = (size_t)(parent_top - lo);
+                        if (slen > (size_t)(512u * 1024u))
+                            slen = (size_t)(512u * 1024u);
+                        child->vfork_parent_stack_backup = kmalloc(slen);
+                        if (child->vfork_parent_stack_backup) {
+                            memcpy(child->vfork_parent_stack_backup, (void*)lo, slen);
+                            child->vfork_parent_saved_rsp = saved_rsp;
+                            child->vfork_parent_stack_backup_len = (uint64_t)slen;
+                        }
+                    }
+                }
                 child->vfork_parent_tid = (int)(p->tid ? p->tid : 1);
                 /* block parent until child exits */
                 p->vfork_parent_tid = -1;
@@ -4816,6 +4859,19 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (copy_to_user_safe(up, &u, sizeof(u)) != 0) return ret_err(EFAULT);
             return 0;
         }
+        case 170: { /* gethostname — BusyBox getty login prompt */
+            char *buf = (char *)(uintptr_t)a1;
+            size_t len = (size_t)a2;
+            if (!buf || len == 0) return ret_err(EINVAL);
+            static const char host[] = "axoniso";
+            size_t n = sizeof(host) - 1;
+            if (n >= len) n = len - 1;
+            char k[64];
+            memcpy(k, host, n);
+            k[n] = '\0';
+            if (copy_to_user_safe(buf, k, n + 1) != 0) return ret_err(EFAULT);
+            return 0;
+        }
         case SYS_getcwd: {
             char *bufp = (char*)(uintptr_t)a1;
             size_t size = (size_t)a2;
@@ -5270,7 +5326,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             size_t used = (p->head >= p->tail) ? (p->head - p->tail) : (p->size - p->tail + p->head);
                             int is_write_end = (f->fs_private == (void *)1);
                             release_irqrestore(&p->lock, fl);
-                            if (!is_write_end && used > 0) can_r = 1;
+                            if (!is_write_end && (used > 0 || p->refcount < 2)) can_r = 1;
                         } else {
                             if (f->type == FS_TYPE_DIR) can_r = 1;
                             else if ((size_t)f->pos < (size_t)f->size) can_r = 1;
@@ -6742,7 +6798,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             size_t used = (p->head >= p->tail) ? (p->head - p->tail) : (p->size - p->tail + p->head);
                             int is_we = (f->fs_private == (void *)1);
                             release_irqrestore(&p->lock, fl);
-                            if (!is_we && (ev & POLLIN_K) && used > 0) rev |= POLLIN_K;
+                            if (!is_we && (ev & POLLIN_K) && (used > 0 || p->refcount < 2)) rev |= POLLIN_K;
                             if (is_we && (ev & POLLOUT_K) && (p->size - 1 - used) > 0) rev |= POLLOUT_K;
                         } else if (ev & POLLIN_K && f->type != FS_TYPE_DIR && (size_t)f->pos < (size_t)f->size) rev |= POLLIN_K;
                     }
@@ -7177,9 +7233,32 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             return 0;
         }
         case SYS_fork: {
-            auto void fork_abort_child(thread_t *child) {
+            static spinlock_t fork_syscall_cli_lock;
+            unsigned long fork_irqf = 0;
+            uint64_t fork_ret = 0;
+            int fork_fail = 0;
+            {
+                size_t hu = heap_used_bytes();
+                size_t ht = heap_total_bytes();
+                if (ht > 0 && hu + (32u << 20) > ht) {
+                    kprintf("fork: ENOMEM heap_used=%llu heap_total=%llu\n",
+                        (unsigned long long)hu, (unsigned long long)ht);
+                    return ret_err(ENOMEM);
+                }
+            }
+            /* Block preemption: fork runs on shared per-CPU syscall stack; a child
+               started mid-fork would clobber the parent's syscall frame (hang). */
+            acquire_irqsave(&fork_syscall_cli_lock, &fork_irqf);
+            auto void fork_abort_child(thread_t *child, thread_t *parent) {
                 if (!child) return;
                 thread_stop((int)(child->tid ? child->tid : 1));
+                if (child->vfork_parent_stack_backup) {
+                    kfree(child->vfork_parent_stack_backup);
+                    child->vfork_parent_stack_backup = NULL;
+                    child->vfork_parent_stack_backup_len = 0;
+                    child->vfork_parent_saved_rsp = 0;
+                }
+                child->vfork_parent_tid = -1;
                 if (child->mm && child->mm != mm_kernel()) {
                     mm_release(child->mm);
                     child->mm = mm_retain(mm_kernel());
@@ -7188,278 +7267,242 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     mm_release(child->mm_ptemplate);
                     child->mm_ptemplate = NULL;
                 }
+                if (parent && parent->state == THREAD_BLOCKED)
+                    thread_unblock((int)(parent->tid ? parent->tid : 1));
             }
-            /* Full fork: child gets its own mm, private copy of heap/stack/TLS.
-               Parent returns immediately with child pid; child runs concurrently. */
-            /* Minimal fork emulation:
-               - create a new kernel thread that will enter user mode at the saved
-                 return RIP and user RSP (copied from syscall stack / saved RSP).
-               - duplicate file descriptor table (increment refcounts).
-               - return child's pid to parent, child will see 0 as fork return (user_thread_entry clears RAX). */
-            /* Read saved return RIP from syscall entry recorded in `syscall_user_return_rip`.
-               If it's zero (not recorded), attempt to read it from the kernel syscall stack
-               top (`syscall_kernel_rsp0`) at the same offset used by the SYSCALL entry. */
+            /* Linux fork: parent returns immediately with child pid; child gets 0 via tramp.
+               Child gets private mm (COW copy of mapped pages) and its own stack slot. */
             uint64_t saved_rcx = cur->saved_user_rip;
             uint64_t saved_rsp = cur->saved_user_rsp;
-
-            /* create kernel thread that will enter user mode at saved_rcx/saved_rsp */
             if (saved_rcx == 0) {
-                return ret_err(EINVAL);
+                fork_fail = EINVAL;
+                goto fork_finish;
             }
-            /* Try to ensure the user pages around saved_rcx are user-accessible to avoid PF
-               when the child enters user mode. This sets PG_US on the containing 2MiB region. */
-            if (saved_rcx != 0) {
+            if ((uintptr_t)saved_rsp == 0 || (uintptr_t)saved_rsp >= (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                fork_fail = EINVAL;
+                goto fork_finish;
+            }
+            {
                 uintptr_t begin = (uintptr_t)saved_rcx & ~((uintptr_t)PAGE_SIZE_2M - 1);
                 uintptr_t end = begin + (uintptr_t)PAGE_SIZE_2M;
-                if (mark_user_identity_range_2m_sys((uint64_t)begin, (uint64_t)end) == 0) {
-                } else {
-                }
+                (void)mark_user_identity_range_2m_sys((uint64_t)begin, (uint64_t)end);
             }
             char child_name[32];
             snprintf(child_name, sizeof(child_name), "%s.child", cur->name);
-            // kprintf("DBG: fork: syscall_user_return_rip=0x%llx syscall_user_rsp_saved=0x%llx (saved_rcx=0x%llx saved_rsp=0x%llx)\n",
-            //         (unsigned long long)syscall_user_return_rip, (unsigned long long)syscall_user_rsp_saved,
-            //         (unsigned long long)saved_rcx, (unsigned long long)saved_rsp);
-            /* Create BLOCKED first to avoid running before initialization. */
             thread_t *child = thread_create_blocked(user_thread_entry, child_name);
-            if (!child) return ret_err(ENOMEM);
-            /* Iteration 1: fork gets its own CR3 root (user pages still shared until remapped). */
+            if (!child) {
+                fork_fail = ENOMEM;
+                goto fork_finish;
+            }
+            child->vfork_parent_tid = -1;
             {
                 mm_t *child_mm = mm_clone_current();
                 if (!child_mm) {
-                    fork_abort_child(child);
-                    return ret_err(ENOMEM);
+                    fork_abort_child(child, cur);
+                    fork_fail = ENOMEM;
+                    goto fork_finish;
                 }
                 if (child->mm) mm_release(child->mm);
                 child->mm = child_mm;
             }
-            /* clone parent's active stack slice into child's own stack (like vfork safe variant) */
+            uintptr_t parent_stack_top = user_stack_top_for_tid_like_exec(cur->tid ? cur->tid : 1);
+            uintptr_t parent_slot_lo = (parent_stack_top - (uintptr_t)USER_STACK_SIZE) & ~0xFFFULL;
+            uintptr_t max_copy = (uintptr_t)USER_STACK_SIZE;
+            uintptr_t used_tail = 0;
+            if (parent_stack_top > (uintptr_t)saved_rsp)
+                used_tail = parent_stack_top - (uintptr_t)saved_rsp;
+            if (used_tail == 0) used_tail = (uintptr_t)(32 * 1024);
+            if (used_tail < 4096) used_tail = 4096;
+            if (used_tail < max_copy) max_copy = used_tail;
+            uintptr_t copy_bytes = (uintptr_t)MMIO_IDENTITY_LIMIT - (uintptr_t)saved_rsp;
+            if (copy_bytes > max_copy) copy_bytes = max_copy;
+            if (copy_bytes < 256) {
+                fork_abort_child(child, cur);
+                fork_fail = EINVAL;
+                goto fork_finish;
+            }
+            uintptr_t child_stack_top = (uintptr_t)USER_STACK_TOP;
+            {
+                const uintptr_t stride = (uintptr_t)USER_STACK_SIZE + (uintptr_t)USER_TLS_SIZE + (uintptr_t)(64 * 1024);
+                const uint64_t slot = (uint64_t)child->tid + 1ULL;
+                if (stride != 0 && slot <= (uint64_t)((uintptr_t)-1) / (uint64_t)stride) {
+                    const uintptr_t off = (uintptr_t)(slot * (uint64_t)stride);
+                    const uintptr_t top = (uintptr_t)USER_STACK_TOP;
+                    const uintptr_t min_room = (uintptr_t)USER_STACK_SIZE + (uintptr_t)USER_TLS_SIZE + 0x10000u;
+                    if (top > min_room && off < (top - min_room))
+                        child_stack_top = (uintptr_t)USER_STACK_TOP - off;
+                }
+            }
+            child_stack_top &= ~((uintptr_t)0xFULL);
+            uintptr_t child_slot_lo = (child_stack_top - (uintptr_t)USER_STACK_SIZE) & ~0xFFFULL;
+            uintptr_t child_rsp = (child_stack_top - copy_bytes);
+            uintptr_t align_mask = (uintptr_t)0xFULL;
+            uintptr_t want = (uintptr_t)saved_rsp & align_mask;
+            uintptr_t have = (uintptr_t)child_rsp & align_mask;
+            if (have != want)
+                child_rsp += (want - have) & align_mask;
+            {
+                uintptr_t sb = (child_stack_top - (uintptr_t)USER_STACK_SIZE) & ~0xFFFULL;
+                if (mark_user_identity_range_2m_sys((uint64_t)sb, (uint64_t)child_stack_top) != 0) {
+                    fork_abort_child(child, cur);
+                    fork_fail = EFAULT;
+                    goto fork_finish;
+                }
+            }
+            memcpy((void *)child_rsp, (void *)(uintptr_t)saved_rsp, (size_t)copy_bytes);
+            {
+                const uintptr_t parent_lo = (uintptr_t)saved_rsp;
+                const uintptr_t parent_hi = parent_lo + copy_bytes;
+                /* Only rewrite the stack slice we copied from the parent. Scanning the
+                   whole 8MiB child slot relocates random qwords that look like parent
+                   stack pointers and corrupts return addresses (invalid opcode in sh). */
+                fork_reloc_range_u64((uintptr_t)child_rsp, copy_bytes,
+                    parent_lo, parent_hi, (uintptr_t)child_rsp,
+                    parent_slot_lo, parent_stack_top, child_slot_lo);
+            }
             {
                 uintptr_t parent_fs = (uintptr_t)cur->user_fs_base;
                 uintptr_t parent_tls_region = (parent_fs >= 0x1000u) ? (parent_fs - 0x1000u) : 0;
-                if ((uintptr_t)saved_rsp == 0 || (uintptr_t)saved_rsp >= (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                    fork_abort_child(child);
-                    return ret_err(EINVAL);
-                }
-                /* Hot path optimization:
-                   copying a fixed 1 MiB on every fork is very expensive on real HW.
-                   Copy only active parent stack tail (bounded). */
-                uintptr_t max_copy = (uintptr_t)(128 * 1024); /* hard cap for fork latency */
-                uintptr_t parent_stack_top = user_stack_top_for_tid_like_exec(cur->tid ? cur->tid : 1);
-                uintptr_t used_tail = 0;
-                if (parent_stack_top > (uintptr_t)saved_rsp) used_tail = parent_stack_top - (uintptr_t)saved_rsp;
-                if (used_tail == 0) used_tail = (uintptr_t)(32 * 1024);
-                if (used_tail < 4096) used_tail = 4096;
-                if (used_tail < max_copy) max_copy = used_tail;
-                uintptr_t avail = (uintptr_t)MMIO_IDENTITY_LIMIT - (uintptr_t)saved_rsp;
-                uintptr_t copy_bytes = (avail < max_copy) ? avail : max_copy;
-                if (copy_bytes < 256) {
-                    fork_abort_child(child);
-                    return ret_err(EINVAL);
-                }
-
-                uintptr_t child_stack_top = (uintptr_t)USER_STACK_TOP;
-                {
-                    const uintptr_t stride = (uintptr_t)USER_STACK_SIZE + (uintptr_t)USER_TLS_SIZE + (uintptr_t)(64 * 1024);
-                    const uint64_t slot = (uint64_t)child->tid + 1ULL;
-                    if (stride != 0 && slot <= (uint64_t)((uintptr_t)-1) / (uint64_t)stride) {
-                        const uintptr_t off = (uintptr_t)(slot * (uint64_t)stride);
-                        const uintptr_t top = (uintptr_t)USER_STACK_TOP;
-                        const uintptr_t min_room = (uintptr_t)USER_STACK_SIZE + (uintptr_t)USER_TLS_SIZE + 0x10000u;
-                        if (top > min_room && off < (top - min_room)) {
-                            child_stack_top = (uintptr_t)USER_STACK_TOP - off;
-                        }
-                    }
-                }
-                child_stack_top &= ~((uintptr_t)0xFULL);
-                uintptr_t child_rsp = (child_stack_top - copy_bytes);
-                /* Preserve original stack alignment (SSE movdqa expects this). */
-                uintptr_t align_mask = (uintptr_t)0xFULL;
-                uintptr_t want = (uintptr_t)saved_rsp & align_mask;
-                uintptr_t have = (uintptr_t)child_rsp & align_mask;
-                if (have != want) {
-                    child_rsp += (want - have) & align_mask;
-                }
-
-                {
-                    uintptr_t sb = (child_stack_top - (uintptr_t)USER_STACK_SIZE) & ~0xFFFULL;
-                    if (mark_user_identity_range_2m_sys((uint64_t)sb, (uint64_t)child_stack_top) != 0) {
-                        fork_abort_child(child);
-                        return ret_err(EFAULT);
-                    }
-                }
-                memcpy((void*)child_rsp, (void*)(uintptr_t)saved_rsp, (size_t)copy_bytes);
-                {
-                    const uintptr_t parent_lo = (uintptr_t)saved_rsp;
-                    const uintptr_t parent_hi = parent_lo + (uintptr_t)copy_bytes;
-                    uintptr_t pp = (uintptr_t)child_rsp;
-                    uintptr_t end = (uintptr_t)child_rsp + (uintptr_t)copy_bytes;
-                    for (; pp + 8 <= end; pp += 8) {
-                        uint64_t v = *(uint64_t *)(uintptr_t)pp;
-                        uintptr_t vv = (uintptr_t)v;
-                        if ((vv & 7u) == 0 && vv >= parent_lo && vv < parent_hi) {
-                            uintptr_t nv = (uintptr_t)child_rsp + (uintptr_t)(vv - parent_lo);
-                            *(uint64_t *)(uintptr_t)pp = (uint64_t)nv;
-                        }
-                    }
-                }
-
-                /* set up TLS for child */
                 uintptr_t child_tls_region = child_stack_top - (uintptr_t)USER_STACK_SIZE - (uintptr_t)USER_TLS_SIZE;
                 uintptr_t child_fs = child_tls_region + 0x1000u;
                 uintptr_t child_pthread_fake = child_tls_region + 0x2000u;
-                if (mark_user_identity_range_2m_sys((uint64_t)child_tls_region, (uint64_t)(child_pthread_fake + 0x1000u)) != 0) {
-                    fork_abort_child(child);
-                    return ret_err(EFAULT);
+                if (mark_user_identity_range_2m_sys((uint64_t)child_tls_region,
+                        (uint64_t)(child_pthread_fake + 0x1000u)) != 0) {
+                    fork_abort_child(child, cur);
+                    fork_fail = EFAULT;
+                    goto fork_finish;
                 }
-                memset((void*)child_tls_region, 0, 0x3000u);
-                if (parent_tls_region != 0 && parent_tls_region + 0x3000u < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                    memcpy((void*)child_tls_region, (void*)parent_tls_region, 0x3000u);
-                }
+                memset((void *)child_tls_region, 0, 0x3000u);
+                if (parent_tls_region != 0 && parent_tls_region + 0x3000u < (uintptr_t)MMIO_IDENTITY_LIMIT)
+                    memcpy((void *)child_tls_region, (void *)parent_tls_region, 0x3000u);
                 if (user_write_u64((void *)(uintptr_t)(child_fs - 0x78u), (uint64_t)child_pthread_fake) != 0) {
-                    fork_abort_child(child);
-                    return ret_err(EFAULT);
+                    fork_abort_child(child, cur);
+                    fork_fail = EFAULT;
+                    goto fork_finish;
                 }
                 {
                     const uintptr_t c_str = child_tls_region + 0x2800u;
                     if (c_str + 2 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                        if (user_write_u8((void *)(uintptr_t)(c_str + 0), (uint8_t)'C') != 0) {
-                            fork_abort_child(child);
-                            return ret_err(EFAULT);
-                        }
-                        if (user_write_u8((void *)(uintptr_t)(c_str + 1), 0) != 0) {
-                            fork_abort_child(child);
-                            return ret_err(EFAULT);
-                        }
+                        (void)user_write_u8((void *)(uintptr_t)(c_str + 0), (uint8_t)'C');
+                        (void)user_write_u8((void *)(uintptr_t)(c_str + 1), 0);
                         const uintptr_t specific5_slot = child_pthread_fake + 0x80u + (uintptr_t)(5u * 8u);
-                        for (int si = 0; si < 32; si++) {
-                            if (user_write_u64((void *)(uintptr_t)(child_pthread_fake + 0x80u + (uintptr_t)(si * 8u)), 0) != 0) {
-                                fork_abort_child(child);
-                                return ret_err(EFAULT);
-                            }
-                        }
-                        if (user_write_u64((void *)(uintptr_t)specific5_slot, (uint64_t)c_str) != 0) {
-                            fork_abort_child(child);
-                            return ret_err(EFAULT);
-                        }
+                        for (int si = 0; si < 32; si++)
+                            (void)user_write_u64((void *)(uintptr_t)(child_pthread_fake + 0x80u + (uintptr_t)(si * 8u)), 0);
+                        (void)user_write_u64((void *)(uintptr_t)specific5_slot, (uint64_t)c_str);
                     }
                 }
                 child->user_fs_base = (uint64_t)child_fs;
-
-                /* inherit parent's brk and mmap cursor so child has valid heap/mmap state before exec */
-                child->user_brk_base = cur->user_brk_base;
-                child->user_brk_cur = cur->user_brk_cur;
-                if (cur->user_mmap_next) child->user_mmap_next = cur->user_mmap_next;
-                child->user_mmap_hi = cur->user_mmap_hi;
-                if (user_vma_clone_for_tid((uint64_t)(cur->tid ? cur->tid : 1), (uint64_t)(child->tid ? child->tid : 1)) != 0) {
-                    fork_abort_child(child);
-                    return ret_err(ENOSPC);
-                }
-
-                /* set up user entry and stack for the child (restore full regs, relocate stack pointers) */
-                {
-                    uintptr_t tramp = (uintptr_t)USER_VFORK_TRAMP;
-                    mark_user_identity_range_2m_sys((uint64_t)(tramp & ~((uintptr_t)(PAGE_SIZE_2M - 1))),
-                                                   (uint64_t)((tramp & ~((uintptr_t)(PAGE_SIZE_2M - 1))) + PAGE_SIZE_2M));
-                    if ((uintptr_t)tramp + 64 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                        const uintptr_t parent_lo = (uintptr_t)saved_rsp;
-                        const uintptr_t parent_hi = parent_lo + (uintptr_t)copy_bytes;
-                        #define VFORK_RELOC(val64) \
-                            ((((uintptr_t)(val64) >= parent_lo) && ((uintptr_t)(val64) < parent_hi)) ? \
-                             (uint64_t)((uintptr_t)child_rsp + ((uintptr_t)(val64) - parent_lo)) : \
-                             (uint64_t)(val64))
-                        unsigned char stub[160];
-                        int off = 0;
-                        uint64_t imm_rdi = VFORK_RELOC(cur->saved_user_rdi);
-                        stub[off++] = 0x48; stub[off++] = 0xBF; memcpy(&stub[off], &imm_rdi, 8); off += 8;
-                        uint64_t imm_rsi = VFORK_RELOC(cur->saved_user_rsi);
-                        stub[off++] = 0x48; stub[off++] = 0xBE; memcpy(&stub[off], &imm_rsi, 8); off += 8;
-                        uint64_t imm_rdx = VFORK_RELOC(cur->saved_user_rdx);
-                        stub[off++] = 0x48; stub[off++] = 0xBA; memcpy(&stub[off], &imm_rdx, 8); off += 8;
-                        uint64_t imm_r8 = VFORK_RELOC(cur->saved_user_r8);
-                        stub[off++] = 0x49; stub[off++] = 0xB8; memcpy(&stub[off], &imm_r8, 8); off += 8;
-                        uint64_t imm_r9 = VFORK_RELOC(cur->saved_user_r9);
-                        stub[off++] = 0x49; stub[off++] = 0xB9; memcpy(&stub[off], &imm_r9, 8); off += 8;
-                        uint64_t imm_r10 = VFORK_RELOC(cur->saved_user_r10);
-                        stub[off++] = 0x49; stub[off++] = 0xBA; memcpy(&stub[off], &imm_r10, 8); off += 8;
-                        uint64_t imm_rcx = (uint64_t)saved_rcx;
-                        stub[off++] = 0x48; stub[off++] = 0xB9; memcpy(&stub[off], &imm_rcx, 8); off += 8;
-                        uint64_t imm_r11_flags = cur->saved_user_r11;
-                        stub[off++] = 0x49; stub[off++] = 0xBB; memcpy(&stub[off], &imm_r11_flags, 8); off += 8;
-                        uint64_t imm_rbx = VFORK_RELOC(cur->saved_user_rbx);
-                        stub[off++] = 0x48; stub[off++] = 0xBB; memcpy(&stub[off], &imm_rbx, 8); off += 8;
-                        uint64_t imm_rbp = VFORK_RELOC(cur->saved_user_rbp);
-                        stub[off++] = 0x48; stub[off++] = 0xBD; memcpy(&stub[off], &imm_rbp, 8); off += 8;
-                        uint64_t imm_r12 = VFORK_RELOC(cur->saved_user_r12);
-                        stub[off++] = 0x49; stub[off++] = 0xBC; memcpy(&stub[off], &imm_r12, 8); off += 8;
-                        uint64_t imm_r13 = VFORK_RELOC(cur->saved_user_r13);
-                        stub[off++] = 0x49; stub[off++] = 0xBD; memcpy(&stub[off], &imm_r13, 8); off += 8;
-                        uint64_t imm_r14 = VFORK_RELOC(cur->saved_user_r14);
-                        stub[off++] = 0x49; stub[off++] = 0xBE; memcpy(&stub[off], &imm_r14, 8); off += 8;
-                        uint64_t imm_r15 = VFORK_RELOC(cur->saved_user_r15);
-                        stub[off++] = 0x49; stub[off++] = 0xBF; memcpy(&stub[off], &imm_r15, 8); off += 8;
-                        stub[off++] = 0x48; stub[off++] = 0x31; stub[off++] = 0xC0;
-                        uint64_t imm_rsp = (uint64_t)child_rsp;
-                        stub[off++] = 0x48; stub[off++] = 0xBC; memcpy(&stub[off], &imm_rsp, 8); off += 8;
-                        stub[off++] = 0xFF; stub[off++] = 0xE1;
-                        #undef VFORK_RELOC
-                        for (int z = off; z < (int)sizeof(stub); z++) stub[z] = 0x90;
-                        memcpy((void*)(uintptr_t)tramp, stub, off);
-                        unsigned char verify[16];
-                        memcpy(verify, (void*)(uintptr_t)tramp, sizeof(verify));
-                        child->user_rip = (uint64_t)tramp;
-                    } else {
-                        child->user_rip = saved_rcx;
-                    }
-                    child->user_stack = (uint64_t)child_rsp;
-                    child->ring = 3;
-                }
             }
-            /* Iteration 1 deep-copy fork:
-               materialize private writable pages for child mm (no COW yet). */
+            child->user_brk_base = cur->user_brk_base;
+            child->user_brk_cur = cur->user_brk_cur;
+            if (cur->user_mmap_next) child->user_mmap_next = cur->user_mmap_next;
+            child->user_mmap_hi = cur->user_mmap_hi;
+            if (user_vma_clone_for_tid((uint64_t)(cur->tid ? cur->tid : 1),
+                    (uint64_t)(child->tid ? child->tid : 1)) != 0) {
+                fork_abort_child(child, cur);
+                fork_fail = ENOSPC;
+                goto fork_finish;
+            }
+            child->user_stack_base = (uint64_t)child_slot_lo;
+            child->user_stack_limit = (uint64_t)child_stack_top;
+            child->ring = 3;
+            {
+                uintptr_t tramp = (uintptr_t)USER_VFORK_TRAMP;
+                mark_user_identity_range_2m_sys((uint64_t)(tramp & ~((uintptr_t)(PAGE_SIZE_2M - 1))),
+                    (uint64_t)((tramp & ~((uintptr_t)(PAGE_SIZE_2M - 1))) + PAGE_SIZE_2M));
+                if ((uintptr_t)tramp + 64 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                    const uintptr_t parent_lo = (uintptr_t)saved_rsp;
+                    const uintptr_t parent_hi = parent_lo + copy_bytes;
+                    #define VFORK_RELOC(val64) \
+                        fork_reloc_user_ptr((uint64_t)(val64), parent_lo, parent_hi, \
+                            (uintptr_t)child_rsp, parent_slot_lo, parent_stack_top, child_slot_lo)
+                    unsigned char stub[160];
+                    int off = 0;
+                    uint64_t imm_rdi = VFORK_RELOC(cur->saved_user_rdi);
+                    stub[off++] = 0x48; stub[off++] = 0xBF; memcpy(&stub[off], &imm_rdi, 8); off += 8;
+                    uint64_t imm_rsi = VFORK_RELOC(cur->saved_user_rsi);
+                    stub[off++] = 0x48; stub[off++] = 0xBE; memcpy(&stub[off], &imm_rsi, 8); off += 8;
+                    uint64_t imm_rdx = VFORK_RELOC(cur->saved_user_rdx);
+                    stub[off++] = 0x48; stub[off++] = 0xBA; memcpy(&stub[off], &imm_rdx, 8); off += 8;
+                    uint64_t imm_r8 = VFORK_RELOC(cur->saved_user_r8);
+                    stub[off++] = 0x49; stub[off++] = 0xB8; memcpy(&stub[off], &imm_r8, 8); off += 8;
+                    uint64_t imm_r9 = VFORK_RELOC(cur->saved_user_r9);
+                    stub[off++] = 0x49; stub[off++] = 0xB9; memcpy(&stub[off], &imm_r9, 8); off += 8;
+                    uint64_t imm_r10 = VFORK_RELOC(cur->saved_user_r10);
+                    stub[off++] = 0x49; stub[off++] = 0xBA; memcpy(&stub[off], &imm_r10, 8); off += 8;
+                    uint64_t imm_rcx = (uint64_t)saved_rcx;
+                    stub[off++] = 0x48; stub[off++] = 0xB9; memcpy(&stub[off], &imm_rcx, 8); off += 8;
+                    uint64_t imm_r11_flags = cur->saved_user_r11;
+                    stub[off++] = 0x49; stub[off++] = 0xBB; memcpy(&stub[off], &imm_r11_flags, 8); off += 8;
+                    uint64_t imm_rbx = VFORK_RELOC(cur->saved_user_rbx);
+                    stub[off++] = 0x48; stub[off++] = 0xBB; memcpy(&stub[off], &imm_rbx, 8); off += 8;
+                    uint64_t imm_rbp = VFORK_RELOC(cur->saved_user_rbp);
+                    stub[off++] = 0x48; stub[off++] = 0xBD; memcpy(&stub[off], &imm_rbp, 8); off += 8;
+                    uint64_t imm_r12 = VFORK_RELOC(cur->saved_user_r12);
+                    stub[off++] = 0x49; stub[off++] = 0xBC; memcpy(&stub[off], &imm_r12, 8); off += 8;
+                    uint64_t imm_r13 = VFORK_RELOC(cur->saved_user_r13);
+                    stub[off++] = 0x49; stub[off++] = 0xBD; memcpy(&stub[off], &imm_r13, 8); off += 8;
+                    uint64_t imm_r14 = VFORK_RELOC(cur->saved_user_r14);
+                    stub[off++] = 0x49; stub[off++] = 0xBE; memcpy(&stub[off], &imm_r14, 8); off += 8;
+                    uint64_t imm_r15 = VFORK_RELOC(cur->saved_user_r15);
+                    stub[off++] = 0x49; stub[off++] = 0xBF; memcpy(&stub[off], &imm_r15, 8); off += 8;
+                    stub[off++] = 0x48; stub[off++] = 0x31; stub[off++] = 0xC0;
+                    uint64_t imm_rsp = (uint64_t)child_rsp;
+                    stub[off++] = 0x48; stub[off++] = 0xBC; memcpy(&stub[off], &imm_rsp, 8); off += 8;
+                    stub[off++] = 0xFF; stub[off++] = 0xE1;
+                    #undef VFORK_RELOC
+                    for (int z = off; z < (int)sizeof(stub); z++) stub[z] = 0x90;
+                    memcpy((void *)(uintptr_t)tramp, stub, (size_t)off);
+                    child->user_rip = (uint64_t)tramp;
+                } else {
+                    child->user_rip = saved_rcx;
+                }
+                child->user_stack = (uint64_t)child_rsp;
+            }
             {
                 const uintptr_t base = (uintptr_t)0x00200000u;
                 uintptr_t used_end = (uintptr_t)cur->user_brk_cur;
-                /* Copy brk-backed heap only; do not use user_mmap_hi (bump cursor can be huge
-                   after mmap tests and makes fork ENOMEM). Per-VMA anon mmap is copied below. */
                 const uintptr_t min_copy_end = base + (1u * 1024u * 1024u);
                 if (used_end < min_copy_end || used_end == 0) used_end = min_copy_end;
-                /* Static/PIE images load at 0x400000; include through brk for .bss isolation. */
                 const uintptr_t img_floor = (uintptr_t)0x00400000u;
                 if (used_end < img_floor + (2u * 1024u * 1024u))
                     used_end = img_floor + (2u * 1024u * 1024u);
                 if (used_end > (uintptr_t)USER_TLS_BASE) used_end = (uintptr_t)USER_TLS_BASE;
                 if (used_end > base) {
                     if (mm_make_private_range(child->mm, (uint64_t)base, (uint64_t)used_end, 1, cur->mm) != 0) {
-                        fork_abort_child(child);
-                        return ret_err(ENOMEM);
+                        fork_abort_child(child, cur);
+                        fork_fail = ENOMEM;
+                        goto fork_finish;
                     }
                 }
                 if (user_vma_fork_privatize_mapped(child->mm, (uint64_t)(cur->tid ? cur->tid : 1)) != 0) {
-                    fork_abort_child(child);
-                    return ret_err(ENOMEM);
+                    fork_abort_child(child, cur);
+                    fork_fail = ENOMEM;
+                    goto fork_finish;
                 }
                 uintptr_t c_top = user_stack_top_for_tid_like_exec(child->tid ? child->tid : 1);
                 uintptr_t c_stack_base = (c_top - (uintptr_t)USER_STACK_SIZE) & ~0xFFFULL;
                 uintptr_t c_tls_base = c_top - (uintptr_t)USER_STACK_SIZE - (uintptr_t)USER_TLS_SIZE;
                 if (mm_make_private_range(child->mm, (uint64_t)c_stack_base, (uint64_t)c_top, 1, cur->mm) != 0) {
-                    fork_abort_child(child);
-                    return ret_err(ENOMEM);
+                    fork_abort_child(child, cur);
+                    fork_fail = ENOMEM;
+                    goto fork_finish;
                 }
                 if (mm_make_private_range(child->mm, (uint64_t)c_tls_base, (uint64_t)(c_tls_base + 0x3000u), 1, cur->mm) != 0) {
-                    fork_abort_child(child);
-                    return ret_err(ENOMEM);
+                    fork_abort_child(child, cur);
+                    fork_fail = ENOMEM;
+                    goto fork_finish;
                 }
-                if (mm_make_private_range(child->mm, (uint64_t)USER_VFORK_TRAMP, (uint64_t)(USER_VFORK_TRAMP + 0x1000u), 1, cur->mm) != 0) {
-                    fork_abort_child(child);
-                    return ret_err(ENOMEM);
+                if (mm_make_private_range(child->mm, (uint64_t)USER_VFORK_TRAMP,
+                        (uint64_t)(USER_VFORK_TRAMP + 0x1000u), 1, cur->mm) != 0) {
+                    fork_abort_child(child, cur);
+                    fork_fail = ENOMEM;
+                    goto fork_finish;
                 }
             }
-            /* Retain parent mm for mm_make_private_range COW table splits (e.g. exec); cleared in elf enter_user_mode. */
             if (child->mm_ptemplate)
                 mm_release(child->mm_ptemplate);
             child->mm_ptemplate = mm_retain(cur->mm);
-            /* inherit credentials */
             child->uid = cur->uid;
             child->euid = cur->euid;
             child->suid = cur->suid;
@@ -7467,16 +7510,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             child->egid = cur->egid;
             child->sgid = cur->sgid;
             child->attached_tty = cur->attached_tty;
-            /* Keep child->user_fs_base from the fork child TLS setup above.
-               Overwriting it with parent's FS base breaks child's TLS context. */
-            /* inherit job control + parent */
             child->parent_tid = (int)(cur->tid ? cur->tid : 1);
             child->sid = cur->sid;
             child->pgid = cur->pgid;
-            /* copy cwd */
-            strncpy(child->cwd, cur->cwd, sizeof(child->cwd)-1);
-            child->cwd[sizeof(child->cwd)-1] = '\0';
-            /* duplicate file descriptors (increase refcounts) */
+            strncpy(child->cwd, cur->cwd, sizeof(child->cwd) - 1);
+            child->cwd[sizeof(child->cwd) - 1] = '\0';
             for (int i = 0; i < THREAD_MAX_FD; i++) {
                 child->fds[i] = cur->fds[i];
                 if (child->fds[i]) {
@@ -7484,10 +7522,13 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     else child->fds[i]->refcount++;
                 }
             }
-            /* now allow child to run */
             thread_unblock((int)(child->tid ? child->tid : 1));
-            /* child is ready, return child's pid to parent */
-            return (uint64_t)(child->tid ? child->tid : 1);
+            rebuild_syscall_frame(cur);
+            fork_ret = (uint64_t)(child->tid ? child->tid : 1);
+fork_finish:
+            release_irqrestore(&fork_syscall_cli_lock, fork_irqf);
+            if (fork_fail) return ret_err(fork_fail);
+            return fork_ret;
         }
         case SYS_wait4: {
             /* waitpid(pid, status*, options, rusage*) minimal implementation
@@ -7578,7 +7619,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     return 0;
                 }
                 /* block current thread and set waiter on child */
-                found->waiter_tid = (int)tcur->tid;
+                found->waiter_tid = (int)(tcur->tid ? tcur->tid : 1);
                 /* Unconditional marker when we really block in wait4. */
                 qemu_debug_printf("wait4: block parent=%llu name=%s child=%llu child_state=%d\n",
                     (unsigned long long)(tcur->tid ? tcur->tid : 1),
@@ -7586,7 +7627,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     (unsigned long long)(found->tid ? found->tid : 1),
                     (int)found->state);
                 /* block current and yield */
-                thread_block((int)tcur->tid);
+                thread_block((int)(tcur->tid ? tcur->tid : 1));
                 thread_yield();
                 /* when unblocked, loop to check again */
             }
@@ -7610,12 +7651,18 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 TCSETS    = 0x5402,
                 TCSETSW   = 0x5403,
                 TCSETSF   = 0x5404,
+                TCFLSH    = 0x540B, /* tcflush(3): arg is TCIFLUSH/TCOFLUSH/TCIOFLUSH */
                 TIOCSTI   = 0x5412, /* inject byte into tty input queue (terminal ioctls) */
+                TIOCGSID  = 0x5429, /* tcgetsid(3) */
+                TIOCNOTTY = 0x5421, /* drop controlling tty (getty after setsid) */
                 TIOCSCTTY = 0x540E,
                 TIOCGPGRP = 0x540F,
                 TIOCSPGRP = 0x5410,
                 TIOCGWINSZ= 0x5413,
                 TIOCSWINSZ= 0x5414,
+                TIOCMGET  = 0x5415,
+                TIOCMBIS  = 0x5416,
+                TIOCMBIC  = 0x5417,
                 /* Linux block ioctls commonly used by mkfs/mount utilities */
                 BLKGETSIZE   = 0x1260,       /* get device size in 512-byte sectors (unsigned long*) */
                 BLKSSZGET    = 0x1268,       /* get logical sector size (int*) */
@@ -7771,6 +7818,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (cur_sid >= 0 && cur_sid != curth->sid) return ret_err(EPERM);
                 devfs_tty_attach_thread(f, curth);
                 devfs_set_tty_controlling_sid(f, curth->sid);
+                {
+                    int tty_idx = devfs_get_tty_index_from_file(f);
+                    if (tty_idx >= 0 && curth->pgid >= 0)
+                        devfs_set_tty_fg_pgrp(tty_idx, curth->pgid);
+                }
                 return 0;
             }
             if (req == TIOCGPGRP) {
@@ -7794,24 +7846,64 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 return 0;
             }
+            if (req == TCFLSH) {
+                if (!devfs_is_tty_file(f)) return ret_err(ENOTTY);
+                int tty_idx = devfs_get_tty_index_from_file(f);
+                if (tty_idx < 0) return ret_err(ENOTTY);
+                (void)tty_idx;
+                (void)argp;
+                return 0;
+            }
+            if (req == TIOCNOTTY) {
+                if (!devfs_is_tty_file(f)) return ret_err(ENOTTY);
+                thread_t *ct = thread_current();
+                if (ct) {
+                    int tty_idx = devfs_get_tty_index_from_file(f);
+                    if (tty_idx >= 0 && ct->attached_tty == tty_idx)
+                        ct->attached_tty = -1;
+                    if (tty_idx >= 0 && devfs_get_tty_by_index(tty_idx) &&
+                        devfs_get_tty_by_index(tty_idx)->controlling_sid == ct->sid)
+                        devfs_get_tty_by_index(tty_idx)->controlling_sid = -1;
+                }
+                return 0;
+            }
+            if (req == TIOCGSID) {
+                if (!argp) return ret_err(EFAULT);
+                if (!devfs_is_tty_file(f)) return ret_err(ENOTTY);
+                thread_t *ct = thread_current();
+                int sid = (ct && ct->sid >= 0) ? ct->sid : 0;
+                if (copy_to_user_safe(argp, &sid, sizeof(sid)) != 0) return ret_err(EFAULT);
+                return 0;
+            }
+            if (req == TIOCMGET) {
+                if (!argp) return ret_err(EFAULT);
+                if (!devfs_is_tty_file(f)) return ret_err(ENOTTY);
+                /* Virtual consoles: report carrier present so getty proceeds without -L. */
+                int bits = (int)(0x40u | 0x100u | 0x04u); /* CAR|DSR|LE */
+                if (copy_to_user_safe(argp, &bits, sizeof(bits)) != 0) return ret_err(EFAULT);
+                return 0;
+            }
+            if (req == TIOCMBIS || req == TIOCMBIC) {
+                if (!devfs_is_tty_file(f)) return ret_err(ENOTTY);
+                return 0;
+            }
             if (req == TCGETS) {
                 if (!argp) return ret_err(EFAULT);
                 struct termios_k tio;
                 memset(&tio, 0, sizeof(tio));
-                /* A very typical cooked tty: ICANON|ECHO|ISIG, ICRNL, OPOST */
-                tio.c_iflag = 0x00000100u /* ICRNL */ | 0x00000010u /* IXON-ish placeholder */;
+                tio.c_iflag = 0x00000100u /* ICRNL */;
                 tio.c_oflag = 0x00000001u /* OPOST */;
-                tio.c_cflag = 0x000000B0u; /* 8N1-ish placeholder */
+                tio.c_cflag = 0x00000CB7u; /* CS8|CREAD|CLOCAL */
                 tio.c_lflag = 0x00000002u /* ICANON */ | 0x00000008u /* ECHO */ | 0x00000001u /* ISIG */;
-                tio.c_line = 0;
-                /* VMIN/VTIME positions differ across ABIs; leave c_cc[] zeroed */
+                if (devfs_is_tty_file(f)) {
+                    struct devfs_tty *tty = devfs_get_tty_by_index(devfs_get_tty_index_from_file(f));
+                    if (tty && tty->term_lflag)
+                        tio.c_lflag = tty->term_lflag;
+                }
                 tio.c_ispeed = 9600;
                 tio.c_ospeed = 9600;
-                /* IMPORTANT:
-                   libc implementations don't all agree on sizeof(struct termios) (NCCS differs).
-                   If userspace allocated a smaller object on stack and we blindly copy a bigger
-                   struct, we'd overwrite the stack canary and trigger "*** stack smashing detected ***".
-                   To be safe, copy only the fixed header part (flags) which is enough for isatty/setup. */
+                /* Never copy full struct termios to userspace: NCCS differs (BusyBox vs glibc)
+                 * and a 60-byte write clobbers the stack canary -> "stack smashing detected". */
                 size_t safe_sz = 32;
                 if (safe_sz > sizeof(tio)) safe_sz = sizeof(tio);
                 if (copy_to_user_safe(argp, &tio, safe_sz) != 0) return ret_err(EFAULT);
@@ -8032,38 +8124,32 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (!devfs_is_tty_file(f)) {
                 return ret_err(ENOTTY);
             }
-            if (req == 0x5606) { /* VT_ACTIVATE: arg is VT number (1-based) passed as value, not pointer */
-                int vt = (int)(uintptr_t)argp;
-                if (vt >= 1 && vt <= 6) { /* DEVFS_TTY_COUNT=6; Linux VTs are 1-based */
+            if (req == 0x5606) { /* VT_ACTIVATE: BusyBox passes vt as value; glibc may pass int* */
+                int vt = -1;
+                uintptr_t ua = (uintptr_t)argp;
+                if (ua >= 1 && ua <= (uintptr_t)DEVFS_TTY_COUNT)
+                    vt = (int)ua;
+                else if (argp && user_range_ok(argp, sizeof(int))) {
+                    if (copy_from_user_raw(&vt, argp, sizeof(vt)) != 0)
+                        return ret_err(EFAULT);
+                } else
+                    return ret_err(EFAULT);
+                if (vt >= 1 && vt <= DEVFS_TTY_COUNT) {
                     devfs_switch_tty(vt - 1);
                     return 0;
                 }
                 return ret_err(ENOTTY);
             }
-            if (req == 0x5607) { /* VT_WAITACTIVE: arg is VT number; we switch synchronously, no-op */
+            if (req == 0x5607) { /* VT_WAITACTIVE: VT_ACTIVATE is synchronous */
                 (void)argp;
                 return 0;
             }
             if (req == TCSETS || req == TCSETSW || req == TCSETSF) {
-                /* Apply minimal termios flags to the underlying tty: read c_lflag and store it */
                 if (!argp) return ret_err(EFAULT);
-                struct termios_k {
-                    uint32_t c_iflag;
-                    uint32_t c_oflag;
-                    uint32_t c_cflag;
-                    uint32_t c_lflag;
-                    uint32_t c_line;
-                    uint8_t  c_cc[8];
-                    uint32_t c_ispeed;
-                    uint32_t c_ospeed;
-                } tio;
-                size_t need = sizeof(uint32_t) * 4; /* at least up to c_lflag */
+                struct termios_k tio;
+                size_t need = sizeof(uint32_t) * 4;
                 if (copy_from_user_raw(&tio, argp, need) != 0) return ret_err(EFAULT);
-                /* map fd to tty and set flags */
-                if (!f) return ret_err(ENOTTY);
-                /* ensure this file is a tty */
                 if (!devfs_is_tty_file(f)) return ret_err(ENOTTY);
-                /* Resolve file -> tty index safely (driver_private may be a marker) */
                 int tty_idx = devfs_get_tty_index_from_file(f);
                 if (tty_idx < 0) return ret_err(ENOTTY);
                 struct devfs_tty *tty = devfs_get_tty_by_index(tty_idx);
@@ -9335,12 +9421,35 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             return (uint64_t)wrote;
         }
         case SYS_arch_prctl: {
-            /* Linux x86_64 arch_prctl */
-            const uint64_t code = a1;
-            const uint64_t addr = a2;
+            /* Linux x86_64 arch_prctl(code, addr) — rdi=code, rsi=addr */
             enum { ARCH_SET_GS = 0x1001, ARCH_SET_FS = 0x1002, ARCH_GET_FS = 0x1003, ARCH_GET_GS = 0x1004 };
-            if (code == ARCH_SET_FS) {
-                if (addr >= (uint64_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
+            uint64_t code = a1;
+            uint64_t addr = a2;
+            /* Defensive: some callers have been seen with code/addr swapped. */
+            if (code >= 0x200000ULL && code < (uint64_t)USER_STACK_TOP &&
+                (addr == ARCH_SET_FS || addr == ARCH_SET_GS || addr == ARCH_GET_FS || addr == ARCH_GET_GS)) {
+                uint64_t t = code;
+                code = addr;
+                addr = t;
+            }
+            if (code == ARCH_SET_FS || code == ARCH_SET_GS) {
+                if (code == ARCH_SET_GS)
+                    code = ARCH_SET_FS;
+                if (addr < 0x200000ULL || addr >= (uint64_t)USER_STACK_TOP) {
+                    kprintf("arch_prctl SET_FS: bad addr=0x%llx\n", (unsigned long long)addr);
+                    return ret_err(EFAULT);
+                }
+                {
+                    uint64_t map_lo = addr & ~((uint64_t)PAGE_SIZE_2M - 1);
+                    uint64_t map_hi = (addr + 0x4000ULL + PAGE_SIZE_2M - 1) & ~((uint64_t)PAGE_SIZE_2M - 1);
+                    if (map_hi > (uint64_t)USER_STACK_TOP) map_hi = (uint64_t)USER_STACK_TOP;
+                    if (user_map_ensure_present_us_2m(map_lo, map_hi) != 0) {
+                        kprintf("arch_prctl SET_FS: map fail addr=0x%llx lo=0x%llx hi=0x%llx\n",
+                            (unsigned long long)addr,
+                            (unsigned long long)map_lo, (unsigned long long)map_hi);
+                        return ret_err(EFAULT);
+                    }
+                }
                 /* Fix for early "stack smashing detected" in glibc:
                    If userspace executed stack-protected frames BEFORE TLS (FS base) was set,
                    then changing FS base later makes the epilogue compare against a different
@@ -9356,20 +9465,28 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
 
                 cur->user_fs_base = addr;
-                msr_write_u64(MSR_FS_BASE, addr);
+                set_user_fs_base(addr);
 
-                if (addr + 0x30 < (uint64_t)MMIO_IDENTITY_LIMIT) {
+                if (addr + 0x30 <= (uint64_t)USER_STACK_TOP) {
                     (void)copy_to_user_safe((void *)(uintptr_t)(addr + 0x28), &old_guard, sizeof(old_guard));
                 }
                 return 0;
             } else if (code == ARCH_GET_FS) {
-                if (addr >= (uint64_t)MMIO_IDENTITY_LIMIT) return ret_err(EFAULT);
-                if (copy_to_user_safe((void *)(uintptr_t)addr, &cur->user_fs_base, sizeof(cur->user_fs_base)) != 0)
+                if (addr < 0x200000ULL || addr >= (uint64_t)MMIO_IDENTITY_LIMIT) {
+                    kprintf("arch_prctl GET_FS: bad addr=0x%llx\n", (unsigned long long)addr);
                     return ret_err(EFAULT);
+                }
+                if (copy_to_user_safe((void *)(uintptr_t)addr, &cur->user_fs_base, sizeof(cur->user_fs_base)) != 0) {
+                    kprintf("arch_prctl GET_FS: copy fail addr=0x%llx\n", (unsigned long long)addr);
+                    return ret_err(EFAULT);
+                }
                 return 0;
-            } else if (code == ARCH_SET_GS || code == ARCH_GET_GS) {
+            } else if (code == ARCH_GET_GS) {
+                kprintf("arch_prctl GET_GS: ENOSYS\n");
                 return ret_err(ENOSYS);
             }
+            kprintf("arch_prctl: EINVAL code=0x%llx addr=0x%llx\n",
+                (unsigned long long)code, (unsigned long long)addr);
             return ret_err(EINVAL);
         }
         case SYS_mount: {
@@ -9788,6 +9905,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             cur->waiter_tid);
                     }
                     thread_unblock(cur->waiter_tid);
+                    thread_schedule();
                 }
                 /* glibc pthread_join waits on clear_child_tid; write 0 and FUTEX_WAKE so parent wakes */
                 if (cur->clear_child_tid != 0 && cur->clear_child_tid < (uint64_t)MMIO_IDENTITY_LIMIT - 4) {

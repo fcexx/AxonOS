@@ -9,6 +9,7 @@
 #include <paging.h>
 #include <string.h>
 #include <thread.h>
+#include <axonos.h>
 
 extern void kprintf(const char *fmt, ...);
 
@@ -34,10 +35,14 @@ int fault_try_grow_user_heap(uint64_t cr2) {
     uintptr_t brk_cur = tcur->user_brk_cur;
     if (brk_base == 0) brk_base = brk_cur = 8u * 1024u * 1024u;
     uintptr_t top_limit = user_as_mmap_brk_top_limit(tcur);
-    uintptr_t heap_lo = (uintptr_t)heap_base_addr();
-    if (heap_lo > brk_base && heap_lo < top_limit) {
-        uintptr_t guard = 0x10000u;
-        top_limit = (heap_lo > guard) ? (heap_lo - guard) : heap_lo;
+    {
+        uintptr_t heap_lo = (uintptr_t)heap_base_addr();
+        if (heap_lo > 0x200000u && heap_lo < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+            uintptr_t guard = 0x20000u;
+            uintptr_t heap_cap = (heap_lo > guard) ? (heap_lo - guard) : heap_lo;
+            if (heap_cap < top_limit)
+                top_limit = heap_cap;
+        }
     }
     {
         uintptr_t mmap_lo = user_vma_min_mmap_like_for_thread(tcur, brk_base);
@@ -53,11 +58,11 @@ int fault_try_grow_user_heap(uint64_t cr2) {
     uintptr_t old_brk = brk_cur;
     uintptr_t new_brk = page_va + PAGE_SIZE_2M;
     if (old_brk < page_va) old_brk = page_va;
-    if (new_brk > old_brk)
-        memset((void *)old_brk, 0, (size_t)(new_brk - old_brk));
     if (new_brk > brk_cur)
         tcur->user_brk_cur = new_brk;
     user_as_shared_publish_brk(tcur, tcur->user_brk_base, tcur->user_brk_cur);
+    if (new_brk > old_brk && !user_as_mmap_overlaps_kernel_heap(old_brk, (uintptr_t)(new_brk - old_brk)))
+        user_as_mmap_memset_zero_chunked(old_brk, (size_t)(new_brk - old_brk));
     if (user_brk_watch(tcur)) {
         kprintf("heap-grow: pid=%s cr2=0x%llx page=0x%llx old_brk=0x%llx new_brk=0x%llx\n",
             tcur->name, (unsigned long long)cr2, (unsigned long long)page_va,
@@ -94,9 +99,11 @@ uint64_t user_syscall_brk(uint64_t req) {
     uintptr_t top_limit = user_as_mmap_brk_top_limit(tcur);
     {
         uintptr_t heap_lo = (uintptr_t)heap_base_addr();
-        if (heap_lo > *p_base && heap_lo < top_limit) {
-            uintptr_t guard = 0x10000u;
-            top_limit = (heap_lo > guard) ? (heap_lo - guard) : heap_lo;
+        if (heap_lo > 0x200000u && heap_lo < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+            uintptr_t guard = 0x20000u;
+            uintptr_t heap_cap = (heap_lo > guard) ? (heap_lo - guard) : heap_lo;
+            if (heap_cap < top_limit)
+                top_limit = heap_cap;
         }
     }
     {
@@ -104,11 +111,33 @@ uint64_t user_syscall_brk(uint64_t req) {
         if (mmap_lo < (uintptr_t)MMIO_IDENTITY_LIMIT && mmap_lo > *p_base && mmap_lo < top_limit)
             top_limit = mmap_lo;
     }
+    {
+        uintptr_t rsp = (uintptr_t)syscall_user_rsp_saved;
+        if (rsp >= 0x200000u && rsp < top_limit) {
+            uintptr_t rsp_cap = (rsp > 0x40000u) ? (rsp - 0x40000u) : 0x200000u;
+            if (rsp_cap < top_limit)
+                top_limit = rsp_cap;
+        }
+    }
     if (req < *p_base || req >= top_limit) return (uint64_t)(*p_cur);
     if (req > *p_cur) {
-        if (user_map_mark_identity_2m((uint64_t)(*p_cur), (uint64_t)req) != 0)
+        if (tcur && user_as_mmap_overlaps_user_stack(tcur, (uintptr_t)(*p_cur),
+                (uintptr_t)(req - *p_cur), NULL)) {
+            kprintf("brk: refuse grow through stack cur=0x%llx req=0x%llx rsp=0x%llx stk=[0x%llx..0x%llx]\n",
+                (unsigned long long)*p_cur, (unsigned long long)req,
+                (unsigned long long)(uint64_t)syscall_user_rsp_saved,
+                (unsigned long long)tcur->user_stack_base,
+                (unsigned long long)tcur->user_stack_limit);
             return (uint64_t)(*p_cur);
-        memset((void *)(*p_cur), 0, req - (*p_cur));
+        }
+        if (user_map_ensure_present_us_2m((uint64_t)(*p_cur), (uint64_t)req) != 0)
+            return (uint64_t)(*p_cur);
+        if (tcur && user_as_mmap_overlaps_user_stack(tcur, (uintptr_t)(*p_cur),
+                (uintptr_t)(req - *p_cur), NULL))
+            return (uint64_t)(*p_cur);
+        if (user_as_mmap_overlaps_kernel_heap((uintptr_t)(*p_cur), (uintptr_t)(req - *p_cur)))
+            return (uint64_t)(*p_cur);
+        user_as_mmap_memset_zero_chunked((uintptr_t)(*p_cur), (size_t)(req - *p_cur));
     }
     *p_cur = (uintptr_t)req;
     user_as_shared_publish_brk(tcur, *p_base, *p_cur);

@@ -97,6 +97,20 @@ int user_map_mprotect_range(uint64_t va_begin, uint64_t va_end, int prot) {
     return 0;
 }
 
+int user_map_ensure_present_us_2m(uint64_t va_begin, uint64_t va_end) {
+    if (va_end < va_begin) return -1;
+    if (va_begin >= (uint64_t)MMIO_IDENTITY_LIMIT) return -1;
+    if (va_end > (uint64_t)MMIO_IDENTITY_LIMIT) va_end = (uint64_t)MMIO_IDENTITY_LIMIT;
+    uint64_t begin = va_begin & ~((uint64_t)(PAGE_SIZE_2M - 1));
+    uint64_t end = (va_end + PAGE_SIZE_2M - 1) & ~((uint64_t)(PAGE_SIZE_2M - 1));
+    if (begin >= end) return -1;
+    for (uint64_t va = begin; va < end; va += PAGE_SIZE_2M) {
+        if (map_page_2m(va, va, PG_PRESENT | PG_RW | PG_US) != 0)
+            return -1;
+    }
+    return 0;
+}
+
 int user_map_mark_identity_2m(uint64_t va_begin, uint64_t va_end) {
     if (va_end < va_begin) return -1;
     uint64_t cr3 = paging_read_cr3();
@@ -118,6 +132,8 @@ int user_map_mark_identity_2m(uint64_t va_begin, uint64_t va_end) {
         l3[l3i] &= ~PG_NX;
         uint64_t l3e = l3[l3i];
         if (l3e & PG_PS_2M) {
+            l3[l3i] |= PG_US | PG_RW;
+            l3[l3i] &= ~PG_NX;
             invlpg((void *)(uintptr_t)va);
             continue;
         }
@@ -127,6 +143,7 @@ int user_map_mark_identity_2m(uint64_t va_begin, uint64_t va_end) {
         l2[l2i] &= ~PG_NX;
         uint64_t l2e = l2[l2i];
         if (l2e & PG_PS_2M) {
+            l2[l2i] = (l2e | PG_US | PG_RW) & ~PG_NX;
             invlpg((void *)(uintptr_t)va);
             continue;
         }
