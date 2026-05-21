@@ -1,6 +1,6 @@
 <div align="center">
 
-# AXON OS
+<img src="https://capsule-render.vercel.app/api?type=waving&color=6C63FF&height=180&section=header&text=AXON%20OS&fontSize=48&fontColor=ffffff&animation=fadeIn"/>
 
 ### The operating system built for speed, simplicity and full control.
 
@@ -12,8 +12,6 @@
 <img src="https://img.shields.io/badge/Platform-x86__64-7B68EE?style=for-the-badge">
 <img src="https://img.shields.io/badge/Made%20with-C%20%2F%20ASM-9D4EDD?style=for-the-badge">
 </p>
-
-<img src="https://capsule-render.vercel.app/api?type=waving&color=6C63FF&height=180&section=header&text=AXON%20OS&fontSize=48&fontColor=ffffff&animation=fadeIn"/>
 
 <a href="https://axont.ru">
 <img src="https://readme-typing-svg.herokuapp.com?font=Orbitron&size=28&duration=3000&color=6C63FF&center=true&vCenter=true&width=700&lines=Visit+AXON+OS+Official+Website;axont.ru">
