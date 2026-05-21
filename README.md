@@ -6,7 +6,6 @@
 
 <p align="center">
 <img src="https://img.shields.io/github/stars/fcexx/AxonOS?style=for-the-badge&color=6C63FF">
-<img src="https://img.shields.io/github/issues/fcexx/AxonOS?style=for-the-badge&color=9D4EDD">
 <img src="https://img.shields.io/github/issues-pr/fcexx/AxonOS?style=for-the-badge&color=C77DFF">
 <img src="https://img.shields.io/github/license/fcexx/AxonOS?style=for-the-badge&color=5D3FD3">
 <img src="https://img.shields.io/github/last-commit/fcexx/AxonOS?style=for-the-badge&color=836FFF">
