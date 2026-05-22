@@ -72,7 +72,7 @@ void heap_init(uintptr_t heap_start, size_t heap_size) {
         heap_start = base;
     }
     if (heap_size == 0) {
-        // Default size: 512 MiB (increase to support very large initfs/modules)
+        /* Fallback when kernel_main does not pass a size; use available RAM if known. */
         heap_size = 512ULL * 1024 * 1024;
     }
 
@@ -364,6 +364,22 @@ void* kcalloc(size_t num, size_t size) {
 size_t heap_total_bytes(void) { return heap_capacity; }
 size_t heap_used_bytes(void)  { return heap_used_now; }
 size_t heap_peak_bytes(void)  { return heap_peak; }
+
+size_t heap_free_bytes(void) {
+    unsigned long flags = 0;
+    acquire_irqsave(&heap_lock, &flags);
+    size_t n = heap_total_free_bytes();
+    release_irqrestore(&heap_lock, flags);
+    return n;
+}
+
+size_t heap_largest_free(void) {
+    unsigned long flags = 0;
+    acquire_irqsave(&heap_lock, &flags);
+    size_t n = heap_largest_free_block();
+    release_irqrestore(&heap_lock, flags);
+    return n;
+}
 
 uintptr_t heap_base_addr(void) { return (uintptr_t)heap_base; }
 

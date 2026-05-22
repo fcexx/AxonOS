@@ -126,6 +126,8 @@ typedef struct thread {
         uint64_t saved_sig_mask;
         /* if non-negative, tid of thread waiting for this child (wait/waitpid) */
         int waiter_tid;
+        /* fork/clone3: unblock child after parent syscall returns (avoid clobbering per-CPU syscall stack). */
+        int defer_unblock_tid;
         
         /* exit status encoded like wait(2) returns (status word) */
         int exit_status;

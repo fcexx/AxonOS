@@ -259,7 +259,7 @@ int user_vma_fork_privatize_mapped(mm_t *child_mm, uint64_t from_tid) {
             rc = -1;
             break;
         }
-        if (mm_make_private_range(child_mm, (uint64_t)a, (uint64_t)e, 1, NULL) != 0) {
+        if (mm_cow_private_writable(child_mm, (uint64_t)a, (uint64_t)e) != 0) {
             rc = -1;
             break;
         }

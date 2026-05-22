@@ -15,6 +15,8 @@ void* kcalloc(size_t num, size_t size);
 size_t heap_total_bytes(void);
 size_t heap_used_bytes(void);
 size_t heap_peak_bytes(void);
+size_t heap_free_bytes(void);
+size_t heap_largest_free(void);
 
 /* Base virtual/physical address where the kernel heap starts (identity mapped). */
 uintptr_t heap_base_addr(void);

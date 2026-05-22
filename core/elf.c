@@ -525,8 +525,9 @@ int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk
        We do not implement dynamic linking (PT_INTERP) nor relocation processing for PIE/ET_DYN yet.
        Loading ET_DYN images without relocations commonly crashes immediately (NULL/GOT derefs).
        Return a distinct error so execve can translate it to ENOEXEC instead of letting userspace fault. */
-    if (eh.e_type == 3) {
-        qemu_debug_printf("elf: refusing ET_DYN (PIE) without relocations: %s\n", path ? path : "(null)");
+    if (eh.e_type != 2) {
+        qemu_debug_printf("elf: refusing non-ET_EXEC e_type=%u: %s\n",
+            (unsigned)eh.e_type, path ? path : "(null)");
         fs_file_free(f);
         return -2;
     }
@@ -761,9 +762,8 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
 
     uintptr_t stack_top = user_stack_top_for_tid(target_tid);
     stack_top &= ~((uintptr_t)0xFULL);
-    uintptr_t final_stack = (stack_top - total - 8u) & ~((uintptr_t)0xFULL);
-    while ((final_stack & 0xFULL) != 8u)
-        final_stack -= 8u;
+    /* RSP ≡ 0 (mod 16) at process start; crt0 call chains keep 16-byte alignment in nested C functions. */
+    uintptr_t final_stack = (stack_top - total) & ~((uintptr_t)0xFULL);
     uintptr_t ptrs_addr = final_stack + 8u;
     uintptr_t base = ptrs_addr;
     uintptr_t strings_addr = base + ptrs_bytes;
@@ -917,6 +917,8 @@ static int try_exec_shebang(const char *resolved_path,
 
 int kernel_execve_from_path(const char *path, const char *const argv[], const char *const envp[]) {
     if (!path) return -1;
+    if (strstr(path, "ld-linux") || strstr(path, "ld-musl"))
+        return -2;
     /* IMPORTANT:
        Symlinks are resolved by VFS (`fs_open()` does it via `fs_resolve_symlinks()`).
        Do NOT attempt to "readlink" via fs_open() here, because that would read the
@@ -1055,11 +1057,8 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     uintptr_t stack_top = user_stack_top_for_tid(planned_tid);
     stack_top &= ~((uintptr_t)0xFULL);
 
-    /* SysV: argc at RSP; argv at RSP+8. Align argv block to 16B so RSP in main (after
-       crt0 call) is 16-byte aligned — axon-harness checks (rsp & 0xF) == 0 in main(). */
-    uintptr_t final_stack = (stack_top - total - 8u) & ~((uintptr_t)0xFULL);
-    while ((final_stack & 0xFULL) != 8u)
-        final_stack -= 8u;
+    /* RSP ≡ 0 (mod 16) at process start; crt0 call chains keep 16-byte alignment in nested C functions. */
+    uintptr_t final_stack = (stack_top - total) & ~((uintptr_t)0xFULL);
     uintptr_t ptrs_addr = final_stack + 8u;
     uintptr_t base = ptrs_addr;
 

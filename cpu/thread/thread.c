@@ -15,6 +15,12 @@
 #include <exec.h>
 #include <spinlock.h>
 #include <smp.h>
+#include <fs.h>
+#include <stdio.h>
+
+#ifndef AXON_FORK_DEBUG
+#define AXON_FORK_DEBUG 1
+#endif
 
 #define MAX_THREADS 128
 thread_t* threads[MAX_THREADS];
@@ -312,6 +318,7 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->saved_user_r11 = 0;
         t->saved_user_rcx = 0;
         t->saved_syscall_frame = NULL;
+        t->defer_unblock_tid = -1;
         t->uaccess_begin = 0;
         t->uaccess_end = 0;
         t->uaccess_resume_rip = 0;
@@ -440,6 +447,7 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         t->saved_user_r11 = 0;
         t->saved_user_rcx = 0;
         t->saved_syscall_frame = NULL;
+        t->defer_unblock_tid = -1;
         t->uaccess_begin = 0;
         t->uaccess_end = 0;
         t->uaccess_resume_rip = 0;
@@ -473,6 +481,20 @@ void user_thread_entry(void) {
 	if (!self) {
 		for (;;) asm volatile("hlt");
 	}
+#if AXON_FORK_DEBUG
+	{
+		uint64_t cr3 = paging_read_cr3();
+		uint64_t mm_cr3 = (self->mm && self->mm->cr3) ? self->mm->cr3 : 0;
+		axon_user_dbg(self, "user-entry", 0, "start",
+			(unsigned long long)(self->tid ? self->tid : 0),
+			(unsigned long long)self->user_rip,
+			(unsigned long long)self->user_stack);
+		axon_user_dbg(self, "user-entry", 1, "mm",
+			(unsigned long long)cr3,
+			(unsigned long long)mm_cr3,
+			(unsigned long long)self->user_fs_base);
+	}
+#endif
 	// mark as user thread
 	self->ring = 3;
 	thread_set_current_user(self);

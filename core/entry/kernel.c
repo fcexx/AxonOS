@@ -277,6 +277,12 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
            simple identity-mapped arena; if we size it past RAM we will scribble
            into non-existent memory and get "random" initfs extraction failures. */
         size_t heap_size = 0;
+        size_t initrd_sz = 0;
+        if (axon_boot_params_phys) {
+            uintptr_t rd_st = 0;
+            if (linux_bootparams_ramdisk((const void *)(uintptr_t)axon_boot_params_phys, &rd_st, &initrd_sz) != 0)
+                initrd_sz = 0;
+        }
         int ram_mb = sysinfo_ram_mb();
         if (ram_mb > 0) {
             uint64_t ram_bytes = (uint64_t)ram_mb * 1024ULL * 1024ULL;
@@ -284,8 +290,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             const uint64_t guard = 4ULL * 1024ULL * 1024ULL; /* 4 MiB (was 8) — more heap for VMware/low-RAM */
             if (ram_bytes > start + guard + (16ULL * 1024ULL * 1024ULL)) {
                 uint64_t max = ram_bytes - start - guard;
-                const uint64_t cap = 512ULL * 1024ULL * 1024ULL;
-                if (max > cap) max = cap;
                 heap_size = (size_t)max;
             }
         }
@@ -297,6 +301,10 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         }
         if (heap_size == 0)
             heap_size = 64ULL * 1024ULL * 1024ULL; /* safe default when RAM unknown */
+        if (initrd_sz > 0 && (uint64_t)heap_size < (uint64_t)initrd_sz + (32ULL * 1024ULL * 1024ULL))
+            kprintf("warning: heap %llu MiB may be too small for initfs %llu MiB — increase VM RAM\n",
+                    (unsigned long long)(heap_size / (1024ULL * 1024ULL)),
+                    (unsigned long long)(initrd_sz / (1024ULL * 1024ULL)));
         /* Identity-mapped heap must not cover user TLS/stack (USER_TLS_BASE..USER_STACK_TOP).
            Otherwise kmalloc's arena overlaps userspace and mmap cannot use the gap without
            clobbering heap metadata — wget/glibc then hit mmap ENOMEM and corrupt malloc. */
