@@ -32,8 +32,12 @@ void pit_handler(cpu_registers_t* regs) {
                 loadavg_second_tick();
 
         if (!init) return;
-        /* То же правило, что и для APIC: не планируем из IRQ, пришедшего из ring3. */
-        if (regs && ((regs->cs & 3) == 3)) return;
+        /* Avoid full schedule from ring-3 IRQ on SMP; on UP, yield spinners when others wait. */
+        if (regs && ((regs->cs & 3) == 3)) {
+                if (smp_cpu_count() <= 1)
+                        thread_ring3_preempt_if_waiters();
+                return;
+        }
         
         /* SMP: never thread_schedule() from IRQ — nested scheduler + sched_lock corrupts state.
            Idle loops + IPI wake other CPUs; BSP is driven by syscalls/yield. */

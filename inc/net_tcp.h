@@ -22,6 +22,7 @@ typedef struct {
 typedef struct {
     int used;
     int established;
+    int connect_pending; /* nonblocking connect: SYN sent, awaiting SYN-ACK */
     int peer_fin;
     uint32_t dst_ip_be;
     uint16_t dst_port;
@@ -32,10 +33,19 @@ typedef struct {
     /* Bigger receive window for HTTP downloads; 8 KiB caused frequent sender stalls. */
     uint8_t rx_buf[65536];
     size_t rx_len;
+    /* One out-of-order segment (reordering after ~15 KiB was stalling wget). */
+    uint8_t ooo_buf[2048];
+    size_t ooo_len;
+    uint32_t ooo_seq;
+    int ooo_valid;
 } net_tcp_conn_t;
 
 int net_tcp_connect(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t dst_ip_be, uint16_t dst_port, uint16_t src_port, uint32_t timeout_ms);
+/* Finish connect_pending (0=established, -1=still pending, -2=failed/timeout). */
+int net_tcp_connect_poll(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t timeout_ms);
 int net_tcp_send(net_tcp_conn_t *c, const net_tcp_ops_t *ops, const uint8_t *data, size_t len, uint32_t timeout_ms);
 int net_tcp_recv(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint8_t *out, size_t cap, uint32_t timeout_ms);
 int net_tcp_close(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t timeout_ms);
 int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget);
+/* Tell peer receive window opened after application read() drains rx_buf. */
+int net_tcp_window_update(net_tcp_conn_t *c, const net_tcp_ops_t *ops);

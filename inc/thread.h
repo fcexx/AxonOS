@@ -161,6 +161,7 @@ thread_t* thread_create(void (*entry)(void), const char* name);
    safely initialize fields before scheduling can run it. */
 thread_t* thread_create_blocked(void (*entry)(void), const char* name);
 void thread_yield();
+void thread_ring3_preempt_if_waiters(void);
 void thread_schedule();
 thread_t* thread_current();
 void thread_stop(int pid);

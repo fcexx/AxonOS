@@ -29,4 +29,13 @@ void cirrusfb_snapshot_screen(uint8_t *out, size_t max_bytes);
 void cirrusfb_restore_screen(const uint8_t *src, uint32_t cols, uint32_t rows);
 uint8_t cirrusfb_get_cell_attr(uint32_t x, uint32_t y);
 
+/* Boot logo: mono8 pixels (grayscale byte -> RGB), top-left blit. */
+void cirrusfb_blit_mono8(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint8_t *pixels);
+/* Rows at top excluded from console scroll / minimum cursor Y (0 = off). */
+void cirrusfb_set_margin_rows(uint32_t rows);
+uint32_t cirrusfb_margin_rows(void);
+void cirrusfb_set_logo_visible(int visible);
+/* Drop pinned logo: restore console text over logo rows, allow normal scroll. */
+void cirrusfb_dismiss_boot_logo(void);
+
 #endif

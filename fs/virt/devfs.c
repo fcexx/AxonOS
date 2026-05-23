@@ -1348,8 +1348,8 @@ int devfs_register(void) {
     /* init ttys */
     for (int i = 0; i < DEVFS_TTY_COUNT; i++) {
         dev_ttys[i].id = i;
-        dev_ttys[i].cursor_x = 0;
-        dev_ttys[i].cursor_y = 0;
+        dev_ttys[i].cursor_x = get_cursor_x();
+        dev_ttys[i].cursor_y = get_cursor_y();
         dev_ttys[i].in_head = dev_ttys[i].in_tail = dev_ttys[i].in_count = 0;
         dev_ttys[i].in_lock.lock = 0;
         dev_ttys[i].waiters_count = 0;

@@ -84,6 +84,7 @@
 #define SYS_rt_sigtimedwait 128
 #define SYS_clock_nanosleep 230
 #define SYS_select  23
+#define SYS_sched_yield 24
 #define SYS_socket  41
 #define SYS_getrlimit 97
 #define SYS_sysinfo  99

@@ -253,17 +253,6 @@ static void rebuild_syscall_frame(thread_t *t) {
     frame[15] = t->saved_user_rsp;
 }
 
-/* Rebuild saved frame and defer child unblock until after syscall_do (IF=0 until iret). */
-static void syscall_finish_user_return(thread_t *t) {
-    if (!t || t->ring != 3) return;
-    asm volatile("cli" ::: "memory");
-    if (t->defer_unblock_tid > 0) {
-        thread_unblock(t->defer_unblock_tid);
-        t->defer_unblock_tid = -1;
-    }
-    rebuild_syscall_frame(t);
-}
-
 /* Keep stack layout consistent with core/elf.c user_stack_top_for_tid().
    Duplicated here because elf.c helper is static. */
 static uintptr_t user_stack_top_for_tid_like_exec(uint64_t tid) {
@@ -694,6 +683,18 @@ typedef struct __attribute__((packed)) {
 } udp_hdr_t;
 
 typedef struct __attribute__((packed)) {
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint32_t seq;
+    uint32_t ack;
+    uint8_t doff_res;
+    uint8_t flags;
+    uint16_t wnd;
+    uint16_t csum;
+    uint16_t urg;
+} tcp_hdr_t;
+
+typedef struct __attribute__((packed)) {
     uint16_t htype;
     uint16_t ptype;
     uint8_t hlen;
@@ -707,6 +708,8 @@ typedef struct __attribute__((packed)) {
 
 typedef struct {
     int sock_domain;
+    /* socket(AF_INET6) is IPv4 internally; getsockname must still report v4-mapped sockaddr_in6. */
+    int ipv6_stub;
     /* socket(AF_UNIX) is created as IPv4 internally; nscd uses connect(sockaddr_un). */
     int unix_domain_stub;
     int unix_bound;
@@ -1212,7 +1215,7 @@ static uint16_t ip_checksum16(const void *data, size_t len);
 static void ip_be_to_bytes(uint32_t ip_be, uint8_t out[4]);
 static int net_send_eth_ipv4(const uint8_t dst_mac[6], uint32_t dst_ip_be, uint8_t proto, const void *l4, size_t l4_len);
 
-#define NET_RXQ_SLOTS  32
+#define NET_RXQ_SLOTS  128
 #define NET_RXQ_BUF    2048
 static uint8_t g_net_rxq[NET_RXQ_SLOTS][NET_RXQ_BUF];
 static uint16_t g_net_rxq_len[NET_RXQ_SLOTS];
@@ -1254,6 +1257,22 @@ static int net_rxq_pop(void *out, size_t cap) {
     size_t copy_len = (n > cap) ? cap : (size_t)n;
     memcpy(out, g_net_rxq[idx], copy_len);
     return (int)copy_len;
+}
+
+/* Drop queued RX frames (stale TCP after failed HTTPS, etc.) before a new connect. */
+static void net_rxq_flush(void) {
+    unsigned long irqf = 0;
+    acquire_irqsave(&g_net_rxq_lock, &irqf);
+    g_net_rxq_head = 0;
+    g_net_rxq_tail = 0;
+    g_net_rxq_count = 0;
+    release_irqrestore(&g_net_rxq_lock, irqf);
+    uint8_t junk[256];
+    for (int d = 0; d < 128; d++) {
+        e1000_poll();
+        if (e1000_recv_frame(junk, sizeof(junk)) <= 0)
+            break;
+    }
 }
 
 static int net_reply_arp_if_needed(const uint8_t *frame, size_t n) {
@@ -1352,6 +1371,75 @@ static int net_recv_frame_any(void *buf, size_t cap) {
         return n;
     }
     return 0;
+}
+
+/* Match IPv4/TCP frame to an established connection (same filters as net/tcp.c). */
+static int net_tcp_match_frame(const uint8_t *frame, size_t n, uint32_t local_ip_be,
+    const net_tcp_conn_t *c) {
+    if (!c || !c->used || !frame || n < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t) + 20u)
+        return 0;
+    const eth_hdr_t *eth = (const eth_hdr_t *)frame;
+    if (be16(eth->ethertype) != ETH_TYPE_IPV4) return 0;
+    const ipv4_hdr_t *ip = (const ipv4_hdr_t *)(frame + sizeof(eth_hdr_t));
+    size_t ihl = (size_t)((ip->ver_ihl & 0x0Fu) * 4u);
+    if (ip->proto != IPPROTO_TCP_LOCAL || ihl < sizeof(ipv4_hdr_t)) return 0;
+    if ((be16(ip->frag_off) & 0x1FFFu) != 0) return 0;
+    if (n < sizeof(eth_hdr_t) + ihl + sizeof(tcp_hdr_t)) return 0;
+    if (be32(ip->dst) != local_ip_be || be32(ip->src) != c->dst_ip_be) return 0;
+    const tcp_hdr_t *th = (const tcp_hdr_t *)(frame + sizeof(eth_hdr_t) + ihl);
+    if (be16(th->src_port) != c->dst_port || be16(th->dst_port) != c->src_port) return 0;
+    return 1;
+}
+
+/* Dequeue a TCP frame for this socket without head-of-line blocking (DNS-style scan). */
+static int net_rxq_take_tcp_frame(const net_tcp_conn_t *c, uint32_t local_ip_be,
+    void *buf, size_t cap) {
+    if (!c || !buf || cap == 0) return 0;
+    unsigned long irqf = 0;
+    acquire_irqsave(&g_net_rxq_lock, &irqf);
+    uint32_t cnt = g_net_rxq_count;
+    if (cnt == 0) {
+        release_irqrestore(&g_net_rxq_lock, irqf);
+        return 0;
+    }
+    uint32_t head0 = g_net_rxq_head;
+    int found_at = -1;
+    for (uint32_t i = 0; i < cnt; i++) {
+        uint32_t idx = (head0 + i) % NET_RXQ_SLOTS;
+        uint16_t fn = g_net_rxq_len[idx];
+        if (fn == 0) continue;
+        if (net_tcp_match_frame(g_net_rxq[idx], fn, local_ip_be, c)) {
+            found_at = (int)i;
+            break;
+        }
+    }
+    if (found_at < 0) {
+        release_irqrestore(&g_net_rxq_lock, irqf);
+        return 0;
+    }
+    uint8_t tmp[NET_RXQ_BUF];
+    for (int r = 0; r < found_at; r++) {
+        uint32_t hi = g_net_rxq_head;
+        uint16_t tn = g_net_rxq_len[hi];
+        memcpy(tmp, g_net_rxq[hi], tn);
+        g_net_rxq_len[hi] = 0;
+        g_net_rxq_head = (hi + 1) % NET_RXQ_SLOTS;
+        g_net_rxq_count--;
+        uint32_t ti = g_net_rxq_tail;
+        memcpy(g_net_rxq[ti], tmp, tn);
+        g_net_rxq_len[ti] = tn;
+        g_net_rxq_tail = (ti + 1) % NET_RXQ_SLOTS;
+        g_net_rxq_count++;
+    }
+    uint32_t hi2 = g_net_rxq_head;
+    uint16_t n = g_net_rxq_len[hi2];
+    g_net_rxq_len[hi2] = 0;
+    g_net_rxq_head = (hi2 + 1) % NET_RXQ_SLOTS;
+    g_net_rxq_count--;
+    release_irqrestore(&g_net_rxq_lock, irqf);
+    size_t copy_len = (n > cap) ? cap : (size_t)n;
+    memcpy(buf, g_net_rxq[hi2], copy_len);
+    return (int)copy_len;
 }
 
 static void net_rx_pump_thread(void) {
@@ -1796,7 +1884,22 @@ static int net_send_l4_ipv4_cb(uint32_t dst_ip_be, uint8_t proto, const void *l4
     return net_send_eth_ipv4(dst_mac, dst_ip_be, proto, l4, l4_len);
 }
 
+static const net_tcp_conn_t *s_tcp_rx_match;
+
 static int net_recv_frame_cb(void *buf, size_t cap) {
+    if (s_tcp_rx_match && g_net.ready) {
+        int n = net_rxq_take_tcp_frame(s_tcp_rx_match, g_net.ip_be, buf, cap);
+        if (n > 0) return n;
+        for (int i = 0; i < 32; i++) {
+            e1000_poll();
+            int r = e1000_recv_frame(buf, cap);
+            if (r <= 0) return 0;
+            if (net_tcp_match_frame((const uint8_t *)buf, (size_t)r, g_net.ip_be, s_tcp_rx_match))
+                return r;
+            (void)net_process_incoming_or_queue((const uint8_t *)buf, (size_t)r);
+        }
+        return 0;
+    }
     return net_recv_frame_any(buf, cap);
 }
 
@@ -1805,18 +1908,28 @@ static uint64_t net_time_ms_cb(void) {
 }
 
 static void net_yield_cb(void) {
-    /* VMware: thread_sleep(1) instead of yield — prevents tight loop, lets emulation deliver packets */
-    thread_sleep(1);
+    uint8_t junk[NET_RXQ_BUF];
+    for (int i = 0; i < 24; i++) {
+        e1000_poll();
+        int n = e1000_recv_frame(junk, sizeof(junk));
+        if (n > 0)
+            (void)net_process_incoming_or_queue(junk, (size_t)n);
+    }
 }
 
 static void net_tcp_return_frame_cb(const void *frame, size_t n) {
     if (!frame || n == 0) return;
-    (void)net_rxq_push((const uint8_t *)frame, n);
+    if (net_rxq_push((const uint8_t *)frame, n) != 0) {
+        uint8_t drop[NET_RXQ_BUF];
+        (void)net_rxq_pop(drop, sizeof(drop));
+        (void)net_rxq_push((const uint8_t *)frame, n);
+    }
 }
 
-static void net_make_tcp_ops(net_tcp_ops_t *ops) {
+static void net_make_tcp_ops(net_tcp_ops_t *ops, net_tcp_conn_t *match) {
     if (!ops) return;
     memset(ops, 0, sizeof(*ops));
+    s_tcp_rx_match = match;
     ops->local_ip_be = g_net.ip_be;
     ops->send_l4 = net_send_l4_ipv4_cb;
     ops->recv_frame = net_recv_frame_cb;
@@ -1952,7 +2065,7 @@ static int net_stack_init(void) {
     if (!g_net_rx_thread_started) {
         thread_t *t = thread_create(net_rx_pump_thread, "net_rx");
         if (t) {
-            t->nice = 10; /* low priority */
+            t->nice = 5;
             g_net_rx_thread_started = 1;
         }
     }
@@ -2547,6 +2660,20 @@ typedef struct __attribute__((packed)) {
     uint8_t sin6_addr[16];
 } sockaddr_in6_k;
 
+static void sockaddr_in6_v4mapped_fill(sockaddr_in6_k *s6, uint32_t ip_be, uint16_t port_host)
+{
+    memset(s6, 0, sizeof(*s6));
+    s6->sin6_family = AF_INET6;
+    s6->sin6_port = be16(port_host);
+    memset(s6->sin6_addr, 0, 10);
+    s6->sin6_addr[10] = 0xff;
+    s6->sin6_addr[11] = 0xff;
+    {
+        uint32_t s_addr = be32(ip_be);
+        memcpy(s6->sin6_addr + 12, &s_addr, 4);
+    }
+}
+
 /* connect/sendto: Linux glibc often passes AF_INET6 (v4-mapped or ::1). Returns 0 or errno. */
 static int user_sockaddr_to_ipv4_peer(const void *addr_u, size_t addrlen, sockaddr_in_k *out) {
     if (!out) return EFAULT;
@@ -2571,10 +2698,15 @@ static int user_sockaddr_to_ipv4_peer(const void *addr_u, size_t addrlen, sockad
             if (s6.sin6_addr[i]) v4m = 0;
         }
         if (s6.sin6_addr[10] != 0xff || s6.sin6_addr[11] != 0xff) v4m = 0;
+        /* Some getaddrinfo paths pass IPv4 in the low 32 bits without ::ffff prefix. */
+        int v4lo = 1;
+        for (int i = 0; i < 12; i++) {
+            if (s6.sin6_addr[i]) v4lo = 0;
+        }
         memset(out, 0, sizeof(*out));
         out->sin_family = AF_INET_LOCAL;
         out->sin_port = s6.sin6_port;
-        if (v4m) {
+        if (v4m || v4lo) {
             memcpy(&out->sin_addr, s6.sin6_addr + 12, 4);
             return 0;
         }
@@ -3400,9 +3532,10 @@ static ssize_t net_sock_write_userspace(thread_t *cur, int fd, ksock_net_t *s, c
             return (ssize_t)cnt;
         }
         if (!bufp || cnt == 0 || !user_range_ok(bufp, cnt)) return -EFAULT;
+        if (!s->connected || !s->tcp.established) return -ENOTCONN;
         size_t total = 0;
         net_tcp_ops_t ops;
-        net_make_tcp_ops(&ops);
+        net_make_tcp_ops(&ops, &s->tcp);
         if (tcp_wr_dbg_left-- > 0) {
             klogprintf("tcp: write fd=%d cnt=%u dst=%u.%u.%u.%u:%u\n",
                 fd, (unsigned)cnt,
@@ -3505,38 +3638,56 @@ static ssize_t net_sock_read_userspace(thread_t *cur, ksock_net_t *s, void *bufp
             return (ssize_t)n;
         }
         if (!bufp || cnt == 0 || !user_range_ok(bufp, cnt)) return -EFAULT;
+        if (!s->tcp.established && s->tcp.connect_pending) {
+            net_tcp_ops_t cops;
+            net_make_tcp_ops(&cops, &s->tcp);
+            e1000_poll();
+            if (net_tcp_connect_poll(&s->tcp, &cops, 200) == 0)
+                s->connected = 1;
+        }
+        if (!s->connected || !s->tcp.established) return -ENOTCONN;
         net_tcp_ops_t ops;
-        net_make_tcp_ops(&ops);
+        net_make_tcp_ops(&ops, &s->tcp);
         size_t chunk = cnt;
         if (chunk > 16384) chunk = 16384;
         uint8_t *tmp = (uint8_t *)kmalloc(chunk);
         if (!tmp) return -ENOMEM;
-        int rr = net_tcp_recv(&s->tcp, &ops, tmp, chunk, 5000);
-        if (rr > 0) {
-            if (copy_to_user_safe(bufp, tmp, (size_t)rr) != 0) {
-                kfree(tmp);
-                return -EFAULT;
+        size_t total = 0;
+        for (;;) {
+            for (int pump = 0; pump < 128; pump++) {
+                e1000_poll();
+                (void)net_tcp_service(&s->tcp, &ops, 128);
+                if (s->tcp.rx_len > 0)
+                    break;
             }
+            if (s->tcp.established && s->tcp.rx_len < sizeof(s->tcp.rx_buf))
+                (void)net_tcp_window_update(&s->tcp, &ops);
+            uint32_t tmo = s->nonblock ? 0u : 120000u;
+            int rr = net_tcp_recv(&s->tcp, &ops, tmp + total, chunk - total, tmo);
+            if (rr > 0) {
+                total += (size_t)rr;
+                if (total >= chunk || rr < (int)(chunk - total))
+                    break;
+                for (int pump = 0; pump < 16; pump++) {
+                    e1000_poll();
+                    (void)net_tcp_service(&s->tcp, &ops, 64);
+                }
+                continue;
+            }
+            if (total > 0)
+                break;
             kfree(tmp);
-            return (ssize_t)rr;
+            if (rr == 0) return 0;
+            if (rr == -2)
+                return (ssize_t)(s->nonblock ? -EAGAIN : -ETIMEDOUT);
+            return (ssize_t)(s->nonblock ? -EAGAIN : -EIO);
+        }
+        if (copy_to_user_safe(bufp, tmp, total) != 0) {
+            kfree(tmp);
+            return -EFAULT;
         }
         kfree(tmp);
-        if (rr == 0) return 0;
-        if (rr == -2) {
-            /* Timeout on blocking stream sockets can cause userland retry loops
-               (observed with HTTPS redirects). Make it a hard I/O failure and
-               mark socket disconnected so the caller does not spin forever. */
-            if (!s->nonblock) {
-                s->connected = 0;
-                s->tcp.established = 0;
-                s->tcp.peer_fin = 1;
-                return (ssize_t)-EIO;
-            }
-            return (ssize_t)-EAGAIN;
-        }
-        /* Other TCP receive failures (e.g. disconnected/not established) should not
-           look like "try again" for blocking sockets, otherwise userland may spin. */
-        return (ssize_t)(s->nonblock ? -EAGAIN : -EIO);
+        return (ssize_t)total;
     }
     if (s->type_base == SOCK_DGRAM_LOCAL && s->protocol == IPPROTO_UDP_LOCAL) {
         if (!bufp || cnt == 0 || !user_range_ok(bufp, cnt)) return -EFAULT;
@@ -4150,11 +4301,23 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     child_tid_ptr && child_tid_ptr < (uint64_t)MMIO_IDENTITY_LIMIT - 4) {
                     child->clear_child_tid = child_tid_ptr;
                 }
-                cur->defer_unblock_tid = (int)(child->tid ? child->tid : 1);
-                clone3_dbg(cur, 4, "defer unblock",
+                thread_unblock((int)(child->tid ? child->tid : 1));
+                clone3_dbg(cur, 4, "unblock child",
                     (unsigned long long)(child->tid ? child->tid : 0),
                     (unsigned long long)child->user_rip,
                     (unsigned long long)child->user_stack);
+                /* OpenSSL/pthread (CLONE_THREAD): run helper until it blocks, not one schedule()
+                   that can leave a ring-3 spinner starving TCP recv on the parent. */
+                if (flags & 0x00010000u) {
+                    for (int ci = 0; ci < 2048; ci++) {
+                        if (child->state == THREAD_BLOCKED || child->state == THREAD_TERMINATED)
+                            break;
+                        thread_schedule();
+                        if (child->state == THREAD_BLOCKED || child->state == THREAD_TERMINATED)
+                            break;
+                    }
+                    thread_schedule();
+                }
                 return (uint64_t)(child->tid ? child->tid : 1);
             }
             return syscall_do_inner(SYS_fork, 0, 0, 0, 0, 0, 0);
@@ -4546,7 +4709,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             qemu_debug_printf("vfork: default path, unblocking child %llu\n",
                 (unsigned long long)(child->tid ? child->tid : 1));
             child->vfork_parent_tid = -1;
-            p->defer_unblock_tid = (int)(child->tid ? child->tid : 1);
+            thread_unblock((int)(child->tid ? child->tid : 1));
             /* when parent is unblocked and resumes here, return child's pid to parent */
             return (uint64_t)(child->tid ? child->tid : 1);
         }
@@ -5394,6 +5557,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (tgid == self && tid == self) return 0;
             return ret_err(ESRCH);
         }
+        case SYS_sched_yield: {
+            thread_yield();
+            return 0;
+        }
         case SYS_select: { /* select(nfds, readfds, writefds, exceptfds, timeout) - minimal stub */
             /* Minimal but functional select():
                - supports readfds/writefds (exceptfds ignored)
@@ -5501,8 +5668,13 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                 }
                             } else if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
                                 net_tcp_ops_t ops;
-                                net_make_tcp_ops(&ops);
-                                (void)net_tcp_service(&s->tcp, &ops, 4);
+                                net_make_tcp_ops(&ops, &s->tcp);
+                                if (s->tcp.connect_pending)
+                                    (void)net_tcp_connect_poll(&s->tcp, &ops, 0);
+                                for (int ps = 0; ps < 8; ps++) {
+                                    e1000_poll();
+                                    (void)net_tcp_service(&s->tcp, &ops, 64);
+                                }
                                 if (s->tcp.rx_len > 0 || s->tcp.peer_fin) can_r = 1;
                             }
                         } else if (f->type == FS_TYPE_PIPE && f->driver_private) {
@@ -5532,9 +5704,18 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                     can_w = 1;
                             } else if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
                                 net_tcp_ops_t ops;
-                                net_make_tcp_ops(&ops);
-                                (void)net_tcp_service(&s->tcp, &ops, 4);
-                                if (s->tcp.established) can_w = 1;
+                                net_make_tcp_ops(&ops, &s->tcp);
+                                if (s->tcp.connect_pending) {
+                                    e1000_poll();
+                                    if (net_tcp_connect_poll(&s->tcp, &ops, 200) == 0) {
+                                        s->connected = 1;
+                                        can_w = 1;
+                                    }
+                                } else {
+                                    e1000_poll();
+                                    (void)net_tcp_service(&s->tcp, &ops, 64);
+                                    if (s->tcp.established) can_w = 1;
+                                }
                             } else {
                                 can_w = 1;
                             }
@@ -5642,6 +5823,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             int type = (int)a2;
             int protocol = (int)a3;
             int unix_stub = 0;
+            int ipv6_stub = (domain == AF_INET6);
             int type_base = type & 0x0F; /* mask SOCK_NONBLOCK/CLOEXEC flags */
             if (domain == AF_INET_LOCAL) {
                 if (!(type_base == SOCK_RAW_LOCAL || type_base == SOCK_DGRAM_LOCAL || type_base == SOCK_STREAM_LOCAL)) return ret_err(ESOCKTNOSUPPORT);
@@ -5686,6 +5868,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (domain == AF_NETLINK_LOCAL) snprintf(p, 24, "socket:[netlink]");
             else snprintf(p, 24, "socket:[icmp]");
             s->sock_domain = domain;
+            s->ipv6_stub = ipv6_stub;
             s->unix_domain_stub = unix_stub;
             s->type_base = type_base;
             if (domain == AF_NETLINK_LOCAL) {
@@ -5955,22 +6138,55 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (dst_ip_be == 0x7F000001u)
                     return ret_err(ECONNREFUSED);
                 if (net_stack_init() != 0) return ret_err(ENETDOWN);
-                { uint8_t drain[256]; for (int d = 0; d < 64; d++) { e1000_poll(); if (e1000_recv_frame(drain, sizeof(drain)) <= 0) break; } }
-                s->connected = 1;
+                if (s->tcp.used) {
+                    net_tcp_ops_t close_ops;
+                    net_make_tcp_ops(&close_ops, &s->tcp);
+                    (void)net_tcp_close(&s->tcp, &close_ops, 500);
+                }
+                memset(&s->tcp, 0, sizeof(s->tcp));
+                s->dns_tcp_udp_bridge = 0;
+                s->connected = 0;
+                net_rxq_flush();
                 s->peer_ip_be = dst_ip_be;
-                s->peer_port = be16(to.sin_port);
-                if (s->local_port == 0)
-                    s->local_port = net_alloc_ephemeral_port();
+                s->peer_port = dport;
+                /* Fresh local port on redirect/reconnect (avoids TIME_WAIT / NAT confusion). */
+                s->local_port = net_alloc_ephemeral_port();
                 net_tcp_ops_t ops;
-                net_make_tcp_ops(&ops);
+                net_make_tcp_ops(&ops, &s->tcp);
+                kprintf("tcp: connect dst=%u.%u.%u.%u:%u nb=%d\n",
+                    (unsigned)((s->peer_ip_be >> 24) & 0xFF), (unsigned)((s->peer_ip_be >> 16) & 0xFF),
+                    (unsigned)((s->peer_ip_be >> 8) & 0xFF), (unsigned)(s->peer_ip_be & 0xFF),
+                    (unsigned)dport, s->nonblock);
+                /* Always block until SYN-ACK (OpenSSL/wget TLS hung on EINPROGRESS + poll). */
                 int rc = net_tcp_connect(&s->tcp, &ops, s->peer_ip_be, s->peer_port, s->local_port, 45000);
                 if (rc == -2 && dst_ip_be_alt != dst_ip_be) {
-                    /* Retry with alternate byte order for glibc/wget sockaddr. */
+                    memset(&s->tcp, 0, sizeof(s->tcp));
                     s->peer_ip_be = dst_ip_be_alt;
                     rc = net_tcp_connect(&s->tcp, &ops, s->peer_ip_be, s->peer_port, s->local_port, 45000);
                 }
-                if (rc == -2) return ret_err(ETIMEDOUT);
-                if (rc != 0) return ret_err(EIO);
+                if (rc == -2) {
+                    kprintf("tcp: connect timeout dst=%u.%u.%u.%u:%u\n",
+                        (unsigned)((s->peer_ip_be >> 24) & 0xFF), (unsigned)((s->peer_ip_be >> 16) & 0xFF),
+                        (unsigned)((s->peer_ip_be >> 8) & 0xFF), (unsigned)(s->peer_ip_be & 0xFF),
+                        (unsigned)dport);
+                    memset(&s->tcp, 0, sizeof(s->tcp));
+                    s->connected = 0;
+                    return ret_err(ETIMEDOUT);
+                }
+                if (rc != 0) {
+                    kprintf("tcp: connect failed rc=%d dst=%u.%u.%u.%u:%u\n", rc,
+                        (unsigned)((s->peer_ip_be >> 24) & 0xFF), (unsigned)((s->peer_ip_be >> 16) & 0xFF),
+                        (unsigned)((s->peer_ip_be >> 8) & 0xFF), (unsigned)(s->peer_ip_be & 0xFF),
+                        (unsigned)dport);
+                    memset(&s->tcp, 0, sizeof(s->tcp));
+                    s->connected = 0;
+                    return ret_err(EIO);
+                }
+                kprintf("tcp: connected dst=%u.%u.%u.%u:%u\n",
+                    (unsigned)((s->peer_ip_be >> 24) & 0xFF), (unsigned)((s->peer_ip_be >> 16) & 0xFF),
+                    (unsigned)((s->peer_ip_be >> 8) & 0xFF), (unsigned)(s->peer_ip_be & 0xFF),
+                    (unsigned)dport);
+                s->connected = 1;
                 return 0;
             }
             return 0;
@@ -6009,6 +6225,22 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (copy_to_user_safe(addr_u, &sa, copy_len) != 0) return ret_err(EFAULT);
                 }
                 ulen = (uint32_t)sizeof(sa);
+                if (copy_to_user_safe(addrlen_u, &ulen, 4) != 0) return ret_err(EFAULT);
+                return 0;
+            }
+
+            if (s->ipv6_stub) {
+                sockaddr_in6_k sa6;
+                uint16_t lport = 0;
+                if ((s->type_base == SOCK_DGRAM_LOCAL || s->type_base == SOCK_STREAM_LOCAL) && s->local_port)
+                    lport = s->local_port;
+                sockaddr_in6_v4mapped_fill(&sa6, g_net.ip_be, lport);
+                uint32_t copy_len = (ulen < (uint32_t)sizeof(sa6)) ? ulen : (uint32_t)sizeof(sa6);
+                if (copy_len > 0) {
+                    if (!user_range_ok(addr_u, copy_len)) return ret_err(EFAULT);
+                    if (copy_to_user_safe(addr_u, &sa6, copy_len) != 0) return ret_err(EFAULT);
+                }
+                ulen = (uint32_t)sizeof(sa6);
                 if (copy_to_user_safe(addrlen_u, &ulen, 4) != 0) return ret_err(EFAULT);
                 return 0;
             }
@@ -6069,6 +6301,19 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return 0;
             }
 
+            if (s->ipv6_stub) {
+                sockaddr_in6_k sa6;
+                sockaddr_in6_v4mapped_fill(&sa6, s->peer_ip_be, s->peer_port);
+                uint32_t copy_len = (ulen < (uint32_t)sizeof(sa6)) ? ulen : (uint32_t)sizeof(sa6);
+                if (copy_len > 0) {
+                    if (!user_range_ok(addr_u, copy_len)) return ret_err(EFAULT);
+                    if (copy_to_user_safe(addr_u, &sa6, copy_len) != 0) return ret_err(EFAULT);
+                }
+                ulen = (uint32_t)sizeof(sa6);
+                if (copy_to_user_safe(addrlen_u, &ulen, 4) != 0) return ret_err(EFAULT);
+                return 0;
+            }
+
             sockaddr_in_k sa;
             memset(&sa, 0, sizeof(sa));
             sa.sin_family = AF_INET_LOCAL;
@@ -6095,6 +6340,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         }
         case 55: { /* getsockopt */
             int fd = (int)a1;
+            int level = (int)a2;
+            int optname = (int)a3;
             void *optval_u = (void *)(uintptr_t)a4;
             void *optlen_u = (void *)(uintptr_t)a5;
             thread_t *t = thread_get_current_user();
@@ -6104,6 +6351,20 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (!optlen_u || !user_range_ok(optlen_u, 4)) return ret_err(EFAULT);
             uint32_t olen = 0;
             if (copy_from_user_raw(&olen, optlen_u, 4) != 0) return ret_err(EFAULT);
+            enum { SOL_SOCKET_LOCAL = 1, SO_ERROR_LOCAL = 4 };
+            if (level == SOL_SOCKET_LOCAL && optname == SO_ERROR_LOCAL &&
+                s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && !s->dns_tcp_udp_bridge &&
+                optval_u && olen >= 4) {
+                int soerr = 0;
+                if (s->tcp.connect_pending)
+                    soerr = 0;
+                else if (s->tcp.used && !s->tcp.established)
+                    soerr = 111; /* ECONNREFUSED */
+                if (copy_to_user_safe(optval_u, &soerr, 4) != 0) return ret_err(EFAULT);
+                olen = 4;
+                if (copy_to_user_safe(optlen_u, &olen, 4) != 0) return ret_err(EFAULT);
+                return 0;
+            }
             if (optval_u && olen >= 4) {
                 uint32_t zero = 0;
                 if (copy_to_user_safe(optval_u, &zero, 4) != 0) return ret_err(EFAULT);
@@ -6141,6 +6402,15 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (!s->connected) return ret_err(ENOTCONN);
                 ssize_t wr = unix_stream_write_from_user(s, buf_u, len);
                 if (wr < 0) return ret_err((int)(-wr));
+                return (uint64_t)wr;
+            }
+            /* glibc send(2) -> sendto; OpenSSL wget uses this for TLS on :443. */
+            if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && !s->dns_tcp_udp_bridge) {
+                if (!buf_u || len == 0) return ret_err(EINVAL);
+                if (!user_range_ok(buf_u, len)) return ret_err(EFAULT);
+                if (!s->connected || !s->tcp.established) return ret_err(ENOTCONN);
+                ssize_t wr = net_sock_write_userspace(t, fd, s, buf_u, len);
+                if (wr < 0) return ret_err((int)-wr);
                 return (uint64_t)wr;
             }
             if (!buf_u || len == 0 || len > 2048) return ret_err(EINVAL);
@@ -6261,6 +6531,28 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (!buf_u) {
                 if (dbg_wget) qemu_debug_printf("RECVFROM-EFAULT: null buf with len=%llu\n", (unsigned long long)len);
                 return ret_err(EFAULT);
+            }
+            /* glibc recv(2) -> recvfrom; OpenSSL wget uses this for TLS on :443. */
+            if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && !s->dns_tcp_udp_bridge) {
+                if (!user_range_ok(buf_u, len)) return ret_err(EFAULT);
+                if (!s->connected || !s->tcp.established) return ret_err(ENOTCONN);
+                ssize_t rr = net_sock_read_userspace(t, s, buf_u, len);
+                if (rr < 0) return ret_err((int)-rr);
+                if (rr == 0) return 0;
+                if (from_u && fromlen_u && user_range_ok(fromlen_u, 4)) {
+                    uint32_t flen = 0;
+                    if (copy_from_user_raw(&flen, fromlen_u, 4) == 0 && flen >= sizeof(sockaddr_in_k) && user_range_ok(from_u, sizeof(sockaddr_in_k))) {
+                        sockaddr_in_k sa;
+                        memset(&sa, 0, sizeof(sa));
+                        sa.sin_family = AF_INET_LOCAL;
+                        sa.sin_port = be16(s->peer_port);
+                        sa.sin_addr = be32(s->peer_ip_be);
+                        (void)copy_to_user_safe(from_u, &sa, sizeof(sa));
+                        flen = sizeof(sa);
+                        (void)copy_to_user_safe(fromlen_u, &flen, 4);
+                    }
+                }
+                return (uint64_t)rr;
             }
             size_t cap = len;
             if (cap > 8192) cap = 8192; /* defensive cap to avoid huge temporary allocations */
@@ -6416,13 +6708,21 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 (void)netlink_build_route_dump(s, h->nlmsg_type, h->nlmsg_seq);
                 return (uint64_t)iov.len;
             }
-            if (!iov.base || iov.len == 0 || iov.len > 2048 || !user_range_ok(iov.base, (size_t)iov.len)) return ret_err(EFAULT);
             if (s->unix_domain_stub) {
+                if (!iov.base || iov.len == 0 || !user_range_ok(iov.base, (size_t)iov.len)) return ret_err(EFAULT);
                 if (!s->connected) return ret_err(ENOTCONN);
                 ssize_t wr = unix_stream_write_from_user(s, iov.base, (size_t)iov.len);
                 if (wr < 0) return ret_err((int)(-wr));
                 return (uint64_t)wr;
             }
+            if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && !s->dns_tcp_udp_bridge) {
+                if (!iov.base || iov.len == 0 || !user_range_ok(iov.base, (size_t)iov.len)) return ret_err(EFAULT);
+                if (!s->connected || !s->tcp.established) return ret_err(ENOTCONN);
+                ssize_t wr = net_sock_write_userspace(t, fd, s, iov.base, (size_t)iov.len);
+                if (wr < 0) return ret_err((int)-wr);
+                return (uint64_t)wr;
+            }
+            if (!iov.base || iov.len == 0 || iov.len > 2048 || !user_range_ok(iov.base, (size_t)iov.len)) return ret_err(EFAULT);
             uint32_t dst_ip_be = 0;
             uint16_t dst_port = 0;
             if (m.msg_name && m.msg_namelen >= 2u && user_range_ok(m.msg_name, (size_t)m.msg_namelen)) {
@@ -6541,6 +6841,26 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (!iov.base) {
                 if (dbg_wget) qemu_debug_printf("RECVMSG-EFAULT: null base with len=%llu\n", (unsigned long long)iov.len);
                 return ret_err(EFAULT);
+            }
+            if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && !s->dns_tcp_udp_bridge) {
+                if (!user_range_ok(iov.base, (size_t)iov.len)) return ret_err(EFAULT);
+                if (!s->connected || !s->tcp.established) return ret_err(ENOTCONN);
+                ssize_t rr = net_sock_read_userspace(t, s, iov.base, (size_t)iov.len);
+                if (rr < 0) return ret_err((int)-rr);
+                if (rr == 0) return 0;
+                if (m.msg_name && m.msg_namelen >= sizeof(sockaddr_in_k) && user_range_ok(m.msg_name, sizeof(sockaddr_in_k))) {
+                    sockaddr_in_k sa;
+                    memset(&sa, 0, sizeof(sa));
+                    sa.sin_family = AF_INET_LOCAL;
+                    sa.sin_port = be16(s->peer_port);
+                    sa.sin_addr = be32(s->peer_ip_be);
+                    (void)copy_to_user_safe(m.msg_name, &sa, sizeof(sa));
+                }
+                if (m.msg_name && user_range_ok(msg_u, sizeof(m))) {
+                    m.msg_namelen = sizeof(sockaddr_in_k);
+                    (void)copy_to_user_safe(msg_u, &m, sizeof(m));
+                }
+                return (uint64_t)rr;
             }
             size_t cap = (size_t)iov.len;
             if (cap > 8192) cap = 8192;
@@ -7676,11 +7996,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     else child->fds[i]->refcount++;
                 }
             }
-            cur->defer_unblock_tid = (int)(child->tid ? child->tid : 1);
-            fork_dbg(cur, 8, "defer unblock",
+            thread_unblock((int)(child->tid ? child->tid : 1));
+            rebuild_syscall_frame(cur);
+            fork_dbg(cur, 8, "unblocked child",
                 (unsigned long long)(child->tid ? child->tid : 0), 0, 0);
-            /* Do not thread_yield/schedule here: syscall_do runs on the per-CPU
-               syscall stack (see syscall.S); yielding clobbers the saved frame. */
             fork_dbg(cur, 9, "return pid",
                 (unsigned long long)(child->tid ? child->tid : 0), 0, 0);
             return (uint64_t)(child->tid ? child->tid : 1);
@@ -8818,9 +9137,18 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                         revents |= POLLOUT;
                                     } else if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
                                         net_tcp_ops_t ops;
-                                        net_make_tcp_ops(&ops);
-                                        (void)net_tcp_service(&s->tcp, &ops, 4);
-                                        if (s->tcp.established) revents |= POLLOUT;
+                                        net_make_tcp_ops(&ops, &s->tcp);
+                                        if (s->tcp.connect_pending) {
+                                            e1000_poll();
+                                            if (net_tcp_connect_poll(&s->tcp, &ops, 200) == 0) {
+                                                s->connected = 1;
+                                                revents |= POLLOUT;
+                                            }
+                                        } else {
+                                            e1000_poll();
+                                            (void)net_tcp_service(&s->tcp, &ops, 64);
+                                            if (s->tcp.established) revents |= POLLOUT;
+                                        }
                                     } else {
                                         revents |= POLLOUT;
                                     }
@@ -8851,8 +9179,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                     }
                                 } else if ((events & POLLIN) && s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
                                     net_tcp_ops_t ops;
-                                    net_make_tcp_ops(&ops);
-                                    (void)net_tcp_service(&s->tcp, &ops, 4);
+                                    net_make_tcp_ops(&ops, &s->tcp);
+                                    if (s->tcp.connect_pending)
+                                        (void)net_tcp_connect_poll(&s->tcp, &ops, 0);
+                                    e1000_poll();
+                                    (void)net_tcp_service(&s->tcp, &ops, 64);
                                     if (s->tcp.rx_len > 0 || s->tcp.peer_fin) revents |= POLLIN;
                                 }
                             } else if (usb_is_devfs_file(f)) {
@@ -9179,8 +9510,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     }
                     if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && !s->dns_tcp_udp_bridge) {
                         net_tcp_ops_t ops;
-                        net_make_tcp_ops(&ops);
+                        net_make_tcp_ops(&ops, &s->tcp);
                         (void)net_tcp_close(&s->tcp, &ops, 1000);
+                        net_rxq_flush();
                     }
                     kfree(f->driver_private);
                     f->driver_private = NULL;
@@ -10305,11 +10637,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 }
 
 uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
-    uint64_t r = syscall_do_inner(num, a1, a2, a3, a4, a5, a6);
-    thread_t *cur = thread_get_current_user();
-    if (!cur) cur = thread_current();
-    syscall_finish_user_return(cur);
-    return r;
+    return syscall_do_inner(num, a1, a2, a3, a4, a5, a6);
 }
 
 void isr_syscall(cpu_registers_t* regs) {

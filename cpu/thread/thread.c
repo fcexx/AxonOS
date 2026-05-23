@@ -481,20 +481,6 @@ void user_thread_entry(void) {
 	if (!self) {
 		for (;;) asm volatile("hlt");
 	}
-#if AXON_FORK_DEBUG
-	{
-		uint64_t cr3 = paging_read_cr3();
-		uint64_t mm_cr3 = (self->mm && self->mm->cr3) ? self->mm->cr3 : 0;
-		axon_user_dbg(self, "user-entry", 0, "start",
-			(unsigned long long)(self->tid ? self->tid : 0),
-			(unsigned long long)self->user_rip,
-			(unsigned long long)self->user_stack);
-		axon_user_dbg(self, "user-entry", 1, "mm",
-			(unsigned long long)cr3,
-			(unsigned long long)mm_cr3,
-			(unsigned long long)self->user_fs_base);
-	}
-#endif
 	// mark as user thread
 	self->ring = 3;
 	thread_set_current_user(self);
@@ -632,6 +618,35 @@ int thread_fd_isatty(int fd) {
 
 thread_t* thread_current(void) {
         return current_cpu[smp_sched_cpu_id()];
+}
+
+/* If a ring-3 thread is spinning, run pthread helpers / syscall waiters (OpenSSL init). */
+void thread_ring3_preempt_if_waiters(void) {
+        thread_t *cur = thread_current();
+        if (!cur || cur->ring != 3 || cur->state != THREAD_RUNNING)
+                return;
+        for (int i = 0; i < thread_count; ++i) {
+                thread_t *t = threads[i];
+                if (!t || t == cur || thread_is_any_idle(t))
+                        continue;
+                if (t->state == THREAD_READY) {
+                        thread_schedule();
+                        return;
+                }
+        }
+        if (thread_runnable_nonidle_count() > 1) {
+                thread_schedule();
+                return;
+        }
+        for (int i = 0; i < thread_count; ++i) {
+                thread_t *t = threads[i];
+                if (!t || t == cur)
+                        continue;
+                if (t->state == THREAD_SLEEPING || t->state == THREAD_BLOCKED) {
+                        thread_schedule();
+                        return;
+                }
+        }
 }
 
 void thread_yield() {

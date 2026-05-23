@@ -46,6 +46,7 @@
 #include <usb.h>
 #include <exec.h>
 #include <klog.h>
+#include <boot_logo.h>
 #include <debug.h>
 #include <vbe.h>
 #include <cirrus.h>
@@ -449,11 +450,13 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     pci_init();
     /* Fbcon before long PCI/disk logs: otherwise klog uses VGA 80x25 and lines wrap ~66 chars with timestamps. */
     if (vmwgfx_kernel_init() == 0) {
+        devfs_tty_realloc_for_console();
+        boot_logo_show();
         klogprintf("video: vmwgfx fbcon enabled early (wide console)\n");
-        devfs_tty_realloc_for_console();
     } else if (cirrus_kernel_init() == 0) {
-        klogprintf("video: cirrus fbcon enabled early\n");
         devfs_tty_realloc_for_console();
+        boot_logo_show();
+        klogprintf("video: cirrus fbcon enabled early\n");
     }
     pci_dump_devices();
     intel_chipset_init();
@@ -662,6 +665,29 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     }
     syscall_net_ensure_resolv();
     ramfs_install_libnss_dns();
+    /* OpenSSL/wget: avoid slow ENOENT walks; --no-check-certificate still opens these paths. */
+    {
+        static const char openssl_cnf[] =
+            "openssl_conf = openssl_init\n\n[openssl_init]\n";
+        (void)fs_mkdir("/etc/ssl");
+        (void)fs_mkdir("/etc/ssl/certs");
+        (void)fs_unlink("/etc/ssl/openssl.cnf");
+        struct fs_file *oc = fs_create_file("/etc/ssl/openssl.cnf");
+        if (!oc) oc = fs_open("/etc/ssl/openssl.cnf");
+        if (oc) {
+            fs_write(oc, openssl_cnf, sizeof(openssl_cnf) - 1, 0);
+            fs_file_free(oc);
+        }
+        (void)fs_unlink("/etc/ssl/certs/ca-certificates.crt");
+        struct fs_file *ca = fs_create_file("/etc/ssl/certs/ca-certificates.crt");
+        if (!ca) ca = fs_open("/etc/ssl/certs/ca-certificates.crt");
+        if (ca) fs_file_free(ca);
+        (void)fs_mkdir("/etc/pki/tls/certs");
+        (void)fs_unlink("/etc/pki/tls/certs/ca-bundle.crt");
+        struct fs_file *pk = fs_create_file("/etc/pki/tls/certs/ca-bundle.crt");
+        if (!pk) pk = fs_open("/etc/pki/tls/certs/ca-bundle.crt");
+        if (pk) fs_file_free(pk);
+    }
     /* Programs (mount, sh) open /etc/localtime; create so open doesn't fail. */
     {
         struct fs_file *lt = fs_create_file("/etc/localtime");
@@ -671,7 +697,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     {
         static const char profile[] =
             "export TERM=builtin_ansi\n"
-            "export PS1='\\[\\033[1;31m\\]\\u\\033[0m@\\h \\033[1;37m\\w\\033[0m \\$ '\n";
+            "export PS1='\\[\\033[1;31m\\]\\u\\033[0m@\\h \\033[1;37m\\w\\033[0m \\$ '\n"
+            "export OPENSSL_CONF=/etc/ssl/openssl.cnf\n";
         struct fs_file *pf = fs_create_file("/etc/profile");
         if (!pf) pf = fs_open("/etc/profile");
         if (pf) {
@@ -749,8 +776,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     }
     ps2_keyboard_init();
     ps2_mouse_init();
-    rtc_init();
-    kclear();
+    boot_logo_dismiss();
     // Prefer linuxrc/init if present; fallback to kernel shell.
     if (boot_try_run_init() != 0) {
         klogprintf("fatal: There's nothing to run. Download the correct initfs from https://apm.axont.ru/Packages/initfs.cpio and place it in the root of the boot device.");

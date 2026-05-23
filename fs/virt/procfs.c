@@ -321,26 +321,10 @@ static ssize_t procfs_show_scsi(char *buf, size_t size, void *priv) {
 	return (ssize_t)w;
 }
 
-/* /proc/pci — список PCI устройств (формат lspci-подобный) */
+/* Linux /proc/bus/pci/devices (legacy alias: /proc/pci) */
 static ssize_t procfs_show_pci(char *buf, size_t size, void *priv) {
 	(void)priv;
-	if (!buf || size == 0) return 0;
-	size_t w = 0;
-	pci_device_t *devs = pci_get_devices();
-	int count = pci_get_device_count();
-	for (int i = 0; i < count && w < size; i++) {
-		pci_device_t *d = &devs[i];
-		int written = snprintf(buf + w, (w < size) ? (size - w) : 0,
-			"%02x:%02x.%x %04x:%04x class %02x%02x%02x\n",
-			d->bus, d->device, d->function,
-			d->vendor_id, d->device_id,
-			d->class_code, d->subclass, d->prog_if);
-		if (written < 0) break;
-		w += (size_t)written;
-	}
-	if (count == 0)
-		w += (size_t)snprintf(buf + w, (w < size) ? (size - w) : 0, "(no PCI devices)\n");
-	return (ssize_t)w;
+	return pci_show_proc_devices(buf, size);
 }
 
 /* CPU info */
@@ -646,8 +630,23 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
                         return 0;
                     }
                     const char *rest2 = rest + 4; /* after usb/ */
-                    if (strncmp(rest2, "devices", 7) == 0) {
+                    if (strncmp(rest2, "devices", 7) == 0 && rest2[7] == '\0') {
                         h->kind = 7; h->file_id = 30; f->type = FS_TYPE_REG; f->size = 0;
+                        f->driver_private = h;
+                        *out_file = f;
+                        return 0;
+                    }
+                }
+                if (strncmp(rest, "pci", 3) == 0 && (rest[3] == '\0' || rest[3] == '/')) {
+                    if (rest[3] == '\0') {
+                        h->kind = 16; f->type = FS_TYPE_DIR; f->size = 0;
+                        f->driver_private = h;
+                        *out_file = f;
+                        return 0;
+                    }
+                    const char *rest2 = rest + 4; /* after pci/ */
+                    if (strncmp(rest2, "devices", 7) == 0 && rest2[7] == '\0') {
+                        h->kind = 7; h->file_id = 42; f->type = FS_TYPE_REG; f->size = 0;
                         f->driver_private = h;
                         *out_file = f;
                         return 0;
@@ -1023,11 +1022,11 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 
     /* /proc/bus directory listing */
     if (h->kind == 10) {
-        const char *names[] = { "usb" };
+        const char *names[] = { "usb", "pci" };
         size_t pos = 0;
         size_t written = 0;
         uint8_t *out = (uint8_t*)buf;
-        for (int idx = 0; idx < 1; idx++) {
+        for (int idx = 0; idx < 2; idx++) {
             size_t namelen = strlen(names[idx]);
             size_t rec_len = 8 + namelen;
             rec_len = (rec_len + 3) & ~3u;
@@ -1053,7 +1052,39 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
         return (ssize_t)written;
     }
 
-    /* /proc/bus/usb directory listing */
+    /* /proc/bus/pci directory listing */
+    if (h->kind == 16) {
+        const char *names[] = { "devices" };
+        size_t pos = 0;
+        size_t written = 0;
+        uint8_t *out = (uint8_t*)buf;
+        for (int idx = 0; idx < 1; idx++) {
+            size_t namelen = strlen(names[idx]);
+            size_t rec_len = 8 + namelen;
+            rec_len = (rec_len + 3) & ~3u;
+            if (pos + rec_len <= offset) { pos += rec_len; continue; }
+            if (written >= size) break;
+            size_t entry_off = ((size_t)offset > pos) ? ((size_t)offset - pos) : 0;
+            uint8_t tmp[128];
+            memset(tmp, 0, sizeof(tmp));
+            struct ext2_dir_entry de;
+            de.inode = (uint32_t)(3100 + idx);
+            de.rec_len = (uint16_t)rec_len;
+            de.name_len = (uint8_t)namelen;
+            de.file_type = EXT2_FT_REG_FILE;
+            memcpy(tmp, &de, 8);
+            memcpy(tmp + 8, names[idx], namelen);
+            size_t avail = size - written;
+            size_t tocopy = rec_len > entry_off ? rec_len - entry_off : 0;
+            if (tocopy > avail) tocopy = avail;
+            if (tocopy > 0) memcpy(out + written, tmp + entry_off, tocopy);
+            written += tocopy;
+            pos += rec_len;
+        }
+        return (ssize_t)written;
+    }
+
+    /* /proc/scsi directory listing */
     if (h->kind == 13) {
         /* /proc/scsi: list file "scsi" */
         const char *names[] = { "scsi" };
@@ -1211,7 +1242,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 		else if (h->file_id == 15) full = procfs_show_kernel_stat(tmpbuf, cap, NULL);
         else if (h->file_id == 16) full = procfs_show_mounts(tmpbuf, cap, NULL);
 		else if (h->file_id == 40) full = procfs_show_scsi(tmpbuf, cap, NULL);
-		else if (h->file_id == 41) full = procfs_show_pci(tmpbuf, cap, NULL);
+		else if (h->file_id == 41 || h->file_id == 42) full = procfs_show_pci(tmpbuf, cap, NULL);
         else if (h->file_id == 30) full = usb_proc_bus_devices_show(tmpbuf, cap, NULL);
         else if (h->file_id == 31) full = (ssize_t)snprintf(tmpbuf, cap, "pty_slave            /dev/tty\n");
         else if (h->file_id == 50) full = procfs_net_snap_tcp(tmpbuf, cap);

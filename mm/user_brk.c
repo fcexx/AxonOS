@@ -123,11 +123,6 @@ uint64_t user_syscall_brk(uint64_t req) {
     if (req > *p_cur) {
         if (tcur && user_as_mmap_overlaps_user_stack(tcur, (uintptr_t)(*p_cur),
                 (uintptr_t)(req - *p_cur), NULL)) {
-            kprintf("brk: refuse grow through stack cur=0x%llx req=0x%llx rsp=0x%llx stk=[0x%llx..0x%llx]\n",
-                (unsigned long long)*p_cur, (unsigned long long)req,
-                (unsigned long long)(uint64_t)syscall_user_rsp_saved,
-                (unsigned long long)tcur->user_stack_base,
-                (unsigned long long)tcur->user_stack_limit);
             return (uint64_t)(*p_cur);
         }
         if (user_map_ensure_present_us_2m((uint64_t)(*p_cur), (uint64_t)req) != 0)
@@ -141,11 +136,5 @@ uint64_t user_syscall_brk(uint64_t req) {
     }
     *p_cur = (uintptr_t)req;
     user_as_shared_publish_brk(tcur, *p_base, *p_cur);
-    if (user_brk_watch(tcur)) {
-        kprintf("brk: pid=%s base=0x%llx cur=0x%llx req=0x%llx top=0x%llx mmap_next=0x%llx\n",
-            tcur->name, (unsigned long long)*p_base, (unsigned long long)*p_cur,
-            (unsigned long long)req, (unsigned long long)top_limit,
-            (unsigned long long)(tcur ? tcur->user_mmap_next : user_as_mmap_next));
-    }
     return (uint64_t)(*p_cur);
 }
