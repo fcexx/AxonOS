@@ -33,6 +33,12 @@ int e1000_recv_frame(void *buf, size_t cap);
 /* Optional driver polling hook (for setups without NIC IRQ path). */
 void e1000_poll(void);
 
+/* Drop all pending RX frames (call before DHCP after link change). */
+void e1000_flush_rx(void);
+
+/* Returns 1 if link-up (LU) bit changed since last call (clears latch). */
+int e1000_link_changed(void);
+
 /* Debug: print RX ring state. */
 void e1000_debug_rx(void);
 

@@ -122,6 +122,8 @@ typedef struct {
     uint32_t rx_next;
 
     e1000_stats_t stats;
+    int last_link_up;
+    int link_changed;
 } e1000_state_t;
 
 static e1000_state_t g_e1000;
@@ -265,8 +267,9 @@ static int e1000_setup_rx(void) {
     e1000_write32(E1000_REG_RDT, E1000_RX_DESC_COUNT - 1);
     g_e1000.rx_next = 0;
 
-    /* Enable broad receive filters during early bring-up. */
-    e1000_write32(E1000_REG_RCTL, E1000_RCTL_EN | E1000_RCTL_UPE | E1000_RCTL_MPE | E1000_RCTL_BAM | E1000_RCTL_SECRC);
+    /* Enable broad receive filters; BUF_SIZE=00b => 2048-byte buffers (matches E1000_RX_BUF_SIZE). */
+    e1000_write32(E1000_REG_RCTL,
+        E1000_RCTL_EN | E1000_RCTL_UPE | E1000_RCTL_MPE | E1000_RCTL_BAM | E1000_RCTL_SECRC);
     return 0;
 }
 
@@ -340,9 +343,11 @@ int e1000_init(void) {
     }
 
     g_e1000.initialized = 1;
+    g_e1000.last_link_up = (e1000_read32(E1000_REG_STATUS) & E1000_STATUS_LU) ? 1 : 0;
+    g_e1000.link_changed = 0;
     /* Не ждём link здесь: pit_sleep_ms в контексте первого ping (syscall) на VMware может зависнуть. */
     {
-        int link_up = (e1000_read32(E1000_REG_STATUS) & E1000_STATUS_LU) ? 1 : 0;
+        int link_up = g_e1000.last_link_up;
         klogprintf("e1000: %02x:%02x.%x dev=%04x mac=%02x:%02x:%02x:%02x:%02x:%02x link=%s\n",
                    pdev->bus, pdev->device, pdev->function, pdev->device_id,
                    g_e1000.mac[0], g_e1000.mac[1], g_e1000.mac[2],
@@ -368,33 +373,35 @@ int e1000_send_frame(const void *data, size_t len) {
     if (!g_e1000.initialized || !data) return -1;
     if (len == 0 || len > E1000_TX_BUF_SIZE) return -1;
 
-    uint32_t tail = e1000_read32(E1000_REG_TDT);
-    if (tail >= E1000_TX_DESC_COUNT) tail = 0;
-    e1000_tx_desc_t *d = &g_e1000.tx_desc[tail];
+    for (int attempt = 0; attempt < 8; attempt++) {
+        uint32_t tail = e1000_read32(E1000_REG_TDT);
+        if (tail >= E1000_TX_DESC_COUNT) tail = 0;
+        e1000_tx_desc_t *d = &g_e1000.tx_desc[tail];
 
-    if ((d->status & E1000_TX_STATUS_DD) == 0) {
-        g_e1000.stats.tx_errors++;
-        return -2; /* ring full/busy */
-    }
+        if ((d->status & E1000_TX_STATUS_DD) == 0) {
+            for (volatile int s = 0; s < 2000; s++)
+                ;
+            continue;
+        }
 
-    size_t wire_len = (len < E1000_ETH_MIN_FRAME) ? E1000_ETH_MIN_FRAME : len;
-    memcpy(g_e1000.tx_buf[tail], data, len);
-    if (wire_len > len) memset(g_e1000.tx_buf[tail] + len, 0, wire_len - len);
+        size_t wire_len = (len < E1000_ETH_MIN_FRAME) ? E1000_ETH_MIN_FRAME : len;
+        memcpy(g_e1000.tx_buf[tail], data, len);
+        if (wire_len > len) memset(g_e1000.tx_buf[tail] + len, 0, wire_len - len);
 
-    d->length = (uint16_t)wire_len;
-    d->cso = 0;
-    d->cmd = E1000_TX_CMD_EOP | E1000_TX_CMD_IFCS | E1000_TX_CMD_RS;
-    d->status = 0;
-    d->css = 0;
-    d->special = 0;
+        d->length = (uint16_t)wire_len;
+        d->cso = 0;
+        d->cmd = E1000_TX_CMD_EOP | E1000_TX_CMD_IFCS | E1000_TX_CMD_RS;
+        d->status = 0;
+        d->css = 0;
+        d->special = 0;
 
-    e1000_write32(E1000_REG_TDT, (tail + 1) % E1000_TX_DESC_COUNT);
+        e1000_write32(E1000_REG_TDT, (tail + 1) % E1000_TX_DESC_COUNT);
 
-    /* Ограниченный спин без pit_sleep_ms: в syscall pit_sleep_ms может зависнуть (timer_ticks не тикает). */
-    for (int i = 0; i < 100000; i++) {
-        if (d->status & E1000_TX_STATUS_DD) {
-            g_e1000.stats.tx_packets++;
-            return (int)len;
+        for (int i = 0; i < 100000; i++) {
+            if (d->status & E1000_TX_STATUS_DD) {
+                g_e1000.stats.tx_packets++;
+                return (int)len;
+            }
         }
     }
 
@@ -405,18 +412,18 @@ int e1000_send_frame(const void *data, size_t len) {
 int e1000_recv_frame(void *buf, size_t cap) {
     if (!g_e1000.initialized || !buf || cap == 0) return -1;
 
-    uint32_t rdh = e1000_read32(E1000_REG_RDH);
+    e1000_poll();
+
     uint32_t rdt = e1000_read32(E1000_REG_RDT);
-    uint32_t next = (rdt + 1) % E1000_RX_DESC_COUNT;
-    if (rdh == next) return 0; /* ring empty */
+    uint32_t rdh = e1000_read32(E1000_REG_RDH);
+    uint32_t idx = (rdt + 1) % E1000_RX_DESC_COUNT;
+    if (idx == rdh)
+        return 0;
 
-    /* Resync rx_next if desynced (second ping timeout: rx_next=3 but packets at 21-24) */
-    if (g_e1000.rx_next != next) g_e1000.rx_next = next;
-
-    uint32_t idx = g_e1000.rx_next;
     volatile e1000_rx_desc_t *d = (volatile e1000_rx_desc_t *)&g_e1000.rx_desc[idx];
-    __asm__ volatile("" ::: "memory"); /* memory barrier */
-    if ((d->status & E1000_RX_STATUS_DD) == 0) return 0;
+    __asm__ volatile("" ::: "memory");
+    if ((d->status & E1000_RX_STATUS_DD) == 0)
+        return 0;
 
     if ((d->status & E1000_RX_STATUS_EOP) == 0) {
         d->status = 0;
@@ -426,9 +433,11 @@ int e1000_recv_frame(void *buf, size_t cap) {
         return -2;
     }
 
-    size_t frame_len = d->length;
+    size_t frame_len = (size_t)(d->length & 0x3FFFu);
+    if (frame_len > E1000_RX_BUF_SIZE)
+        frame_len = E1000_RX_BUF_SIZE;
     size_t copy_len = (frame_len > cap) ? cap : frame_len;
-    __asm__ volatile("" ::: "memory"); /* ensure DMA data is visible */
+    __asm__ volatile("" ::: "memory");
     memcpy(buf, g_e1000.rx_buf[idx], copy_len);
 
     d->status = 0;
@@ -439,10 +448,33 @@ int e1000_recv_frame(void *buf, size_t cap) {
     return (int)copy_len;
 }
 
+void e1000_flush_rx(void) {
+    if (!g_e1000.initialized) return;
+    uint8_t junk[E1000_RX_BUF_SIZE];
+    for (int i = 0; i < E1000_RX_DESC_COUNT * 2; i++) {
+        e1000_poll();
+        if (e1000_recv_frame(junk, sizeof(junk)) <= 0)
+            break;
+    }
+}
+
 void e1000_poll(void) {
     if (!g_e1000.initialized) return;
     (void)e1000_read32(E1000_REG_ICR);
-    (void)e1000_read32(E1000_REG_RDH); /* sync: VMware may need device read before DMA visibility */
+    (void)e1000_read32(E1000_REG_RDH);
+    int up = (e1000_read32(E1000_REG_STATUS) & E1000_STATUS_LU) ? 1 : 0;
+    if (up != g_e1000.last_link_up) {
+        g_e1000.link_changed = 1;
+        g_e1000.last_link_up = up;
+    }
+}
+
+int e1000_link_changed(void) {
+    if (!g_e1000.initialized) return 0;
+    e1000_poll();
+    if (!g_e1000.link_changed) return 0;
+    g_e1000.link_changed = 0;
+    return 1;
 }
 
 void e1000_debug_rx(void) {

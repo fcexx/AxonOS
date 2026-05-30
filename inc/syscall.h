@@ -92,7 +92,9 @@
 #define SYS_getpriority       140
 #define SYS_setpriority       141
 #define SYS_nanosleep 35
-#define SYS_gettimeofday 169
+/* Linux x86_64: gettimeofday = 96, reboot = 169. */
+#define SYS_gettimeofday 96
+#define SYS_reboot 169
 #define SYS_access 21
 #define SYS_link   86
 #define SYS_mkdir  83

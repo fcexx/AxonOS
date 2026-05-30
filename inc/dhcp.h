@@ -21,4 +21,7 @@ typedef struct {
  */
 int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease);
 
+/* Drop in-RAM lease cache (required after link/network change). */
+void dhcp_invalidate_cache(void);
+
 #endif /* DHCP_H */

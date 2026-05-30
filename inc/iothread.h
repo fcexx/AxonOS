@@ -38,4 +38,10 @@ int iothread_check_completed();
 // get completed operation
 io_request_t* iothread_get_completed();
 
+/* Non-zero while the I/O worker still has queued work (sync/reboot drain). */
+int iothread_pending(void);
+
+/* Block until pending_queue is empty (yields to io_worker). */
+void iothread_drain(void);
+
 #endif // IOTHREAD_H 

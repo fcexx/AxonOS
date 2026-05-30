@@ -174,6 +174,23 @@ int iothread_check_completed() {
         return count;
 }
 
+int iothread_pending(void) {
+        if (!iothread_initialized)
+                return 0;
+        unsigned long _flags = 0;
+        acquire_irqsave(&io_lock, &_flags);
+        int pending = (pending_queue != NULL);
+        release_irqrestore(&io_lock, _flags);
+        return pending;
+}
+
+void iothread_drain(void) {
+        if (!iothread_initialized)
+                return;
+        while (iothread_pending())
+                thread_yield();
+}
+
 // Получить завершенную операцию (любую)
 io_request_t* iothread_get_completed() {
         if (!iothread_initialized) return NULL;

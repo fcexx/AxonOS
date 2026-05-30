@@ -32,6 +32,8 @@
 #include <debug.h>
 #include <klog.h>
 #include <fbdev.h>
+#include <power.h>
+#include <iothread.h>
 #include <stdio.h>
 #include <user_vma.h>
 #include <user_as.h>
@@ -749,7 +751,7 @@ typedef struct {
     uint32_t nl_pid;
     uint32_t nl_groups;
     uint32_t nl_peer_pid;
-    uint8_t nl_rx[4096];
+    uint8_t nl_rx[8192];
     size_t nl_rx_len;
     size_t nl_rx_off;
     /* glibc tries TCP :53 first; many routers RST -> ECONNREFUSED. Fake connect and use UDP for DNS. */
@@ -1201,12 +1203,7 @@ typedef struct {
 static net_state_t g_net;
 static net_state_t g_net_shadow;
 static int g_net_shadow_valid = 0;
-static uint32_t g_net_cfg_magic = 0x4E455443u; /* "NETC" */
-static uint8_t g_net_cfg_mac[6];
-static uint32_t g_net_cfg_ip_be = 0;
-static uint32_t g_net_cfg_mask_be = 0;
-static uint32_t g_net_cfg_gw_be = 0;
-static uint32_t g_net_cfg_dns_be = 0;
+static volatile int g_net_redhcp_pending = 0;
 
 /* ---------- RX pump: answer ARP/ICMP and queue everything else ---------- */
 static inline uint16_t be16(uint16_t v);
@@ -1442,9 +1439,26 @@ static int net_rxq_take_tcp_frame(const net_tcp_conn_t *c, uint32_t local_ip_be,
     return (int)copy_len;
 }
 
+static int net_stack_init(void);
+
 static void net_rx_pump_thread(void) {
     uint8_t buf[NET_RXQ_BUF];
     for (;;) {
+        if (e1000_link_changed()) {
+            klogprintf("net: link changed, scheduling DHCP renew\n");
+            g_net_redhcp_pending = 1;
+        }
+        if (g_net_redhcp_pending) {
+            g_net_redhcp_pending = 0;
+            dhcp_invalidate_cache();
+            g_net_shadow_valid = 0;
+            memset(&g_net_shadow, 0, sizeof(g_net_shadow));
+            g_net.ready = 0;
+            g_net.gw_mac_valid = 0;
+            g_net.inited = 0;
+            net_rxq_flush();
+            (void)net_stack_init();
+        }
         if (!g_net.ready) { thread_sleep(50); continue; }
         /* Drain a small budget to keep latency low but avoid starving other work. */
         for (int i = 0; i < 32; i++) {
@@ -1689,13 +1703,15 @@ static uint16_t ip_checksum16(const void *data, size_t len) {
     const uint8_t *p = (const uint8_t *)data;
     uint32_t sum = 0;
     while (len > 1) {
-        sum += (uint32_t)((p[0] << 8) | p[1]);
+        sum += (uint32_t)((uint16_t)p[0] << 8) | p[1];
         p += 2;
         len -= 2;
     }
-    if (len) sum += (uint32_t)(p[0] << 8);
-    while (sum >> 16) sum = (sum & 0xFFFFu) + (sum >> 16);
-    return (uint16_t)(~sum);
+    if (len)
+        sum += (uint32_t)((uint16_t)p[0] << 8);
+    while (sum >> 16)
+        sum = (sum & 0xFFFFu) + (sum >> 16);
+    return (uint16_t)(~sum & 0xFFFFu);
 }
 
 static void ip_be_to_bytes(uint32_t ip_be, uint8_t out[4]) {
@@ -1735,7 +1751,12 @@ static int net_send_eth_ipv4(const uint8_t dst_mac[6], uint32_t dst_ip_be, uint8
     ip->proto = proto;
     ip->src = be32(g_net.ip_be);
     ip->dst = be32(dst_ip_be);
-    ip->csum = be16(ip_checksum16(ip, sizeof(*ip)));
+    {
+        uint16_t c = ip_checksum16(ip, sizeof(*ip));
+        uint8_t *cp = (uint8_t *)&ip->csum;
+        cp[0] = (uint8_t)(c >> 8);
+        cp[1] = (uint8_t)(c & 0xFF);
+    }
 
     memcpy(frame + sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t), l4, l4_len);
     int r = e1000_send_frame(frame, frame_len);
@@ -1995,7 +2016,8 @@ static int net_stack_init(void) {
     if (g_net.inited) return g_net.ready ? 0 : -1;
     if (g_net_shadow_valid && g_net_shadow.ready) {
         g_net = g_net_shadow;
-        klogprintf("net: restored cached state ip=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
+        g_net.inited = 1;
+        klogprintf("net: restored session ip=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
                    (unsigned)((g_net.ip_be >> 24) & 0xFF), (unsigned)((g_net.ip_be >> 16) & 0xFF),
                    (unsigned)((g_net.ip_be >> 8) & 0xFF), (unsigned)(g_net.ip_be & 0xFF),
                    (unsigned)((g_net.gw_be >> 24) & 0xFF), (unsigned)((g_net.gw_be >> 16) & 0xFF),
@@ -2007,59 +2029,41 @@ static int net_stack_init(void) {
     g_net.ip_id = 1;
     if (e1000_get_mac(g_net.mac) != 0) return -1;
 
-    /* Strong fallback cache keyed by NIC MAC: bypass repeated DHCP if g_net was reset. */
-    if (g_net_cfg_magic == 0x4E455443u &&
-        g_net_cfg_ip_be != 0 && g_net_cfg_mask_be != 0 && g_net_cfg_gw_be != 0 &&
-        memcmp(g_net_cfg_mac, g_net.mac, 6) == 0) {
-        g_net.ip_be = g_net_cfg_ip_be;
-        g_net.mask_be = g_net_cfg_mask_be;
-        g_net.gw_be = g_net_cfg_gw_be;
-        g_net.dns_be = g_net_cfg_dns_be ? g_net_cfg_dns_be : g_net_cfg_gw_be;
-        g_net.ready = 1;
-        g_net_shadow = g_net;
-        g_net_shadow_valid = 1;
-        klogprintf("net: restored MAC cache ip=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
-                   (unsigned)((g_net.ip_be >> 24) & 0xFF), (unsigned)((g_net.ip_be >> 16) & 0xFF),
-                   (unsigned)((g_net.ip_be >> 8) & 0xFF), (unsigned)(g_net.ip_be & 0xFF),
-                   (unsigned)((g_net.gw_be >> 24) & 0xFF), (unsigned)((g_net.gw_be >> 16) & 0xFF),
-                   (unsigned)((g_net.gw_be >> 8) & 0xFF), (unsigned)(g_net.gw_be & 0xFF));
-        return 0;
-    }
-    
     dhcp_lease_t lease;
-    uint32_t dns_be = 0;
-    if (dhcp_acquire(g_net.mac, &lease) == 0) {
+    int dhcp_ok = 0;
+    for (int dhcp_round = 0; dhcp_round < 2 && !dhcp_ok; dhcp_round++) {
+        if (dhcp_round > 0) {
+            klogprintf("net: DHCP retry after link settle\n");
+            e1000_flush_rx();
+            pit_sleep_ms(3000);
+        }
+        if (dhcp_acquire(g_net.mac, &lease) != 0)
+            continue;
         g_net.ip_be = lease.ip_be;
         g_net.mask_be = lease.mask_be;
         g_net.gw_be = lease.gw_be;
-        dns_be = lease.dns_be ? lease.dns_be : lease.gw_be;
-        g_net.dns_be = dns_be;
-    } else {
-        /* Fallback for QEMU user networking only. Do NOT cache: bridged/NAT would
-           get wrong 10.0.2.x and DNS would never work. Next init retries DHCP. */
+        g_net.dns_be = lease.dns_be ? lease.dns_be : lease.gw_be;
+        dhcp_ok = 1;
+    }
+    if (!dhcp_ok) {
+        /* QEMU user-NAT fallback only — never reuse across bridged WiFi changes. */
         g_net.ip_be = 0x0A00020Fu;   /* 10.0.2.15 */
         g_net.mask_be = 0xFFFFFF00u; /* /24 */
         g_net.gw_be = 0x0A000202u;   /* 10.0.2.2 */
-        dns_be = 0x0A000203u;        /* 10.0.2.3 QEMU DNS */
-        g_net.dns_be = dns_be;
-        klogprintf("net: DHCP failed, fallback ip=10.0.2.15 gw=10.0.2.2 (not cached)\n");
+        g_net.dns_be = 0x0A000203u;   /* 10.0.2.3 */
+        klogprintf("net: DHCP failed, fallback ip=10.0.2.15 gw=10.0.2.2\n");
     }
     g_net.ready = 1;
-    g_net_shadow = g_net;
-    g_net_shadow_valid = 1;
-    /* Only cache when DHCP succeeded; bridged mode would otherwise get stuck on 10.0.2.x */
-    if (dns_be != 0x0A000203u) { /* not QEMU fallback */
-        memcpy(g_net_cfg_mac, g_net.mac, 6);
-        g_net_cfg_ip_be = g_net.ip_be;
-        g_net_cfg_mask_be = g_net.mask_be;
-        g_net_cfg_gw_be = g_net.gw_be;
-        g_net_cfg_dns_be = g_net.dns_be;
+    if (dhcp_ok) {
+        g_net_shadow = g_net;
+        g_net_shadow_valid = 1;
     }
-    klogprintf("net: ready ip=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
+    klogprintf("net: ready ip=%u.%u.%u.%u gw=%u.%u.%u.%u%s\n",
                (unsigned)((g_net.ip_be >> 24) & 0xFF), (unsigned)((g_net.ip_be >> 16) & 0xFF),
                (unsigned)((g_net.ip_be >> 8) & 0xFF), (unsigned)(g_net.ip_be & 0xFF),
                (unsigned)((g_net.gw_be >> 24) & 0xFF), (unsigned)((g_net.gw_be >> 16) & 0xFF),
-               (unsigned)((g_net.gw_be >> 8) & 0xFF), (unsigned)(g_net.gw_be & 0xFF));
+               (unsigned)((g_net.gw_be >> 8) & 0xFF), (unsigned)(g_net.gw_be & 0xFF),
+               dhcp_ok ? "" : " (dhcp fallback)");
 
     /* Start background RX pump once: reply to ARP/ICMP even when userland is idle. */
     if (!g_net_rx_thread_started) {
@@ -3595,7 +3599,8 @@ static ssize_t net_sock_read_userspace(thread_t *cur, ksock_net_t *s, void *bufp
     if (s->sock_domain == AF_NETLINK_LOCAL) {
         if (cnt == 0) return 0;
         if (!bufp || !user_range_ok(bufp, cnt)) return -EFAULT;
-        if (s->nl_rx_off >= s->nl_rx_len) return -EAGAIN;
+        if (s->nl_rx_off >= s->nl_rx_len)
+            return 0; /* EOF after dump — ip(8) treats EAGAIN as OVERRUN */
         size_t avail = s->nl_rx_len - s->nl_rx_off;
         size_t ncopy = (avail > cnt) ? cnt : avail;
         if (copy_to_user_safe(bufp, s->nl_rx + s->nl_rx_off, ncopy) != 0) return -EFAULT;
@@ -5128,8 +5133,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (copy_to_user_safe(tp, &ts, sizeof(ts)) != 0) return ret_err(EFAULT);
             return 0;
         }
-        case 96: /* Linux uses 96 for gettimeofday; glibc may call it */
-        case SYS_gettimeofday: {
+        case SYS_gettimeofday: { /* Linux x86_64 nr 96 */
             /* gettimeofday(struct timeval *tv, struct timezone *tz) */
             void *tv_u = (void*)(uintptr_t)a1;
             (void)a2;
@@ -5143,6 +5147,45 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             tv.tv_usec = (int64_t)usec;
             if (copy_to_user_safe(tv_u, &tv, sizeof(tv)) != 0) return ret_err(EFAULT);
             return 0;
+        }
+        case SYS_reboot: {
+            /* Linux reboot(magic1, magic2, cmd, arg) — BusyBox reboot/halt/poweroff. */
+            enum {
+                LINUX_REBOOT_MAGIC1 = 0xFEE1DEADu,
+                LINUX_REBOOT_MAGIC2 = 672274793u,  /* 0x28121969 */
+                LINUX_REBOOT_MAGIC2A = 0x05121996u,
+                LINUX_REBOOT_CMD_RESTART   = 0x01234567u,
+                LINUX_REBOOT_CMD_HALT      = 0xCDEF0123u,
+                LINUX_REBOOT_CMD_CAD_ON    = 0x89ABCDEFu,
+                LINUX_REBOOT_CMD_CAD_OFF   = 0u,
+                LINUX_REBOOT_CMD_POWER_OFF = 0x4321FEDCu,
+                LINUX_REBOOT_CMD_RESTART2  = 0xA1B2C3D4u,
+            };
+            uint32_t magic1 = (uint32_t)a1;
+            uint32_t magic2 = (uint32_t)a2;
+            uint32_t cmd    = (uint32_t)a3;
+            const void *arg_u = (const void *)(uintptr_t)a4;
+            if (magic1 != LINUX_REBOOT_MAGIC1)
+                return ret_err(EINVAL);
+            if (magic2 != LINUX_REBOOT_MAGIC2 && magic2 != LINUX_REBOOT_MAGIC2A)
+                return ret_err(EINVAL);
+            if (cmd == LINUX_REBOOT_CMD_CAD_ON || cmd == LINUX_REBOOT_CMD_CAD_OFF)
+                return 0;
+            if (cmd == LINUX_REBOOT_CMD_POWER_OFF || cmd == LINUX_REBOOT_CMD_HALT) {
+                power_request_shutdown("reboot syscall");
+                return 0;
+            }
+            if (cmd == LINUX_REBOOT_CMD_RESTART2) {
+                if (arg_u && !user_range_ok(arg_u, 1))
+                    return ret_err(EFAULT);
+                power_request_reboot("reboot syscall RESTART2");
+                return 0;
+            }
+            if (cmd == LINUX_REBOOT_CMD_RESTART) {
+                power_request_reboot("reboot syscall");
+                return 0;
+            }
+            return ret_err(EINVAL);
         }
         case SYS_clock_nanosleep: {
             /* clock_nanosleep(clockid, flags, req, rem) */
@@ -6491,7 +6534,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (s->sock_domain == AF_NETLINK_LOCAL) {
                 if (len == 0) return 0;
                 if (!buf_u || !user_range_ok(buf_u, len)) return ret_err(EFAULT);
-                if (s->nl_rx_off >= s->nl_rx_len) return ret_err(EAGAIN);
+                if (s->nl_rx_off >= s->nl_rx_len) return 0;
                 size_t avail = s->nl_rx_len - s->nl_rx_off;
                 size_t ncopy = (avail > len) ? len : avail;
                 if (copy_to_user_safe(buf_u, s->nl_rx + s->nl_rx_off, ncopy) != 0) return ret_err(EFAULT);
@@ -6806,7 +6849,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (s->sock_domain == AF_NETLINK_LOCAL) {
                 if (iov.len == 0) return 0;
                 if (!iov.base || !user_range_ok(iov.base, (size_t)iov.len)) return ret_err(EFAULT);
-                if (s->nl_rx_off >= s->nl_rx_len) return ret_err(EAGAIN);
+                if (s->nl_rx_off >= s->nl_rx_len) return 0;
                 size_t avail = s->nl_rx_len - s->nl_rx_off;
                 size_t ncopy = (avail > (size_t)iov.len) ? (size_t)iov.len : avail;
                 if (copy_to_user_safe(iov.base, s->nl_rx + s->nl_rx_off, ncopy) != 0) return ret_err(EFAULT);
@@ -7233,7 +7276,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (!cur->fds[fd]) return ret_err(EBADF);
             return 0;
         }
-        case 162: { /* sync() - no-op */
+        case 162: { /* sync() — drain async block I/O before reboot (BusyBox calls this without -f). */
+            iothread_drain();
             return 0;
         }
         case 270: {

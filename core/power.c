@@ -51,18 +51,12 @@ void power_poll(void) {
 		kprintf("\n[power] shutdown requested (%s)\n", why);
 
 		/* Give the operator time to see the message and allow klog file appends. */
-		pit_sleep_ms(1500);
+		apic_timer_sleep_ms(1500);
 
 		acpi_try_power_off();
 	} else if (act == POWER_ACT_REBOOT) {
 		klogprintf("power: reboot requested (%s)\n", why);
 		kprintf("\n[power] reboot requested (%s)\n", why);
-		pit_sleep_ms(800);
-		for (volatile int i = 0; i < 500000; i++) {
-#if defined(__GNUC__) || defined(__clang__)
-			__asm__ volatile("pause");
-#endif
-		}
 		reboot_system();
 	}
 }
