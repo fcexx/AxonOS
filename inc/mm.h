@@ -3,7 +3,10 @@
 #include <stdint.h>
 
 typedef struct mm_struct {
-    /* Top-level page table (virtual pointer to identity-mapped physical page). */
+    /* Top-level page table (virtual pointer to identity-mapped physical page).
+     * Linux separates mm_struct (page tables, refcount) from the VMA rb_tree in
+     * struct mm_struct; AxonOS keeps user VMAs in mm/user_vma.c and mmap/brk cursors
+     * in mm/user_as.c (per-thread fields + CLONE_VM publish). */
     uint64_t *pml4;
     /* CR3 value used for this address space. */
     uint64_t cr3;
@@ -37,3 +40,15 @@ int mm_switch(mm_t *mm);
  * When copy_old!=0 (fork), the live parent root is taken from paging_read_cr3(); share_cmp_mm
  * is ignored for split/dup decisions (callers may still pass parent mm for API symmetry). */
 int mm_make_private_range(mm_t *mm, uint64_t va_begin, uint64_t va_end, int copy_old, mm_t *share_cmp_mm);
+
+/* COW up to max_pages present user-writable 4KiB pages (splits 2MiB when needed).
+ * share_l4: parent page table root (NOT paging_read_cr3() — CR3 may differ mid-fork). */
+int mm_cow_fork_pages(mm_t *mm, uint64_t *share_l4, uint64_t va_begin, uint64_t va_end,
+                      unsigned max_pages, unsigned *copied_out);
+
+/* Fork COW: copy only present user-writable pages in [va_begin, va_end). */
+int mm_cow_private_writable(mm_t *mm, uint64_t va_begin, uint64_t va_end);
+
+/* Clear [va_begin, va_end) in child mm without touching parent share_l4 mappings.
+   Duplicates shared page-table pages one level at a time before clearing PTEs. */
+int mm_clear_range_private(mm_t *mm, uint64_t *share_l4, uint64_t va_begin, uint64_t va_end);

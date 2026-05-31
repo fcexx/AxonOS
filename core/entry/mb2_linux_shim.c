@@ -5,8 +5,6 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define MB2_MOD_SIZE_CAP ((uint64_t)(512u * 1024u * 1024u))
-
 static int mb2_module_in_kzip_reloc_arena(uint32_t mod_start) {
     return mod_start >= AXON_MB2_MODULE_RELOC_BASE && mod_start < AXON_MB2_MODULE_RELOC_CEIL;
 }
@@ -47,23 +45,26 @@ static uint32_t mb2_extend_mod_end(uint32_t mod_start, uint32_t mod_end, uint32_
     if (next_mod_start <= mod_end)
         return mod_end;
     uint64_t span = (uint64_t)next_mod_start - (uint64_t)mod_start;
-    if (span > MB2_MOD_SIZE_CAP)
+    if (span > AXON_INITRD_SIZE_MAX)
         return mod_end;
     klogprintf("mb2: initfs tag end 0x%x -> 0x%x (use span to next module)\n", (unsigned)mod_end,
                (unsigned)next_mod_start);
     return next_mod_start;
 }
 
-static void shim_write_bootparams(uint32_t mod_start, uint32_t mod_end, void *boot_params, size_t boot_params_sz) {
+static int shim_write_bootparams(uint32_t mod_start, uint32_t mod_end, void *boot_params, size_t boot_params_sz) {
     if (mod_end <= mod_start || boot_params_sz < LINUX_BOOTPARAM_MIN_SIZE)
-        return;
+        return -1;
     uint64_t sz64 = (uint64_t)mod_end - (uint64_t)mod_start;
-    if (sz64 == 0 || sz64 > MB2_MOD_SIZE_CAP)
-        return;
+    if (sz64 == 0 || sz64 > AXON_INITRD_SIZE_MAX)
+        return -1;
     memset(boot_params, 0, boot_params_sz);
     *(uint32_t *)((uint8_t *)boot_params + LINUX_BOOTPARAM_OFF_HDR_MAGIC) = LINUX_BOOTPARAM_HEADER_MAGIC;
     *(uint32_t *)((uint8_t *)boot_params + LINUX_BOOTPARAM_OFF_RAMDISK_IMG) = mod_start;
+    *(uint32_t *)((uint8_t *)boot_params + LINUX_BOOTPARAM_OFF_EXT_RD_IMG) = (uint32_t)((uint64_t)mod_start >> 32);
     *(uint32_t *)((uint8_t *)boot_params + LINUX_BOOTPARAM_OFF_RAMDISK_SZ) = (uint32_t)sz64;
+    *(uint32_t *)((uint8_t *)boot_params + LINUX_BOOTPARAM_OFF_EXT_RD_SZ) = (uint32_t)(sz64 >> 32);
+    return 0;
 }
 
 static size_t shim_strnlen(const char *s, size_t maxn) {
@@ -163,8 +164,7 @@ static int shim_try_fill_from_tags(uint8_t *p, uint32_t total_size, uint32_t fir
                     me = mb2_extend_mod_end(ms, me, next_s);
                 if (me <= ms)
                     return -2;
-                shim_write_bootparams(ms, me, boot_params, boot_params_sz);
-                return 0;
+                return shim_write_bootparams(ms, me, boot_params, boot_params_sz);
             }
         }
         offset += (tag_size + 7) & ~7u;
@@ -192,7 +192,7 @@ static int shim_loose_scan(uint8_t *p, const char *module_name, void *boot_param
         uint64_t mod_start = (uint64_t)ms32;
         uint64_t mod_end = (uint64_t)me32;
         size_t mod_size = (size_t)(mod_end - mod_start);
-        if (mod_size == 0 || mod_size > (512u * 1024u * 1024u))
+        if (mod_size == 0 || (uint64_t)mod_size > AXON_INITRD_SIZE_MAX)
             continue;
 
         const char *name = (const char *)(p + off + 16u);
@@ -212,8 +212,8 @@ static int shim_loose_scan(uint8_t *p, const char *module_name, void *boot_param
             me = mb2_extend_mod_end(ms, me, next_s);
         if (me <= ms)
             continue;
-        shim_write_bootparams(ms, me, boot_params, boot_params_sz);
-        return 0;
+        if (shim_write_bootparams(ms, me, boot_params, boot_params_sz) == 0)
+            return 0;
     }
     return -1;
 }
@@ -256,8 +256,8 @@ int mb2_linux_shim_fill_bootparams(uint32_t multiboot_magic, uint64_t multiboot_
                                                     mb2_min_module_start_above(p, alt_max, 0u, ms32));
                         if (me <= ms32)
                             continue;
-                        shim_write_bootparams(ms32, me, boot_params, boot_params_sz);
-                        return 0;
+                        if (shim_write_bootparams(ms32, me, boot_params, boot_params_sz) == 0)
+                            return 0;
                     }
                 }
             }

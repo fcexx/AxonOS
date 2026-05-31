@@ -1,6 +1,8 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
+#include <fs.h>
 
 /**
  * struct pci_device - simple PCI device descriptor
@@ -29,6 +31,7 @@ typedef struct pci_device {
     uint8_t prog_if;
     uint8_t header_type;
     uint8_t irq;
+    uint8_t revision;
     uint32_t bar[6];
 } pci_device_t;
 
@@ -38,6 +41,11 @@ typedef struct pci_device {
 void pci_init(void);
 void pci_sysfs_init(void);
 void pci_dump_devices(void);
+
+/* Linux /proc/bus/pci/devices and lspci -n style formatting */
+ssize_t pci_format_proc_line(char *buf, size_t size, const pci_device_t *dev);
+ssize_t pci_format_lspci_n_line(char *buf, size_t size, const pci_device_t *dev);
+ssize_t pci_show_proc_devices(char *buf, size_t size);
 
 /*
  * pci_config_read_dword/pci_config_write_dword - access PCI config space

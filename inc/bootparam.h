@@ -27,5 +27,8 @@
 #define AXON_MB2_MODULE_RELOC_BASE 0x02000000u
 #define AXON_MB2_MODULE_RELOC_CEIL 0x05000000u
 
+/* Max initrd size from GRUB module2 / mb2_linux_shim (was 512 MiB — too small for large initfs). */
+#define AXON_INITRD_SIZE_MAX ((uint64_t)(2048u * 1024u * 1024u))
+
 /* Returns 0 and fills *start_out/*size_out (physical initrd region) if HdrS present and size != 0. */
 int linux_bootparams_ramdisk(const void *boot_params, uintptr_t *start_out, size_t *size_out);

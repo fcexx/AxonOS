@@ -17,15 +17,13 @@
 #define SYS_resolve 1000
 #endif
 
+/* ip_be from SYS_resolve is in_addr.s_addr layout (network-order octets in LE memory). */
 static void fill_v4mapped_addr(uint8_t out[16], uint32_t ip_be)
 {
     memset(out, 0, 16);
     out[10] = 0xff;
     out[11] = 0xff;
-    out[12] = (uint8_t)((ip_be >> 24) & 0xff);
-    out[13] = (uint8_t)((ip_be >> 16) & 0xff);
-    out[14] = (uint8_t)((ip_be >> 8) & 0xff);
-    out[15] = (uint8_t)(ip_be & 0xff);
+    memcpy(out + 12, &ip_be, 4);
 }
 
 enum nss_status _nss_dns_gethostbyname3_r(const char *name, int af, struct hostent *result,
@@ -68,12 +66,6 @@ enum nss_status _nss_dns_gethostbyname4_r(const char *name, struct gaih_addrtupl
     if (ttlp)
         *ttlp = 0;
 
-    if (buflen < sizeof(struct gaih_addrtuple)) {
-        *errnop = ERANGE;
-        *h_errnop = NETDB_INTERNAL;
-        return NSS_STATUS_TRYAGAIN;
-    }
-
     uint32_t ip_be = 0;
     if (syscall(SYS_resolve, name, &ip_be) != 0) {
         int e = errno;
@@ -87,16 +79,28 @@ enum nss_status _nss_dns_gethostbyname4_r(const char *name, struct gaih_addrtupl
         return NSS_STATUS_UNAVAIL;
     }
 
-    struct gaih_addrtuple *t = (struct gaih_addrtuple *)buffer;
-    memset(t, 0, sizeof(*t));
-    t->next = NULL;
-    t->name = NULL;
-    /* Conservative compatibility: provide AF_INET tuple in name4 path.
-       This avoids glibc's strict v4mapped assertions in some builds. */
-    t->family = AF_INET;
-    t->addr[0] = ip_be;
-    t->scopeid = 0;
-    *pat = t;
+    if (buflen < 2 * sizeof(struct gaih_addrtuple)) {
+        *errnop = ERANGE;
+        *h_errnop = NETDB_INTERNAL;
+        return NSS_STATUS_TRYAGAIN;
+    }
+
+    struct gaih_addrtuple *t6 = (struct gaih_addrtuple *)buffer;
+    struct gaih_addrtuple *t4 = (struct gaih_addrtuple *)(buffer + sizeof(struct gaih_addrtuple));
+    memset(t6, 0, sizeof(*t6));
+    memset(t4, 0, sizeof(*t4));
+    t6->next = t4;
+    t6->name = NULL;
+    t4->next = NULL;
+    t4->name = NULL;
+    /* glibc getaddrinfo asserts IN6_IS_ADDR_V4MAPPED for AF_INET6 results. */
+    t6->family = AF_INET6;
+    fill_v4mapped_addr((uint8_t *)t6->addr, ip_be);
+    t6->scopeid = 0;
+    t4->family = AF_INET;
+    t4->addr[0] = ip_be;
+    t4->scopeid = 0;
+    *pat = t6;
     *errnop = 0;
     *h_errnop = NETDB_SUCCESS;
     return NSS_STATUS_SUCCESS;
@@ -110,13 +114,6 @@ enum nss_status _nss_dns_gethostbyname3_r(const char *name, int af, struct hoste
         return NSS_STATUS_NOTFOUND;
     if (!name || !result || !buffer || !errnop || !h_errnop)
         return NSS_STATUS_UNAVAIL;
-    /* AxonOS currently resolves IPv4 only. Returning AF_INET6 here can trigger
-       strict glibc v4mapped assertions in some getaddrinfo paths. */
-    if (af == AF_INET6) {
-        *errnop = ENOENT;
-        *h_errnop = HOST_NOT_FOUND;
-        return NSS_STATUS_NOTFOUND;
-    }
     if (canon)
         *canon = NULL;
     if (ttlp)
@@ -136,7 +133,9 @@ enum nss_status _nss_dns_gethostbyname3_r(const char *name, int af, struct hoste
     }
 
     size_t nl = strlen(name) + 1;
-    size_t addr_len = 4u;
+    /* AF_UNSPEC: glibc getaddrinfo expects IPv6 v4-mapped, not bare AF_INET. */
+    int out_af = (af == AF_INET) ? AF_INET : AF_INET6;
+    size_t addr_len = (out_af == AF_INET6) ? 16u : 4u;
     size_t off_addr = (nl + sizeof(void *) - 1) & ~(sizeof(void *) - 1);
     size_t need = off_addr + addr_len + sizeof(char *) * 2 + sizeof(char *) * 2;
 
@@ -147,9 +146,11 @@ enum nss_status _nss_dns_gethostbyname3_r(const char *name, int af, struct hoste
     }
 
     memcpy(buffer, name, nl);
-    memcpy(buffer + off_addr, &ip_be, 4);
+    if (out_af == AF_INET6)
+        fill_v4mapped_addr((uint8_t *)(buffer + off_addr), ip_be);
+    else
+        memcpy(buffer + off_addr, &ip_be, 4);
 
-    /* Address payload is 4 bytes for AF_INET and 16 for AF_INET6. */
     char **addrlist = (char **)(buffer + off_addr + addr_len);
     char **aliases = addrlist + 2;
     aliases[0] = NULL;
@@ -159,7 +160,7 @@ enum nss_status _nss_dns_gethostbyname3_r(const char *name, int af, struct hoste
     memset(result, 0, sizeof(*result));
     result->h_name = buffer;
     result->h_aliases = aliases;
-    result->h_addrtype = AF_INET;
+    result->h_addrtype = out_af;
     result->h_length = (int)addr_len;
     result->h_addr_list = addrlist;
 

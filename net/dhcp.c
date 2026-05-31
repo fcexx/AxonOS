@@ -52,14 +52,24 @@ static inline uint16_t be16(uint16_t x) {
     return (uint16_t)((x >> 8) | (x << 8));
 }
 
-/* IP checksum */
-static uint16_t ip_checksum16(const void *data, size_t len) {
-    const uint16_t *p = (const uint16_t *)data;
+/* IP checksum over wire-order (big-endian) 16-bit words. */
+static uint16_t ip_checksum_be(const uint8_t *data, size_t len) {
     uint32_t sum = 0;
-    while (len > 1) { sum += *p++; len -= 2; }
-    if (len) sum += *(const uint8_t *)p;
-    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-    return (uint16_t)~sum;
+    for (size_t i = 0; i + 1 < len; i += 2)
+        sum += ((uint16_t)data[i] << 8) | data[i + 1];
+    if (len & 1)
+        sum += (uint16_t)data[len - 1] << 8;
+    while (sum >> 16)
+        sum = (sum & 0xFFFFu) + (sum >> 16);
+    return (uint16_t)(~sum & 0xFFFFu);
+}
+
+static void ip_put_csum(ipv4_hdr_t *ip, size_t ihl) {
+    ip->csum = 0;
+    uint16_t c = ip_checksum_be((const uint8_t *)ip, ihl);
+    uint8_t *p = (uint8_t *)&ip->csum;
+    p[0] = (uint8_t)(c >> 8);
+    p[1] = (uint8_t)(c & 0xFF);
 }
 
 /* DHCP option parser */
@@ -86,6 +96,17 @@ static uint16_t g_ip_id = 1;
 static dhcp_lease_t g_cached_lease;
 static uint8_t g_cached_mac[6];
 static int g_cached_lease_valid = 0;
+
+void dhcp_invalidate_cache(void) {
+    g_cached_lease_valid = 0;
+    memset(&g_cached_lease, 0, sizeof(g_cached_lease));
+    memset(g_cached_mac, 0, sizeof(g_cached_mac));
+}
+
+static uint32_t dhcp_read_be32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
 
 /* Send DHCP packet */
 static int dhcp_send_packet(const uint8_t mac[6], uint8_t msg_type, uint32_t xid, 
@@ -156,7 +177,7 @@ static int dhcp_send_packet(const uint8_t mac[6], uint8_t msg_type, uint32_t xid
     ip->proto = 17; /* UDP */
     ip->src = 0;
     ip->dst = 0xFFFFFFFFu;
-    ip->csum = be16(ip_checksum16(ip, sizeof(*ip)));
+    ip_put_csum(ip, sizeof(*ip));
     
     /* UDP header */
     udp_hdr_t *udp = (udp_hdr_t *)(frm + sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t));
@@ -166,10 +187,172 @@ static int dhcp_send_packet(const uint8_t mac[6], uint8_t msg_type, uint32_t xid
     udp->csum = 0;
     memcpy((uint8_t *)udp + sizeof(udp_hdr_t), pkt, o);
     
-    int sr = e1000_send_frame(frm, frm_len);
-    klogprintf("dhcp: e1000_send_frame(%u) = %d\n", (unsigned)frm_len, sr);
+    int sr = -1;
+    for (int t = 0; t < 4 && sr < 0; t++)
+        sr = e1000_send_frame(frm, frm_len);
     kfree(frm);
     return (sr < 0) ? -1 : 0;
+}
+
+#define DHCP_DISCOVER_TRIES  6
+#define DHCP_REQUEST_TRIES   4
+#define DHCP_RX_TIMEOUT_MS   10000u
+#define DHCP_LINK_SETTLE_MS  4000u
+#define DHCP_LINK_WAIT_MS    15000u
+
+static int dhcp_parse_offer(const uint8_t *d, size_t opts_len, uint32_t xid,
+                            uint32_t *offered_ip, uint32_t *server_id,
+                            uint32_t *netmask, uint32_t *router, uint32_t *dns) {
+    if (d[0] != 2) /* BOOTREPLY */
+        return 0;
+
+    uint32_t rx_xid = dhcp_read_be32(&d[4]);
+    if (rx_xid != xid)
+        return 0;
+
+    uint8_t l = 0;
+    const uint8_t *t = dhcp_find_opt(d + 240, opts_len, 53, &l);
+    uint8_t msg_type = (t && l == 1) ? t[0] : 0;
+    /* OFFER = 2; some firmware only sets op=2 without option 53. */
+    if (msg_type != 0 && msg_type != 2)
+        return 0;
+
+    uint32_t yiaddr = dhcp_read_be32(&d[16]);
+    uint32_t ciaddr = dhcp_read_be32(&d[12]);
+    uint32_t siaddr = dhcp_read_be32(&d[20]);
+    uint32_t ip = yiaddr ? yiaddr : ciaddr;
+
+    const uint8_t *yip = dhcp_find_opt(d + 240, opts_len, 50, &l);
+    if (!ip && yip && l == 4) ip = dhcp_read_be32(yip);
+
+    const uint8_t *sid = dhcp_find_opt(d + 240, opts_len, 54, &l);
+    uint32_t srv = (sid && l == 4) ? dhcp_read_be32(sid) : (siaddr ? siaddr : 0);
+
+    const uint8_t *msk = dhcp_find_opt(d + 240, opts_len, 1, &l);
+    uint32_t mask = (msk && l == 4) ? dhcp_read_be32(msk) : 0;
+    const uint8_t *rtr = dhcp_find_opt(d + 240, opts_len, 3, &l);
+    uint32_t gw = (rtr && l >= 4) ? dhcp_read_be32(rtr) : 0;
+    const uint8_t *dnsopt = dhcp_find_opt(d + 240, opts_len, 6, &l);
+    uint32_t dnsrv = (dnsopt && l >= 4) ? dhcp_read_be32(dnsopt) : 0;
+
+    if (!ip) return 0;
+
+    klogprintf("dhcp: OFFER ip=%u.%u.%u.%u server=%u.%u.%u.%u\n",
+        (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF,
+        (srv >> 24) & 0xFF, (srv >> 16) & 0xFF, (srv >> 8) & 0xFF, srv & 0xFF);
+
+    *offered_ip = ip;
+    *server_id = srv;
+    *netmask = mask;
+    *router = gw;
+    *dns = dnsrv;
+    return 1;
+}
+
+static int dhcp_l2_ipv4_offset(const uint8_t *frame, int n, uint16_t *out_eth_type) {
+    if (n < 14 || !out_eth_type)
+        return -1;
+    size_t off = 12;
+    uint16_t et = (uint16_t)(((uint16_t)frame[off] << 8) | frame[off + 1]);
+    /* 802.1Q / 802.1ad VLAN tags (common on VMware bridged). */
+    if ((et == 0x8100u || et == 0x88A8u) && n >= (int)(off + 6)) {
+        off += 4;
+        et = (uint16_t)(((uint16_t)frame[off] << 8) | frame[off + 1]);
+    }
+    *out_eth_type = et;
+    return (int)(off + 2); /* start of IPv4 header */
+}
+
+static int dhcp_handle_rx_frame(const uint8_t *frame, int n, uint32_t xid,
+                                uint32_t *offered_ip, uint32_t *server_id,
+                                uint32_t *netmask, uint32_t *router, uint32_t *dns) {
+    uint16_t eth_type = 0;
+    int ip_off = dhcp_l2_ipv4_offset(frame, n, &eth_type);
+    if (ip_off < 0)
+        return 0;
+    if (eth_type != 0x0800u) {
+        if (eth_type != 0x0806u && eth_type != 0x86DDu)
+            klogprintf("dhcp: skip eth=0x%04x len=%d\n", (unsigned)eth_type, n);
+        return 0;
+    }
+    if (n < ip_off + 20 + 8 + 240)
+        return 0;
+
+    const ipv4_hdr_t *ip = (const ipv4_hdr_t *)(frame + ip_off);
+    size_t ihl = (size_t)((ip->ver_ihl & 0x0Fu) * 4u);
+    if (ip->proto != 17 || ihl < 20)
+        return 0;
+    if (be16(ip->flags_frag) & 0x3FFFu)
+        return 0;
+
+    const udp_hdr_t *udp = (const udp_hdr_t *)(frame + ip_off + ihl);
+    uint16_t sport = be16(udp->src_port);
+    uint16_t dport = be16(udp->dst_port);
+    if (sport != UDP_PORT_DHCP_SERVER || dport != UDP_PORT_DHCP_CLIENT)
+        return 0;
+
+    uint16_t ulen = be16(udp->len);
+    if (ulen < 8 + 240 || (size_t)n < (size_t)ip_off + ihl + ulen)
+        return 0;
+
+    const uint8_t *d = (const uint8_t *)udp + sizeof(udp_hdr_t);
+    if (!(d[236] == 99 && d[237] == 130 && d[238] == 83 && d[239] == 99)) {
+        klogprintf("dhcp: no magic cookie op=%u sport=%u\n", (unsigned)d[0], (unsigned)sport);
+        return 0;
+    }
+
+    size_t bootp_len = (size_t)ulen - 8;
+    size_t opts_len = bootp_len > 240 ? bootp_len - 240 : 0;
+
+    if (dhcp_parse_offer(d, opts_len, xid, offered_ip, server_id, netmask, router, dns))
+        return 1;
+
+    uint8_t ol = 0;
+    const uint8_t *ot = dhcp_find_opt(d + 240, opts_len, 53, &ol);
+    uint8_t mt = (ot && ol == 1) ? ot[0] : 0;
+    klogprintf("dhcp: dhcp-udp op=%u mt=%u xid=0x%08x (want 0x%08x)\n",
+               (unsigned)d[0], (unsigned)mt, dhcp_read_be32(&d[4]), xid);
+    return 0;
+}
+
+static int dhcp_try_ack_frame(const uint8_t *frame, int n, uint32_t xid) {
+    uint16_t eth_type = 0;
+    int ip_off = dhcp_l2_ipv4_offset(frame, n, &eth_type);
+    if (ip_off < 0 || eth_type != 0x0800u || n < ip_off + 20 + 8 + 240)
+        return 0;
+
+    const ipv4_hdr_t *ip = (const ipv4_hdr_t *)(frame + ip_off);
+    size_t ihl = (size_t)((ip->ver_ihl & 0x0Fu) * 4u);
+    if (ip->proto != 17 || ihl < 20)
+        return 0;
+
+    const udp_hdr_t *udp = (const udp_hdr_t *)(frame + ip_off + ihl);
+    if (be16(udp->src_port) != UDP_PORT_DHCP_SERVER ||
+        be16(udp->dst_port) != UDP_PORT_DHCP_CLIENT)
+        return 0;
+
+    uint16_t ulen = be16(udp->len);
+    if (ulen < 8 + 240 || (size_t)n < (size_t)ip_off + ihl + ulen)
+        return 0;
+
+    const uint8_t *d = (const uint8_t *)udp + sizeof(udp_hdr_t);
+    if (!(d[236] == 99 && d[237] == 130 && d[238] == 83 && d[239] == 99))
+        return 0;
+    if (dhcp_read_be32(&d[4]) != xid)
+        return 0;
+
+    size_t bootp_len = (size_t)ulen - 8;
+    size_t opts_len = bootp_len > 240 ? bootp_len - 240 : 0;
+    uint8_t l = 0;
+    const uint8_t *t = dhcp_find_opt(d + 240, opts_len, 53, &l);
+    uint8_t msg_type = (t && l == 1) ? t[0] : 0;
+    if (msg_type == 0 && d[0] == 2)
+        msg_type = 5;
+    if (msg_type == 5)
+        return 1;
+    if (msg_type == 6)
+        return -1;
+    return 0;
 }
 
 int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease) {
@@ -177,38 +360,20 @@ int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease) {
     
     memset(out_lease, 0, sizeof(*out_lease));
 
-    /* Reuse the latest successful lease for repeated callers (e.g. second `ip a`). */
-    if (g_cached_lease_valid && memcmp(g_cached_mac, mac, 6) == 0) {
-        *out_lease = g_cached_lease;
-        klogprintf("dhcp: reuse cached lease ip=%u.%u.%u.%u\n",
-            (g_cached_lease.ip_be >> 24) & 0xFF, (g_cached_lease.ip_be >> 16) & 0xFF,
-            (g_cached_lease.ip_be >> 8) & 0xFF, g_cached_lease.ip_be & 0xFF);
-        return 0;
-    }
-    
-    /* Wait for link (VMware NAT can be slow to bring link up) */
+    /* Wait for link (VMware bridged WiFi can take many seconds after host roam). */
     uint64_t link_wait = pit_get_time_ms();
-    while (!e1000_is_ready() && (pit_get_time_ms() - link_wait) < 5000)
+    while (!e1000_is_ready() && (pit_get_time_ms() - link_wait) < DHCP_LINK_WAIT_MS)
         thread_yield();
     if (!e1000_is_ready())
-        klogprintf("dhcp: link not up after 5s, proceeding anyway\n");
+        klogprintf("dhcp: link not up after %us, proceeding anyway\n",
+                   (unsigned)(DHCP_LINK_WAIT_MS / 1000u));
 
-    /* VMware virtual switch needs time to be ready after link up */
+    /* Settle after link-up so bridged vSwitch/DHCP relay is ready. */
     uint64_t settle = pit_get_time_ms();
-    while ((pit_get_time_ms() - settle) < 1500) thread_yield();
+    while ((pit_get_time_ms() - settle) < DHCP_LINK_SETTLE_MS)
+        thread_yield();
 
-    /* Drain stale frames (limit 64 to avoid blocking on broadcast flood) */
-    uint8_t drain[512];
-    int drained = 0;
-    for (int d = 0; d < 64; d++) {
-        e1000_poll();
-        if (e1000_recv_frame(drain, sizeof(drain)) <= 0) break;
-        drained++;
-    }
-    if (drained) klogprintf("dhcp: drained %d stale frames\n", drained);
-
-    /* Let NIC stabilize (especially QEMU) */
-    for (int i = 0; i < 3000; i++) thread_yield();
+    e1000_flush_rx();
     
     uint32_t xid = (uint32_t)(pit_get_ticks() ^ 0xA5F0C31Du);
     uint32_t offered_ip = 0, server_id = 0, netmask = 0, router = 0, dns = 0;
@@ -216,100 +381,62 @@ int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease) {
     if (!frame) return -1;
     
     /* PHASE 1: DISCOVER -> OFFER (with retries) */
-    for (int disc_try = 0; disc_try < 3 && !offered_ip; disc_try++) {
+    int rx_count = 0;
+    for (int disc_try = 0; disc_try < DHCP_DISCOVER_TRIES && !offered_ip; disc_try++) {
+        if (disc_try > 0)
+            xid = (uint32_t)(pit_get_ticks() ^ 0xA5F0C31Du ^ (uint32_t)disc_try);
         klogprintf("dhcp: DISCOVER (xid=0x%08x, try=%d)\n", xid, disc_try + 1);
-        int send_rc = dhcp_send_packet(mac, 1, xid, 0, 0);
-        klogprintf("dhcp: send_rc=%d\n", send_rc);
-        if (send_rc != 0) {
+        if (dhcp_send_packet(mac, 1, xid, 0, 0) != 0) {
             klogprintf("dhcp: DISCOVER send failed\n");
             for (int w = 0; w < 500; w++) thread_yield();
             continue;
         }
         
-        /* Give QEMU/network time to process and respond */
-        for (int w = 0; w < 100; w++) thread_yield();
-        
-        e1000_debug_rx();
-        
-        uint64_t start = pit_get_time_ms();
-        int rx_count = 0;
-        while ((pit_get_time_ms() - start) < 4000) {
+        /* Busy-poll RX right after TX (VMware often answers in <1ms). */
+        for (int burst = 0; burst < 8000; burst++) {
             e1000_poll();
             int n = e1000_recv_frame(frame, DHCP_FRAME_BUF);
-            if (n <= 0) { thread_yield(); continue; }
-            rx_count++;
-            if ((size_t)n < sizeof(eth_hdr_t) + 20 + 8 + 240) continue;
-            
-            const eth_hdr_t *eth = (const eth_hdr_t *)frame;
-            if (be16(eth->ethertype) != ETH_TYPE_IPV4) continue;
-            
-            const ipv4_hdr_t *ip = (const ipv4_hdr_t *)(frame + sizeof(eth_hdr_t));
-            size_t ihl = (size_t)((ip->ver_ihl & 0x0Fu) * 4u);
-            if (ip->proto != 17 || ihl < 20) continue;
-            
-            const udp_hdr_t *udp = (const udp_hdr_t *)(frame + sizeof(eth_hdr_t) + ihl);
-            if (be16(udp->dst_port) != UDP_PORT_DHCP_CLIENT) continue;
-            
-            const uint8_t *d = (const uint8_t *)udp + sizeof(udp_hdr_t);
-            /* Check DHCP magic cookie */
-            if (!(d[236] == 99 && d[237] == 130 && d[238] == 83 && d[239] == 99)) continue;
-            
-            uint32_t rx_xid = ((uint32_t)d[4] << 24) | ((uint32_t)d[5] << 16) | 
-                              ((uint32_t)d[6] << 8) | d[7];
-            uint32_t yiaddr = ((uint32_t)d[16] << 24) | ((uint32_t)d[17] << 16) | 
-                              ((uint32_t)d[18] << 8) | d[19];
-            
-            uint8_t l = 0;
-            const uint8_t *t = dhcp_find_opt(d + 240, (size_t)n - (sizeof(eth_hdr_t) + ihl + 8 + 240), 53, &l);
-            uint8_t msg_type = (t && l == 1) ? t[0] : 0;
-            
-            klogprintf("dhcp: rx type=%u xid=0x%08x ip=%u.%u.%u.%u\n", msg_type, rx_xid,
-                (yiaddr >> 24) & 0xFF, (yiaddr >> 16) & 0xFF, 
-                (yiaddr >> 8) & 0xFF, yiaddr & 0xFF);
-            
-            if (rx_xid != xid) continue;
-            
-            if (msg_type == 2) { /* OFFER */
-                const uint8_t *sid = dhcp_find_opt(d + 240, (size_t)n - (sizeof(eth_hdr_t) + ihl + 8 + 240), 54, &l);
-                if (sid && l == 4) server_id = ((uint32_t)sid[0] << 24) | ((uint32_t)sid[1] << 16) | 
-                                                ((uint32_t)sid[2] << 8) | sid[3];
-                const uint8_t *msk = dhcp_find_opt(d + 240, (size_t)n - (sizeof(eth_hdr_t) + ihl + 8 + 240), 1, &l);
-                if (msk && l == 4) netmask = ((uint32_t)msk[0] << 24) | ((uint32_t)msk[1] << 16) | 
-                                              ((uint32_t)msk[2] << 8) | msk[3];
-                const uint8_t *rtr = dhcp_find_opt(d + 240, (size_t)n - (sizeof(eth_hdr_t) + ihl + 8 + 240), 3, &l);
-                if (rtr && l >= 4) router = ((uint32_t)rtr[0] << 24) | ((uint32_t)rtr[1] << 16) | 
-                                            ((uint32_t)rtr[2] << 8) | rtr[3];
-                const uint8_t *dnsopt = dhcp_find_opt(d + 240, (size_t)n - (sizeof(eth_hdr_t) + ihl + 8 + 240), 6, &l);
-                if (dnsopt && l >= 4) dns = ((uint32_t)dnsopt[0] << 24) | ((uint32_t)dnsopt[1] << 16) | 
-                                            ((uint32_t)dnsopt[2] << 8) | dnsopt[3];
-                offered_ip = yiaddr;
-                klogprintf("dhcp: OFFER ip=%u.%u.%u.%u server=%u.%u.%u.%u\n",
-                    (offered_ip >> 24) & 0xFF, (offered_ip >> 16) & 0xFF, 
-                    (offered_ip >> 8) & 0xFF, offered_ip & 0xFF,
-                    (server_id >> 24) & 0xFF, (server_id >> 16) & 0xFF, 
-                    (server_id >> 8) & 0xFF, server_id & 0xFF);
-                break;
+            if (n > 0) {
+                rx_count++;
+                if (dhcp_handle_rx_frame(frame, n, xid, &offered_ip, &server_id,
+                                         &netmask, &router, &dns))
+                    goto discover_done;
             }
         }
+        
+        uint64_t start = pit_get_time_ms();
+        while ((pit_get_time_ms() - start) < DHCP_RX_TIMEOUT_MS) {
+            e1000_poll();
+            int got_pkt = 0;
+            for (;;) {
+                int n = e1000_recv_frame(frame, DHCP_FRAME_BUF);
+                if (n <= 0)
+                    break;
+                got_pkt = 1;
+                rx_count++;
+                if (dhcp_handle_rx_frame(frame, n, xid, &offered_ip, &server_id,
+                                         &netmask, &router, &dns))
+                    goto discover_done;
+            }
+            if (offered_ip)
+                goto discover_done;
+            if (!got_pkt)
+                thread_yield();
+        }
+discover_done:
         klogprintf("dhcp: DISCOVER phase rx_count=%d\n", rx_count);
     }
     
-    if (!offered_ip || !server_id) {
-        if (g_cached_lease_valid && memcmp(g_cached_mac, mac, 6) == 0) {
-            *out_lease = g_cached_lease;
-            klogprintf("dhcp: no OFFER, using cached lease ip=%u.%u.%u.%u\n",
-                (g_cached_lease.ip_be >> 24) & 0xFF, (g_cached_lease.ip_be >> 16) & 0xFF,
-                (g_cached_lease.ip_be >> 8) & 0xFF, g_cached_lease.ip_be & 0xFF);
-                kfree(frame);
-            return 0;
-        }
+    if (!offered_ip) {
         klogprintf("dhcp: failed - no OFFER\n");
         kfree(frame);
         return -1;
     }
+    if (!server_id)
+        server_id = router ? router : offered_ip;
     
     /* PHASE 2: REQUEST -> ACK (with retries) */
-    for (int req_try = 0; req_try < 3; req_try++) {
+    for (int req_try = 0; req_try < DHCP_REQUEST_TRIES; req_try++) {
         klogprintf("dhcp: REQUEST (try=%d)\n", req_try + 1);
         int send_rc = dhcp_send_packet(mac, 3, xid, offered_ip, server_id);
         klogprintf("dhcp: REQUEST send_rc=%d\n", send_rc);
@@ -319,69 +446,63 @@ int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease) {
             continue;
         }
         
-        for (int w = 0; w < 100; w++) thread_yield();
-        
-        uint64_t start = pit_get_time_ms();
-        while ((pit_get_time_ms() - start) < 4000) {
+        for (int burst = 0; burst < 8000; burst++) {
             e1000_poll();
             int n = e1000_recv_frame(frame, DHCP_FRAME_BUF);
-            if (n <= 0) { thread_yield(); continue; }
-            if ((size_t)n < sizeof(eth_hdr_t) + 20 + 8 + 240) continue;
-            
-            const eth_hdr_t *eth = (const eth_hdr_t *)frame;
-            if (be16(eth->ethertype) != ETH_TYPE_IPV4) continue;
-            
-            const ipv4_hdr_t *ip = (const ipv4_hdr_t *)(frame + sizeof(eth_hdr_t));
-            size_t ihl = (size_t)((ip->ver_ihl & 0x0Fu) * 4u);
-            if (ip->proto != 17 || ihl < 20) continue;
-            
-            const udp_hdr_t *udp = (const udp_hdr_t *)(frame + sizeof(eth_hdr_t) + ihl);
-            if (be16(udp->dst_port) != UDP_PORT_DHCP_CLIENT) continue;
-            
-            const uint8_t *d = (const uint8_t *)udp + sizeof(udp_hdr_t);
-            if (!(d[236] == 99 && d[237] == 130 && d[238] == 83 && d[239] == 99)) continue;
-            
-            uint32_t rx_xid = ((uint32_t)d[4] << 24) | ((uint32_t)d[5] << 16) | 
-                              ((uint32_t)d[6] << 8) | d[7];
-            if (rx_xid != xid) continue;
-            
-            uint8_t l = 0;
-            const uint8_t *t = dhcp_find_opt(d + 240, (size_t)n - (sizeof(eth_hdr_t) + ihl + 8 + 240), 53, &l);
-            uint8_t msg_type = (t && l == 1) ? t[0] : 0;
-            
-            klogprintf("dhcp: rx type=%u\n", msg_type);
-            
-            if (msg_type == 5) { /* ACK */
-                out_lease->ip_be = offered_ip;
-                out_lease->mask_be = netmask ? netmask : 0xFFFFFF00u;
-                out_lease->gw_be = router ? router : server_id;
-                out_lease->dns_be = dns ? dns : server_id;
-                out_lease->server_be = server_id;
-                g_cached_lease = *out_lease;
-                memcpy(g_cached_mac, mac, 6);
-                g_cached_lease_valid = 1;
-                klogprintf("dhcp: ACK! ip=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
-                    (out_lease->ip_be >> 24) & 0xFF, (out_lease->ip_be >> 16) & 0xFF,
-                    (out_lease->ip_be >> 8) & 0xFF, out_lease->ip_be & 0xFF,
-                    (out_lease->gw_be >> 24) & 0xFF, (out_lease->gw_be >> 16) & 0xFF,
-                    (out_lease->gw_be >> 8) & 0xFF, out_lease->gw_be & 0xFF);
-                return 0;
-            } else if (msg_type == 6) { /* NAK */
+            if (n <= 0)
+                continue;
+            int ar = dhcp_try_ack_frame(frame, n, xid);
+            if (ar == 1)
+                goto got_ack;
+            if (ar < 0) {
                 klogprintf("dhcp: NAK!\n");
+                kfree(frame);
                 return -1;
             }
+        }
+
+        uint64_t start = pit_get_time_ms();
+        while ((pit_get_time_ms() - start) < DHCP_RX_TIMEOUT_MS) {
+            e1000_poll();
+            int got_pkt = 0;
+            for (;;) {
+                int n = e1000_recv_frame(frame, DHCP_FRAME_BUF);
+                if (n <= 0)
+                    break;
+                got_pkt = 1;
+                int ar = dhcp_try_ack_frame(frame, n, xid);
+                if (ar == 1)
+                    goto got_ack;
+                if (ar < 0) {
+                    klogprintf("dhcp: NAK!\n");
+                    kfree(frame);
+                    return -1;
+                }
+            }
+            if (!got_pkt)
+                thread_yield();
         }
         klogprintf("dhcp: REQUEST timeout\n");
     }
     
-    if (g_cached_lease_valid && memcmp(g_cached_mac, mac, 6) == 0) {
-        *out_lease = g_cached_lease;
-        klogprintf("dhcp: no ACK, using cached lease ip=%u.%u.%u.%u\n",
-            (g_cached_lease.ip_be >> 24) & 0xFF, (g_cached_lease.ip_be >> 16) & 0xFF,
-            (g_cached_lease.ip_be >> 8) & 0xFF, g_cached_lease.ip_be & 0xFF);
-        return 0;
-    }
-
     klogprintf("dhcp: failed - no ACK\n");
+    kfree(frame);
     return -1;
+
+got_ack:
+    out_lease->ip_be = offered_ip;
+    out_lease->mask_be = netmask ? netmask : 0xFFFFFF00u;
+    out_lease->gw_be = router ? router : server_id;
+    out_lease->dns_be = dns ? dns : server_id;
+    out_lease->server_be = server_id;
+    g_cached_lease = *out_lease;
+    memcpy(g_cached_mac, mac, 6);
+    g_cached_lease_valid = 1;
+    klogprintf("dhcp: ACK! ip=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
+        (out_lease->ip_be >> 24) & 0xFF, (out_lease->ip_be >> 16) & 0xFF,
+        (out_lease->ip_be >> 8) & 0xFF, out_lease->ip_be & 0xFF,
+        (out_lease->gw_be >> 24) & 0xFF, (out_lease->gw_be >> 16) & 0xFF,
+        (out_lease->gw_be >> 8) & 0xFF, out_lease->gw_be & 0xFF);
+    kfree(frame);
+    return 0;
 }

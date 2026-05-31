@@ -58,6 +58,9 @@
 #define SYS_ftruncate 77
 #define SYS_munmap  11
 #define SYS_madvise 28
+#define SYS_shmget  29
+#define SYS_shmat   30
+#define SYS_shmctl  31
 #define SYS_brk     12
 #define SYS_pipe    22
 #define SYS_dup3    292
@@ -75,11 +78,13 @@
 #define SYS_newfstatat 262
 #define SYS_tgkill  234
 #define SYS_sendfile 40
+#define SYS_shmdt   67
 #define SYS_mount   165
 #define SYS_umount2 166
 #define SYS_rt_sigtimedwait 128
 #define SYS_clock_nanosleep 230
 #define SYS_select  23
+#define SYS_sched_yield 24
 #define SYS_socket  41
 #define SYS_getrlimit 97
 #define SYS_sysinfo  99
@@ -87,7 +92,9 @@
 #define SYS_getpriority       140
 #define SYS_setpriority       141
 #define SYS_nanosleep 35
-#define SYS_gettimeofday 169
+/* Linux x86_64: gettimeofday = 96, reboot = 169. */
+#define SYS_gettimeofday 96
+#define SYS_reboot 169
 #define SYS_access 21
 #define SYS_link   86
 #define SYS_mkdir  83

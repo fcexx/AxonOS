@@ -6,6 +6,7 @@
 #include <klog.h>
 #include <video.h>
 #include <pit.h>
+#include <devfs.h>
 
 /* VGA Sequencer registers for Cirrus hardware cursor */
 #define VGA_SEQ_INDEX   0x3C4
@@ -47,12 +48,47 @@ static cell_t *g_textbuf = NULL;
 static uint32_t g_cursor_x = 0;
 static uint32_t g_cursor_y = 0;
 static uint8_t g_current_attr = 0x07;
+static uint32_t g_margin_rows = 0;
+static int g_logo_visible = 0;
 
 /* Software cursor (used when hardware cursor isn't available).
    Uses "save-under by redraw": cursor draws an underscore on the bottom scanlines,
    and erase restores the original cell by redrawing its glyph from g_textbuf. */
 static int g_swcursor_visible = 1;
 static uint64_t g_swcursor_last_phase = 0;
+
+/* Coalesce SVGA FIFO updates: many glyphs -> one dirty rect + one SYNC. */
+static int g_fb_dirty = 0;
+static uint32_t g_dirty_x0 = 0, g_dirty_y0 = 0, g_dirty_x1 = 0, g_dirty_y1 = 0;
+
+static void fb_dirty_mark(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+	if (w == 0 || h == 0) return;
+	uint32_t x1 = x + w - 1;
+	uint32_t y1 = y + h - 1;
+	if (x1 >= g_width) x1 = g_width - 1;
+	if (y1 >= g_height) y1 = g_height - 1;
+	if (!g_fb_dirty) {
+		g_dirty_x0 = x;
+		g_dirty_y0 = y;
+		g_dirty_x1 = x1;
+		g_dirty_y1 = y1;
+		g_fb_dirty = 1;
+		return;
+	}
+	if (x < g_dirty_x0) g_dirty_x0 = x;
+	if (y < g_dirty_y0) g_dirty_y0 = y;
+	if (x1 > g_dirty_x1) g_dirty_x1 = x1;
+	if (y1 > g_dirty_y1) g_dirty_y1 = y1;
+}
+
+static void cirrusfb_flush_dirty(void) {
+	if (!g_fb_dirty || !g_ready) return;
+	uint32_t w = g_dirty_x1 - g_dirty_x0 + 1;
+	uint32_t h = g_dirty_y1 - g_dirty_y0 + 1;
+	video_flush_region_pixels(g_dirty_x0, g_dirty_y0, w, h);
+	video_display_sync();
+	g_fb_dirty = 0;
+}
 
 /* ANSI: kputchar() goes straight here when Cirrus is active — devfs may not see all output. */
 enum { CIR_ESC_NONE = 0, CIR_ESC_ESC = 1, CIR_ESC_CSI = 2, CIR_ESC_SS3 = 3 };
@@ -94,41 +130,60 @@ static inline uint32_t rgb_to_pixel(uint32_t rgb) {
 	return pack_pixel(r, g, b);
 }
 
-static void draw_glyph(uint32_t cx, uint32_t cy, uint8_t ch, uint8_t attr) {
+static void draw_glyph_noflush(uint32_t cx, uint32_t cy, uint8_t ch, uint8_t attr) {
 	if (!g_fb) return;
-	uint32_t fg = attr_to_rgb(attr, 1);
-	uint32_t bg = attr_to_rgb(attr, 0);
-	uint32_t fg_pix = rgb_to_pixel(fg);
-	uint32_t bg_pix = rgb_to_pixel(bg);
+	/* Boot logo pixels are not owned by the text console. */
+	if (g_logo_visible && g_margin_rows > 0 && cy < g_margin_rows)
+		return;
+	uint32_t fg_pix = rgb_to_pixel(attr_to_rgb(attr, 1));
+	uint32_t bg_pix = rgb_to_pixel(attr_to_rgb(attr, 0));
 
 	uint32_t px = cx * FONT_W;
 	uint32_t py = cy * FONT_H;
 	uint32_t bpp = (g_bpp + 7) / 8;
 
-	for (uint32_t row = 0; row < FONT_H; row++) {
-		uint8_t glyph = font8x16[ch][row];
-		uint8_t *line = (uint8_t*)g_fb + (py + row) * g_pitch + px * bpp;
-		for (uint32_t bit = 0; bit < FONT_W; bit++) {
-			uint32_t pix = (glyph & (1 << (7 - bit))) ? fg_pix : bg_pix;
-			if (bpp == 4) {
-				*(uint32_t*)(line + bit * 4) = pix;
-			} else if (bpp == 3) {
-				line[bit * 3 + 0] = pix & 0xFF;
-				line[bit * 3 + 1] = (pix >> 8) & 0xFF;
-				line[bit * 3 + 2] = (pix >> 16) & 0xFF;
-			} else if (bpp == 2) {
-				*(uint16_t*)(line + bit * 2) = (uint16_t)pix;
+	if (bpp == 4) {
+		for (uint32_t row = 0; row < FONT_H; row++) {
+			uint8_t glyph = font8x16[ch][row];
+			uint32_t *line = (uint32_t *)((uint8_t *)g_fb + (py + row) * g_pitch + px * 4);
+			for (uint32_t bit = 0; bit < FONT_W; bit++) {
+				line[bit] = (glyph & (1u << (7 - bit))) ? fg_pix : bg_pix;
+			}
+		}
+	} else {
+		for (uint32_t row = 0; row < FONT_H; row++) {
+			uint8_t glyph = font8x16[ch][row];
+			uint8_t *line = (uint8_t *)g_fb + (py + row) * g_pitch + px * bpp;
+			for (uint32_t bit = 0; bit < FONT_W; bit++) {
+				uint32_t pix = (glyph & (1u << (7 - bit))) ? fg_pix : bg_pix;
+				if (bpp == 3) {
+					line[bit * 3 + 0] = pix & 0xFF;
+					line[bit * 3 + 1] = (pix >> 8) & 0xFF;
+					line[bit * 3 + 2] = (pix >> 16) & 0xFF;
+				} else if (bpp == 2) {
+					*(uint16_t *)(line + bit * 2) = (uint16_t)pix;
+				}
 			}
 		}
 	}
-	video_flush_region_pixels(px, py, FONT_W, FONT_H);
+	fb_dirty_mark(px, py, FONT_W, FONT_H);
+}
+
+static void draw_text_row_noflush(uint32_t row) {
+	if (!g_textbuf || row >= g_rows) return;
+	if (g_logo_visible && g_margin_rows > 0 && row < g_margin_rows)
+		return;
+	for (uint32_t x = 0; x < g_cols; x++) {
+		cell_t c = g_textbuf[row * g_cols + x];
+		draw_glyph_noflush(x, row, c.ch, c.attr);
+	}
 }
 
 static void swcursor_erase_at(uint32_t cx, uint32_t cy) {
 	if (!g_ready || !g_textbuf) return;
 	if (cx >= g_cols || cy >= g_rows) return;
 	cell_t c = g_textbuf[cy * g_cols + cx];
-	draw_glyph(cx, cy, c.ch, c.attr);
+	draw_glyph_noflush(cx, cy, c.ch, c.attr);
 }
 
 static void swcursor_draw_at(uint32_t cx, uint32_t cy) {
@@ -157,31 +212,79 @@ static void swcursor_draw_at(uint32_t cx, uint32_t cy) {
 			}
 		}
 	}
-	video_flush_region_pixels(px, py + (FONT_H - 2), FONT_W, 2);
+	fb_dirty_mark(px, py + (FONT_H - 2), FONT_W, 2);
+}
+
+static void put_pixel_noflush(uint32_t px, uint32_t py, uint32_t pix) {
+	if (!g_fb || px >= g_width || py >= g_height) return;
+	uint32_t bpp = (g_bpp + 7) / 8;
+	if (bpp == 4) {
+		*(uint32_t *)((uint8_t *)g_fb + py * g_pitch + px * 4) = pix;
+	} else {
+		uint8_t *p = (uint8_t *)g_fb + py * g_pitch + px * bpp;
+		if (bpp == 3) {
+			p[0] = pix & 0xFF;
+			p[1] = (pix >> 8) & 0xFF;
+			p[2] = (pix >> 16) & 0xFF;
+		} else if (bpp == 2) {
+			*(uint16_t *)p = (uint16_t)pix;
+		}
+	}
+}
+
+void cirrusfb_dismiss_boot_logo(void) {
+	if (!g_ready || !g_logo_visible)
+		return;
+	uint32_t rows = g_margin_rows;
+	g_logo_visible = 0;
+	g_margin_rows = 0;
+	for (uint32_t r = 0; r < rows && r < g_rows; r++)
+		draw_text_row_noflush(r);
+	fb_dirty_mark(0, 0, g_width, rows * FONT_H);
+	cirrusfb_flush_dirty();
 }
 
 static void scroll_up(void) {
 	if (!g_fb || !g_textbuf) return;
-	memmove(g_textbuf, g_textbuf + g_cols, g_cols * (g_rows - 1) * sizeof(cell_t));
-	for (uint32_t x = 0; x < g_cols; x++) {
-		g_textbuf[(g_rows - 1) * g_cols + x].ch = ' ';
-		g_textbuf[(g_rows - 1) * g_cols + x].attr = g_current_attr;
-	}
-	uint32_t bpp = (g_bpp + 7) / 8;
-	size_t row_bytes = g_pitch;
-	size_t move_bytes = row_bytes * (g_height - FONT_H);
-	memmove(g_fb, (uint8_t*)g_fb + FONT_H * row_bytes, move_bytes);
-	uint32_t bg_pix = rgb_to_pixel(attr_to_rgb(g_current_attr, 0));
-	uint32_t clear_y = g_height - FONT_H;
-	for (uint32_t ry = 0; ry < FONT_H; ry++) {
-		uint8_t *line = (uint8_t*)g_fb + (clear_y + ry) * row_bytes;
-		for (uint32_t x = 0; x < g_width; x++) {
-			if (bpp == 4) *(uint32_t*)(line + x * 4) = bg_pix;
-			else if (bpp == 3) { line[x*3]=bg_pix&0xFF; line[x*3+1]=(bg_pix>>8)&0xFF; line[x*3+2]=(bg_pix>>16)&0xFF; }
-			else if (bpp == 2) *(uint16_t*)(line + x * 2) = (uint16_t)bg_pix;
+	uint32_t top = g_margin_rows;
+	if (top >= g_rows - 1)
+		top = 0;
+
+	if (top == 0) {
+		memmove(g_textbuf, g_textbuf + g_cols, (size_t)g_cols * (g_rows - 1) * sizeof(cell_t));
+		for (uint32_t x = 0; x < g_cols; x++) {
+			g_textbuf[(g_rows - 1) * g_cols + x].ch = ' ';
+			g_textbuf[(g_rows - 1) * g_cols + x].attr = g_current_attr;
 		}
+		size_t row_bytes = g_pitch;
+		size_t move_bytes = row_bytes * (g_height - FONT_H);
+		memmove(g_fb, (uint8_t *)g_fb + FONT_H * row_bytes, move_bytes);
+		draw_text_row_noflush(g_rows - 1);
+	} else {
+		size_t row_cells = (size_t)g_cols * sizeof(cell_t);
+		memmove(g_textbuf + top * g_cols,
+		        g_textbuf + (top + 1) * g_cols,
+		        row_cells * (g_rows - 1 - top));
+		for (uint32_t x = 0; x < g_cols; x++) {
+			g_textbuf[(g_rows - 1) * g_cols + x].ch = ' ';
+			g_textbuf[(g_rows - 1) * g_cols + x].attr = g_current_attr;
+		}
+		uint32_t y0 = top * FONT_H;
+		uint32_t y1 = (top + 1) * FONT_H;
+		size_t move_bytes = (size_t)g_pitch * (g_height - y1);
+		memmove((uint8_t *)g_fb + y0 * g_pitch,
+		        (uint8_t *)g_fb + y1 * g_pitch,
+		        move_bytes);
+		draw_text_row_noflush(g_rows - 1);
 	}
-	video_flush_region_pixels(0, 0, g_width, g_height);
+	fb_dirty_mark(0, 0, g_width, g_height);
+	cirrusfb_flush_dirty();
+}
+
+static void clamp_cursor_to_margin(void) {
+	if (g_margin_rows == 0 || g_rows == 0) return;
+	if (g_cursor_y < g_margin_rows)
+		g_cursor_y = g_margin_rows;
 }
 
 /*
@@ -314,6 +417,7 @@ int cirrusfb_init(void *fb, uint32_t width, uint32_t height, uint32_t pitch, uin
 	g_current_attr = 0x07;
 	g_swcursor_visible = 1;
 	g_swcursor_last_phase = 0;
+	g_fb_dirty = 0;
 	g_ready = 1;
 
 	cirrusfb_clear(WHITE_ON_BLACK);
@@ -344,7 +448,8 @@ void cirrusfb_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
 	if (!g_ready || !g_textbuf || x >= g_cols || y >= g_rows) return;
 	g_textbuf[y * g_cols + x].ch = ch;
 	g_textbuf[y * g_cols + x].attr = attr;
-	draw_glyph(x, y, ch, attr);
+	draw_glyph_noflush(x, y, ch, attr);
+	cirrusfb_flush_dirty();
 }
 
 static void cirrusfb_putchar_inner(uint8_t ch, uint8_t attr) {
@@ -365,35 +470,34 @@ static void cirrusfb_putchar_inner(uint8_t ch, uint8_t attr) {
 		while (g_cursor_x < newx && g_cursor_x < g_cols) {
 			g_textbuf[oy * g_cols + g_cursor_x].ch = ' ';
 			g_textbuf[oy * g_cols + g_cursor_x].attr = g_current_attr;
-			draw_glyph(g_cursor_x, oy, ' ', g_current_attr);
+			draw_glyph_noflush(g_cursor_x, oy, ' ', g_current_attr);
 			g_cursor_x++;
 		}
 	} else if (ch == '\b') {
 		if (g_cursor_x > 0) g_cursor_x--;
 		g_textbuf[g_cursor_y * g_cols + g_cursor_x].ch = ' ';
 		g_textbuf[g_cursor_y * g_cols + g_cursor_x].attr = g_current_attr;
-		draw_glyph(g_cursor_x, g_cursor_y, ' ', g_current_attr);
+		draw_glyph_noflush(g_cursor_x, g_cursor_y, ' ', g_current_attr);
 	} else {
 		g_textbuf[oy * g_cols + ox].ch = ch;
 		g_textbuf[oy * g_cols + ox].attr = g_current_attr;
-		draw_glyph(ox, oy, ch, g_current_attr);
+		draw_glyph_noflush(ox, oy, ch, g_current_attr);
 		g_cursor_x++;
 		if (g_cursor_x >= g_cols) { g_cursor_x = 0; g_cursor_y++; }
 	}
 
 	if (g_cursor_y >= g_rows) {
-		/* Ensure cursor doesn't get "stuck" in scrolled pixels. */
 		if (!g_hwcursor_ok && g_swcursor_visible) {
 			swcursor_erase_at(ox, oy);
 		}
 		scroll_up();
 		g_cursor_y = g_rows - 1;
 	}
+	clamp_cursor_to_margin();
 
 	if (g_hwcursor_ok) {
 		hwcursor_set_pos(g_cursor_x, g_cursor_y);
 	} else {
-		/* If cursor moved without overwriting the old cell (e.g. newline), erase underline there. */
 		if (g_swcursor_visible && (ox != g_cursor_x || oy != g_cursor_y)) {
 			swcursor_erase_at(ox, oy);
 		}
@@ -401,6 +505,7 @@ static void cirrusfb_putchar_inner(uint8_t ch, uint8_t attr) {
 			swcursor_draw_at(g_cursor_x, g_cursor_y);
 		}
 	}
+	cirrusfb_flush_dirty();
 }
 
 void cirrusfb_putchar_literal(uint8_t ch, uint8_t attr) {
@@ -412,6 +517,8 @@ void cirrusfb_set_cursor(uint32_t x, uint32_t y) {
 	if (!g_ready) return;
 	if (x >= g_cols) x = g_cols - 1;
 	if (y >= g_rows) y = g_rows - 1;
+	if (g_margin_rows > 0 && y < g_margin_rows)
+		y = g_margin_rows;
 	uint32_t ox = g_cursor_x, oy = g_cursor_y;
 	if (!g_hwcursor_ok && g_swcursor_visible) {
 		swcursor_erase_at(ox, oy);
@@ -424,6 +531,7 @@ void cirrusfb_set_cursor(uint32_t x, uint32_t y) {
 	} else {
 		if (g_swcursor_visible) swcursor_draw_at(x, y);
 	}
+	cirrusfb_flush_dirty();
 }
 
 void cirrusfb_get_cursor(uint32_t *x, uint32_t *y) {
@@ -450,9 +558,15 @@ void cirrusfb_restore_screen(const uint8_t *src, uint32_t cols, uint32_t rows) {
 	for (uint32_t y = 0; y < rows; y++) {
 		for (uint32_t x = 0; x < cols; x++) {
 			size_t off = ((size_t)y * cols + x) * 2u;
-			cirrusfb_putch_xy(x, y, src[off], src[off + 1]);
+			uint8_t ch = src[off];
+			uint8_t attr = src[off + 1];
+			g_textbuf[y * g_cols + x].ch = ch;
+			g_textbuf[y * g_cols + x].attr = attr;
+			draw_glyph_noflush(x, y, ch, attr);
 		}
 	}
+	fb_dirty_mark(0, 0, g_width, g_height);
+	cirrusfb_flush_dirty();
 }
 
 void cirrusfb_clear(uint8_t attr) {
@@ -464,21 +578,82 @@ void cirrusfb_clear(uint8_t attr) {
 	}
 	uint32_t bg_pix = rgb_to_pixel(attr_to_rgb(attr, 0));
 	uint32_t bpp = (g_bpp + 7) / 8;
-	for (uint32_t y = 0; y < g_height; y++) {
-		uint8_t *line = (uint8_t*)g_fb + y * g_pitch;
-		for (uint32_t x = 0; x < g_width; x++) {
-			if (bpp == 4) *(uint32_t*)(line + x * 4) = bg_pix;
-			else if (bpp == 3) { line[x*3]=bg_pix&0xFF; line[x*3+1]=(bg_pix>>8)&0xFF; line[x*3+2]=(bg_pix>>16)&0xFF; }
-			else if (bpp == 2) *(uint16_t*)(line + x * 2) = (uint16_t)bg_pix;
+	if (bpp == 4) {
+		for (uint32_t y = 0; y < g_height; y++) {
+			uint32_t *line = (uint32_t *)((uint8_t *)g_fb + y * g_pitch);
+			for (uint32_t x = 0; x < g_width; x++)
+				line[x] = bg_pix;
+		}
+	} else {
+		for (uint32_t y = 0; y < g_height; y++) {
+			uint8_t *line = (uint8_t *)g_fb + y * g_pitch;
+			for (uint32_t x = 0; x < g_width; x++) {
+				if (bpp == 3) {
+					line[x * 3 + 0] = bg_pix & 0xFF;
+					line[x * 3 + 1] = (bg_pix >> 8) & 0xFF;
+					line[x * 3 + 2] = (bg_pix >> 16) & 0xFF;
+				} else if (bpp == 2) {
+					*(uint16_t *)(line + x * 2) = (uint16_t)bg_pix;
+				}
+			}
 		}
 	}
 	g_cursor_x = 0;
 	g_cursor_y = 0;
-	
+	g_margin_rows = 0;
+	g_logo_visible = 0;
 	if (g_hwcursor_ok) {
 		hwcursor_set_pos(0, 0);
 	}
-	video_flush_region_pixels(0, 0, g_width, g_height);
+	if (devfs_is_ready()) {
+		struct devfs_tty *tty = devfs_get_tty_by_index(devfs_get_active());
+		if (tty) {
+			tty->cursor_x = 0;
+			tty->cursor_y = 0;
+		}
+	}
+	g_fb_dirty = 0;
+	fb_dirty_mark(0, 0, g_width, g_height);
+	cirrusfb_flush_dirty();
+}
+
+void cirrusfb_blit_mono8(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint8_t *pixels) {
+	if (!g_ready || !g_fb || !pixels || w == 0 || h == 0)
+		return;
+	for (uint32_t row = 0; row < h; row++) {
+		uint32_t py = y + row;
+		if (py >= g_height)
+			break;
+		for (uint32_t col = 0; col < w; col++) {
+			uint32_t px = x + col;
+			if (px >= g_width)
+				break;
+			uint8_t g = pixels[row * w + col];
+			uint32_t pix = rgb_to_pixel((uint32_t)g | ((uint32_t)g << 8) | ((uint32_t)g << 16));
+			put_pixel_noflush(px, py, pix);
+		}
+	}
+	fb_dirty_mark(x, y, w, h);
+	cirrusfb_flush_dirty();
+}
+
+void cirrusfb_set_margin_rows(uint32_t rows) {
+	if (!g_ready) {
+		g_margin_rows = rows;
+		return;
+	}
+	if (rows >= g_rows)
+		rows = g_rows > 0 ? g_rows - 1 : 0;
+	g_margin_rows = rows;
+	clamp_cursor_to_margin();
+}
+
+uint32_t cirrusfb_margin_rows(void) {
+	return g_margin_rows;
+}
+
+void cirrusfb_set_logo_visible(int visible) {
+	g_logo_visible = visible ? 1 : 0;
 }
 
 static void cirrusfb_erase_cells(uint32_t x0, uint32_t x1, uint32_t y) {
@@ -488,8 +663,9 @@ static void cirrusfb_erase_cells(uint32_t x0, uint32_t x1, uint32_t y) {
 	for (uint32_t x = x0; x <= x1; x++) {
 		g_textbuf[y * g_cols + x].ch = ' ';
 		g_textbuf[y * g_cols + x].attr = g_current_attr;
-		draw_glyph(x, y, ' ', g_current_attr);
+		draw_glyph_noflush(x, y, ' ', g_current_attr);
 	}
+	cirrusfb_flush_dirty();
 }
 
 static void cirrusfb_csi_apply_sgr(void) {
@@ -668,4 +844,5 @@ void cirrusfb_update_cursor(void) {
 	g_swcursor_visible = want_visible;
 	if (g_swcursor_visible) swcursor_draw_at(g_cursor_x, g_cursor_y);
 	else swcursor_erase_at(g_cursor_x, g_cursor_y);
+	cirrusfb_flush_dirty();
 }

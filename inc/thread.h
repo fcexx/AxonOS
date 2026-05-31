@@ -126,6 +126,8 @@ typedef struct thread {
         uint64_t saved_sig_mask;
         /* if non-negative, tid of thread waiting for this child (wait/waitpid) */
         int waiter_tid;
+        /* fork/clone3: unblock child after parent syscall returns (avoid clobbering per-CPU syscall stack). */
+        int defer_unblock_tid;
         
         /* exit status encoded like wait(2) returns (status word) */
         int exit_status;
@@ -159,6 +161,7 @@ thread_t* thread_create(void (*entry)(void), const char* name);
    safely initialize fields before scheduling can run it. */
 thread_t* thread_create_blocked(void (*entry)(void), const char* name);
 void thread_yield();
+void thread_ring3_preempt_if_waiters(void);
 void thread_schedule();
 thread_t* thread_current();
 void thread_stop(int pid);

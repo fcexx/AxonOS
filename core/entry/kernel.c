@@ -6,6 +6,7 @@
 
 #include <axonos.h>
 #include <keyboard.h>
+#include <mouse.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <gdt.h>
@@ -45,11 +46,14 @@
 #include <usb.h>
 #include <exec.h>
 #include <klog.h>
+#include <boot_logo.h>
 #include <debug.h>
 #include <vbe.h>
 #include <cirrus.h>
 #include <vmwgfx.h>
+#include <vboxsvga.h>
 #include <cirrusfb.h>
+#include <acpi_powerbtn.h>
 #include <nvme.h>
 #include <e1000.h>
 void ata_dma_init(void);
@@ -61,6 +65,32 @@ static char g_cwd[256] = "/";
 extern uint8_t _end[]; /* kernel end symbol from linker */
 extern const char nss_dns_so_blob_start[];
 extern const char nss_dns_so_blob_end[];
+extern const char ca_trust_pem_start[];
+extern const char ca_trust_pem_end[];
+
+static void ramfs_install_ca_trust(void)
+{
+    size_t len = (size_t)(ca_trust_pem_end - ca_trust_pem_start);
+    if (len == 0U)
+        return;
+    (void)fs_mkdir("/etc/ssl");
+    (void)fs_mkdir("/etc/ssl/certs");
+    (void)fs_mkdir("/etc/pki/tls/certs");
+    const char *paths[] = {
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+    };
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        (void)fs_unlink(paths[i]);
+        struct fs_file *f = fs_create_file(paths[i]);
+        if (!f)
+            f = fs_open(paths[i]);
+        if (f) {
+            fs_write(f, ca_trust_pem_start, len, 0);
+            fs_file_free(f);
+        }
+    }
+}
 
 static void ramfs_install_libnss_dns(void)
 {
@@ -190,6 +220,8 @@ void kernel_sysfs_populate_default(void) {
     }
     usb_sysfs_populate_default();
     pci_sysfs_init();  /* /sys/bus/pci/devices для lspci */
+    keyboard_publish_sysfs();
+    mouse_publish_sysfs();
 }
 
 static int boot_try_run_init(void) {
@@ -272,6 +304,12 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
            simple identity-mapped arena; if we size it past RAM we will scribble
            into non-existent memory and get "random" initfs extraction failures. */
         size_t heap_size = 0;
+        size_t initrd_sz = 0;
+        if (axon_boot_params_phys) {
+            uintptr_t rd_st = 0;
+            if (linux_bootparams_ramdisk((const void *)(uintptr_t)axon_boot_params_phys, &rd_st, &initrd_sz) != 0)
+                initrd_sz = 0;
+        }
         int ram_mb = sysinfo_ram_mb();
         if (ram_mb > 0) {
             uint64_t ram_bytes = (uint64_t)ram_mb * 1024ULL * 1024ULL;
@@ -279,8 +317,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             const uint64_t guard = 4ULL * 1024ULL * 1024ULL; /* 4 MiB (was 8) — more heap for VMware/low-RAM */
             if (ram_bytes > start + guard + (16ULL * 1024ULL * 1024ULL)) {
                 uint64_t max = ram_bytes - start - guard;
-                const uint64_t cap = 512ULL * 1024ULL * 1024ULL;
-                if (max > cap) max = cap;
                 heap_size = (size_t)max;
             }
         }
@@ -292,6 +328,21 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         }
         if (heap_size == 0)
             heap_size = 64ULL * 1024ULL * 1024ULL; /* safe default when RAM unknown */
+        if (initrd_sz > 0 && (uint64_t)heap_size < (uint64_t)initrd_sz + (32ULL * 1024ULL * 1024ULL))
+            kprintf("warning: heap %llu MiB may be too small for initfs %llu MiB — increase VM RAM\n",
+                    (unsigned long long)(heap_size / (1024ULL * 1024ULL)),
+                    (unsigned long long)(initrd_sz / (1024ULL * 1024ULL)));
+        /* Identity-mapped heap must not cover user TLS/stack (USER_TLS_BASE..USER_STACK_TOP).
+           Otherwise kmalloc's arena overlaps userspace and mmap cannot use the gap without
+           clobbering heap metadata — wget/glibc then hit mmap ENOMEM and corrupt malloc. */
+        {
+            uint64_t tls = (uint64_t)USER_TLS_BASE;
+            const uint64_t tls_guard = 1ULL << 20; /* 1 MiB below TLS */
+            uint64_t max_heap_end = tls > tls_guard ? tls - tls_guard : tls;
+            uint64_t hs = (uint64_t)heap_start;
+            if (max_heap_end > hs && hs + (uint64_t)heap_size > max_heap_end)
+                heap_size = (size_t)(max_heap_end - hs);
+        }
         heap_init(heap_start, heap_size);
         kprintf("Kernel starting... heap_start: %p heap_size=%llu heap_total=%llu heap_base=%p ram_mb=%d kernel_end: %p mods_end: %p\n",
                 (void*)heap_start,
@@ -364,6 +415,9 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     sysinfo_print_e820(multiboot_magic, multiboot_info);
     if (vbe_is_available() == 1) klogprintf("screen: Set mode: %ux%u@%u.\n", vbe_get_width(), vbe_get_height(), vbe_get_bpp());
     else klogprintf("screen: Set VGA+ 80x25 16 colors\n");
+
+    /* ACPI fixed-feature power button (SCI). Best-effort: do not fail boot on errors. */
+    (void)acpi_powerbtn_init(multiboot_magic, multiboot_info);
     
     apic_init();
     apic_timer_init();
@@ -377,6 +431,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     asm volatile("sti");
     /* Recalibrate after STI when PIT ticks are guaranteed to progress. */
     apic_timer_calibrate();
+    /* TSC vs PIT while IRQ0 still drives timer_ticks (before APIC-only timekeeping). */
+    klog_calibrate_tsc();
 
     /* Enable APIC timer if it behaves sanely; otherwise keep PIT.
        Real hardware can hang or run at wildly wrong rate with bad APIC calibration. */
@@ -413,20 +469,18 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         }
     }
 
-    // Calibrate TSC for high resolution timestamps now that APIC timer is running
-    // Otherwise, for microseconds.
-    klog_calibrate_tsc();
-
     smp_finalize_topology(multiboot_magic, multiboot_info);
 
     pci_init();
     /* Fbcon before long PCI/disk logs: otherwise klog uses VGA 80x25 and lines wrap ~66 chars with timestamps. */
     if (vmwgfx_kernel_init() == 0) {
+        devfs_tty_realloc_for_console();
+        boot_logo_show();
         klogprintf("video: vmwgfx fbcon enabled early (wide console)\n");
-        devfs_tty_realloc_for_console();
     } else if (cirrus_kernel_init() == 0) {
-        klogprintf("video: cirrus fbcon enabled early\n");
         devfs_tty_realloc_for_console();
+        boot_logo_show();
+        klogprintf("video: cirrus fbcon enabled early\n");
     }
     pci_dump_devices();
     intel_chipset_init();
@@ -635,6 +689,21 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     }
     syscall_net_ensure_resolv();
     ramfs_install_libnss_dns();
+    /* OpenSSL/wget: avoid slow ENOENT walks; --no-check-certificate still opens these paths. */
+    {
+        static const char openssl_cnf[] =
+            "openssl_conf = openssl_init\n\n[openssl_init]\n";
+        (void)fs_mkdir("/etc/ssl");
+        (void)fs_mkdir("/etc/ssl/certs");
+        (void)fs_unlink("/etc/ssl/openssl.cnf");
+        struct fs_file *oc = fs_create_file("/etc/ssl/openssl.cnf");
+        if (!oc) oc = fs_open("/etc/ssl/openssl.cnf");
+        if (oc) {
+            fs_write(oc, openssl_cnf, sizeof(openssl_cnf) - 1, 0);
+            fs_file_free(oc);
+        }
+        ramfs_install_ca_trust();
+    }
     /* Programs (mount, sh) open /etc/localtime; create so open doesn't fail. */
     {
         struct fs_file *lt = fs_create_file("/etc/localtime");
@@ -644,7 +713,10 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     {
         static const char profile[] =
             "export TERM=builtin_ansi\n"
-            "export PS1='\\[\\033[1;31m\\]\\u\\033[0m@\\h \\033[1;37m\\w\\033[0m \\$ '\n";
+            "export PS1='\\[\\033[1;31m\\]\\u\\033[0m@\\h \\033[1;37m\\w\\033[0m \\$ '\n"
+            "export OPENSSL_CONF=/etc/ssl/openssl.cnf\n"
+            "export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n"
+            "export SSL_CERT_DIR=/etc/ssl/certs\n";
         struct fs_file *pf = fs_create_file("/etc/profile");
         if (!pf) pf = fs_open("/etc/profile");
         if (pf) {
@@ -654,7 +726,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     }
     /* /etc/issue: getty prints this before login prompt. \l = tty name (tty1, tty2, ...) */
     {
-        static const char issue[] = "AxonOS " OS_VERSION " for servers (\\l)\n\n";
+        static const char issue[] = "AxonOS " OS_VERSION " (\\l)\n\n";
         struct fs_file *ifile = fs_create_file("/etc/issue");
         if (!ifile) ifile = fs_open("/etc/issue");
         if (ifile) {
@@ -721,8 +793,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         }
     }
     ps2_keyboard_init();
-    rtc_init();
-    kclear();
+    ps2_mouse_init();
+    boot_logo_dismiss();
     // Prefer linuxrc/init if present; fallback to kernel shell.
     if (boot_try_run_init() != 0) {
         klogprintf("fatal: There's nothing to run. Download the correct initfs from https://apm.axont.ru/Packages/initfs.cpio and place it in the root of the boot device.");

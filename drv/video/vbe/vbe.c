@@ -143,6 +143,14 @@ void vbe_clear_region(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t p
 	if (x >= g_width || y >= g_height) return;
 	if (x + w > g_width) w = g_width - x;
 	if (y + h > g_height) h = g_height - y;
+	if (bytespp == 4 && x == 0 && w == g_width) {
+		for (uint32_t ry = 0; ry < h; ry++) {
+			uint32_t *line = (uint32_t *)(fb + (size_t)(y + ry) * g_pitch);
+			for (uint32_t rx = 0; rx < w; rx++)
+				line[rx] = packed_pixel;
+		}
+		return;
+	}
 	for (uint32_t ry = 0; ry < h; ry++) {
 		uint8_t *line = fb + (size_t)( (y + ry) * g_pitch + x * bytespp );
 		for (uint32_t rx = 0; rx < w; rx++) {

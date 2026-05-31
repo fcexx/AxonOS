@@ -3,6 +3,7 @@
 #include <vga.h>
 #include <stdint.h>
 #include <cirrusfb.h>
+#include <devfs.h>
 
 void console_putch_xy(uint32_t x, uint32_t y, uint8_t ch, uint8_t attr) {
 	if (cirrusfb_is_ready()) {
@@ -187,16 +188,31 @@ void console_get_cursor(uint32_t *x, uint32_t *y) {
 	vga_get_cursor(x,y);
 }
 
+static void console_sync_active_tty_home(void) {
+	if (!devfs_is_ready())
+		return;
+	struct devfs_tty *tty = devfs_get_tty_by_index(devfs_get_active());
+	if (!tty)
+		return;
+	tty->cursor_x = 0;
+	tty->cursor_y = 0;
+}
+
 void console_clear_screen_attr(uint8_t attr) {
 	if (cirrusfb_is_ready()) {
 		cirrusfb_clear(attr);
+		console_set_cursor(0, 0);
 		return;
 	}
 	if (vbe_is_available()) {
 		vbefb_clear(attr);
+		console_sync_active_tty_home();
+		console_set_cursor(0, 0);
 		return;
 	}
 	vga_clear_screen_attr(attr);
+	console_sync_active_tty_home();
+	console_set_cursor(0, 0);
 }
 
 void console_clear_line_segment(uint32_t x0, uint32_t x1, uint32_t y, uint8_t attr) {

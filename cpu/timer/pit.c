@@ -1,4 +1,6 @@
 #include <pit.h>
+#include <apic_timer.h>
+#include <klog.h>
 #include <debug.h> 
 #include <pic.h>
 #include <idt.h>
@@ -9,6 +11,7 @@
 #include <cirrusfb.h>
 #include <smp.h>
 #include <loadavg.h>
+#include <power.h>
 
 // Global variables
 volatile uint64_t pit_ticks = 0;
@@ -21,13 +24,22 @@ void pit_handler(cpu_registers_t* regs) {
         pit_ticks++;
         timer_ticks++;
 
+        /* Ensure ACPI/power requests progress even when system is otherwise idle at a prompt. */
+        if (power_is_pending() && (!regs || ((regs->cs & 3) == 0))) {
+                power_poll();
+        }
+
         if (init && smp_sched_cpu_id() == 0 && pit_ticks > 0 &&
             pit_frequency > 0 && (pit_ticks % pit_frequency) == 0)
                 loadavg_second_tick();
 
         if (!init) return;
-        /* То же правило, что и для APIC: не планируем из IRQ, пришедшего из ring3. */
-        if (regs && ((regs->cs & 3) == 3)) return;
+        /* Avoid full schedule from ring-3 IRQ on SMP; on UP, yield spinners when others wait. */
+        if (regs && ((regs->cs & 3) == 3)) {
+                if (smp_cpu_count() <= 1)
+                        thread_ring3_preempt_if_waiters();
+                return;
+        }
         
         /* SMP: never thread_schedule() from IRQ — nested scheduler + sched_lock corrupts state.
            Idle loops + IPI wake other CPUs; BSP is driven by syscalls/yield. */
@@ -124,10 +136,18 @@ uint64_t pit_get_ticks() {
 
 // Get time in milliseconds since boot
 uint64_t pit_get_time_ms() {
-        /* Prefer common ticks (expected 1ms tick when configured at 1000Hz). */
+        /* Match klog timestamps (TSC); APIC-only ms can run ~10x slow on VMware. */
+        if (klog_tsc_per_us != 0)
+                return time_monotonic_ms();
+        if (apic_timer_is_running())
+                return apic_timer_get_time_ms();
+        if (pit_frequency == 0)
+                return 0;
         return (timer_ticks * 1000) / pit_frequency;
 }
 
 uint64_t pit_get_frequency() {
+        if (apic_timer_is_running())
+                return apic_timer_get_frequency();
         return pit_frequency;
 }

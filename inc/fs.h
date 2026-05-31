@@ -75,6 +75,10 @@ int fs_get_mount_path(const struct fs_driver *drv, char *out, size_t outlen);
 int fs_get_matching_mount_prefix(const char *path, char *out, size_t outlen);
 /* Get basenames of mount points that are direct children of dir_path. Fills names[][64], returns count. */
 int fs_get_mount_children(const char *dir_path, char names[][64], int max_count);
+/* Enumerate mounted filesystems. Returns current mount count. */
+int fs_mount_count(void);
+/* Get mount entry by index: path and fs short name (ops->name). Returns 0 on success. */
+int fs_mount_get(int index, char *out_path, size_t out_path_len, char *out_fs_name, size_t out_fs_name_len);
 
 /* High-level helpers which dispatch to registered drivers in registration order */
 struct fs_file *fs_create_file(const char *path);

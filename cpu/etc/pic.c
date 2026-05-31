@@ -59,6 +59,13 @@ void pic_unmask_irq(uint8_t irq) {
         
         value = inb(port) & ~(1 << irq);
         outb(port, value);
+
+        /* Any slave IRQ (8..15) needs master cascade IRQ2 unmasked,
+           otherwise the slave interrupt never reaches CPU. */
+        if (port == 0xA1) {
+                uint8_t m = inb(0x21) & (uint8_t)~(1u << 2);
+                outb(0x21, m);
+        }
 }
 
 void pic_set_irq_handler(uint8_t irq, void (*handler)()) {

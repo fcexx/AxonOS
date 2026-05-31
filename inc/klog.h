@@ -15,4 +15,8 @@ void klog_calibrate_tsc(void);
 /* Set by klog_calibrate_tsc(); 0 until calibrated. Used for CLI-safe busy waits (e.g. SMP INIT/SIPI). */
 extern uint64_t klog_tsc_per_us;
 
+/* Monotonic time (us/ms) — same source as kernel log timestamps (TSC when calibrated). */
+uint64_t time_monotonic_us(void);
+uint64_t time_monotonic_ms(void);
+
 

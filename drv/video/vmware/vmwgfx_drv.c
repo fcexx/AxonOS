@@ -890,7 +890,14 @@ static void vmwgfx_flush_region(video_device_t *dev, uint32_t x, uint32_t y, uin
 	if (y + h > fh)
 		h = fh - y;
 	vmwgfx_fifo_submit_update(&g_vmwgfx, x, y, w, h);
+}
+
+static void vmwgfx_display_sync(video_device_t *dev) {
+	(void)dev;
+	if (!g_vmwgfx.present || !g_vmwgfx.scanout_on)
+		return;
 	svga_reg_write32(&g_vmwgfx, SVGA_REG_SYNC, 1);
+	vmwgfx_io_barrier();
 }
 
 static int vmwgfx_set_mode(video_device_t *dev, uint32_t width, uint32_t height, uint32_t bpp) {
@@ -906,6 +913,7 @@ const video_ops_t vmwgfx_video_ops = {
 	.init = vmwgfx_init,
 	.shutdown = vmwgfx_shutdown,
 	.flush_region = vmwgfx_flush_region,
+	.display_sync = vmwgfx_display_sync,
 	.set_mode = vmwgfx_set_mode,
 };
 
@@ -1166,6 +1174,7 @@ int vmwgfx_kernel_init(void) {
 #endif
 	/* Host display refresh: FIFO UPDATE + SYNC (required on many VMware builds). */
 	video_flush_region_pixels(0, 0, vd->width, vd->height);
+	video_display_sync();
 
 	fbdev_register_linear(vd->mmio_base, g_vmwgfx.fb_pa + (uint64_t)g_vmwgfx.fb_offset,
 	                      (size_t)usable, vd->width, vd->height, vd->pitch, vd->bpp);

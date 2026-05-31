@@ -7,6 +7,7 @@
 #include <pit.h>
 #include <thread.h>
 #include <smp.h>
+#include <power.h>
 #include <loadavg.h>
 #include <stdio.h>
 #include <string.h>
@@ -221,6 +222,12 @@ void apic_timer_handler(cpu_registers_t* regs) {
         apic_timer_ticks > 0 &&
         (apic_timer_ticks % (uint64_t)apic_timer_state.frequency) == 0)
         loadavg_second_tick();
+
+    /* Ensure ACPI/power requests progress even when system is otherwise idle at a prompt. */
+    if (power_is_pending() && (!regs || ((regs->cs & 3) == 0))) {
+        power_poll();
+    }
+
     /* Never call the scheduler from an interrupt handler.
        Switching context while running on an IRQ stack frame corrupts return context.
        This became a hard hang once we introduced an always-READY idle thread. */

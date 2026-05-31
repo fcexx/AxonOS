@@ -85,3 +85,11 @@ void video_flush_region_pixels(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 	}
 }
 
+void video_display_sync(void) {
+	for (size_t i = 0; i < g_device_count; i++) {
+		video_device_t *d = &g_devices[i];
+		if (d->ops && d->ops->display_sync)
+			d->ops->display_sync(d);
+	}
+}
+
