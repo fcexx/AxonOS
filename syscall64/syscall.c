@@ -521,6 +521,9 @@ static void *copy_from_user_safe(const void *uptr, size_t count, size_t max, siz
 #define ENODEV   19
 #define ETIMEDOUT 110
 #define ECONNREFUSED 111
+#ifndef ECONNRESET
+#define ECONNRESET 104
+#endif
 
 /* Pipe: kernel buffer + two fd ends. driver_private = pipe_t*, fs_private = 0 read / 1 write */
 #define PIPE_BUF_SIZE 4096
