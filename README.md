@@ -26,7 +26,7 @@
 AxonOS is not just a repository.
 It is a real operating system project focused on performance, stability and modern design.
 
-Built from the ground up with a clean architecture and a vision for the future, AxonOS is designed for people who want more than a standard environment. Fast boot, lightweight core, flexible development and full customization — everything is made to feel smooth and powerful.
+Built from the ground up with a clean architecture and a vision for the future, AxonOS is designed for people who want more than a standard environment. Lightweight core, flexible development and full customization — everything is made to feel smooth and powerful.
 
 Whether you are exploring low-level systems, building your own environment or simply following the development of a modern OS project, AxonOS represents the idea of freedom and control.
 
