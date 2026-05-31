@@ -398,8 +398,10 @@ int e1000_send_frame(const void *data, size_t len) {
         e1000_write32(E1000_REG_TDT, (tail + 1) % E1000_TX_DESC_COUNT);
 
         for (int i = 0; i < 100000; i++) {
+            e1000_poll();
             if (d->status & E1000_TX_STATUS_DD) {
                 g_e1000.stats.tx_packets++;
+                e1000_poll();
                 return (int)len;
             }
         }

@@ -65,6 +65,32 @@ static char g_cwd[256] = "/";
 extern uint8_t _end[]; /* kernel end symbol from linker */
 extern const char nss_dns_so_blob_start[];
 extern const char nss_dns_so_blob_end[];
+extern const char ca_trust_pem_start[];
+extern const char ca_trust_pem_end[];
+
+static void ramfs_install_ca_trust(void)
+{
+    size_t len = (size_t)(ca_trust_pem_end - ca_trust_pem_start);
+    if (len == 0U)
+        return;
+    (void)fs_mkdir("/etc/ssl");
+    (void)fs_mkdir("/etc/ssl/certs");
+    (void)fs_mkdir("/etc/pki/tls/certs");
+    const char *paths[] = {
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+    };
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        (void)fs_unlink(paths[i]);
+        struct fs_file *f = fs_create_file(paths[i]);
+        if (!f)
+            f = fs_open(paths[i]);
+        if (f) {
+            fs_write(f, ca_trust_pem_start, len, 0);
+            fs_file_free(f);
+        }
+    }
+}
 
 static void ramfs_install_libnss_dns(void)
 {
@@ -405,6 +431,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     asm volatile("sti");
     /* Recalibrate after STI when PIT ticks are guaranteed to progress. */
     apic_timer_calibrate();
+    /* TSC vs PIT while IRQ0 still drives timer_ticks (before APIC-only timekeeping). */
+    klog_calibrate_tsc();
 
     /* Enable APIC timer if it behaves sanely; otherwise keep PIT.
        Real hardware can hang or run at wildly wrong rate with bad APIC calibration. */
@@ -440,10 +468,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             apic_timer_stop();
         }
     }
-
-    // Calibrate TSC for high resolution timestamps now that APIC timer is running
-    // Otherwise, for microseconds.
-    klog_calibrate_tsc();
 
     smp_finalize_topology(multiboot_magic, multiboot_info);
 
@@ -678,15 +702,7 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
             fs_write(oc, openssl_cnf, sizeof(openssl_cnf) - 1, 0);
             fs_file_free(oc);
         }
-        (void)fs_unlink("/etc/ssl/certs/ca-certificates.crt");
-        struct fs_file *ca = fs_create_file("/etc/ssl/certs/ca-certificates.crt");
-        if (!ca) ca = fs_open("/etc/ssl/certs/ca-certificates.crt");
-        if (ca) fs_file_free(ca);
-        (void)fs_mkdir("/etc/pki/tls/certs");
-        (void)fs_unlink("/etc/pki/tls/certs/ca-bundle.crt");
-        struct fs_file *pk = fs_create_file("/etc/pki/tls/certs/ca-bundle.crt");
-        if (!pk) pk = fs_open("/etc/pki/tls/certs/ca-bundle.crt");
-        if (pk) fs_file_free(pk);
+        ramfs_install_ca_trust();
     }
     /* Programs (mount, sh) open /etc/localtime; create so open doesn't fail. */
     {
@@ -698,7 +714,9 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
         static const char profile[] =
             "export TERM=builtin_ansi\n"
             "export PS1='\\[\\033[1;31m\\]\\u\\033[0m@\\h \\033[1;37m\\w\\033[0m \\$ '\n"
-            "export OPENSSL_CONF=/etc/ssl/openssl.cnf\n";
+            "export OPENSSL_CONF=/etc/ssl/openssl.cnf\n"
+            "export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\n"
+            "export SSL_CERT_DIR=/etc/ssl/certs\n";
         struct fs_file *pf = fs_create_file("/etc/profile");
         if (!pf) pf = fs_open("/etc/profile");
         if (pf) {

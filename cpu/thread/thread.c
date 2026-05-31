@@ -717,7 +717,11 @@ void thread_sleep(uint32_t ms) {
         if (!c)
                 return;
         uint32_t now = (uint32_t)timer_ticks;
-        c->sleep_until = (uint32_t)(now + ms);
+        uint32_t freq = (uint32_t)pit_get_frequency();
+        if (freq == 0) freq = 1000u;
+        uint32_t ticks = (uint32_t)(((uint64_t)ms * (uint64_t)freq + 999u) / 1000u);
+        if (ticks == 0) ticks = 1;
+        c->sleep_until = (uint32_t)(now + ticks);
         c->state = THREAD_SLEEPING;
         thread_yield();
 }

@@ -23,12 +23,15 @@ typedef struct {
     int used;
     int established;
     int connect_pending; /* nonblocking connect: SYN sent, awaiting SYN-ACK */
+    int connect_peer_pkts; /* RX TCP segments from peer during connect (debug) */
     int peer_fin;
+    int peer_rst;
     uint32_t dst_ip_be;
     uint16_t dst_port;
     uint16_t src_port;
     uint32_t snd_una;
     uint32_t snd_nxt;
+    uint32_t syn_isn;    /* initial seq for outbound SYN (connect handshake) */
     uint32_t rcv_nxt;
     /* Bigger receive window for HTTP downloads; 8 KiB caused frequent sender stalls. */
     uint8_t rx_buf[65536];
@@ -44,6 +47,8 @@ int net_tcp_connect(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t dst_ip
 /* Finish connect_pending (0=established, -1=still pending, -2=failed/timeout). */
 int net_tcp_connect_poll(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t timeout_ms);
 int net_tcp_send(net_tcp_conn_t *c, const net_tcp_ops_t *ops, const uint8_t *data, size_t len, uint32_t timeout_ms);
+/* Wait until all sent bytes are ACKed (needed before TLS read after Client Finished). */
+int net_tcp_flush_tx(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t timeout_ms);
 int net_tcp_recv(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint8_t *out, size_t cap, uint32_t timeout_ms);
 int net_tcp_close(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t timeout_ms);
 int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget);

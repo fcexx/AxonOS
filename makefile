@@ -50,6 +50,9 @@ AP_TRAMP_BIN_SYM := $(subst -,_,$(subst .,_,$(subst /,_,$(AP_TRAMP_BIN))))
 NSS_DNS_SHIM := $(BUILD_DIR)/nss_dns/shim
 NSS_DNS_BLOB_OBJ := $(BUILD_DIR)/nss_dns/shim_blob.o
 
+CA_TRUST_PEM := $(BUILD_DIR)/isrgrootx1.pem
+CA_TRUST_BLOB_OBJ := $(BUILD_DIR)/ca_trust_blob.o
+
 .PHONY: all kernel iso clean run
 
 all: iso
@@ -99,7 +102,20 @@ $(NSS_DNS_BLOB_OBJ): $(NSS_DNS_SHIM)
 	objcopy --redefine-sym $$START=nss_dns_so_blob_start --redefine-sym $$END=nss_dns_so_blob_end $@.tmp $@ && \
 	rm -f $@.tmp
 
-$(PAYLOAD_ELF): $(OTHER_ASM_OBJS) $(SOBJS) $(AP_TRAMP_OBJ) $(NSS_DNS_BLOB_OBJ) $(PAYLOAD_COBJS)
+$(CA_TRUST_PEM): core/isrgrootx1.pem
+	@mkdir -p $(dir $@)
+	@cp $< $@
+
+$(CA_TRUST_BLOB_OBJ): $(CA_TRUST_PEM)
+	@echo "LD(BIN) [ca_trust]	$<"
+	@ld -r -b binary -o $@.tmp $< && \
+	START=$$(nm $@.tmp | awk '$$3 ~ /^_binary_.*_start$$/ {print $$3; exit}') && \
+	END=$$(nm $@.tmp | awk '$$3 ~ /^_binary_.*_end$$/ {print $$3; exit}') && \
+	test -n "$$START" && test -n "$$END" && \
+	objcopy --redefine-sym $$START=ca_trust_pem_start --redefine-sym $$END=ca_trust_pem_end $@.tmp $@ && \
+	rm -f $@.tmp
+
+$(PAYLOAD_ELF): $(OTHER_ASM_OBJS) $(SOBJS) $(AP_TRAMP_OBJ) $(NSS_DNS_BLOB_OBJ) $(CA_TRUST_BLOB_OBJ) $(PAYLOAD_COBJS)
 	@mkdir -p $(BUILD_DIR)
 	@echo "LD		$@"
 	@ld -m elf_x86_64 -T linker.payload.ld -o $@ $^

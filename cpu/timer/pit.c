@@ -1,4 +1,6 @@
 #include <pit.h>
+#include <apic_timer.h>
+#include <klog.h>
 #include <debug.h> 
 #include <pic.h>
 #include <idt.h>
@@ -134,10 +136,18 @@ uint64_t pit_get_ticks() {
 
 // Get time in milliseconds since boot
 uint64_t pit_get_time_ms() {
-        /* Prefer common ticks (expected 1ms tick when configured at 1000Hz). */
+        /* Match klog timestamps (TSC); APIC-only ms can run ~10x slow on VMware. */
+        if (klog_tsc_per_us != 0)
+                return time_monotonic_ms();
+        if (apic_timer_is_running())
+                return apic_timer_get_time_ms();
+        if (pit_frequency == 0)
+                return 0;
         return (timer_ticks * 1000) / pit_frequency;
 }
 
 uint64_t pit_get_frequency() {
+        if (apic_timer_is_running())
+                return apic_timer_get_frequency();
         return pit_frequency;
 }
