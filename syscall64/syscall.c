@@ -105,6 +105,55 @@ __attribute__((noreturn)) void syscall_return_to_shell(void) {
     for (;;) { asm volatile("sti; hlt" ::: "memory"); }
 }
 
+#ifndef SIGCHLD
+#define SIGCHLD 17
+#endif
+
+static void exit_group_reap_peer_threads(thread_t *cur);
+static void sysv_shm_detach_all_for_tid(uint64_t tid);
+static void thread_set_pending_signal(thread_t *t, int signum);
+
+void syscall_user_fatal_exit(int signo) {
+    thread_t *cur = thread_get_current_user();
+    if (!cur)
+        cur = thread_current();
+    if (cur && cur->ring == 3) {
+        if (cur->attached_tty >= 0)
+            devfs_tty_leave_alt_screen(cur->attached_tty);
+        devfs_tty_remove_waiter_from_all_ttys((int)(cur->tid ? cur->tid : 1));
+        exit_group_reap_peer_threads(cur);
+        cur->exit_status = (signo & 0x7f) << 8;
+        sysv_shm_detach_all_for_tid((uint64_t)(cur->tid ? cur->tid : 1));
+        user_vma_remove_all_for_tid((uint64_t)(cur->tid ? cur->tid : 1));
+        for (int i = 0; i < THREAD_MAX_FD; i++) {
+            if (cur->fds[i]) {
+                struct fs_file *f = cur->fds[i];
+                cur->fds[i] = NULL;
+                fs_file_free(f);
+            }
+        }
+        cur->state = THREAD_TERMINATED;
+        if (cur->parent_tid >= 0) {
+            thread_t *pt = thread_get(cur->parent_tid);
+            if (pt) {
+                thread_set_pending_signal(pt, SIGCHLD);
+                thread_unblock((int)(pt->tid ? pt->tid : 1));
+                if (cur->attached_tty >= 0 && pt->attached_tty == cur->attached_tty)
+                    devfs_set_tty_fg_pgrp(cur->attached_tty, pt->pgid);
+            }
+        }
+        if (cur->waiter_tid >= 0)
+            thread_unblock(cur->waiter_tid);
+        if (cur->mm && cur->mm != mm_kernel()) {
+            mm_release(cur->mm);
+            cur->mm = mm_kernel();
+        }
+    }
+    thread_set_current_user(NULL);
+    thread_schedule();
+    for (;;) { asm volatile("sti; hlt" ::: "memory"); }
+}
+
 extern void syscall_entry64(void);
 /* helper entry for kernel-created user threads (defined in cpu/thread.c) */
 extern void user_thread_entry(void);
@@ -1514,10 +1563,15 @@ static int net_stack_init(void);
 
 static void net_rx_pump_thread(void) {
     uint8_t buf[NET_RXQ_BUF];
+    static uint64_t link_down_ms = 0;
     for (;;) {
         if (e1000_link_changed()) {
-            klogprintf("net: link changed, scheduling DHCP renew\n");
-            g_net_redhcp_pending = 1;
+            if (!e1000_link_is_up()) {
+                link_down_ms = pit_get_time_ms();
+            } else if (link_down_ms && pit_get_time_ms() - link_down_ms >= 2000ULL) {
+                g_net_redhcp_pending = 1;
+                link_down_ms = 0;
+            }
         }
         if (g_net_redhcp_pending) {
             g_net_redhcp_pending = 0;
@@ -2171,17 +2225,13 @@ static int net_resolve_mac(uint32_t ip_be, uint8_t out_mac[6], uint32_t timeout_
 
 
 static int net_stack_init(void) {
+    static uint32_t net_announced_ip;
     if (g_net.inited) return g_net.ready ? 0 : -1;
     if (g_net_shadow_valid && g_net_shadow.ready) {
         g_net = g_net_shadow;
         g_net.inited = 1;
         /* L2 next-hop is not part of DHCP; stale gw_mac caused TCP timeout while ICMP worked. */
         g_net.gw_mac_valid = 0;
-        klogprintf("net: restored session ip=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
-                   (unsigned)((g_net.ip_be >> 24) & 0xFF), (unsigned)((g_net.ip_be >> 16) & 0xFF),
-                   (unsigned)((g_net.ip_be >> 8) & 0xFF), (unsigned)(g_net.ip_be & 0xFF),
-                   (unsigned)((g_net.gw_be >> 24) & 0xFF), (unsigned)((g_net.gw_be >> 16) & 0xFF),
-                   (unsigned)((g_net.gw_be >> 8) & 0xFF), (unsigned)(g_net.gw_be & 0xFF));
         return 0;
     }
     memset(&g_net, 0, sizeof(g_net));
@@ -2193,7 +2243,6 @@ static int net_stack_init(void) {
     int dhcp_ok = 0;
     for (int dhcp_round = 0; dhcp_round < 2 && !dhcp_ok; dhcp_round++) {
         if (dhcp_round > 0) {
-            klogprintf("net: DHCP retry after link settle\n");
             e1000_flush_rx();
             pit_sleep_ms(3000);
         }
@@ -2218,12 +2267,15 @@ static int net_stack_init(void) {
         g_net_shadow = g_net;
         g_net_shadow_valid = 1;
     }
-    klogprintf("net: ready ip=%u.%u.%u.%u gw=%u.%u.%u.%u%s\n",
-               (unsigned)((g_net.ip_be >> 24) & 0xFF), (unsigned)((g_net.ip_be >> 16) & 0xFF),
-               (unsigned)((g_net.ip_be >> 8) & 0xFF), (unsigned)(g_net.ip_be & 0xFF),
-               (unsigned)((g_net.gw_be >> 24) & 0xFF), (unsigned)((g_net.gw_be >> 16) & 0xFF),
-               (unsigned)((g_net.gw_be >> 8) & 0xFF), (unsigned)(g_net.gw_be & 0xFF),
-               dhcp_ok ? "" : " (dhcp fallback)");
+    if (g_net.ip_be != net_announced_ip) {
+        net_announced_ip = g_net.ip_be;
+        klogprintf("net: ready ip=%u.%u.%u.%u gw=%u.%u.%u.%u%s\n",
+                   (unsigned)((g_net.ip_be >> 24) & 0xFF), (unsigned)((g_net.ip_be >> 16) & 0xFF),
+                   (unsigned)((g_net.ip_be >> 8) & 0xFF), (unsigned)(g_net.ip_be & 0xFF),
+                   (unsigned)((g_net.gw_be >> 24) & 0xFF), (unsigned)((g_net.gw_be >> 16) & 0xFF),
+                   (unsigned)((g_net.gw_be >> 8) & 0xFF), (unsigned)(g_net.gw_be & 0xFF),
+                   dhcp_ok ? "" : " (dhcp fallback)");
+    }
 
     /* Start background RX pump once: reply to ARP/ICMP even when userland is idle. */
     if (!g_net_rx_thread_started) {
@@ -5597,6 +5649,65 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             return (uint64_t)cur->gid;
         case SYS_getegid:
             return (uint64_t)cur->egid;
+        case SYS_capget:
+        case SYS_capset: {
+            /* Linux capabilities (htop, libcap). Minimal v1/v2/v3; no per-thread cap storage. */
+            enum {
+                _CAP_VERSION_1 = 0x19980330u,
+                _CAP_VERSION_2 = 0x20071026u,
+                _CAP_VERSION_3 = 0x20080522u,
+            };
+            typedef struct { uint32_t version; int32_t pid; } cap_user_header_t;
+            typedef struct { uint32_t effective; uint32_t permitted; uint32_t inheritable; } cap_user_data_t;
+
+            void *hdr_u = (void *)(uintptr_t)a1;
+            void *dat_u = (void *)(uintptr_t)a2;
+            if (!hdr_u) return ret_err(EFAULT);
+            if (!user_range_ok(hdr_u, sizeof(cap_user_header_t))) return ret_err(EFAULT);
+
+            cap_user_header_t hdr;
+            if (copy_from_user_raw(&hdr, hdr_u, sizeof(hdr)) != 0) return ret_err(EFAULT);
+
+            int ndata = 0;
+            if (hdr.version == _CAP_VERSION_1) ndata = 1;
+            else if (hdr.version == _CAP_VERSION_2 || hdr.version == _CAP_VERSION_3) ndata = 2;
+            else return ret_err(EINVAL);
+
+            int target_pid = hdr.pid;
+            if (target_pid == 0)
+                target_pid = (int)(cur->tid ? cur->tid : 1);
+            thread_t *target = thread_get(target_pid);
+            if (!target || target->state == THREAD_TERMINATED) return ret_err(ESRCH);
+
+            int privileged = (target->euid == 0);
+            uint32_t lo = privileged ? 0xFFFFFFFFu : 0u;
+            uint32_t hi = privileged ? 0x1FFu : 0u; /* caps 32..40 (CAP_LAST_CAP=40) */
+
+            if (num == SYS_capset) {
+                if (cur->euid != 0) return ret_err(EPERM);
+                if (!dat_u) return ret_err(EFAULT);
+                if (!user_range_ok(dat_u, (size_t)ndata * sizeof(cap_user_data_t))) return ret_err(EFAULT);
+                return 0;
+            }
+
+            /* capget: datap==NULL probes version/pid only */
+            if (!dat_u) return 0;
+            if (!user_range_ok(dat_u, (size_t)ndata * sizeof(cap_user_data_t))) return ret_err(EFAULT);
+
+            cap_user_data_t data[2];
+            memset(data, 0, sizeof(data));
+            data[0].effective = lo;
+            data[0].permitted = lo;
+            data[0].inheritable = 0;
+            if (ndata >= 2) {
+                data[1].effective = hi;
+                data[1].permitted = hi;
+                data[1].inheritable = 0;
+            }
+            if (copy_to_user_safe(dat_u, data, (size_t)ndata * sizeof(cap_user_data_t)) != 0)
+                return ret_err(EFAULT);
+            return 0;
+        }
         case SYS_setuid: {
             /* setuid(uid): set uid, euid, suid. Root can set any; otherwise uid must equal uid/euid/suid. */
             uid_t uid = (uid_t)a1;

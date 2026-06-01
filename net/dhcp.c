@@ -94,6 +94,7 @@ static const uint8_t *dhcp_find_opt(const uint8_t *opts, size_t opts_len, uint8_
 /* Global IP ID counter for packet identification */
 static uint16_t g_ip_id = 1;
 static dhcp_lease_t g_cached_lease;
+static uint32_t dhcp_last_logged_ip;
 static uint8_t g_cached_mac[6];
 static int g_cached_lease_valid = 0;
 
@@ -237,10 +238,6 @@ static int dhcp_parse_offer(const uint8_t *d, size_t opts_len, uint32_t xid,
 
     if (!ip) return 0;
 
-    klogprintf("dhcp: OFFER ip=%u.%u.%u.%u server=%u.%u.%u.%u\n",
-        (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF,
-        (srv >> 24) & 0xFF, (srv >> 16) & 0xFF, (srv >> 8) & 0xFF, srv & 0xFF);
-
     *offered_ip = ip;
     *server_id = srv;
     *netmask = mask;
@@ -270,11 +267,8 @@ static int dhcp_handle_rx_frame(const uint8_t *frame, int n, uint32_t xid,
     int ip_off = dhcp_l2_ipv4_offset(frame, n, &eth_type);
     if (ip_off < 0)
         return 0;
-    if (eth_type != 0x0800u) {
-        if (eth_type != 0x0806u && eth_type != 0x86DDu)
-            klogprintf("dhcp: skip eth=0x%04x len=%d\n", (unsigned)eth_type, n);
+    if (eth_type != 0x0800u)
         return 0;
-    }
     if (n < ip_off + 20 + 8 + 240)
         return 0;
 
@@ -296,22 +290,14 @@ static int dhcp_handle_rx_frame(const uint8_t *frame, int n, uint32_t xid,
         return 0;
 
     const uint8_t *d = (const uint8_t *)udp + sizeof(udp_hdr_t);
-    if (!(d[236] == 99 && d[237] == 130 && d[238] == 83 && d[239] == 99)) {
-        klogprintf("dhcp: no magic cookie op=%u sport=%u\n", (unsigned)d[0], (unsigned)sport);
+    if (!(d[236] == 99 && d[237] == 130 && d[238] == 83 && d[239] == 99))
         return 0;
-    }
 
     size_t bootp_len = (size_t)ulen - 8;
     size_t opts_len = bootp_len > 240 ? bootp_len - 240 : 0;
 
     if (dhcp_parse_offer(d, opts_len, xid, offered_ip, server_id, netmask, router, dns))
         return 1;
-
-    uint8_t ol = 0;
-    const uint8_t *ot = dhcp_find_opt(d + 240, opts_len, 53, &ol);
-    uint8_t mt = (ot && ol == 1) ? ot[0] : 0;
-    klogprintf("dhcp: dhcp-udp op=%u mt=%u xid=0x%08x (want 0x%08x)\n",
-               (unsigned)d[0], (unsigned)mt, dhcp_read_be32(&d[4]), xid);
     return 0;
 }
 
@@ -385,9 +371,7 @@ int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease) {
     for (int disc_try = 0; disc_try < DHCP_DISCOVER_TRIES && !offered_ip; disc_try++) {
         if (disc_try > 0)
             xid = (uint32_t)(pit_get_ticks() ^ 0xA5F0C31Du ^ (uint32_t)disc_try);
-        klogprintf("dhcp: DISCOVER (xid=0x%08x, try=%d)\n", xid, disc_try + 1);
         if (dhcp_send_packet(mac, 1, xid, 0, 0) != 0) {
-            klogprintf("dhcp: DISCOVER send failed\n");
             for (int w = 0; w < 500; w++) thread_yield();
             continue;
         }
@@ -424,7 +408,7 @@ int dhcp_acquire(const uint8_t mac[6], dhcp_lease_t *out_lease) {
                 thread_yield();
         }
 discover_done:
-        klogprintf("dhcp: DISCOVER phase rx_count=%d\n", rx_count);
+        (void)rx_count;
     }
     
     if (!offered_ip) {
@@ -437,11 +421,8 @@ discover_done:
     
     /* PHASE 2: REQUEST -> ACK (with retries) */
     for (int req_try = 0; req_try < DHCP_REQUEST_TRIES; req_try++) {
-        klogprintf("dhcp: REQUEST (try=%d)\n", req_try + 1);
         int send_rc = dhcp_send_packet(mac, 3, xid, offered_ip, server_id);
-        klogprintf("dhcp: REQUEST send_rc=%d\n", send_rc);
         if (send_rc != 0) {
-            klogprintf("dhcp: REQUEST send failed\n");
             for (int w = 0; w < 500; w++) thread_yield();
             continue;
         }
@@ -482,7 +463,6 @@ discover_done:
             if (!got_pkt)
                 thread_yield();
         }
-        klogprintf("dhcp: REQUEST timeout\n");
     }
     
     klogprintf("dhcp: failed - no ACK\n");
@@ -498,11 +478,14 @@ got_ack:
     g_cached_lease = *out_lease;
     memcpy(g_cached_mac, mac, 6);
     g_cached_lease_valid = 1;
-    klogprintf("dhcp: ACK! ip=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
-        (out_lease->ip_be >> 24) & 0xFF, (out_lease->ip_be >> 16) & 0xFF,
-        (out_lease->ip_be >> 8) & 0xFF, out_lease->ip_be & 0xFF,
-        (out_lease->gw_be >> 24) & 0xFF, (out_lease->gw_be >> 16) & 0xFF,
-        (out_lease->gw_be >> 8) & 0xFF, out_lease->gw_be & 0xFF);
+    if (offered_ip != dhcp_last_logged_ip) {
+        dhcp_last_logged_ip = offered_ip;
+        klogprintf("dhcp: ACK! ip=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
+            (out_lease->ip_be >> 24) & 0xFF, (out_lease->ip_be >> 16) & 0xFF,
+            (out_lease->ip_be >> 8) & 0xFF, out_lease->ip_be & 0xFF,
+            (out_lease->gw_be >> 24) & 0xFF, (out_lease->gw_be >> 16) & 0xFF,
+            (out_lease->gw_be >> 8) & 0xFF, out_lease->gw_be & 0xFF);
+    }
     kfree(frame);
     return 0;
 }

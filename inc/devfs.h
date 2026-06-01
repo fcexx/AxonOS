@@ -25,8 +25,16 @@ struct devfs_tty {
     int esc_state; /* 0=normal,1=ESC,2=CSI */
     char esc_buf[64];
     int esc_len;
-    /* saved cursor position for save/restore */
-    uint16_t saved_cursor;
+    /* saved cursor for DEC smcup/rmcup (alternate screen) */
+    uint32_t saved_x;
+    uint32_t saved_y;
+    uint32_t dec_saved_x; /* CSI s / CSI u */
+    uint32_t dec_saved_y;
+    uint8_t *alt_screen; /* main-screen backup while alt_active */
+    uint8_t alt_active;
+    uint8_t attr_reverse; /* SGR 7 active */
+    uint32_t scroll_top;    /* DECSTBM inclusive, 0-based */
+    uint32_t scroll_bottom; /* DECSTBM inclusive, 0-based */
     /* input buffer (chars) */
     char inbuf[256];
     int in_head;
@@ -38,8 +46,16 @@ struct devfs_tty {
     int waiters_count;
     /* current VGA attribute for output on this tty (low nibble FG, high nibble BG) */
     uint8_t current_attr;
-    /* simple ANSI escape state for CSI parsing (0=normal,1=ESC seen,2=CSI) */
+    /* simple ANSI escape state for CSI parsing (0=normal,1=ESC,2=CSI,3=SS3,4=)G0,5=(G0) */
     uint8_t ansi_escape_state;
+    /* DEC line-drawing (ACS):
+       - ESC ( 0 / ESC ) 0 select special-graphics for G0/G1
+       - ESC ( B / ESC ) B select ASCII for G0/G1
+       - SI (0x0F) / SO (0x0E) shift in/out (ncurses uses this) */
+    uint8_t g0_is_acs;
+    uint8_t acs_mode; /* active shift state (SO=1, SI=0) */
+    /* CSI had '?' (DEC private params) */
+    uint8_t ansi_csi_private;
     /* simple CSI parameter storage (up to 8 parameters) */
     int ansi_param[8];
     int ansi_param_count;
@@ -96,6 +112,8 @@ int devfs_tty_add_waiter(int tty, int tid);
 void devfs_tty_remove_waiter(int tty, int tid);
 /* Remove tid from every tty waiter list (fixes slot exhaustion after exit_group). */
 void devfs_tty_remove_waiter_from_all_ttys(int tid);
+/* Restore main TTY buffer after smcup/rmcup or fatal exit (htop/nano). */
+void devfs_tty_leave_alt_screen(int tty);
 /* Check whether an fs_file is a devfs tty device */
 int devfs_is_tty_file(struct fs_file *file);
 

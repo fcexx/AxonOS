@@ -65,32 +65,6 @@ static char g_cwd[256] = "/";
 extern uint8_t _end[]; /* kernel end symbol from linker */
 extern const char nss_dns_so_blob_start[];
 extern const char nss_dns_so_blob_end[];
-extern const char ca_trust_pem_start[];
-extern const char ca_trust_pem_end[];
-
-static void ramfs_install_ca_trust(void)
-{
-    size_t len = (size_t)(ca_trust_pem_end - ca_trust_pem_start);
-    if (len == 0U)
-        return;
-    (void)fs_mkdir("/etc/ssl");
-    (void)fs_mkdir("/etc/ssl/certs");
-    (void)fs_mkdir("/etc/pki/tls/certs");
-    const char *paths[] = {
-        "/etc/ssl/certs/ca-certificates.crt",
-        "/etc/pki/tls/certs/ca-bundle.crt",
-    };
-    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
-        (void)fs_unlink(paths[i]);
-        struct fs_file *f = fs_create_file(paths[i]);
-        if (!f)
-            f = fs_open(paths[i]);
-        if (f) {
-            fs_write(f, ca_trust_pem_start, len, 0);
-            fs_file_free(f);
-        }
-    }
-}
 
 static void ramfs_install_libnss_dns(void)
 {
@@ -689,21 +663,6 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
     }
     syscall_net_ensure_resolv();
     ramfs_install_libnss_dns();
-    /* OpenSSL/wget: avoid slow ENOENT walks; --no-check-certificate still opens these paths. */
-    {
-        static const char openssl_cnf[] =
-            "openssl_conf = openssl_init\n\n[openssl_init]\n";
-        (void)fs_mkdir("/etc/ssl");
-        (void)fs_mkdir("/etc/ssl/certs");
-        (void)fs_unlink("/etc/ssl/openssl.cnf");
-        struct fs_file *oc = fs_create_file("/etc/ssl/openssl.cnf");
-        if (!oc) oc = fs_open("/etc/ssl/openssl.cnf");
-        if (oc) {
-            fs_write(oc, openssl_cnf, sizeof(openssl_cnf) - 1, 0);
-            fs_file_free(oc);
-        }
-        ramfs_install_ca_trust();
-    }
     /* Programs (mount, sh) open /etc/localtime; create so open doesn't fail. */
     {
         struct fs_file *lt = fs_create_file("/etc/localtime");

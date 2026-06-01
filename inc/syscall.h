@@ -45,6 +45,8 @@
 #define SYS_getgid  104
 #define SYS_geteuid 107
 #define SYS_getegid 108
+#define SYS_capget  125
+#define SYS_capset  126
 #define SYS_setuid  105
 #define SYS_setgid  106
 #define SYS_setreuid 113
@@ -124,5 +126,7 @@ uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_
 /* Control flag and helper for syscall_entry64. */
 extern uint64_t syscall_exit_to_shell_flag;
 __attribute__((noreturn)) void syscall_return_to_shell(void);
+/* Terminate current user thread after fatal trap (GPF etc.); schedule parent/shell. */
+void syscall_user_fatal_exit(int signo);
 
 

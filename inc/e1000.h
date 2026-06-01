@@ -39,6 +39,9 @@ void e1000_flush_rx(void);
 /* Returns 1 if link-up (LU) bit changed since last call (clears latch). */
 int e1000_link_changed(void);
 
+/* Current link-up (LU) status without clearing link_changed latch. */
+int e1000_link_is_up(void);
+
 /* Debug: print RX ring state. */
 void e1000_debug_rx(void);
 

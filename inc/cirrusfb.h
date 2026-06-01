@@ -34,6 +34,8 @@ void cirrusfb_blit_mono8(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const u
 /* Rows at top excluded from console scroll / minimum cursor Y (0 = off). */
 void cirrusfb_set_margin_rows(uint32_t rows);
 uint32_t cirrusfb_margin_rows(void);
+/* Scroll rows [top..bottom] up by one line within the text buffer (DECSTBM). */
+void cirrusfb_scroll_region(uint32_t top, uint32_t bottom);
 void cirrusfb_set_logo_visible(int visible);
 /* Drop pinned logo: restore console text over logo rows, allow normal scroll. */
 void cirrusfb_dismiss_boot_logo(void);

@@ -14,6 +14,7 @@
 #include <debug.h>
 #include <mmio.h>
 #include <klog.h>
+#include <syscall.h>
 #include <paging.h>
 #include <keyboard.h>
 #include <serial.h>
@@ -448,10 +449,8 @@ static void gp_fault_handler(cpu_registers_t* regs){
             klogprintf("stack @ RSP: (outside identity map)\n");
         }
 
-        klogprintf("GPF: terminating user thread and returning to shell\n");
-        /* terminate current user thread safely and return to ring0 shell */
-        extern void syscall_return_to_shell(void);
-        syscall_return_to_shell();
+        klogprintf("GPF: terminating user thread\n");
+        syscall_user_fatal_exit(11); /* SIGSEGV */
     }
     // kernel GP — стоп, но оставляем PIT активным для мигания курсора
     (void)regs;

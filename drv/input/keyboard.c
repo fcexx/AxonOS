@@ -67,8 +67,8 @@ static int ps2_kbd_send_ack(uint8_t byte) {
 
 // Таблица сканкодов для преобразования в ASCII
 static const char scancode_to_ascii[128] = {
-        0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 0x7F, 0,
-        'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n', 0, 'a', 's',
+        0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b', 0,
+        'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\r', 0, 'a', 's',
         'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0, '\\', 'z', 'x', 'c', 'v',
         'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' ', 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, '7', '8', '9', '-', '4', '5', '6', '+', '1',
@@ -79,8 +79,8 @@ static const char scancode_to_ascii[128] = {
 
 // Таблица сканкодов для Shift
 static const char scancode_to_ascii_shift[128] = {
-        0, 0, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', 0x7F, 0,
-        'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n', 0, 'A', 'S',
+        0, 0, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b', 0,
+        'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\r', 0, 'A', 'S',
         'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~', 0, '|', 'Z', 'X', 'C', 'V',
         'B', 'N', 'M', '<', '>', '?', 0, '*', 0, ' ', 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, '7', '8', '9', '-', '4', '5', '6', '+', '1',
@@ -135,10 +135,8 @@ void keyboard_publish_sysfs(void) {
         keyboard_register_sysfs();
 }
 
-// Добавить символ в буфер
-static void add_to_buffer(char c) {
-    /* Legacy wrapper kept for compatibility; push to devfs active tty non-blocking */
-    devfs_tty_push_input_noblock(devfs_get_active(), c);
+static void kbd_push_char(int tty, char c) {
+    devfs_tty_push_input_noblock(tty, c);
 }
 
 // Обработчик прерывания клавиатуры
@@ -239,8 +237,8 @@ void keyboard_process_scancode(uint8_t scancode) {
                         case 0x51: /* PgDn */  kbd_push_sequence(target_tty_for_user, "\x1B[6~"); break;
                         case 0x52: /* Ins */   kbd_push_sequence(target_tty_for_user, "\x1B[2~"); break;
                         case 0x53: /* Del */   kbd_push_sequence(target_tty_for_user, "\x1B[3~"); break;
-                        case 0x1C: /* Keypad Enter */ add_to_buffer('\n'); break;
-                        case 0x35: /* Keypad '/' */   add_to_buffer('/'); break;
+                        case 0x1C: /* Keypad Enter */ kbd_push_char(target_tty_for_user, '\r'); break;
+                        case 0x35: /* Keypad '/' */   kbd_push_char(target_tty_for_user, '/'); break;
                         case 0x01: /* Escape (E0 01 on some kbd) */ devfs_tty_push_input_noblock(target_tty_for_user, 27); break;
                         default: break;
                 }
@@ -260,8 +258,7 @@ void keyboard_process_scancode(uint8_t scancode) {
                         alt_pressed = true;
                         break;
                 case 0x0E: // Backspace
-                        /* Always send DEL (0x7f) to TTY for userspace; kernel kgetc handles \b */
-                        devfs_tty_push_input_noblock(target_tty_for_user, 0x7F);
+                        kbd_push_char(target_tty_for_user, '\b');
                         break;
                 case 0x48: // Up arrow
                 case 0x50: // Down arrow
@@ -286,7 +283,7 @@ void keyboard_process_scancode(uint8_t scancode) {
                         else kbd_push_sequence(target_tty_for_user, "\x1B[3~");
                         break;
                 case 0x0F: // Tab — отправляем ASCII '\t' (0x09), чтобы в TTY/sh отображался таб, а не неизвестный символ
-                        add_to_buffer('\t');
+                        kbd_push_char(target_tty_for_user, '\t');
                         break;
                 case 0x01: // Escape
                 case 0x76: // Escape (alternate scancode)
@@ -305,15 +302,14 @@ void keyboard_process_scancode(uint8_t scancode) {
                                           (scancode == 0x3F) ? 4 : 5;
                                 devfs_switch_tty(idx);
                         } else {
-                                if (thread_get_current_user()) {
-                                        switch (scancode) {
-                                                case 0x3B: kbd_push_sequence(target_tty_for_user, "\x1BOP"); break; /* F1 */
-                                                case 0x3C: kbd_push_sequence(target_tty_for_user, "\x1BOQ"); break; /* F2 */
-                                                case 0x3D: kbd_push_sequence(target_tty_for_user, "\x1BOR"); break; /* F3 */
-                                                case 0x3E: kbd_push_sequence(target_tty_for_user, "\x1BOS"); break; /* F4 */
-                                                case 0x3F: kbd_push_sequence(target_tty_for_user, "\x1B[15~"); break; /* F5 */
-                                                case 0x40: kbd_push_sequence(target_tty_for_user, "\x1B[17~"); break; /* F6 */
-                                        }
+                                /* Always push (ISR has no user context; same as arrow keys). */
+                                switch (scancode) {
+                                        case 0x3B: kbd_push_sequence(target_tty_for_user, "\x1BOP"); break; /* F1 */
+                                        case 0x3C: kbd_push_sequence(target_tty_for_user, "\x1BOQ"); break; /* F2 */
+                                        case 0x3D: kbd_push_sequence(target_tty_for_user, "\x1BOR"); break; /* F3 */
+                                        case 0x3E: kbd_push_sequence(target_tty_for_user, "\x1BOS"); break; /* F4 */
+                                        case 0x3F: kbd_push_sequence(target_tty_for_user, "\x1B[15~"); break; /* F5 */
+                                        case 0x40: kbd_push_sequence(target_tty_for_user, "\x1B[17~"); break; /* F6 */
                                 }
                         }
                         break;
@@ -323,15 +319,13 @@ void keyboard_process_scancode(uint8_t scancode) {
                 case 0x44: // F10
                 case 0x57: // F11
                 case 0x58: // F12
-                        if (thread_get_current_user()) {
-                                switch (scancode) {
-                                        case 0x41: kbd_push_sequence(target_tty_for_user, "\x1B[18~"); break; /* F7 */
-                                        case 0x42: kbd_push_sequence(target_tty_for_user, "\x1B[19~"); break; /* F8 */
-                                        case 0x43: kbd_push_sequence(target_tty_for_user, "\x1B[20~"); break; /* F9 */
-                                        case 0x44: kbd_push_sequence(target_tty_for_user, "\x1B[21~"); break; /* F10 */
-                                        case 0x57: kbd_push_sequence(target_tty_for_user, "\x1B[23~"); break; /* F11 */
-                                        case 0x58: kbd_push_sequence(target_tty_for_user, "\x1B[24~"); break; /* F12 */
-                                }
+                        switch (scancode) {
+                                case 0x41: kbd_push_sequence(target_tty_for_user, "\x1B[18~"); break; /* F7 */
+                                case 0x42: kbd_push_sequence(target_tty_for_user, "\x1B[19~"); break; /* F8 */
+                                case 0x43: kbd_push_sequence(target_tty_for_user, "\x1B[20~"); break; /* F9 */
+                                case 0x44: kbd_push_sequence(target_tty_for_user, "\x1B[21~"); break; /* F10 */
+                                case 0x57: kbd_push_sequence(target_tty_for_user, "\x1B[23~"); break; /* F11 */
+                                case 0x58: kbd_push_sequence(target_tty_for_user, "\x1B[24~"); break; /* F12 */
                         }
                         break;
                 default:
@@ -350,7 +344,7 @@ void keyboard_process_scancode(uint8_t scancode) {
                                 if (c == 3) {
                                         ctrlc_pending = true;
                                 }
-                                        add_to_buffer(c);
+                                        kbd_push_char(target_tty_for_user, c);
                                         //qemu_debug_printf("kbd: char '%c' (0x%02x) -> buffer_count=%d\n", c, (unsigned char)c, buffer_count);
                                 }
                         }

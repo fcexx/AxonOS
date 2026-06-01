@@ -917,8 +917,9 @@ void thread_send_sighup_to_pgrp(int pgrp) {
 
 // get thread info by pid
 thread_t* thread_get(int pid) {
+        uint64_t want = (uint64_t)(unsigned)pid;
         for (int i = 0; i < thread_count; ++i) {
-                if (threads[i] && threads[i]->tid == pid) {
+                if (threads[i] && threads[i]->tid == want) {
                         return threads[i];
                 }
         }

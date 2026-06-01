@@ -50,9 +50,6 @@ AP_TRAMP_BIN_SYM := $(subst -,_,$(subst .,_,$(subst /,_,$(AP_TRAMP_BIN))))
 NSS_DNS_SHIM := $(BUILD_DIR)/nss_dns/shim
 NSS_DNS_BLOB_OBJ := $(BUILD_DIR)/nss_dns/shim_blob.o
 
-CA_TRUST_PEM := $(BUILD_DIR)/isrgrootx1.pem
-CA_TRUST_BLOB_OBJ := $(BUILD_DIR)/ca_trust_blob.o
-
 .PHONY: all kernel iso clean run
 
 all: iso

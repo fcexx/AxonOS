@@ -637,6 +637,28 @@ void cirrusfb_blit_mono8(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const u
 	cirrusfb_flush_dirty();
 }
 
+void cirrusfb_scroll_region(uint32_t top, uint32_t bottom) {
+	if (!g_ready || !g_textbuf || g_cols == 0 || g_rows == 0)
+		return;
+	if (top >= g_rows)
+		top = g_rows - 1;
+	if (bottom >= g_rows)
+		bottom = g_rows - 1;
+	if (top >= bottom)
+		return;
+	size_t row_cells = (size_t)g_cols * sizeof(cell_t);
+	memmove(g_textbuf + top * g_cols,
+	        g_textbuf + (top + 1) * g_cols,
+	        row_cells * (bottom - top));
+	for (uint32_t x = 0; x < g_cols; x++) {
+		g_textbuf[bottom * g_cols + x].ch = ' ';
+		g_textbuf[bottom * g_cols + x].attr = g_current_attr;
+	}
+	for (uint32_t r = top; r <= bottom; r++)
+		draw_text_row_noflush(r);
+	cirrusfb_flush_dirty();
+}
+
 void cirrusfb_set_margin_rows(uint32_t rows) {
 	if (!g_ready) {
 		g_margin_rows = rows;

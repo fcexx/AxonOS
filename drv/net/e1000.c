@@ -471,6 +471,11 @@ void e1000_poll(void) {
     }
 }
 
+int e1000_link_is_up(void) {
+    if (!g_e1000.initialized) return 0;
+    return (e1000_read32(E1000_REG_STATUS) & E1000_STATUS_LU) ? 1 : 0;
+}
+
 int e1000_link_changed(void) {
     if (!g_e1000.initialized) return 0;
     e1000_poll();

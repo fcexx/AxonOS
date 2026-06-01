@@ -20,6 +20,7 @@
 #include <elf.h>
 #include <vga.h>
 #include <debug.h>
+#include <smp.h>
 
 extern uint8_t _end[]; /* kernel end symbol from linker */
 
@@ -750,8 +751,9 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
     size_t env_strings_size = 0;
     for (int i = 0; i < envc; i++) env_strings_size += strlen(envp[i]) + 1;
 
-    enum { AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_PAGESZ = 6, AT_ENTRY = 9, AT_RANDOM = 25 };
-    const size_t aux_pairs = 7;
+    enum { AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_PAGESZ = 6, AT_ENTRY = 9,
+           AT_CLKTCK = 17, AT_RANDOM = 25, AT_NPROCESSORS_ONLN = 84 };
+    const size_t aux_pairs = 9;
     const size_t aux_qwords = aux_pairs * 2;
     size_t ptrs = (size_t)(argc + 1 + envc + 1) + aux_qwords;
     size_t ptrs_bytes = ptrs * sizeof(uint64_t);
@@ -810,7 +812,10 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
     sp64[ax + 6] = (uint64_t)AT_ENTRY;  sp64[ax + 7] = aux_entry;
     sp64[ax + 8] = (uint64_t)AT_PAGESZ; sp64[ax + 9] = 4096ULL;
     sp64[ax +10] = (uint64_t)AT_RANDOM; sp64[ax +11] = (uint64_t)random_addr;
-    sp64[ax +12] = (uint64_t)AT_NULL;   sp64[ax +13] = 0;
+    sp64[ax +12] = (uint64_t)AT_CLKTCK; sp64[ax +13] = 100ULL;
+    sp64[ax +14] = (uint64_t)AT_NPROCESSORS_ONLN;
+    sp64[ax +15] = (uint64_t)(smp_cpu_count() > 0 ? smp_cpu_count() : 1);
+    sp64[ax +16] = (uint64_t)AT_NULL;   sp64[ax +17] = 0;
     *((uint64_t*)(uintptr_t)final_stack) = (uint64_t)argc;
 
     {
@@ -1038,8 +1043,9 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
               envp[0..], NULL
               auxv pairs (a_type,a_val) ending with AT_NULL
        Many libc start routines expect auxv to exist; without AT_NULL they may parse garbage. */
-    enum { AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_PAGESZ = 6, AT_ENTRY = 9, AT_RANDOM = 25 };
-    const size_t aux_pairs = 7; /* PHDR,PHENT,PHNUM,ENTRY,PAGESZ,RANDOM,NULL */
+    enum { AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_PAGESZ = 6, AT_ENTRY = 9,
+           AT_CLKTCK = 17, AT_RANDOM = 25, AT_NPROCESSORS_ONLN = 84 };
+    const size_t aux_pairs = 9; /* PHDR,PHENT,PHNUM,ENTRY,PAGESZ,RANDOM,NULL */
     const size_t aux_qwords = aux_pairs * 2;
     /* pointer area: argv pointers + NULL + env pointers + NULL + auxv */
     size_t ptrs = (size_t)(argc + 1 + envc + 1) + aux_qwords;
@@ -1116,7 +1122,10 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     sp64[ax + 6] = (uint64_t)AT_ENTRY;  sp64[ax + 7] = aux_entry;
     sp64[ax + 8] = (uint64_t)AT_PAGESZ; sp64[ax + 9] = 4096ULL;
     sp64[ax +10] = (uint64_t)AT_RANDOM; sp64[ax +11] = (uint64_t)random_addr;
-    sp64[ax +12] = (uint64_t)AT_NULL;   sp64[ax +13] = 0;
+    sp64[ax +12] = (uint64_t)AT_CLKTCK; sp64[ax +13] = 100ULL;
+    sp64[ax +14] = (uint64_t)AT_NPROCESSORS_ONLN;
+    sp64[ax +15] = (uint64_t)(smp_cpu_count() > 0 ? smp_cpu_count() : 1);
+    sp64[ax +16] = (uint64_t)AT_NULL;   sp64[ax +17] = 0;
 
     /* write argc at final_stack (RSP will point here) */
     *((uint64_t*)(uintptr_t)final_stack) = (uint64_t)argc;
