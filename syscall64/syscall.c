@@ -943,6 +943,7 @@ typedef struct {
     int nonblock; /* O_NONBLOCK: recv must not fake-EAGAIN after an internal short timeout */
     int tcp_listening; /* INET stream socket in listen() state */
     net_tcp_conn_t tcp;
+    int kref; /* references from fs_file handles sharing this ksock */
 } ksock_net_t;
 
 typedef struct {
@@ -2278,8 +2279,30 @@ static void net_make_tcp_ops(net_tcp_ops_t *ops, net_tcp_conn_t *match) {
     ops->return_frame = net_tcp_return_frame_cb;
 }
 
-/* Connected sockets must not share ksock_net_t/tcp.rx_buf after fork (httpd parent/child). */
-static int fork_socket_needs_dup(const ksock_net_t *s) {
+static void ksock_hold(ksock_net_t *s) {
+    if (s) s->kref++;
+}
+
+static void ksock_drop(ksock_net_t *s) {
+    if (!s) return;
+    if (s->kref > 1) {
+        s->kref--;
+        return;
+    }
+    if (s->unix_domain_stub)
+        unix_socket_cleanup(s);
+    if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && !s->dns_tcp_udp_bridge) {
+        if (s->tcp.used) {
+            net_tcp_ops_t ops;
+            net_make_tcp_ops(&ops, &s->tcp);
+            (void)net_tcp_close(&s->tcp, &ops, 1000);
+        }
+        net_rxq_flush();
+    }
+    kfree(s);
+}
+
+static int fork_socket_is_connected_client(const ksock_net_t *s) {
     if (!s) return 0;
     if (s->unix_domain_stub)
         return s->connected && !s->unix_listening;
@@ -2288,30 +2311,28 @@ static int fork_socket_needs_dup(const ksock_net_t *s) {
     return 0;
 }
 
-static struct fs_file *fork_dup_socket_file(struct fs_file *pf) {
+/* Child gets its own fs_file; both parent and child share one ksock (RX after fork). */
+static struct fs_file *fork_child_socket_file(struct fs_file *pf) {
     if (!pf || pf->type != SYSCALL_FTYPE_SOCKET || !pf->driver_private) return NULL;
-    ksock_net_t *ps = (ksock_net_t *)pf->driver_private;
-    if (!fork_socket_needs_dup(ps)) return NULL;
-    ksock_net_t *cs = (ksock_net_t *)kmalloc(sizeof(*cs));
+    ksock_net_t *s = (ksock_net_t *)pf->driver_private;
     struct fs_file *cf = (struct fs_file *)kmalloc(sizeof(*cf));
     char *cp = (char *)kmalloc(24);
-    if (!cs || !cf || !cp) {
-        if (cs) kfree(cs);
+    if (!cf || !cp) {
         if (cf) kfree(cf);
         if (cp) kfree(cp);
         return NULL;
     }
-    memcpy(cs, ps, sizeof(*cs));
     memset(cf, 0, sizeof(*cf));
-    if (ps->unix_domain_stub)
+    if (s->unix_domain_stub)
         snprintf(cp, 24, "socket:[unix]");
     else
         snprintf(cp, 24, "socket:[tcp]");
     cf->path = cp;
     cf->type = pf->type;
     cf->fs_private = pf->fs_private;
-    cf->driver_private = cs;
+    cf->driver_private = s;
     cf->refcount = 1;
+    ksock_hold(s);
     return cf;
 }
 
@@ -2320,14 +2341,16 @@ static void fork_inherit_fd_table(thread_t *child, thread_t *parent) {
         struct fs_file *pf = parent->fds[i];
         child->fds[i] = NULL;
         if (!pf) continue;
-        struct fs_file *cf = fork_dup_socket_file(pf);
-        if (cf) {
-            child->fds[i] = cf;
-        } else {
-            child->fds[i] = pf;
-            if (pf->refcount <= 0) pf->refcount = 1;
-            else pf->refcount++;
+        if (pf->type == SYSCALL_FTYPE_SOCKET && fork_socket_is_connected_client((ksock_net_t *)pf->driver_private)) {
+            struct fs_file *cf = fork_child_socket_file(pf);
+            if (cf) {
+                child->fds[i] = cf;
+                continue;
+            }
         }
+        child->fds[i] = pf;
+        if (pf->refcount <= 0) pf->refcount = 1;
+        else pf->refcount++;
     }
 }
 
@@ -2336,20 +2359,8 @@ void net_fs_file_destroy(struct fs_file *f) {
     if (!f) return;
     if (f->type != SYSCALL_FTYPE_SOCKET) return;
     ksock_net_t *s = (ksock_net_t *)f->driver_private;
-    if (s) {
-        if (s->unix_domain_stub)
-            unix_socket_cleanup(s);
-        if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL && !s->dns_tcp_udp_bridge) {
-            if (s->tcp.used) {
-                net_tcp_ops_t ops;
-                net_make_tcp_ops(&ops, &s->tcp);
-                (void)net_tcp_close(&s->tcp, &ops, 1000);
-            }
-            net_rxq_flush();
-        }
-        kfree(s);
-        f->driver_private = NULL;
-    }
+    f->driver_private = NULL;
+    ksock_drop(s);
     if (f->path) {
         kfree((void *)f->path);
         f->path = NULL;
@@ -2380,6 +2391,7 @@ static ksock_net_t *net_tcp_match_established_sock(uint16_t lport, uint32_t rip,
     if (!s || s->unix_domain_stub || s->dns_tcp_udp_bridge) return NULL;
     if (s->type_base != SOCK_STREAM_LOCAL || s->protocol != IPPROTO_TCP_LOCAL) return NULL;
     if (!s->tcp.used || !s->tcp.established) return NULL;
+    if (s->tcp.peer_fin || s->tcp.peer_rst) return NULL;
     if (s->local_port != lport || s->peer_ip_be != rip || s->peer_port != rport) return NULL;
     return s;
 }
@@ -2388,7 +2400,7 @@ static ksock_net_t *net_tcp_find_established(uint16_t lport, uint32_t rip, uint1
     int tcnt = thread_get_count();
     for (int ti = 0; ti < tcnt; ti++) {
         thread_t *th = thread_get_by_index(ti);
-        if (!th) continue;
+        if (!th || th->state == THREAD_TERMINATED) continue;
         for (int fd = 0; fd < THREAD_MAX_FD; fd++) {
             struct fs_file *f = th->fds[fd];
             if (!f || f->type != SYSCALL_FTYPE_SOCKET || !f->driver_private) continue;
@@ -2478,6 +2490,7 @@ static struct fs_file *net_tcp_make_accepted_file(ksock_net_t *listener, const n
     memcpy(&srv->tcp, tcp, sizeof(*tcp));
     if (peer_mac)
         net_tcp_stage_peer_mac(&srv->tcp, peer_mac);
+    srv->kref = 1;
     srv_f->path = srv_p;
     srv_f->type = SYSCALL_FTYPE_SOCKET;
     srv_f->driver_private = srv;
@@ -2614,9 +2627,7 @@ static int net_tcp_dispatch_incoming(const uint8_t *frame, size_t n) {
                     return 1;
                 }
                 if (unix_acceptq_push(wait->listener, af) != 0) {
-                    if (af->driver_private) kfree(af->driver_private);
-                    if (af->path) kfree((void *)af->path);
-                    kfree(af);
+                    net_fs_file_destroy(af);
                 } else {
                     klogprintf("tcp: server accept port=%u from %u.%u.%u.%u:%u\n",
                         (unsigned)dport,
@@ -6771,6 +6782,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             s->local_port = 0;
             s->next_echo_seq = 0;
             s->nonblock = (type & O_NONBLOCK_LINUX) ? 1 : 0;
+            s->kref = 1;
             f->path = p;
             f->type = SYSCALL_FTYPE_SOCKET;
             f->driver_private = s;
@@ -6915,6 +6927,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
             if (s->type_base == SOCK_STREAM_LOCAL && s->protocol == IPPROTO_TCP_LOCAL) {
                 if (!s->tcp_listening) return ret_err(EINVAL);
+                (void)thread_reap_unwaited_zombies();
                 struct fs_file *af = unix_acceptq_pop(s);
                 while (!af) {
                     if (s->nonblock) return ret_err(EAGAIN);
@@ -6926,9 +6939,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 ksock_net_t *as = (ksock_net_t *)af->driver_private;
                 int nfd = thread_fd_alloc(af);
                 if (nfd < 0) {
-                    if (as) kfree(as);
-                    if (af->path) kfree((void *)af->path);
-                    kfree(af);
+                    net_fs_file_destroy(af);
                     return ret_err(EMFILE);
                 }
                 if (addr_u && addrlen_u && as && user_range_ok(addrlen_u, 4)) {
@@ -7004,6 +7015,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 srv->connected = 1;
                 srv->unix_conn = conn;
                 srv->unix_end = 1;
+                srv->kref = 1;
                 memset(srv->unix_path, 0, sizeof(srv->unix_path));
                 strncpy(srv->unix_path, upath, sizeof(srv->unix_path) - 1);
                 srv_f->path = srv_p;

@@ -276,6 +276,7 @@ int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget) {
             c->established = 0;
             c->peer_fin = 1;
             c->peer_rst = 1;
+            c->used = 0;
             got = 1;
             continue;
         }
@@ -342,6 +343,7 @@ int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget) {
             } else if (fin_seq < c->rcv_nxt) {
                 c->peer_fin = 1;
             }
+            c->established = 0;
             (void)tcp_send_seg(c, ops, 0x10u, NULL, 0);
             got = 1;
         }
