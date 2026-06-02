@@ -3,6 +3,7 @@
  */
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 int vbe_init_from_multiboot(uint32_t multiboot_magic, uint64_t multiboot_info);
@@ -38,5 +39,8 @@ void vbe_scroll_up_pixels(uint32_t pixels);
 void vbe_clear_region(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t packed_pixel);
 /* Update blinking cursor (call from timer interrupt). */
 void vbefb_update_cursor(void);
+/* Virtual-console switch: save/restore text buffer (VGA cell layout: char, attr). */
+void vbefb_snapshot_screen(uint8_t *out, size_t max_bytes);
+void vbefb_restore_screen(const uint8_t *src, uint32_t cols, uint32_t rows);
 
 

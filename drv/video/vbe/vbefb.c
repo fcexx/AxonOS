@@ -441,6 +441,32 @@ void vbefb_clear(uint8_t attr) {
 	vbefb_set_cursor(0, 0);
 }
 
+void vbefb_snapshot_screen(uint8_t *out, size_t max_bytes) {
+	if (!vbe_is_available() || !textbuf || !out) return;
+	size_t need = (size_t)cols * (size_t)rows * 2u;
+	if (need > max_bytes) return;
+	memcpy(out, textbuf, need);
+}
+
+void vbefb_restore_screen(const uint8_t *src, uint32_t src_cols, uint32_t src_rows) {
+	if (!vbe_is_available() || !textbuf || !src) return;
+	if (src_cols != cols || src_rows != rows) return;
+	if (cursor_visible) erase_cursor();
+	for (uint32_t y = 0; y < rows; y++) {
+		for (uint32_t x = 0; x < cols; x++) {
+			size_t off = ((size_t)y * cols + x) * 2u;
+			uint8_t ch = src[off];
+			uint8_t attr = src[off + 1];
+			textbuf[y * cols + x].ch = ch;
+			textbuf[y * cols + x].attr = attr;
+			draw_cell_to_framebuffer(x, y);
+		}
+	}
+	g_vbe_dirty = 0;
+	vbe_dirty_mark(0, 0, fb_width, fb_height);
+	vbefb_flush_dirty();
+}
+
 /* Initialize console state after vbe init; called externally if needed */
 int vbefb_init(uint32_t width, uint32_t height, uint32_t pitch, uint32_t bpp) {
 	fb_width = width; fb_height = height; fb_pitch = pitch; fb_bpp = bpp;

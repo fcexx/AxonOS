@@ -69,15 +69,42 @@ static inline size_t devfs_tty_screen_bytes(void) {
     return (size_t)devfs_tty_rows() * (size_t)devfs_tty_cols() * 2u;
 }
 
+static void devfs_tty_snapshot_visible(struct devfs_tty *tty) {
+    if (!tty || !tty->screen) return;
+    size_t scr_sz = devfs_tty_screen_bytes();
+    if (cirrusfb_is_ready()) {
+        cirrusfb_snapshot_screen(tty->screen, scr_sz);
+        cirrusfb_get_cursor(&tty->cursor_x, &tty->cursor_y);
+        return;
+    }
+    if (vbe_is_available()) {
+        vbefb_snapshot_screen(tty->screen, scr_sz);
+        vbefb_get_cursor(&tty->cursor_x, &tty->cursor_y);
+        return;
+    }
+    const size_t vga_scr_sz = (size_t)MAX_COLS * (size_t)MAX_ROWS * 2u;
+    size_t copy_sz = scr_sz < vga_scr_sz ? scr_sz : vga_scr_sz;
+    memcpy(tty->screen, (uint8_t *)VIDEO_ADDRESS, copy_sz);
+    uint16_t pos = get_cursor();
+    uint32_t tty_cols = MAX_COLS;
+    tty->cursor_x = (pos % (tty_cols * 2)) / 2;
+    tty->cursor_y = pos / (tty_cols * 2);
+}
+
 /* Push tty backing store to the visible console (active VC only). */
 static void devfs_tty_blit_to_console(struct devfs_tty *tty) {
     if (!tty || !tty->screen) return;
-    size_t scr_sz = devfs_tty_screen_bytes();
     if (cirrusfb_is_ready()) {
         cirrusfb_restore_screen(tty->screen, cirrusfb_cols(), cirrusfb_rows());
         cirrusfb_set_cursor(tty->cursor_x, tty->cursor_y);
         return;
     }
+    if (vbe_is_available()) {
+        vbefb_restore_screen(tty->screen, devfs_tty_cols(), devfs_tty_rows());
+        vbefb_set_cursor(tty->cursor_x, tty->cursor_y);
+        return;
+    }
+    size_t scr_sz = devfs_tty_screen_bytes();
     const size_t vga_scr_sz = (size_t)MAX_COLS * (size_t)MAX_ROWS * 2u;
     size_t copy_sz = scr_sz < vga_scr_sz ? scr_sz : vga_scr_sz;
     memcpy((uint8_t *)VIDEO_ADDRESS, tty->screen, copy_sz);
@@ -1077,12 +1104,6 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
         }
     }
     if (!t) return -1;
-    /* Route any tty-like output to the currently visible VC.
-       This is the "single fbcon" mode expected by early init/userspace consoles:
-       regardless of which tty handle a program has, writes must land on devfs_active. */
-    if (devfs_is_tty_file(file)) {
-        t = &dev_ttys[devfs_get_active()];
-    }
     int idx = t->id;
     const char *s = (const char*)buf;
     for (size_t i = 0; i < size; i++) {
@@ -1712,6 +1733,8 @@ int devfs_register(void) {
         dev_ttys[i].echo_escape_state = 0;
         dev_ttys[i].unget_char = -1;
     }
+    /* Capture boot-time console into tty0 so VC switch can restore it. */
+    devfs_tty_snapshot_visible(&dev_ttys[0]);
     /* init stdio ring buffers */
     for (int si = 0; si < 2; si++) {
         stdio_bufs[si].cap = 4096;
@@ -1780,53 +1803,28 @@ int devfs_mount(const char *path) {
 void devfs_switch_tty(int index) {
     if (index < 0 || index >= DEVFS_TTY_COUNT) return;
     if (index == devfs_active) return;
-    size_t scr_sz = devfs_tty_screen_bytes();
 
     /* When cirrusfb is active, tty backing store matches its internal textbuf.
        Never memcpy fbcon-sized buffers into legacy VGA text memory; that corrupts memory. */
     if (cirrusfb_is_ready()) {
-        struct devfs_tty *cur = &dev_ttys[devfs_active];
-        if (cur && cur->screen) {
-            cirrusfb_snapshot_screen(cur->screen, scr_sz);
-            /* keep cursor position for this tty (in character cells) */
-            cirrusfb_get_cursor(&cur->cursor_x, &cur->cursor_y);
-        }
-
+        devfs_tty_snapshot_visible(&dev_ttys[devfs_active]);
         devfs_active = index;
+        devfs_tty_blit_to_console(&dev_ttys[devfs_active]);
+        return;
+    }
 
-        struct devfs_tty *n = &dev_ttys[devfs_active];
-        if (n && n->screen) {
-            cirrusfb_restore_screen(n->screen, cirrusfb_cols(), cirrusfb_rows());
-            cirrusfb_set_cursor(n->cursor_x, n->cursor_y);
-        }
+    if (vbe_is_available()) {
+        devfs_tty_snapshot_visible(&dev_ttys[devfs_active]);
+        devfs_active = index;
+        devfs_tty_blit_to_console(&dev_ttys[devfs_active]);
         return;
     }
 
     /* Fallback: legacy VGA text mode only.
        Clamp copy size so we never write beyond the actual VGA text buffer. */
-    const size_t vga_scr_sz = (size_t)MAX_COLS * (size_t)MAX_ROWS * 2u;
-    size_t copy_sz = scr_sz < vga_scr_sz ? scr_sz : vga_scr_sz;
-
-    /* save current VGA into current tty buffer */
-    struct devfs_tty *cur = &dev_ttys[devfs_active];
-    if (cur && cur->screen) {
-        uint8_t *vga = (uint8_t*)VIDEO_ADDRESS;
-        memcpy(cur->screen, vga, copy_sz);
-        uint16_t pos = get_cursor();
-        uint32_t tty_cols = MAX_COLS;
-        cur->cursor_x = (pos % (tty_cols * 2)) / 2;
-        cur->cursor_y = pos / (tty_cols * 2);
-    }
-
+    devfs_tty_snapshot_visible(&dev_ttys[devfs_active]);
     devfs_active = index;
-
-    /* restore new active screen */
-    struct devfs_tty *n = &dev_ttys[devfs_active];
-    if (n && n->screen) {
-        uint8_t *vga = (uint8_t*)VIDEO_ADDRESS;
-        memcpy(vga, n->screen, copy_sz);
-        console_set_cursor(n->cursor_x, n->cursor_y);
-    }
+    devfs_tty_blit_to_console(&dev_ttys[devfs_active]);
     /* set current user/process to first process attached to this tty, if any */
     /* NOTE:
        Do NOT call thread_set_current_user() here.

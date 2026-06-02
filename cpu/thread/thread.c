@@ -47,6 +47,9 @@ static int thread_is_any_idle(const thread_t *t) {
         return 0;
 }
 
+/* declared below (needs main_thread, sched_lock, KERNEL_STACK_SIZE, thread_is_any_idle) */
+int thread_reap(int pid);
+
 int thread_runnable_nonidle_count(void) {
         int n = 0;
         unsigned long irqf;
@@ -148,6 +151,91 @@ static int thread_context_valid(thread_t *t) {
 
 /* 8KiB was too small for syscall_do; 64KiB avoids kstack overflow corrupting thread state. */
 #define KERNEL_STACK_SIZE (64 * 1024)
+
+static void thread_free_resources(thread_t *t) {
+        if (!t) return;
+        /* mm may have been released in SYS_exit, but be defensive */
+        if (t->mm && t->mm != mm_kernel()) {
+                mm_release(t->mm);
+                t->mm = mm_kernel();
+        }
+        if (t->mm_ptemplate) {
+                mm_release(t->mm_ptemplate);
+                t->mm_ptemplate = NULL;
+        }
+        /* kernel_stack points to top; allocation was KERNEL_STACK_SIZE+16 */
+        if (t->kernel_stack) {
+                void *raw = (void *)(uintptr_t)(t->kernel_stack - (uint64_t)KERNEL_STACK_SIZE);
+                kfree(raw);
+                t->kernel_stack = 0;
+        }
+        /* free any vfork backups if still present */
+        if (t->vfork_parent_stack_backup) {
+                kfree(t->vfork_parent_stack_backup);
+                t->vfork_parent_stack_backup = NULL;
+                t->vfork_parent_stack_backup_len = 0;
+        }
+        if (t->vfork_parent_mem_backup) {
+                kfree(t->vfork_parent_mem_backup);
+                t->vfork_parent_mem_backup = NULL;
+                t->vfork_parent_mem_backup_len = 0;
+        }
+        kfree(t);
+}
+
+/* Reap a terminated user/kernel thread: remove slot so fork can reuse it. */
+int thread_reap(int pid) {
+        thread_t *victim = NULL;
+        unsigned long irqf;
+        acquire_irqsave(&sched_lock, &irqf);
+        for (int i = 0; i < thread_count; ++i) {
+                thread_t *t = threads[i];
+                if (!t) continue;
+                if ((int)t->tid != pid) continue;
+                if (t->state != THREAD_TERMINATED) break;
+                /* don't reap main or idle threads */
+                if (t == &main_thread || thread_is_any_idle(t)) break;
+                threads[i] = NULL;
+                victim = t;
+                break;
+        }
+        /* shrink high-water mark when top slots are empty */
+        while (thread_count > 1 && threads[thread_count - 1] == NULL)
+                thread_count--;
+        release_irqrestore(&sched_lock, irqf);
+        if (victim) {
+                thread_free_resources(victim);
+                return 0;
+        }
+        return -1;
+}
+
+/* Drop zombies whose parent is not blocked in wait4 (httpd-style daemons). */
+int thread_reap_unwaited_zombies(void) {
+        int n = 0;
+        for (;;) {
+                thread_t *victim = NULL;
+                unsigned long irqf;
+                acquire_irqsave(&sched_lock, &irqf);
+                for (int i = 1; i < thread_count; ++i) {
+                        thread_t *t = threads[i];
+                        if (!t) continue;
+                        if (t->state != THREAD_TERMINATED) continue;
+                        if (t == &main_thread || thread_is_any_idle(t)) continue;
+                        if (t->waiter_tid >= 0) continue;
+                        threads[i] = NULL;
+                        victim = t;
+                        while (thread_count > 1 && threads[thread_count - 1] == NULL)
+                                thread_count--;
+                        break;
+                }
+                release_irqrestore(&sched_lock, irqf);
+                if (!victim) break;
+                thread_free_resources(victim);
+                n++;
+        }
+        return n;
+}
 
 /* A real idle task: used when all other threads are BLOCKED/SLEEPING/TERMINATED.
    It must be a normal schedulable thread with its own saved context, otherwise
@@ -259,9 +347,29 @@ static void thread_trampoline(void) {
 }
 
 static thread_t* thread_create_with_state(void (*entry)(void), const char* name, thread_state_t st) {
-        if (thread_count >= MAX_THREADS) return NULL;
+        /* Find a free slot so we can reuse reaped threads. */
+        int slot = -1;
+        unsigned long irqf0;
+        acquire_irqsave(&sched_lock, &irqf0);
+        for (int i = 1; i < MAX_THREADS; i++) {
+                if (threads[i] == NULL) { slot = i; break; }
+        }
+        release_irqrestore(&sched_lock, irqf0);
+        if (slot < 0) {
+                (void)thread_reap_unwaited_zombies();
+                acquire_irqsave(&sched_lock, &irqf0);
+                for (int i = 1; i < MAX_THREADS; i++) {
+                        if (threads[i] == NULL) { slot = i; break; }
+                }
+                release_irqrestore(&sched_lock, irqf0);
+        }
+        if (slot < 0) return NULL;
         thread_t* t = (thread_t*)kmalloc(sizeof(thread_t));
-        if (!t) { kprintf("OOM thread: kmalloc(thread_t) failed\n"); return NULL; }
+        if (!t) {
+                (void)thread_reap_unwaited_zombies();
+                t = (thread_t*)kmalloc(sizeof(thread_t));
+                if (!t) return NULL;
+        }
         memset(t, 0, sizeof(thread_t));
         t->bound_cpu = -1;
         t->sched_target_cpu = -1;
@@ -342,9 +450,9 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         {
                 unsigned long irqf;
                 acquire_irqsave(&sched_lock, &irqf);
-                threads[thread_count] = t;
-                t->tid = thread_count;
-                thread_count++;
+                threads[slot] = t;
+                t->tid = slot;
+                if (slot >= thread_count) thread_count = slot + 1;
                 if (st == THREAD_READY)
                         t->sched_fifo_seq = ++sched_fifo_counter;
                 release_irqrestore(&sched_lock, irqf);
@@ -732,6 +840,25 @@ void thread_schedule() {
 
         unsigned long irqf;
         acquire_irqsave(&sched_lock, &irqf);
+
+        /* Auto-reap: no waiter in wait4, or already marked reaped. */
+        for (int i = 1; i < thread_count; ++i) {
+                thread_t *t = threads[i];
+                if (!t) continue;
+                if (t->state != THREAD_TERMINATED) continue;
+                if (thread_is_any_idle(t)) continue;
+                if (t->waiter_tid >= 0) continue;
+                /* Remove from table under lock; free after releasing lock. */
+                threads[i] = NULL;
+                /* shrink high-water mark when top slots are empty */
+                while (thread_count > 1 && threads[thread_count - 1] == NULL)
+                        thread_count--;
+                release_irqrestore(&sched_lock, irqf);
+                thread_free_resources(t);
+                acquire_irqsave(&sched_lock, &irqf);
+                /* restart scan because arrays changed */
+                i = 0;
+        }
 
         uint32_t now = (uint32_t)timer_ticks;
         for (int i = 0; i < thread_count; ++i) {

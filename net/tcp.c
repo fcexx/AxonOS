@@ -394,6 +394,51 @@ int net_tcp_connect(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t dst_ip
     return net_tcp_connect_poll(c, ops, timeout_ms);
 }
 
+int net_tcp_server_reply_syn(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t client_seq) {
+    if (!c || !ops || !ops->time_ms) return -1;
+    uint32_t isn = (uint32_t)(ops->time_ms() ^ 0x81A5D77Du);
+    c->used = 1;
+    c->established = 0;
+    c->connect_pending = 0;
+    c->peer_fin = 0;
+    c->peer_rst = 0;
+    c->syn_isn = isn;
+    c->snd_una = isn;
+    /* SYN-ACK must carry SEQ=ISN; snd_nxt advances to ISN+1 only after the segment is sent. */
+    c->snd_nxt = isn;
+    c->rcv_nxt = client_seq + 1u;
+    c->rx_len = 0;
+    c->ooo_valid = 0;
+    static const uint8_t mss_opt[4] = { 0x02, 0x04, 0x05, 0xB4 };
+    if (tcp_send_seg_len(c, ops, 0x12u, NULL, 0, mss_opt, sizeof(mss_opt)) != 0)
+        return -1;
+    c->snd_nxt = isn + 1u;
+    return 0;
+}
+
+int net_tcp_server_complete_ack(net_tcp_conn_t *c, uint32_t ack) {
+    if (!c || !c->used || c->established) return -1;
+    /* Client ACK must confirm our SYN (ISN+1). Allow retransmit ACKs in [snd_una+1, snd_nxt]. */
+    if (ack < c->syn_isn + 1u || ack > c->snd_nxt) return -1;
+    c->snd_una = ack;
+    if (ack > c->snd_nxt)
+        c->snd_nxt = ack;
+    c->established = 1;
+    c->connect_pending = 0;
+    return 0;
+}
+
+int net_tcp_server_resend_synack(net_tcp_conn_t *c, const net_tcp_ops_t *ops) {
+    if (!c || !c->used || !ops) return -1;
+    uint32_t save_snd = c->snd_nxt;
+    c->snd_nxt = c->syn_isn;
+    static const uint8_t mss_opt[4] = { 0x02, 0x04, 0x05, 0xB4 };
+    int r = tcp_send_seg_len(c, ops, 0x12u, NULL, 0, mss_opt, sizeof(mss_opt));
+    if (save_snd > c->syn_isn)
+        c->snd_nxt = save_snd;
+    return r;
+}
+
 int net_tcp_connect_poll(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t timeout_ms) {
     if (!c || !ops || !ops->time_ms || !ops->yield) return -1;
     if (c->established) {
@@ -519,12 +564,10 @@ int net_tcp_recv(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint8_t *out, size
         (void)net_tcp_window_update(c, ops);
         return (int)n;
     }
-    ops->yield();
-    ops->yield();
     uint64_t start = ops->time_ms();
     uint64_t last_win = start;
     while ((ops->time_ms() - start) < timeout_ms) {
-        net_tcp_drain_rx(c, ops, 16);
+        net_tcp_drain_rx(c, ops, 32);
         if (c->rx_len > 0) {
             size_t n = (c->rx_len > cap) ? cap : c->rx_len;
             memcpy(out, c->rx_buf, n);

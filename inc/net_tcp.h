@@ -41,9 +41,18 @@ typedef struct {
     size_t ooo_len;
     uint32_t ooo_seq;
     int ooo_valid;
+    /* Server path: L2 address learned from the client's SYN (avoid ARP before SYN-ACK). */
+    uint8_t peer_mac[6];
+    int peer_mac_valid;
 } net_tcp_conn_t;
 
 int net_tcp_connect(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t dst_ip_be, uint16_t dst_port, uint16_t src_port, uint32_t timeout_ms);
+/* Inbound SYN (server): reply SYN+ACK and seed connection state. Returns 0 on success. */
+int net_tcp_server_reply_syn(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t client_seq);
+/* Inbound ACK completing server handshake. Returns 0 when established. */
+int net_tcp_server_complete_ack(net_tcp_conn_t *c, uint32_t ack);
+/* Resend SYN+ACK for a half-open server connection (SYN retransmit from client). */
+int net_tcp_server_resend_synack(net_tcp_conn_t *c, const net_tcp_ops_t *ops);
 /* Finish connect_pending (0=established, -1=still pending, -2=failed/timeout). */
 int net_tcp_connect_poll(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t timeout_ms);
 int net_tcp_send(net_tcp_conn_t *c, const net_tcp_ops_t *ops, const uint8_t *data, size_t len, uint32_t timeout_ms);
