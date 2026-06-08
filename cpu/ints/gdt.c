@@ -170,11 +170,8 @@ void tss_set_rsp0(uint64_t rsp0) {
         if (c < 0 || c >= SMP_MAX_CPUS)
                 c = 0;
         cpu_tss[c].rsp0 = rsp0;
-        extern uint64_t syscall_kernel_rsp0;
-        extern uint64_t syscall_kernel_rsp0_by_apic[256];
-        uint8_t apic_id = smp_apic_id_for_logical_cpu(c);
-        syscall_kernel_rsp0_by_apic[apic_id] = rsp0;
-        syscall_kernel_rsp0 = rsp0;
+        /* Do NOT touch syscall_kernel_rsp0_by_apic here: that is the per-thread
+           SYSCALL stack top (syscall_bind_kstack_for_thread), not TSS RSP0. */
 }
 
 void tss_set_ist_for_cpu(int cpu, int idx, uint64_t rsp_top) {

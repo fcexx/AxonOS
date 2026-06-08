@@ -21,6 +21,7 @@
 #include <vga.h>
 #include <debug.h>
 #include <smp.h>
+#include <syscall.h>
 
 extern uint8_t _end[]; /* kernel end symbol from linker */
 
@@ -1234,9 +1235,9 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         if (cur_user->attached_tty >= 0) {
             devfs_set_tty_fg_pgrp(cur_user->attached_tty, cur_user->pgid);
         }
-        /* ensure TSS RSP0 points to this thread's kernel stack */
         if (cur_user->kernel_stack) {
             tss_set_rsp0(cur_user->kernel_stack);
+            syscall_bind_kstack_for_thread(cur_user);
         }
         if (loaded_brk_end != 0) {
             uintptr_t brk_base = loaded_brk_end;
@@ -1311,6 +1312,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         if (ut->attached_tty >= 0) {
             devfs_set_tty_fg_pgrp(ut->attached_tty, ut->pgid);
         }
+        syscall_bind_kstack_for_thread(ut);
         /* Now make the new user thread runnable. */
         thread_unblock((int)ut->tid);
         /* schedule immediately; when caller resumes, the program has terminated */

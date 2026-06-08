@@ -48,6 +48,8 @@ int mm_cow_fork_pages(mm_t *mm, uint64_t *share_l4, uint64_t va_begin, uint64_t 
 
 /* Fork COW: copy only present user-writable pages in [va_begin, va_end). */
 int mm_cow_private_writable(mm_t *mm, uint64_t va_begin, uint64_t va_end);
+/* Linux-style COW on first user write after fork (single 4K page at cr2). */
+int mm_cow_fault_page(mm_t *mm, uint64_t va, mm_t *share_cmp_mm);
 
 /* Clear [va_begin, va_end) in child mm without touching parent share_l4 mappings.
    Duplicates shared page-table pages one level at a time before clearing PTEs. */

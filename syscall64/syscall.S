@@ -29,8 +29,8 @@
 // Assumptions/constraints (current AxonOS design):
 // - Kernel and user share one address space (identity-mapped below 4GiB)
 // - We return to ring3 via IRETQ (not SYSRET), so we can use existing USER_CS/USER_DS
-// - tss_set_rsp0() updates per-CPU rsp0 table (indexed by local APIC ID)
-// - syscall_do runs on one per-CPU kernel stack (syscall_kernel_rsp0_by_apic). Do not
+// - syscall_kernel_rsp0_by_apic is set by syscall_bind_kstack_for_thread() (per-thread
+//   64KiB stack), NOT by tss_set_rsp0(). Do not
 //   thread_yield()/schedule from inside syscall_do: another thread's syscall would
 //   clobber this CPU's syscall stack frame → double fault / triple fault.
 //
@@ -149,7 +149,6 @@ syscall_entry64:
     pushq   48(%rsp)            // a6 = user r9 (7th arg on stack)
     call    syscall_do
     addq    $8, %rsp
-    movq    %rax, syscall_user_return_rax(%rip)
 
     // Check for pending signals and possibly deliver before returning to user
     pushq   %rax
@@ -200,7 +199,7 @@ syscall_entry64:
     // Return to user with IRETQ using the saved return RIP (rcx), flags (r11) and user RSP.
     // USER_DS = 0x23, USER_CS = 0x1B (see cpu/gdt.c)
     pushq   $0x23
-    // push saved user RSP from our per-syscall stack slot (just above this SS)
+    // push saved user RSP from slot just below SS (see pops above)
     pushq   8(%rsp)
     /* Ensure user returns with interrupts enabled (IF=1).
        Some implementations of SYSCALL may present masked RFLAGS in r11

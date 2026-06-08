@@ -113,8 +113,19 @@ typedef struct thread {
         uint64_t saved_user_r11;
         uint64_t saved_user_rcx;
 
-        /* pointer to saved syscall frame on kernel stack (rsp at entry) */
+        /* pointer to saved syscall frame (kmalloc copy; safe across thread_schedule). */
         uint64_t *saved_syscall_frame;
+        /* Private syscall stack (syscall_entry64 rsp); avoids sharing per-CPU stack. */
+        uint64_t syscall_kstack_top;
+        void *syscall_kstack_raw;
+        uint64_t *syscall_frame_kbuf;
+        /* Syscall args copied here at entry — survive thread_schedule() on shared per-CPU syscall stack. */
+        uint64_t sc_a1;
+        uint64_t sc_a2;
+        uint64_t sc_a3;
+        uint64_t sc_a4;
+        uint64_t sc_a5;
+        uint64_t sc_a6;
         /* active kernel-side access to userspace */
         uintptr_t uaccess_begin;
         uintptr_t uaccess_end;

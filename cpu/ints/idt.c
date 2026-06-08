@@ -16,6 +16,7 @@
 #include <klog.h>
 #include <syscall.h>
 #include <paging.h>
+#include <mm.h>
 #include <keyboard.h>
 #include <serial.h>
 // Avoid including <cstdint> because cross-toolchain headers may not provide it; use uint64_t instead
@@ -245,6 +246,18 @@ static void page_fault_handler(cpu_registers_t* regs) {
         if (user && (regs->error_code & 1u) == 0u && fault_try_mmap_lazy_anon(cr2))
                 return;
         if (user && fault_try_grow_user_heap(cr2)) return;
+        /* fork COW: first write to a still-shared writable page (Linux-style). */
+        if (user && (regs->error_code & 0x7u) == 0x7u) {
+                extern thread_t *thread_current(void);
+                extern thread_t *thread_get_current_user(void);
+                thread_t *ut = thread_current();
+                if (!ut || ut->ring != 3) ut = thread_get_current_user();
+                if (ut && ut->mm && ut->mm != mm_kernel()) {
+                        mm_t *share = ut->mm_ptemplate ? ut->mm_ptemplate : mm_kernel();
+                        if (mm_cow_fault_page(ut->mm, cr2, share) == 0)
+                                return;
+                }
+        }
         if (!user) {
             uint64_t resume_rip = 0;
             if (syscall_try_handle_uaccess_fault(cr2, &resume_rip)) {

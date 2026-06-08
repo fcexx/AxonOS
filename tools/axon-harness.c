@@ -268,15 +268,21 @@ struct clone3_args {
 static void test_clone3_thread(void) {
 	static volatile int thread_done;
 	static volatile int thread_ok;
-	thread_done = 0;
-	thread_ok = 0;
-	char stack[65536] __attribute__((aligned(16)));
-	uintptr_t sp = (uintptr_t)(stack + sizeof(stack));
+	enum { CHILD_STK = 65536 };
+	/* mmap stack avoids overlapping the process stack slot (clone3 stack copy heuristics). */
+	long stk = sys6(SYS_mmap, 0, CHILD_STK, PROT_READ | PROT_WRITE,
+		MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (stk < 0) {
+		skip("clone3 thread", "mmap child stack failed");
+		uwrite_hex64("  rc=0x", (unsigned long long)stk);
+		return;
+	}
+	uintptr_t sp = (uintptr_t)stk + (uintptr_t)CHILD_STK;
 	sp &= ~(uintptr_t)0xFULL;
 	struct clone3_args cl = { 0 };
 	cl.flags = 0x00000100ULL;
 	cl.stack = sp;
-	cl.stack_size = sizeof(stack);
+	cl.stack_size = CHILD_STK;
 	long tid = sys2(SYS_clone3, (long)(uintptr_t)&cl, (long)sizeof(cl));
 	if (tid < 0) {
 		skip("clone3 thread", "clone3 failed");
@@ -298,6 +304,7 @@ static void test_clone3_thread(void) {
 		uwrite_hex64("  done=", (unsigned long long)thread_done);
 		uwrite_hex64("  ok=", (unsigned long long)thread_ok);
 	}
+	(void)sys2(SYS_munmap, stk, CHILD_STK);
 }
 
 static void test_open_read(void) {

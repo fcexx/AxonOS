@@ -71,6 +71,25 @@ uint64_t syscall_user_rsp_saved = 0;
 uint64_t syscall_kernel_rsp0 = 0;
 /* Per-APIC-id syscall stack tops. syscall_entry64 picks stack from this table. */
 uint64_t syscall_kernel_rsp0_by_apic[256] = { 0 };
+
+static inline int syscall_lapic_id(void) {
+    return (int)((*(volatile uint32_t *)(uintptr_t)0xFEE00020ULL) >> 24) & 0xFF;
+}
+
+void syscall_bind_kstack_for_thread(thread_t *t) {
+    int apic = syscall_lapic_id();
+    uint64_t sp = 0;
+    if (t && t->syscall_kstack_top)
+        sp = t->syscall_kstack_top;
+    else if (syscall_kernel_rsp0)
+        sp = syscall_kernel_rsp0;
+    else
+        sp = syscall_kernel_rsp0_by_apic[apic];
+    if (!sp) return;
+    syscall_kernel_rsp0_by_apic[apic] = sp;
+    syscall_kernel_rsp0 = sp;
+}
+
 /* Saved user RIP for SYSCALL path (RCX at syscall entry). Used by fork/vfork helpers. */
 uint64_t syscall_user_return_rip = 0;
 /* Last userspace-visible return value from syscall_do before signal delivery. */
@@ -265,7 +284,17 @@ void syscall_snapshot_user_regs(uint64_t *frame) {
         cur = thread_get_current_user();
         if (!cur) return;
     }
-    cur->saved_syscall_frame = frame;
+    syscall_bind_kstack_for_thread(cur);
+    if (!cur->syscall_frame_kbuf) {
+        uint64_t *kbuf = (uint64_t *)kmalloc(16 * sizeof(uint64_t));
+        if (kbuf) cur->syscall_frame_kbuf = kbuf;
+    }
+    if (cur->syscall_frame_kbuf) {
+        memcpy(cur->syscall_frame_kbuf, frame, 16 * sizeof(uint64_t));
+        cur->saved_syscall_frame = cur->syscall_frame_kbuf;
+    } else {
+        cur->saved_syscall_frame = frame;
+    }
     /* Indexes into frame */
     cur->saved_user_r15 = frame[0];
     cur->saved_user_r14 = frame[1];
@@ -284,6 +313,43 @@ void syscall_snapshot_user_regs(uint64_t *frame) {
     cur->saved_user_rip = frame[13];
     /* saved rax is frame[14] */
     cur->saved_user_rsp = frame[15]; /* pushed before regs */
+}
+
+/* Copy live per-CPU syscall stack frame into per-thread saved_user_* (Linux-like:
+   another thread's syscall must not clobber this frame before we return to user). */
+void syscall_frame_refresh(thread_t *t) {
+    if (!t || !t->saved_syscall_frame) return;
+    uint64_t *frame = t->saved_syscall_frame;
+    t->saved_user_r15 = frame[0];
+    t->saved_user_r14 = frame[1];
+    t->saved_user_r13 = frame[2];
+    t->saved_user_r12 = frame[3];
+    t->saved_user_r11 = frame[4];
+    t->saved_user_r10 = frame[5];
+    t->saved_user_r9  = frame[6];
+    t->saved_user_r8  = frame[7];
+    t->saved_user_rdi = frame[8];
+    t->saved_user_rsi = frame[9];
+    t->saved_user_rbp = frame[10];
+    t->saved_user_rbx = frame[11];
+    t->saved_user_rdx = frame[12];
+    t->saved_user_rcx = frame[13];
+    t->saved_user_rip = frame[13];
+    t->saved_user_rsp = frame[15];
+}
+
+void syscall_deferred_unblocks(void) {
+    thread_t *cur = thread_current();
+    if (!cur || cur->ring != 3)
+        cur = thread_get_current_user();
+    if (!cur) return;
+    int tid = cur->defer_unblock_tid;
+    if (tid < 0) return;
+    cur->defer_unblock_tid = -1;
+    thread_unblock(tid);
+    /* Do NOT thread_schedule() here: parent is still inside syscall_do on its
+       per-thread syscall kstack. context_switch would snapshot the wrong RSP
+       (scheduler frame on kernel_stack) and iretq back to user with RIP=0/garbage. */
 }
 
 static void rebuild_syscall_frame(thread_t *t) {
@@ -4788,12 +4854,14 @@ static void axon_wget_sc_log(uint64_t num, uint64_t rax, uint64_t a1, uint64_t a
     }
 }
 
-/* Fork COW: privatize .bss near brk_base and heap near brk_cur (parent CR3 = share baseline). */
+/* Fork COW: privatize program data/bss/heap and anon mmap (parent CR3 = share baseline). */
 static int fork_privatize_child_mm(thread_t *child, thread_t *parent, thread_t *dbg_cur) {
     if (!child || !parent || !child->mm || !parent->mm) return -1;
     uintptr_t brk_lo = parent->user_brk_base ? (uintptr_t)parent->user_brk_base : 0x00800000u;
     uintptr_t brk_hi = parent->user_brk_cur ? (uintptr_t)parent->user_brk_cur : brk_lo;
     if (brk_hi < brk_lo) brk_hi = brk_lo;
+    if (parent->user_mmap_hi > brk_hi)
+        brk_hi = (uintptr_t)parent->user_mmap_hi;
     mm_t *parent_mm = parent->mm ? parent->mm : mm_kernel();
     mm_switch(parent_mm);
     uint64_t live_cr3 = paging_read_cr3() & ~0xFFFULL;
@@ -4809,7 +4877,16 @@ static int fork_privatize_child_mm(thread_t *child, thread_t *parent, thread_t *
         (unsigned long long)(uintptr_t)parent_mm->pml4,
         (unsigned long long)(uintptr_t)child->mm->pml4,
         (unsigned long long)live_cr3);
-    /* brk_base is the first heap byte; .bss/globals live in the page below it. */
+    /* ET_EXEC/PIE .data/.bss through brk (axon-harness globals live here, not only brk-4K). */
+    uintptr_t data_lo = 0x400000u;
+    if (brk_lo > data_lo && brk_hi > data_lo) {
+        uintptr_t data_hi = brk_hi + 0x1000u;
+        uintptr_t cap = brk_lo + (uintptr_t)(4u << 20);
+        if (data_hi > cap) data_hi = cap;
+        if (data_hi > data_lo)
+            (void)mm_cow_private_writable(child->mm, (uint64_t)data_lo, (uint64_t)data_hi);
+    }
+    /* brk page + page below (legacy single-page path). */
     uintptr_t bss_pg = (brk_lo >= 0x1000u) ? ((brk_lo - 0x1000u) & ~0xFFFULL) : 0;
     uintptr_t heap_pg = brk_lo & ~0xFFFULL;
     int r_bss = 0;
@@ -4854,6 +4931,12 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
     if (cur->ring == 3) {
         thread_set_current_user(cur);
     }
+    cur->sc_a1 = a1;
+    cur->sc_a2 = a2;
+    cur->sc_a3 = a3;
+    cur->sc_a4 = a4;
+    cur->sc_a5 = a5;
+    cur->sc_a6 = a6;
     /* saved_user_* are normally captured in syscall_entry64 via syscall_snapshot_user_regs().
        If that path wasn't used (fallback/int0x80), fall back to globals once. */
     /* If return RIP wasn't recorded by entry path, dump stack once for diagnosis. */
@@ -4886,6 +4969,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             uint64_t saved_rcx = cur->saved_user_rip;
             if (saved_rcx == 0) return ret_err(EINVAL);
             /* clone3 with stack: create thread sharing parent's mm (CLONE_VM). */
+            enum { CLONE3_CLONE_THREAD = 0x00010000u };
+            int clone3_need_stack_copy = 0;
             if (stack != 0) {
                 clone3_dbg(cur, 1, "enter",
                     (unsigned long long)flags,
@@ -4930,27 +5015,47 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     uint64_t saved_rsp = cur->saved_user_rsp;
                     uintptr_t parent_stack_top = user_stack_top_for_tid_like_exec(cur->tid ? cur->tid : 1);
                     uintptr_t parent_slot_lo = (parent_stack_top - (uintptr_t)USER_STACK_SIZE) & ~0xFFFULL;
-                    uintptr_t child_stack_top = (uintptr_t)stack & ~((uintptr_t)0xFULL);
                     uintptr_t child_slot_lo = stack_lo & ~0xFFFULL;
-                    enum { CLONE3_STACK_COPY_MAX = 8192u };
-                    uintptr_t used_tail = 0;
-                    if (parent_stack_top > (uintptr_t)saved_rsp)
-                        used_tail = parent_stack_top - (uintptr_t)saved_rsp;
-                    if (used_tail == 0) used_tail = 4096;
-                    if (used_tail < 4096) used_tail = 4096;
-                    uintptr_t max_copy = (uintptr_t)CLONE3_STACK_COPY_MAX;
-                    if (used_tail < max_copy) max_copy = used_tail;
-                    uintptr_t copy_bytes = (uintptr_t)MMIO_IDENTITY_LIMIT - (uintptr_t)saved_rsp;
-                    if (copy_bytes > max_copy) copy_bytes = max_copy;
-                    if (copy_bytes >= 256) {
-                        memcpy((void *)child_rsp, (void *)(uintptr_t)saved_rsp, (size_t)copy_bytes);
-                        fork_reloc_range_u64((uintptr_t)child_rsp, copy_bytes,
-                            (uintptr_t)saved_rsp, (uintptr_t)saved_rsp + copy_bytes, (uintptr_t)child_rsp,
-                            parent_slot_lo, parent_stack_top, child_slot_lo);
-                        clone3_dbg(cur, 5, "stack copy",
-                            (unsigned long long)copy_bytes,
-                            (unsigned long long)saved_rsp,
-                            (unsigned long long)child_rsp);
+                    /* Stack copy is for glibc pthread (CLONE_THREAD): parent RSP still on the old
+                       stack, new stack needs a relocated frame at its high end. axon-harness uses
+                       CLONE_VM only with a fresh buffer — never copy (was corrupting parent slot). */
+                    clone3_need_stack_copy = 0;
+                    if ((flags & CLONE3_CLONE_THREAD) &&
+                        saved_rsp >= stack_lo && saved_rsp < child_rsp) {
+                        clone3_need_stack_copy = 1;
+                    }
+                    if (clone3_need_stack_copy) {
+                        enum { CLONE3_STACK_COPY_MAX = 8192u };
+                        uintptr_t used_tail = 0;
+                        if (parent_stack_top > (uintptr_t)saved_rsp)
+                            used_tail = parent_stack_top - (uintptr_t)saved_rsp;
+                        if (used_tail == 0) used_tail = 4096;
+                        if (used_tail < 4096) used_tail = 4096;
+                        uintptr_t max_copy = (uintptr_t)CLONE3_STACK_COPY_MAX;
+                        if (used_tail < max_copy) max_copy = used_tail;
+                        uintptr_t copy_bytes = (uintptr_t)MMIO_IDENTITY_LIMIT - (uintptr_t)saved_rsp;
+                        if (copy_bytes > max_copy) copy_bytes = max_copy;
+                        if (copy_bytes >= 256) {
+                            uintptr_t copy_lo = child_rsp - copy_bytes;
+                            if (copy_lo < stack_lo)
+                                copy_lo = stack_lo;
+                            copy_bytes = child_rsp - copy_lo;
+                            if (copy_bytes >= 256) {
+                                memcpy((void *)copy_lo, (void *)(uintptr_t)saved_rsp, (size_t)copy_bytes);
+                                fork_reloc_range_u64(copy_lo, copy_bytes,
+                                    (uintptr_t)saved_rsp, (uintptr_t)saved_rsp + copy_bytes, copy_lo,
+                                    parent_slot_lo, parent_stack_top, child_slot_lo);
+                                clone3_dbg(cur, 5, "stack copy",
+                                    (unsigned long long)copy_bytes,
+                                    (unsigned long long)saved_rsp,
+                                    (unsigned long long)copy_lo);
+                            }
+                        }
+                    } else {
+                        clone3_dbg(cur, 5, "fresh stack skip copy",
+                            (unsigned long long)stack_lo,
+                            (unsigned long long)child_rsp,
+                            (unsigned long long)saved_rsp);
                     }
                 }
                 char child_name[32];
@@ -4966,6 +5071,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 mark_user_identity_range_2m_sys((uint64_t)(tramp & ~((uintptr_t)(PAGE_SIZE_2M - 1))),
                     (uint64_t)((tramp & ~((uintptr_t)(PAGE_SIZE_2M - 1))) + PAGE_SIZE_2M));
                 if ((uintptr_t)tramp + 128 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                    /* CLONE_VM shares the address space: pointer registers stay valid as-is.
+                       Relocation is only for CLONE_THREAD after a stack copy (pthread). */
+                    const int use_reloc_stub = clone3_need_stack_copy;
                     const uintptr_t parent_lo = (uintptr_t)cur->saved_user_rsp;
                     enum { CLONE3_STUB_COPY = 8192u };
                     uintptr_t stub_copy = (uintptr_t)MMIO_IDENTITY_LIMIT - parent_lo;
@@ -4974,38 +5082,38 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     uintptr_t parent_stack_top = user_stack_top_for_tid_like_exec(cur->tid ? cur->tid : 1);
                     uintptr_t parent_slot_lo = (parent_stack_top - (uintptr_t)USER_STACK_SIZE) & ~0xFFFULL;
                     uintptr_t child_slot_lo = stack_lo & ~0xFFFULL;
-                    #define CLONE3_RELOC(val64) \
-                        fork_reloc_user_ptr((uint64_t)(val64), parent_lo, parent_hi, \
-                            (uintptr_t)child_rsp, parent_slot_lo, parent_stack_top, child_slot_lo)
+                    #define CLONE3_STUB_REG(raw) \
+                        (use_reloc_stub ? fork_reloc_user_ptr((uint64_t)(raw), parent_lo, parent_hi, \
+                            (uintptr_t)child_rsp, parent_slot_lo, parent_stack_top, child_slot_lo) : (uint64_t)(raw))
                     unsigned char stub[160];
                     int off = 0;
-                    uint64_t imm_rdi = CLONE3_RELOC(cur->saved_user_rdi);
+                    uint64_t imm_rdi = CLONE3_STUB_REG(cur->saved_user_rdi);
                     stub[off++] = 0x48; stub[off++] = 0xBF; memcpy(&stub[off], &imm_rdi, 8); off += 8;
-                    uint64_t imm_rsi = CLONE3_RELOC(cur->saved_user_rsi);
+                    uint64_t imm_rsi = CLONE3_STUB_REG(cur->saved_user_rsi);
                     stub[off++] = 0x48; stub[off++] = 0xBE; memcpy(&stub[off], &imm_rsi, 8); off += 8;
-                    uint64_t imm_rdx = CLONE3_RELOC(cur->saved_user_rdx);
+                    uint64_t imm_rdx = CLONE3_STUB_REG(cur->saved_user_rdx);
                     stub[off++] = 0x48; stub[off++] = 0xBA; memcpy(&stub[off], &imm_rdx, 8); off += 8;
-                    uint64_t imm_r8 = CLONE3_RELOC(cur->saved_user_r8);
+                    uint64_t imm_r8 = CLONE3_STUB_REG(cur->saved_user_r8);
                     stub[off++] = 0x49; stub[off++] = 0xB8; memcpy(&stub[off], &imm_r8, 8); off += 8;
-                    uint64_t imm_r9 = CLONE3_RELOC(cur->saved_user_r9);
+                    uint64_t imm_r9 = CLONE3_STUB_REG(cur->saved_user_r9);
                     stub[off++] = 0x49; stub[off++] = 0xB9; memcpy(&stub[off], &imm_r9, 8); off += 8;
-                    uint64_t imm_r10 = CLONE3_RELOC(cur->saved_user_r10);
+                    uint64_t imm_r10 = CLONE3_STUB_REG(cur->saved_user_r10);
                     stub[off++] = 0x49; stub[off++] = 0xBA; memcpy(&stub[off], &imm_r10, 8); off += 8;
                     stub[off++] = 0x48; stub[off++] = 0xB9; { uint64_t rc = saved_rcx; memcpy(&stub[off], &rc, 8); off += 8; }
                     stub[off++] = 0x49; stub[off++] = 0xBB; memcpy(&stub[off], &cur->saved_user_r11, 8); off += 8;
-                    uint64_t imm_rbx = CLONE3_RELOC(cur->saved_user_rbx);
+                    uint64_t imm_rbx = CLONE3_STUB_REG(cur->saved_user_rbx);
                     stub[off++] = 0x48; stub[off++] = 0xBB; memcpy(&stub[off], &imm_rbx, 8); off += 8;
-                    uint64_t imm_rbp = CLONE3_RELOC(cur->saved_user_rbp);
+                    uint64_t imm_rbp = CLONE3_STUB_REG(cur->saved_user_rbp);
                     stub[off++] = 0x48; stub[off++] = 0xBD; memcpy(&stub[off], &imm_rbp, 8); off += 8;
-                    uint64_t imm_r12 = CLONE3_RELOC(cur->saved_user_r12);
+                    uint64_t imm_r12 = CLONE3_STUB_REG(cur->saved_user_r12);
                     stub[off++] = 0x49; stub[off++] = 0xBC; memcpy(&stub[off], &imm_r12, 8); off += 8;
-                    uint64_t imm_r13 = CLONE3_RELOC(cur->saved_user_r13);
+                    uint64_t imm_r13 = CLONE3_STUB_REG(cur->saved_user_r13);
                     stub[off++] = 0x49; stub[off++] = 0xBD; memcpy(&stub[off], &imm_r13, 8); off += 8;
-                    uint64_t imm_r14 = CLONE3_RELOC(cur->saved_user_r14);
+                    uint64_t imm_r14 = CLONE3_STUB_REG(cur->saved_user_r14);
                     stub[off++] = 0x49; stub[off++] = 0xBE; memcpy(&stub[off], &imm_r14, 8); off += 8;
-                    uint64_t imm_r15 = CLONE3_RELOC(cur->saved_user_r15);
+                    uint64_t imm_r15 = CLONE3_STUB_REG(cur->saved_user_r15);
                     stub[off++] = 0x49; stub[off++] = 0xBF; memcpy(&stub[off], &imm_r15, 8); off += 8;
-                    #undef CLONE3_RELOC
+                    #undef CLONE3_STUB_REG
                     stub[off++] = 0x49; stub[off++] = 0x31; stub[off++] = 0xD2; /* xor r10,r10 (O2 mov rax,r10 after syscall) */
                     stub[off++] = 0x48; stub[off++] = 0x31; stub[off++] = 0xC0; /* xor eax,eax - child returns 0 */
                     stub[off++] = 0x48; stub[off++] = 0xBC; { uint64_t rs = (uint64_t)child_rsp; memcpy(&stub[off], &rs, 8); off += 8; }
@@ -5077,22 +5185,23 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     child_tid_ptr && child_tid_ptr < (uint64_t)MMIO_IDENTITY_LIMIT - 4) {
                     child->clear_child_tid = child_tid_ptr;
                 }
-                thread_unblock((int)(child->tid ? child->tid : 1));
-                clone3_dbg(cur, 4, "unblock child",
-                    (unsigned long long)(child->tid ? child->tid : 0),
-                    (unsigned long long)child->user_rip,
-                    (unsigned long long)child->user_stack);
-                /* OpenSSL/pthread (CLONE_THREAD): run helper until it blocks, not one schedule()
-                   that can leave a ring-3 spinner starving TCP recv on the parent. */
-                if (flags & 0x00010000u) {
-                    for (int ci = 0; ci < 2048; ci++) {
-                        if (child->state == THREAD_BLOCKED || child->state == THREAD_TERMINATED)
-                            break;
-                        thread_schedule();
-                        if (child->state == THREAD_BLOCKED || child->state == THREAD_TERMINATED)
-                            break;
+                rebuild_syscall_frame(cur);
+                {
+                    int ctid = (int)(child->tid ? child->tid : 1);
+                    /* CLONE_VM harness path: unblock now (per-thread syscall stacks). */
+                    if (flags & CLONE3_CLONE_THREAD) {
+                        cur->defer_unblock_tid = ctid;
+                        clone3_dbg(cur, 4, "defer child",
+                            (unsigned long long)ctid,
+                            (unsigned long long)child->user_rip,
+                            (unsigned long long)child->user_stack);
+                    } else {
+                        thread_unblock(ctid);
+                        clone3_dbg(cur, 4, "unblock child",
+                            (unsigned long long)ctid,
+                            (unsigned long long)child->user_rip,
+                            (unsigned long long)child->user_stack);
                     }
-                    thread_schedule();
                 }
                 return (uint64_t)(child->tid ? child->tid : 1);
             }
@@ -8745,6 +8854,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (cow_lo < parent_slot_lo) cow_lo = parent_slot_lo;
                     (void)mm_cow_fork_pages(child->mm, parent_mm->pml4,
                         (uint64_t)cow_lo, (uint64_t)parent_stack_top, max_cow, &copied);
+                    (void)mm_cow_private_writable(child->mm, (uint64_t)cow_lo,
+                        (uint64_t)parent_stack_top);
                     fork_dbg(cur, 69, "stack-cow",
                         (unsigned long long)copied,
                         (unsigned long long)cow_lo,
@@ -8926,12 +9037,14 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             child->sgid = cur->sgid;
             child->attached_tty = cur->attached_tty;
             child->parent_tid = (int)(cur->tid ? cur->tid : 1);
+            child->clear_child_tid = 0;
             child->sid = cur->sid;
             child->pgid = cur->pgid;
             strncpy(child->cwd, cur->cwd, sizeof(child->cwd) - 1);
             child->cwd[sizeof(child->cwd) - 1] = '\0';
             fork_inherit_fd_table(child, cur);
-            thread_unblock((int)(child->tid ? child->tid : 1));
+            /* Defer child run until parent leaves syscall (shared per-CPU syscall stack). */
+            cur->defer_unblock_tid = (int)(child->tid ? child->tid : 1);
             rebuild_syscall_frame(cur);
             fork_dbg(cur, 8, "unblocked child",
                 (unsigned long long)(child->tid ? child->tid : 0), 0, 0);
@@ -8943,24 +9056,27 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             /* waitpid(pid, status*, options, rusage*) minimal implementation
                - pid > 0: wait for specific child pid
                - pid == -1: wait for any child
-               We only support blocking wait (options == 0) and ignore rusage. */
-            int pid = (int)a1;
-            int *status_u = (int*)(uintptr_t)a2;
-            int options = (int)a3;
-            (void)a4;
-            /* Support WNOHANG (1), WUNTRACED (2), WCONTINUED (8) as no-ops. */
-            enum { WNOHANG = 1, WUNTRACED = 2, WCONTINUED = 8 };
-            if (options & ~(WNOHANG | WUNTRACED | WCONTINUED)) return ret_err(ENOSYS);
+               We only support blocking wait (options == 0) and ignore rusage.
+               Use sc_a* (not a1/a2/a3 locals): another thread's syscall reuses the
+               per-CPU syscall kernel stack and clobbers syscall_do_inner's C frame. */
             thread_t *tcur = thread_get_current_user();
             if (!tcur) tcur = thread_current();
             if (!tcur) return ret_err(EINVAL);
+            (void)a4;
+            /* Support WNOHANG (1), WUNTRACED (2), WCONTINUED (8) as no-ops. */
+            enum { WNOHANG = 1, WUNTRACED = 2, WCONTINUED = 8 };
+            if (((int)tcur->sc_a3) & ~(WNOHANG | WUNTRACED | WCONTINUED)) return ret_err(ENOSYS);
 
             for (;;) {
+                tcur = thread_get_current_user();
+                if (!tcur) tcur = thread_current();
+                if (!tcur) return ret_err(EINVAL);
                 thread_t *found = NULL;
-                if (pid > 0) {
-                    thread_t *c = thread_get(pid);
+                int w4_pid = (int)tcur->sc_a1;
+                if (w4_pid > 0) {
+                    thread_t *c = thread_get(w4_pid);
                     if (c && c->parent_tid == (int)tcur->tid) found = c;
-                } else if (pid == -1) {
+                } else if (w4_pid == -1) {
                     /* find any child of current that is not already reaped */
                     for (int i = 0; i < thread_get_count(); i++) {
                         thread_t *c = thread_get_by_index(i);
@@ -8975,7 +9091,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 if (!found) {
                     /* Init fallback: if we somehow lost parent linkage, still reap any terminated child. */
-                    if (pid == -1 && is_init_user(tcur)) {
+                    if (w4_pid == -1 && is_init_user(tcur)) {
                         for (int i = 0; i < thread_get_count(); i++) {
                             thread_t *c = thread_get_by_index(i);
                             if (!c) continue;
@@ -8986,7 +9102,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         }
                     }
                     if (!found) {
-                        if (options & WNOHANG) {
+                        if ((int)tcur->sc_a3 & WNOHANG) {
                             thread_sleep(1);
                             return 0;
                         }
@@ -8998,7 +9114,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     qemu_debug_printf("wait4: parent=%llu name=%s pid_arg=%d -> child=%llu state=%d exit_status=0x%x reaped=%d\n",
                         (unsigned long long)(tcur->tid ? tcur->tid : 1),
                         (tcur->name[0] ? tcur->name : "(noname)"),
-                        pid,
+                        w4_pid,
                         (unsigned long long)(found->tid ? found->tid : 1),
                         (int)found->state,
                         (unsigned)found->exit_status,
@@ -9006,7 +9122,7 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 /* If child was already reaped, behave like Linux: ECHILD */
                 if (found->state == THREAD_TERMINATED && found->exit_status == 0x80000000) {
-                    if (options & WNOHANG) {
+                    if ((int)tcur->sc_a3 & WNOHANG) {
                         thread_sleep(1);
                         return 0;
                     }
@@ -9016,7 +9132,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (found->state == THREAD_TERMINATED && found->exit_status != 0x80000000) {
                     int st = found->exit_status;
                     int dead_pid = (int)(found->tid ? found->tid : 1);
-                    if (status_u) {
+                    if (tcur->sc_a2) {
+                        int *status_u = (int *)(uintptr_t)tcur->sc_a2;
                         if (copy_to_user_safe(status_u, &st, sizeof(st)) != 0) return ret_err(EFAULT);
                     }
                     /* mark reaped */
@@ -9029,17 +9146,16 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     return (uint64_t)dead_pid;
                 }
                 /* not terminated -> WNOHANG returns immediately */
-                if (options & WNOHANG) {
+                if ((int)tcur->sc_a3 & WNOHANG) {
                     thread_sleep(1);
                     return 0;
                 }
                 /* block current thread and set waiter on child */
                 found->waiter_tid = (int)(tcur->tid ? tcur->tid : 1);
-                /* Unconditional marker when we really block in wait4. */
                 {
                     char wbuf[160];
                     int wn = snprintf(wbuf, sizeof(wbuf),
-                        "wait4: block parent=%llu child=%llu state=%d\n",
+                        "wait4: yield parent=%llu child=%llu state=%d\n",
                         (unsigned long long)(tcur->tid ? tcur->tid : 1),
                         (unsigned long long)(found->tid ? found->tid : 1),
                         (int)found->state);
@@ -9051,23 +9167,11 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     (tcur->name[0] ? tcur->name : "(noname)"),
                     (unsigned long long)(found->tid ? found->tid : 1),
                     (int)found->state);
-                /* block current and run child (vfork-style: schedule + rebuild frame) */
-                thread_block((int)(tcur->tid ? tcur->tid : 1));
-                thread_schedule();
-                rebuild_syscall_frame(tcur);
-                if (tcur->fds[1]) {
-                    char wbuf[128];
-                    thread_t *cw = thread_get(pid);
-                    int cst = cw ? (int)cw->state : -1;
-                    int wn = snprintf(wbuf, sizeof(wbuf),
-                        "wait4: wake parent=%llu child=%llu state=%d\n",
-                        (unsigned long long)(tcur->tid ? tcur->tid : 1),
-                        (unsigned long long)(found->tid ? found->tid : 1),
-                        cst);
-                    if (wn > 0 && (size_t)wn < sizeof(wbuf))
-                        (void)fs_write(tcur->fds[1], wbuf, (size_t)wn, tcur->fds[1]->pos);
-                }
-                /* when unblocked, loop to check again */
+                /* Linux-like: stay in syscall (RUNNING), yield so child can run/exit.
+                   Do NOT thread_block+thread_schedule here: that resumes via context_switch
+                   while syscall_do C stack / entry frame get out of sync. */
+                thread_yield();
+                /* when child exits, loop to check again */
             }
             return ret_err(EINVAL);
         }
@@ -9827,6 +9931,36 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 total += (uint64_t)rr;
                 cur_off += (size_t)rr;
                 if ((size_t)rr < chunk) return total;
+            }
+            return total;
+        }
+        case 18: { /* pwrite64(fd, buf, count, offset) */
+            int fd = (int)a1;
+            const void *bufp = (const void *)(uintptr_t)a2;
+            size_t cnt = (size_t)a3;
+            int64_t off_in = (int64_t)a4;
+            if (fd < 0 || fd >= THREAD_MAX_FD) return ret_err(EBADF);
+            if (off_in < 0) return ret_err(EINVAL);
+            if (cnt == 0) return 0;
+            struct fs_file *f = cur->fds[fd];
+            if (!f) return ret_err(EBADF);
+            if (f->type == SYSCALL_FTYPE_SOCKET || f->type == FS_TYPE_PIPE) return ret_err(ESPIPE);
+            if (!bufp || !user_range_ok(bufp, cnt)) return ret_err(EFAULT);
+
+            uint64_t total = 0;
+            size_t cur_off = (size_t)off_in;
+            while ((size_t)total < cnt) {
+                size_t chunk = cnt - (size_t)total;
+                if (chunk > 4096) chunk = 4096;
+                size_t copied = 0;
+                void *tmp = copy_from_user_safe((const uint8_t *)bufp + total, chunk, 4096, &copied);
+                if (!tmp) return (total > 0) ? total : ret_err(EFAULT);
+                ssize_t wr = fs_write(f, tmp, copied, cur_off);
+                kfree(tmp);
+                if (wr <= 0) return (total > 0) ? total : ret_err(EINVAL);
+                total += (uint64_t)wr;
+                cur_off += (size_t)wr;
+                if ((size_t)wr < copied) return total;
             }
             return total;
         }
@@ -11581,7 +11715,9 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 }
 
 uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
-    return syscall_do_inner(num, a1, a2, a3, a4, a5, a6);
+    uint64_t ret = syscall_do_inner(num, a1, a2, a3, a4, a5, a6);
+    syscall_deferred_unblocks();
+    return ret;
 }
 
 void isr_syscall(cpu_registers_t* regs) {

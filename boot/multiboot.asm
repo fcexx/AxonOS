@@ -407,3 +407,5 @@ done:
     pop rbx
     pop rax
     ret
+
+section .note.GNU-stack noalloc

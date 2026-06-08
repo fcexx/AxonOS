@@ -108,6 +108,7 @@
 /* Linux x86_64: preadv/pwritev */
 #define SYS_preadv 295
 #define SYS_pwritev 296
+#define SYS_pwrite64 18
 
 /* AxonOS: resolve hostname via DNS, returns IPv4 in network byte order */
 #define SYS_resolve 1000
@@ -122,6 +123,12 @@ void isr_syscall(cpu_registers_t* regs);
 
 /* Common syscall dispatcher used by both int0x80 and SYSCALL entry. */
 uint64_t syscall_do(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6);
+/* Refresh saved_user_* from live per-CPU syscall stack frame (before schedule in syscall). */
+void syscall_frame_refresh(thread_t *t);
+/* Run deferred thread_unblock after parent leaves syscall (fork child). */
+void syscall_deferred_unblocks(void);
+/* Point this CPU's syscall_entry64 stack at t's private kstack (or global default). */
+void syscall_bind_kstack_for_thread(thread_t *t);
 
 /* Control flag and helper for syscall_entry64. */
 extern uint64_t syscall_exit_to_shell_flag;

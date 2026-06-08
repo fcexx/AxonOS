@@ -17,6 +17,7 @@
 #include <smp.h>
 #include <fs.h>
 #include <stdio.h>
+#include <syscall.h>
 
 #ifndef AXON_FORK_DEBUG
 #define AXON_FORK_DEBUG 1
@@ -151,6 +152,7 @@ static int thread_context_valid(thread_t *t) {
 
 /* 8KiB was too small for syscall_do; 64KiB avoids kstack overflow corrupting thread state. */
 #define KERNEL_STACK_SIZE (64 * 1024)
+#define SYSCALL_KSTACK_SIZE (64 * 1024)
 
 static void thread_free_resources(thread_t *t) {
         if (!t) return;
@@ -168,6 +170,15 @@ static void thread_free_resources(thread_t *t) {
                 void *raw = (void *)(uintptr_t)(t->kernel_stack - (uint64_t)KERNEL_STACK_SIZE);
                 kfree(raw);
                 t->kernel_stack = 0;
+        }
+        if (t->syscall_kstack_raw) {
+                kfree(t->syscall_kstack_raw);
+                t->syscall_kstack_raw = NULL;
+                t->syscall_kstack_top = 0;
+        }
+        if (t->syscall_frame_kbuf) {
+                kfree(t->syscall_frame_kbuf);
+                t->syscall_frame_kbuf = NULL;
         }
         /* free any vfork backups if still present */
         if (t->vfork_parent_stack_backup) {
@@ -376,6 +387,16 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         void *stack_mem = kmalloc(KERNEL_STACK_SIZE + 16);
         if (!stack_mem) { kprintf("OOM thread: kmalloc(stack %u) failed\n", (unsigned)(KERNEL_STACK_SIZE + 16)); kfree(t); return NULL; }
         t->kernel_stack = (uint64_t)stack_mem + KERNEL_STACK_SIZE;
+        {
+                void *sc_mem = kmalloc(SYSCALL_KSTACK_SIZE + 16);
+                if (!sc_mem) {
+                        kfree(stack_mem);
+                        kfree(t);
+                        return NULL;
+                }
+                t->syscall_kstack_raw = sc_mem;
+                t->syscall_kstack_top = (uint64_t)sc_mem + SYSCALL_KSTACK_SIZE;
+        }
         uint64_t* stack = (uint64_t*)t->kernel_stack;
         // Ensure 16-byte alignment for the stack pointer before ret
         uint64_t sp = ((uint64_t)&stack[-1]) & ~0xFULL;
@@ -426,6 +447,8 @@ static thread_t* thread_create_with_state(void (*entry)(void), const char* name,
         t->saved_user_r11 = 0;
         t->saved_user_rcx = 0;
         t->saved_syscall_frame = NULL;
+        t->syscall_frame_kbuf = NULL;
+        t->sc_a1 = t->sc_a2 = t->sc_a3 = t->sc_a4 = t->sc_a5 = t->sc_a6 = 0;
         t->defer_unblock_tid = -1;
         t->uaccess_begin = 0;
         t->uaccess_end = 0;
@@ -479,6 +502,13 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         thread_t* t = (thread_t*)kmalloc(sizeof(thread_t));
         if (!t) { kprintf("OOM thread_register_user: kmalloc(thread_t) failed\n"); return NULL; }
         memset(t, 0, sizeof(thread_t));
+        {
+                void *sc_mem = kmalloc(SYSCALL_KSTACK_SIZE + 16);
+                if (sc_mem) {
+                        t->syscall_kstack_raw = sc_mem;
+                        t->syscall_kstack_top = (uint64_t)sc_mem + SYSCALL_KSTACK_SIZE;
+                }
+        }
         t->bound_cpu = 0;
         t->sched_target_cpu = -1;
         //for (int i=0;i<THREAD_MAX_FD;i++) t->fds[i]=NULL;
@@ -555,6 +585,8 @@ thread_t* thread_register_user(uint64_t user_rip, uint64_t user_rsp, const char*
         t->saved_user_r11 = 0;
         t->saved_user_rcx = 0;
         t->saved_syscall_frame = NULL;
+        t->syscall_frame_kbuf = NULL;
+        t->sc_a1 = t->sc_a2 = t->sc_a3 = t->sc_a4 = t->sc_a5 = t->sc_a6 = 0;
         t->defer_unblock_tid = -1;
         t->uaccess_begin = 0;
         t->uaccess_end = 0;
@@ -609,8 +641,8 @@ void user_thread_entry(void) {
 		if (self->user_stack_limit == 0 || self->user_stack_limit < us + 0x1000u)
 			self->user_stack_limit = se;
 	}
-	// set TSS RSP0 to this thread's kernel stack so syscalls use its stack
 	tss_set_rsp0(self->kernel_stack);
+	syscall_bind_kstack_for_thread(self);
 	// restore user FS base (TLS) so user code can access fs-relative data like stack-protector
 	{
 		uint64_t fsbase = self->user_fs_base;
@@ -957,6 +989,7 @@ void thread_schedule() {
                         set_user_fs_base(0);
                 }
                 mm_switch(cur->mm);
+                syscall_bind_kstack_for_thread(cur);
                 if (!thread_context_valid(cur)) {
                         cur->state = THREAD_TERMINATED;
                         sched_set_current(&main_thread);

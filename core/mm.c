@@ -506,6 +506,13 @@ int mm_cow_private_writable(mm_t *mm, uint64_t va_begin, uint64_t va_end) {
     return 0;
 }
 
+int mm_cow_fault_page(mm_t *mm, uint64_t va, mm_t *share_cmp_mm) {
+    if (!mm || !mm->pml4) return -1;
+    uint64_t pg = va & ~0xFFFULL;
+    if (pg < 0x1000ULL || pg >= (uint64_t)MMIO_IDENTITY_LIMIT) return -1;
+    return mm_make_private_range(mm, pg, pg + 0x1000u, 1, share_cmp_mm);
+}
+
 int mm_make_private_range(mm_t *mm, uint64_t va_begin, uint64_t va_end, int copy_old,
                           mm_t *share_cmp_mm) {
     if (!mm || !mm->pml4) return -1;
