@@ -17,6 +17,8 @@
 #include <syscall.h>
 #include <paging.h>
 #include <mm.h>
+#include <user_map.h>
+#include <exec.h>
 #include <keyboard.h>
 #include <serial.h>
 // Avoid including <cstdint> because cross-toolchain headers may not provide it; use uint64_t instead
@@ -237,13 +239,93 @@ static void div_zero_handler(cpu_registers_t* regs) {
         for(;;){ asm volatile("sti; hlt" ::: "memory"); }
 }
 
+static int fault_try_user_stack_page(uint64_t cr2, uint64_t err) {
+        thread_t *t = thread_current();
+        if (!t || t->ring != 3) {
+                t = thread_get_current_user();
+                if (!t) return 0;
+        }
+        uintptr_t a = (uintptr_t)cr2;
+        if (a < 0x200000u || a >= (uintptr_t)MMIO_IDENTITY_LIMIT)
+                return 0;
+        if (t->user_stack_base == 0 || t->user_stack_limit <= t->user_stack_base)
+                return 0;
+        if (a < (uintptr_t)t->user_stack_base || a >= (uintptr_t)t->user_stack_limit)
+                return 0;
+        uintptr_t page = a & ~((uintptr_t)PAGE_SIZE_2M - 1);
+        if (err & 1u) {
+                if (user_map_mark_identity_2m((uint64_t)page, (uint64_t)(page + PAGE_SIZE_2M)) != 0)
+                        return 0;
+        } else {
+                if (map_page_2m((uint64_t)page, (uint64_t)page, PG_PRESENT | PG_RW | PG_US) != 0)
+                        return 0;
+        }
+        return 1;
+}
+
+static int fault_try_fix_ldso_kernel_phdr(cpu_registers_t *regs, uint64_t cr2) {
+        if (!regs) return 0;
+        if (regs->rip < 0x02007000ULL || regs->rip >= 0x02007800ULL)
+                return 0;
+        uint64_t lm_addr = regs->r13;
+        if (lm_addr < 0x200000ULL || lm_addr + 0x340ULL >= (uint64_t)MMIO_IDENTITY_LIMIT)
+                return 0;
+        uint64_t *lm = (uint64_t *)(uintptr_t)lm_addr;
+        uint64_t l_addr = lm[0];
+        uint64_t *phdr_slot = (uint64_t *)(uintptr_t)(lm_addr + 0x2c0ULL);
+        uint16_t *phnum_slot = (uint16_t *)(uintptr_t)(lm_addr + 0x2d0ULL);
+        uint64_t old_phdr = *phdr_slot;
+        uint16_t phnum = *phnum_slot;
+        if (l_addr < 0x200000ULL || l_addr + 0x1000ULL >= (uint64_t)MMIO_IDENTITY_LIMIT)
+                return 0;
+        if (old_phdr >= (uint64_t)MMIO_IDENTITY_LIMIT)
+                return 0;
+
+        uint64_t fixed_phdr = l_addr + 0x40ULL; /* ELF64 e_phoff is normally 0x40 for glibc DSOs. */
+        uint16_t e_phnum = phnum;
+        const unsigned char *eh = (const unsigned char *)(uintptr_t)l_addr;
+        if (eh[0] == 0x7f && eh[1] == 'E' && eh[2] == 'L' && eh[3] == 'F') {
+                uint64_t e_phoff = *(const uint64_t *)(uintptr_t)(l_addr + 0x20ULL);
+                uint16_t e_phentsize = *(const uint16_t *)(uintptr_t)(l_addr + 0x36ULL);
+                uint16_t hdr_phnum = *(const uint16_t *)(uintptr_t)(l_addr + 0x38ULL);
+                if (e_phoff != 0 && e_phoff <= 0x10000ULL && e_phentsize == 56 && hdr_phnum != 0) {
+                        fixed_phdr = l_addr + e_phoff;
+                        e_phnum = hdr_phnum;
+                }
+        }
+        if (e_phnum == 0 || e_phnum > 64)
+                e_phnum = 16;
+        if (phnum == 0 || phnum > e_phnum)
+                phnum = e_phnum;
+        if (fixed_phdr + (uint64_t)phnum * 56ULL >= (uint64_t)MMIO_IDENTITY_LIMIT)
+                return 0;
+        *phdr_slot = fixed_phdr;
+        *phnum_slot = phnum;
+        if (regs->rbx >= old_phdr && regs->rbx <= old_phdr + (uint64_t)e_phnum * 56ULL)
+                regs->rbx = fixed_phdr + (regs->rbx - old_phdr);
+        klogprintf("ldso-phdr-fix: lm=0x%llx l_addr=0x%llx old=0x%llx new=0x%llx phnum=%u cr2=0x%llx\n",
+                (unsigned long long)lm_addr,
+                (unsigned long long)l_addr,
+                (unsigned long long)old_phdr,
+                (unsigned long long)fixed_phdr,
+                (unsigned)phnum,
+                (unsigned long long)cr2);
+        return 1;
+}
+
 static void page_fault_handler(cpu_registers_t* regs) {
         uint64_t cr2;
         asm volatile("mov %%cr2, %0" : "=r"(cr2));
         int user = (regs->cs & 3) == 3;
+        if (user && (regs->error_code & 1u) && fault_try_fix_ldso_kernel_phdr(regs, cr2))
+                return;
+        if (user && fault_try_user_stack_page(cr2, regs->error_code))
+                return;
         /* Large anonymous mmap: PTEs were installed then removed so we do not memset
          * hundreds of MiB in syscall; fill each 2MiB chunk on first access. */
         if (user && (regs->error_code & 1u) == 0u && fault_try_mmap_lazy_anon(cr2))
+                return;
+        if (user && fault_try_user_vma_nonpresent(cr2, regs->error_code))
                 return;
         if (user && fault_try_grow_user_heap(cr2)) return;
         /* fork COW: first write to a still-shared writable page (Linux-style). */
@@ -333,6 +415,28 @@ static void page_fault_handler(cpu_registers_t* regs) {
             } else {
                 klogprintf("stack @ RSP: (outside identity map)\n");
             }
+            if (regs->rip >= 0x02007000ULL && regs->rip < 0x02007800ULL) {
+                klogprintf("ldso-phdr-walk: rbx=0x%llx r13=0x%llx rax=0x%llx rdx=0x%llx\n",
+                    (unsigned long long)regs->rbx,
+                    (unsigned long long)regs->r13,
+                    (unsigned long long)regs->rax,
+                    (unsigned long long)regs->rdx);
+                if (regs->r13 >= 0x200000ULL && regs->r13 + 0x2d8ULL < (uint64_t)MMIO_IDENTITY_LIMIT) {
+                    const uint64_t *lm = (const uint64_t *)(uintptr_t)regs->r13;
+                    klogprintf("ldso-linkmap: l_addr=0x%llx l_name=0x%llx l_ld=0x%llx l_next=0x%llx l_prev=0x%llx\n",
+                        (unsigned long long)lm[0],
+                        (unsigned long long)lm[1],
+                        (unsigned long long)lm[2],
+                        (unsigned long long)lm[3],
+                        (unsigned long long)lm[4]);
+                    klogprintf("ldso-linkmap: phdr@+0x2c0=0x%llx phnum@+0x2d0=0x%llx flags@+0x338=0x%llx\n",
+                        (unsigned long long)*(const uint64_t *)(uintptr_t)(regs->r13 + 0x2c0ULL),
+                        (unsigned long long)*(const uint64_t *)(uintptr_t)(regs->r13 + 0x2d0ULL),
+                        (unsigned long long)*(const uint64_t *)(uintptr_t)(regs->r13 + 0x338ULL));
+                } else {
+                    klogprintf("ldso-linkmap: r13 outside readable identity range\n");
+                }
+            }
             /* dump memory near CR2 if available; skip when page is non-present
                (err bit 0 = 0) to avoid a second page fault when reading CR2 */
             if ((regs->error_code & 1) != 0 && (uintptr_t)cr2 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
@@ -344,6 +448,16 @@ static void page_fault_handler(cpu_registers_t* regs) {
                 klogprintf("bytes @ CR2: (page not present, skipping read)\n");
             } else {
                 klogprintf("bytes @ CR2: (outside identity map)\n");
+            }
+            if (user && regs->rip >= 0x2200000ULL && regs->rip < 0x2300000ULL &&
+                (uintptr_t)regs->rip < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                const unsigned char *code = (const unsigned char *)(uintptr_t)regs->rip;
+                const unsigned char *base = (const unsigned char *)(uintptr_t)0x2220000ULL;
+                klogprintf("libc-pf: rip=0x%llx rip_bytes=", (unsigned long long)regs->rip);
+                for (int i = 0; i < 16; i++) kprintf("%02x ", (unsigned)code[i]);
+                kprintf(" base@0x2220000=");
+                for (int i = 0; i < 16; i++) kprintf("%02x ", (unsigned)base[i]);
+                kprintf("\n");
             }
             /* dump page table entries for CR2 */
             {

@@ -17,6 +17,8 @@ void syscall_set_user_brk(uintptr_t base);
 int fault_try_grow_user_heap(uint64_t cr2);
 /* Demand-fill + zero one 2MiB page for a large MAP_ANONYMOUS lazy mmap. */
 int fault_try_mmap_lazy_anon(uint64_t cr2);
+/* Demand-materialize a non-present page covered by a user VMA if access is allowed. */
+int fault_try_user_vma_nonpresent(uint64_t cr2, uint64_t err);
 int syscall_try_handle_uaccess_fault(uint64_t fault_addr, uint64_t *resume_rip_out);
 
 /* Populate default sysfs tree and /etc (called from SYS_mount when userspace mounts sysfs). */

@@ -318,15 +318,14 @@ static void test_open_read(void) {
 	} else skip("open/read self", "not installed yet");
 }
 
-static void test_execve_enoexec_dynamic(void) {
-	const char *argv[] = { "/bin/false", 0 };
+static void test_execve_missing_dynamic_loader(void) {
+	const char *argv[] = { "/lib/no-such-ld-linux-x86-64.so.2", 0 };
 	const char *envp[] = { 0 };
-	long r = sys3(SYS_execve, (long)(uintptr_t)"/lib/ld-linux-x86-64.so.2",
+	long r = sys3(SYS_execve, (long)(uintptr_t)argv[0],
 		(long)(uintptr_t)argv, (long)(uintptr_t)envp);
-	if (r == (long)-ENOEXEC) pass("execve dynamic ENOEXEC");
-	else if (r == (long)-ENOENT) skip("execve dynamic", "no ld-linux in initfs");
+	if (r == (long)-ENOENT) pass("execve missing dynamic loader");
 	else {
-		fail("execve dynamic ENOEXEC", "unexpected errno");
+		fail("execve missing dynamic loader", "unexpected errno");
 		uwrite_hex64("  rc=0x", (unsigned long long)r);
 	}
 }
@@ -370,7 +369,7 @@ int main(int argc, char **argv) {
 	run_one("clone3", test_clone3_thread, flt);
 	run_one("open", test_open_read, flt);
 	run_one("execve-enoent", test_execve_enoent, flt);
-	run_one("execve-dyn", test_execve_enoexec_dynamic, flt);
+	run_one("execve-dyn", test_execve_missing_dynamic_loader, flt);
 	uwrite("\nSummary: PASS=");
 	/* minimal decimal print */
 	{

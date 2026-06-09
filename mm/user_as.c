@@ -1,6 +1,7 @@
 #include <user_as.h>
 #include <user_map.h>
 #include <user_mm.h>
+#include <user_vma.h>
 #include <axonos.h>
 #include <exec.h>
 #include <heap.h>
@@ -252,4 +253,67 @@ void user_as_reset_on_exec(thread_t *tcur, uintptr_t brk_base) {
         user_as_mmap_next = 0;
         user_as_mmap_hi = 0;
     }
+}
+
+void user_as_set_brk_after_load(thread_t *tcur, uintptr_t elf_brk, uintptr_t image_hi) {
+    const uintptr_t floor = 8u * 1024u * 1024u;
+    uintptr_t orig = elf_brk;
+    uintptr_t brk = elf_brk;
+    if (brk < floor) brk = floor;
+    brk = user_mm_align_up(brk, 4096);
+    uintptr_t zero_lo = 0;
+    if (image_hi > 0x200000u && brk > image_hi)
+        zero_lo = image_hi;
+    else if (orig > 0x200000u && brk > orig)
+        zero_lo = orig;
+    if (zero_lo != 0 && brk > zero_lo && brk <= (uintptr_t)MMIO_IDENTITY_LIMIT) {
+        (void)user_map_ensure_present_us_2m((uint64_t)zero_lo, (uint64_t)brk);
+        user_as_mmap_memset_zero_chunked(zero_lo, (size_t)(brk - zero_lo));
+    }
+    if (tcur) {
+        tcur->user_brk_base = brk;
+        tcur->user_brk_cur = brk;
+        user_as_shared_publish_brk(tcur, brk, brk);
+    } else {
+        user_as_brk_base = brk;
+        user_as_brk_cur = brk;
+    }
+}
+
+void user_as_teardown_for_exec(thread_t *tcur, uintptr_t new_brk_base) {
+    uintptr_t brk_lo = (uintptr_t)-1;
+    uintptr_t brk_hi = 0;
+    int n = thread_get_count();
+    for (int i = 0; i < n; i++) {
+        thread_t *t = thread_get_by_index(i);
+        if (!t) continue;
+        if (tcur && tcur->mm && t->mm != tcur->mm && t->ring == 3) continue;
+        if (t->user_brk_base != 0) {
+            if (t->user_brk_base < brk_lo) brk_lo = t->user_brk_base;
+            if (t->user_brk_cur > brk_hi) brk_hi = t->user_brk_cur;
+        } else if (t->user_brk_cur > brk_hi) {
+            brk_hi = t->user_brk_cur;
+        }
+    }
+    if (user_as_brk_cur > brk_hi) brk_hi = user_as_brk_cur;
+    if (user_as_brk_base != 0 && user_as_brk_base < brk_lo) brk_lo = user_as_brk_base;
+    if (brk_lo == (uintptr_t)-1)
+        brk_lo = 8u * 1024u * 1024u;
+    if (brk_hi < brk_lo)
+        brk_hi = brk_lo;
+
+    user_vma_teardown_unmap_for_exec(tcur);
+
+    if (brk_hi > brk_lo && brk_lo >= 0x200000u && brk_hi <= (uintptr_t)MMIO_IDENTITY_LIMIT) {
+        (void)user_map_ensure_present_us_2m((uint64_t)brk_lo, (uint64_t)brk_hi);
+        user_as_mmap_memset_zero_chunked(brk_lo, (size_t)(brk_hi - brk_lo));
+    }
+
+    for (int i = 0; i < n; i++) {
+        thread_t *t = thread_get_by_index(i);
+        if (!t) continue;
+        if (t->ring == 3 && tcur && tcur->mm && t->mm != tcur->mm) continue;
+        user_as_reset_on_exec(t, new_brk_base);
+    }
+    user_as_reset_on_exec(NULL, new_brk_base);
 }

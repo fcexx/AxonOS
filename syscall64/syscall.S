@@ -199,7 +199,8 @@ syscall_entry64:
     // Return to user with IRETQ using the saved return RIP (rcx), flags (r11) and user RSP.
     // USER_DS = 0x23, USER_CS = 0x1B (see cpu/gdt.c)
     pushq   $0x23
-    // push saved user RSP from slot just below SS (see pops above)
+    // After popping saved GPRs, %rsp points at the saved user RSP slot pushed on entry.
+    // pushq above moved %rsp, so the saved user RSP is now at 8(%rsp).
     pushq   8(%rsp)
     /* Ensure user returns with interrupts enabled (IF=1).
        Some implementations of SYSCALL may present masked RFLAGS in r11

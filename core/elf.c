@@ -17,10 +17,11 @@
 #include <gdt.h>
 #include <paging.h>
 #include <mm.h>
+#include <user_vma.h>
+#include <user_as.h>
 #include <elf.h>
 #include <vga.h>
 #include <debug.h>
-#include <smp.h>
 #include <syscall.h>
 
 extern uint8_t _end[]; /* kernel end symbol from linker */
@@ -30,6 +31,14 @@ uint64_t elf_et_dyn_base(void) {
     uint64_t base = ((uint64_t)ke + (uint64_t)(PAGE_SIZE_2M - 1)) & ~((uint64_t)PAGE_SIZE_2M - 1);
     if (base < 0x00800000ULL)
         base = 0x00800000ULL;
+    return base;
+}
+
+uint64_t elf_interp_base(void) {
+    uint64_t base = elf_et_dyn_base() + 16ULL * 1024ULL * 1024ULL;
+    base = (base + (uint64_t)(PAGE_SIZE_2M - 1)) & ~((uint64_t)PAGE_SIZE_2M - 1);
+    if (base < 0x02000000ULL)
+        base = 0x02000000ULL;
     return base;
 }
 
@@ -321,6 +330,44 @@ static int elf_needs_private_user_pages(thread_t *tc) {
     return tc->mm->pml4 != k->pml4;
 }
 
+/* Linux applies R_X86_64_RELATIVE for ET_DYN (PIE + ld.so) before user entry. */
+static int elf_apply_rela_relative(uint64_t load_base, const Elf64_Phdr *phdrs, int phnum) {
+    if (!phdrs || phnum <= 0 || load_base == 0) return 0;
+    const Elf64_Rela *rela = NULL;
+    size_t relasz = 0;
+    size_t relaent = sizeof(Elf64_Rela);
+
+    for (int i = 0; i < phnum; i++) {
+        if (phdrs[i].p_type != ELF_PT_DYNAMIC) continue;
+        if (phdrs[i].p_memsz < sizeof(Elf64_Dyn)) return -1;
+        const Elf64_Dyn *dyn = (const Elf64_Dyn *)(uintptr_t)(load_base + phdrs[i].p_vaddr);
+        size_t n = (size_t)(phdrs[i].p_memsz / sizeof(Elf64_Dyn));
+        for (size_t j = 0; j < n; j++) {
+            if (dyn[j].d_tag == ELF_DT_NULL) break;
+            if (dyn[j].d_tag == ELF_DT_RELA)
+                rela = (const Elf64_Rela *)(uintptr_t)(load_base + dyn[j].d_un);
+            else if (dyn[j].d_tag == ELF_DT_RELASZ)
+                relasz = (size_t)dyn[j].d_un;
+            else if (dyn[j].d_tag == ELF_DT_RELAENT && dyn[j].d_un != 0)
+                relaent = (size_t)dyn[j].d_un;
+        }
+        break;
+    }
+    if (!rela || relasz == 0 || relaent < sizeof(Elf64_Rela))
+        return 0;
+    size_t nrel = relasz / relaent;
+    for (size_t i = 0; i < nrel; i++) {
+        const Elf64_Rela *r = (const Elf64_Rela *)((const char *)rela + i * relaent);
+        if (ELF64_R_TYPE(r->r_info) != ELF_R_X86_64_RELATIVE)
+            continue;
+        uint64_t *where = (uint64_t *)(uintptr_t)(load_base + r->r_offset);
+        if ((uintptr_t)where < load_base || (uintptr_t)where >= (uintptr_t)MMIO_IDENTITY_LIMIT)
+            return -1;
+        *where = load_base + (uint64_t)r->r_addend;
+    }
+    return 0;
+}
+
 /* Mark range user-accessible, writable, executable (2MiB walk; no map_page_2m). */
 static int mark_user_range_exec(uint64_t va_begin, uint64_t va_end) {
     if (va_end < va_begin) return -1;
@@ -363,9 +410,14 @@ static int mark_user_range_exec(uint64_t va_begin, uint64_t va_end) {
         }
 
         uint64_t *l1 = (uint64_t *)(uintptr_t)(l2e & ~0xFFFULL);
-        l1[l1i] |= PG_US | PG_RW;
-        l1[l1i] &= ~PG_NX;
-        invlpg((void *)(uintptr_t)va);
+        uint64_t chunk_end = va + PAGE_SIZE_2M;
+        if (chunk_end > end) chunk_end = end;
+        for (uint64_t p = va; p < chunk_end; p += PAGE_SIZE_4K) {
+            uint64_t idx = (p >> 12) & 0x1FF;
+            l1[idx] |= PG_US | PG_RW;
+            l1[idx] &= ~PG_NX;
+            invlpg((void *)(uintptr_t)p);
+        }
     }
     return 0;
 }
@@ -438,7 +490,10 @@ int elf_load_from_memory(const void *buf, size_t len, uint64_t *out_entry) {
         if (mark_user_range_exec(vstart, vend) != 0) return -9;
     }
 
-    if (brk_end) syscall_set_user_brk((uintptr_t)brk_end);
+    if (brk_end) {
+        thread_t *tc = thread_current();
+        user_as_set_brk_after_load(tc, (uintptr_t)brk_end, (uintptr_t)brk_end);
+    }
     if (out_entry) *out_entry = image_entry;
     return 0;
 }
@@ -478,6 +533,16 @@ static int mark_user_identity_range_2m(uint64_t va_begin, uint64_t va_end) {
             l2[l2i] |= PG_US;
         } else {
             l2[l2i] |= PG_US;
+            uint64_t *l1 = (uint64_t*)(uintptr_t)(l2e & ~0xFFFULL);
+            uint64_t chunk_end = va + PAGE_SIZE_2M;
+            if (chunk_end > end) chunk_end = end;
+            for (uint64_t p = va; p < chunk_end; p += PAGE_SIZE_4K) {
+                uint64_t idx = (p >> 12) & 0x1FF;
+                if (l1[idx] & PG_PRESENT)
+                    l1[idx] |= PG_US;
+                invlpg((void*)(uintptr_t)p);
+            }
+            continue;
         }
         invlpg((void*)(uintptr_t)va);
     }
@@ -496,8 +561,14 @@ void exec_ensure_user_mappings(void) {
     mark_broad_user_ranges_for_exec();
 }
 
-int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk_end,
-                       elf_tls_info_t *out_tls) {
+static void exec_reset_shared_user_space(thread_t *owner, uintptr_t brk_base) {
+    user_as_teardown_for_exec(owner, brk_base);
+    exec_ensure_user_mappings();
+}
+
+int elf_load_from_path_info(const char *path, uint64_t load_base_override,
+                            elf_load_info_t *out_info, elf_tls_info_t *out_tls) {
+    if (out_info) memset(out_info, 0, sizeof(*out_info));
     if (out_tls) {
         out_tls->vaddr = 0;
         out_tls->filesz = 0;
@@ -523,17 +594,6 @@ int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk
         return -1;
     }
 
-    /* IMPORTANT:
-       We do not implement dynamic linking (PT_INTERP) nor relocation processing for PIE/ET_DYN yet.
-       Loading ET_DYN images without relocations commonly crashes immediately (NULL/GOT derefs).
-       Return a distinct error so execve can translate it to ENOEXEC instead of letting userspace fault. */
-    if (eh.e_type != 2) {
-        qemu_debug_printf("elf: refusing non-ET_EXEC e_type=%u: %s\n",
-            (unsigned)eh.e_type, path ? path : "(null)");
-        fs_file_free(f);
-        return -2;
-    }
-
     /* Basic safety: do not allow loading segments that overlap kernel image */
     uintptr_t kernel_start = (uintptr_t)0x100000; /* from linker.ld */
     uintptr_t kernel_end = (uintptr_t)_end;
@@ -546,22 +606,47 @@ int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk
     ssize_t rp = fs_read(f, phdrs, phsz, (size_t)eh.e_phoff);
     if (rp != (ssize_t)phsz) { kfree(phdrs); fs_file_free(f); return -1; }
 
-    uint64_t load_base = elf_load_base_for_image(&eh, phdrs, (int)eh.e_phnum);
+    uint64_t load_base = load_base_override ? load_base_override : elf_load_base_for_image(&eh, phdrs, (int)eh.e_phnum);
+    int has_interp = 0;
+    int has_dynamic = 0;
+    char interp_path[192];
+    interp_path[0] = '\0';
 
-    /* Reject dynamically linked binaries (PT_INTERP / PT_DYNAMIC) until we have ld.so. */
     for (int i = 0; i < (int)eh.e_phnum; i++) {
         if (phdrs[i].p_type == 3 /* PT_INTERP */) {
-            qemu_debug_printf("elf: refusing PT_INTERP (dynamic) binary: %s\n", path ? path : "(null)");
-            kfree(phdrs);
-            fs_file_free(f);
-            return -2;
+            if (phdrs[i].p_filesz == 0 || phdrs[i].p_filesz >= sizeof(interp_path)) {
+                kfree(phdrs);
+                fs_file_free(f);
+                return -2;
+            }
+            if (fsz && phdrs[i].p_offset + phdrs[i].p_filesz > (uint64_t)fsz) {
+                kfree(phdrs);
+                fs_file_free(f);
+                return -1;
+            }
+            ssize_t ri = fs_read(f, interp_path, (size_t)phdrs[i].p_filesz, (size_t)phdrs[i].p_offset);
+            if (ri != (ssize_t)phdrs[i].p_filesz) {
+                kfree(phdrs);
+                fs_file_free(f);
+                return -1;
+            }
+            interp_path[phdrs[i].p_filesz] = '\0';
+            if (interp_path[phdrs[i].p_filesz - 1] == '\0') {
+                /* PT_INTERP includes the trailing NUL on Linux. */
+            } else {
+                interp_path[sizeof(interp_path) - 1] = '\0';
+            }
+            has_interp = 1;
         }
         if (phdrs[i].p_type == 2 /* PT_DYNAMIC */) {
-            qemu_debug_printf("elf: refusing PT_DYNAMIC (needs ld.so) binary: %s\n", path ? path : "(null)");
-            kfree(phdrs);
-            fs_file_free(f);
-            return -2;
+            has_dynamic = 1;
         }
+    }
+    if (has_dynamic && !has_interp && eh.e_type == 2 && load_base_override == 0) {
+        qemu_debug_printf("elf: refusing ET_EXEC PT_DYNAMIC without PT_INTERP: %s\n", path ? path : "(null)");
+        kfree(phdrs);
+        fs_file_free(f);
+        return -2;
     }
 
     if (out_tls) {
@@ -580,6 +665,29 @@ int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk
     uint64_t loaded_lo = UINT64_MAX;
     uint64_t loaded_hi = 0;
     const uint64_t image_entry = (uint64_t)eh.e_entry + load_base;
+    uint64_t aux_phdr = 0;
+    uint64_t phsz64 = (uint64_t)eh.e_phnum * (uint64_t)eh.e_phentsize;
+    for (int i = 0; i < (int)eh.e_phnum; i++) {
+        Elf64_Phdr *ph = &phdrs[i];
+        if (ph->p_type == 6 /* PT_PHDR */) {
+            aux_phdr = ph->p_vaddr + load_base;
+            break;
+        }
+    }
+    if (aux_phdr == 0) {
+        uint64_t want0 = eh.e_phoff;
+        uint64_t want1 = eh.e_phoff + phsz64;
+        for (int i = 0; i < (int)eh.e_phnum; i++) {
+            Elf64_Phdr *ph = &phdrs[i];
+            if (ph->p_type != 1) continue; /* PT_LOAD */
+            uint64_t poff = ph->p_offset;
+            uint64_t pend = ph->p_offset + ph->p_filesz;
+            if (want0 >= poff && want1 <= pend) {
+                aux_phdr = ph->p_vaddr + load_base + (want0 - poff);
+                break;
+            }
+        }
+    }
     /* Load PT_LOAD segments directly from file into their target VAs */
     for (int i = 0; i < (int)eh.e_phnum; i++) {
         Elf64_Phdr *ph = &phdrs[i];
@@ -623,6 +731,18 @@ int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk
         }
 
         void *dst = (void*)(uintptr_t)(ph->p_vaddr + load_base);
+        /* Ensure identity user pages exist before copying (bootstrap 1GiB may be split). */
+        {
+            uint64_t map_lo = vstart & ~((uint64_t)PAGE_SIZE_2M - 1);
+            uint64_t map_hi = (vend + PAGE_SIZE_2M - 1) & ~((uint64_t)PAGE_SIZE_2M - 1);
+            for (uint64_t va = map_lo; va < map_hi; va += PAGE_SIZE_2M) {
+                if (map_page_2m(va, va, PG_PRESENT | PG_RW | PG_US) != 0) {
+                    kfree(phdrs);
+                    fs_file_free(f);
+                    return -1;
+                }
+            }
+        }
         /* If current task has a private mm, make destination pages private before writing ELF. */
         {
             thread_t *tc = thread_current();
@@ -657,6 +777,14 @@ int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk
         if (vend > brk_end) brk_end = vend;
     }
 
+    if (eh.e_type == 3 /* ET_DYN */) {
+        if (elf_apply_rela_relative(load_base, phdrs, (int)eh.e_phnum) != 0) {
+            kfree(phdrs);
+            fs_file_free(f);
+            return -1;
+        }
+    }
+
     /* Pass 2: mark user-accessible after all segments are copied (avoid RO before memset). */
     if (loaded_lo < loaded_hi) {
         if (mark_user_range_exec(loaded_lo, loaded_hi) != 0) {
@@ -669,11 +797,40 @@ int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk
         }
     }
 
-    if (brk_end) syscall_set_user_brk((uintptr_t)brk_end);
-    if (out_entry) *out_entry = image_entry;
-    if (out_brk_end) *out_brk_end = (uintptr_t)brk_end;
+    if (brk_end) {
+        thread_t *tc = thread_current();
+        user_as_set_brk_after_load(tc, (uintptr_t)brk_end,
+            loaded_hi != UINT64_MAX ? (uintptr_t)loaded_hi : 0);
+    }
+    if (out_info) {
+        out_info->entry = image_entry;
+        out_info->load_base = load_base;
+        out_info->brk_end = brk_end;
+        out_info->phdr = aux_phdr;
+        out_info->phent = (uint64_t)eh.e_phentsize;
+        out_info->phnum = (uint64_t)eh.e_phnum;
+        out_info->loaded_lo = loaded_lo == UINT64_MAX ? 0 : loaded_lo;
+        out_info->loaded_hi = loaded_hi;
+        out_info->e_type = eh.e_type;
+        out_info->has_interp = has_interp;
+        out_info->has_dynamic = has_dynamic;
+        if (has_interp) {
+            strncpy(out_info->interp_path, interp_path, sizeof(out_info->interp_path) - 1);
+            out_info->interp_path[sizeof(out_info->interp_path) - 1] = '\0';
+        }
+    }
     kfree(phdrs);
     fs_file_free(f);
+    return 0;
+}
+
+int elf_load_from_path(const char *path, uint64_t *out_entry, uintptr_t *out_brk_end,
+                       elf_tls_info_t *out_tls) {
+    elf_load_info_t info;
+    int rc = elf_load_from_path_info(path, 0, &info, out_tls);
+    if (rc != 0) return rc;
+    if (out_entry) *out_entry = info.entry;
+    if (out_brk_end) *out_brk_end = (uintptr_t)info.brk_end;
     return 0;
 }
 
@@ -727,6 +884,14 @@ static char *kstrdup_local(const char *s) {
     return p;
 }
 
+static void exec_register_loaded_range_vma(uint64_t tid, const elf_load_info_t *info) {
+    if (!info || info->loaded_hi <= info->loaded_lo) return;
+    uintptr_t lo = (uintptr_t)(info->loaded_lo & ~0xFFFULL);
+    uintptr_t hi = (uintptr_t)((info->loaded_hi + 0xFFFULL) & ~0xFFFULL);
+    if (hi <= lo || hi >= (uintptr_t)MMIO_IDENTITY_LIMIT) return;
+    (void)user_vma_add(tid, lo, (size_t)(hi - lo), 7, USER_VMA_KIND_ELF_LOAD);
+}
+
 /* Rebuild userspace stack/TLS layout for a specific target tid.
    Used as a recovery path when the final created thread tid differs from the
    initially planned slot (rare concurrent thread creation race). */
@@ -737,6 +902,7 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
                                        uint64_t aux_phent,
                                        uint64_t aux_phnum,
                                        uint64_t aux_entry,
+                                       uint64_t aux_base,
                                        uintptr_t *out_final_stack,
                                        uintptr_t *out_stack_top,
                                        uintptr_t *out_fs_base) {
@@ -752,8 +918,8 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
     size_t env_strings_size = 0;
     for (int i = 0; i < envc; i++) env_strings_size += strlen(envp[i]) + 1;
 
-    enum { AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_PAGESZ = 6, AT_ENTRY = 9,
-           AT_CLKTCK = 17, AT_RANDOM = 25, AT_NPROCESSORS_ONLN = 84 };
+    enum { AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_PAGESZ = 6, AT_BASE = 7, AT_ENTRY = 9,
+           AT_CLKTCK = 17, AT_RANDOM = 25 };
     const size_t aux_pairs = 9;
     const size_t aux_qwords = aux_pairs * 2;
     size_t ptrs = (size_t)(argc + 1 + envc + 1) + aux_qwords;
@@ -765,7 +931,9 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
 
     uintptr_t stack_top = user_stack_top_for_tid(target_tid);
     stack_top &= ~((uintptr_t)0xFULL);
-    /* RSP ≡ 0 (mod 16) at process start; crt0 call chains keep 16-byte alignment in nested C functions. */
+    /* Linux process entry starts with RSP ≡ 0 (mod 16). The dynamic loader is an
+       entry point, not a normally-called function; giving it function-entry
+       alignment makes early SSE stores (movaps/movdqa) fault on unaligned locals. */
     uintptr_t final_stack = (stack_top - total) & ~((uintptr_t)0xFULL);
     uintptr_t ptrs_addr = final_stack + 8u;
     uintptr_t base = ptrs_addr;
@@ -810,12 +978,11 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
     sp64[ax + 0] = (uint64_t)AT_PHDR;   sp64[ax + 1] = aux_phdr;
     sp64[ax + 2] = (uint64_t)AT_PHENT;  sp64[ax + 3] = aux_phent ? aux_phent : (uint64_t)sizeof(Elf64_Phdr);
     sp64[ax + 4] = (uint64_t)AT_PHNUM;  sp64[ax + 5] = aux_phnum;
-    sp64[ax + 6] = (uint64_t)AT_ENTRY;  sp64[ax + 7] = aux_entry;
-    sp64[ax + 8] = (uint64_t)AT_PAGESZ; sp64[ax + 9] = 4096ULL;
-    sp64[ax +10] = (uint64_t)AT_RANDOM; sp64[ax +11] = (uint64_t)random_addr;
-    sp64[ax +12] = (uint64_t)AT_CLKTCK; sp64[ax +13] = 100ULL;
-    sp64[ax +14] = (uint64_t)AT_NPROCESSORS_ONLN;
-    sp64[ax +15] = (uint64_t)(smp_cpu_count() > 0 ? smp_cpu_count() : 1);
+    sp64[ax + 6] = (uint64_t)AT_BASE;   sp64[ax + 7] = aux_base;
+    sp64[ax + 8] = (uint64_t)AT_ENTRY;  sp64[ax + 9] = aux_entry;
+    sp64[ax +10] = (uint64_t)AT_PAGESZ; sp64[ax +11] = 4096ULL;
+    sp64[ax +12] = (uint64_t)AT_RANDOM; sp64[ax +13] = (uint64_t)random_addr;
+    sp64[ax +14] = (uint64_t)AT_CLKTCK; sp64[ax +15] = 100ULL;
     sp64[ax +16] = (uint64_t)AT_NULL;   sp64[ax +17] = 0;
     *((uint64_t*)(uintptr_t)final_stack) = (uint64_t)argc;
 
@@ -827,10 +994,11 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
     }
 
     enum { MSR_FS_BASE_LOCAL = 0xC0000100u };
-    const uintptr_t tls_region_base = user_tls_base_for_stack_top(stack_top);
-    const uintptr_t fs_base = tls_region_base + 0x1000u;
-    const uintptr_t pthread_fake = tls_region_base + 0x2000u;
-    {
+    uintptr_t fs_base = 0;
+    if (aux_base == 0) {
+        const uintptr_t tls_region_base = user_tls_base_for_stack_top(stack_top);
+        fs_base = tls_region_base + 0x1000u;
+        const uintptr_t pthread_fake = tls_region_base + 0x2000u;
         thread_t *tc = thread_current();
         if (elf_needs_private_user_pages(tc)) {
             mm_t *share = tc->mm_ptemplate ? tc->mm_ptemplate : mm_kernel();
@@ -848,15 +1016,22 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
         *(volatile uint64_t*)(uintptr_t)(fs_base + 0x28u) = guard;
         *(volatile uint64_t*)(uintptr_t)(fs_base - 0x78u) = (uint64_t)pthread_fake;
         {
-            const uintptr_t c_str = tls_region_base + 0x2800u;
-            if (c_str + 2 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                *(volatile uint8_t*)(uintptr_t)(c_str + 0) = (uint8_t)'C';
-                *(volatile uint8_t*)(uintptr_t)(c_str + 1) = 0;
-                const uintptr_t specific5_slot = pthread_fake + 0x80u + (uintptr_t)(5u * 8u);
-                *(volatile uint64_t*)(uintptr_t)specific5_slot = (uint64_t)c_str;
+            const uintptr_t fake_locale = tls_region_base + 0x2800u;
+            if (fake_locale + 0x100u < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                *(volatile uint8_t*)(uintptr_t)(fake_locale + 0) = (uint8_t)'C';
+                *(volatile uint8_t*)(uintptr_t)(fake_locale + 1) = 0;
+                for (uintptr_t key = 0; key < 32; key++) {
+                    const uintptr_t slot = pthread_fake + 0x80u + key * sizeof(uint64_t);
+                    *(volatile uint64_t*)(uintptr_t)slot = (uint64_t)fake_locale;
+                }
             }
         }
         msr_write_u64_local(MSR_FS_BASE_LOCAL, (uint64_t)fs_base);
+    } else {
+        /* Dynamic ELF starts in ld.so. Linux enters it with FS unset; ld.so will
+           allocate TLS and set FS with arch_prctl(ARCH_SET_FS). A fake static
+           glibc TCB here makes ld.so follow bogus pthread/locale pointers. */
+        msr_write_u64_local(MSR_FS_BASE_LOCAL, 0);
     }
 
     *out_final_stack = final_stack;
@@ -923,18 +1098,19 @@ static int try_exec_shebang(const char *resolved_path,
 
 int kernel_execve_from_path(const char *path, const char *const argv[], const char *const envp[]) {
     if (!path) return -1;
-    if (strstr(path, "ld-linux") || strstr(path, "ld-musl"))
-        return -2;
     /* IMPORTANT:
        Symlinks are resolved by VFS (`fs_open()` does it via `fs_resolve_symlinks()`).
        Do NOT attempt to "readlink" via fs_open() here, because that would read the
        *target file* (already resolved) rather than the symlink contents. */
     const char *curpath = path;
-    uint64_t entry = 0;
-    uintptr_t loaded_brk_end = 0;
-    int r = elf_load_from_path(curpath, &entry, &loaded_brk_end, NULL);
+    elf_load_info_t main_info;
+    elf_load_info_t interp_info;
+    memset(&main_info, 0, sizeof(main_info));
+    memset(&interp_info, 0, sizeof(interp_info));
+    exec_reset_shared_user_space(thread_get_current_user(), 8u * 1024u * 1024u);
+    int r = elf_load_from_path_info(curpath, 0, &main_info, NULL);
     if (r == -2) {
-        /* unsupported ELF format (dynamic/PIE without relocations) */
+        /* unsupported ELF format */
         return -2;
     }
     if (r != 0) {
@@ -947,65 +1123,38 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
        The previous attempt to build a per-process PML4 was buggy and leaked page tables heavily.
        Once we have a real physical-page allocator, we can reintroduce isolated address spaces. */
 
-    /* Parse ELF headers again to construct a minimal auxv.
-       glibc static startup relies on AT_PHDR/AT_PHENT/AT_PHNUM/AT_ENTRY/AT_RANDOM. */
-    uint64_t aux_entry = entry;
-    uint64_t aux_phdr = 0;
-    uint64_t aux_phent = 0;
-    uint64_t aux_phnum = 0;
-    {
-        struct fs_file *f = fs_open(path);
-        if (f) {
-            Elf64_Ehdr eh;
-            ssize_t rr = fs_read(f, &eh, sizeof(eh), 0);
-            if (rr == (ssize_t)sizeof(eh) && elf_validate_header(&eh, sizeof(eh)) && eh.e_phnum > 0 && eh.e_phentsize == sizeof(Elf64_Phdr)) {
-                size_t phsz = (size_t)eh.e_phnum * (size_t)eh.e_phentsize;
-                size_t need = (size_t)eh.e_phoff + phsz;
-                if (need > 0 && need <= 65536) {
-                    uint8_t *phbuf = (uint8_t*)kmalloc(need);
-                    if (phbuf) {
-                        ssize_t rr2 = fs_read(f, phbuf, need, 0);
-                        if (rr2 == (ssize_t)need) {
-                            const Elf64_Ehdr *eh2 = (const Elf64_Ehdr*)phbuf;
-                            const Elf64_Phdr *ph = (const Elf64_Phdr*)(phbuf + eh2->e_phoff);
-                            aux_phent = (uint64_t)eh2->e_phentsize;
-                            aux_phnum = (uint64_t)eh2->e_phnum;
-                            aux_entry = (uint64_t)eh2->e_entry;
-                            /* Compute in-memory PHDR virtual address: find PT_LOAD that contains e_phoff..e_phoff+phsz */
-                            for (int i = 0; i < eh2->e_phnum; i++) {
-                                if (ph[i].p_type != 1) continue; /* PT_LOAD */
-                                uint64_t poff = ph[i].p_offset;
-                                uint64_t pend = ph[i].p_offset + ph[i].p_filesz;
-                                uint64_t want0 = eh2->e_phoff;
-                                uint64_t want1 = eh2->e_phoff + phsz;
-                                if (want0 >= poff && want1 <= pend) {
-                                    aux_phdr = ph[i].p_vaddr + (want0 - poff);
-                                    break;
-                                }
-                            }
-                        }
-                        kfree(phbuf);
-                    }
-                }
-            }
-            fs_file_free(f);
-        }
-    }
+    uint64_t entry = main_info.entry;
+    uintptr_t loaded_brk_end = (uintptr_t)main_info.brk_end;
+    uint64_t loaded_image_hi = main_info.loaded_hi;
+    uint64_t aux_entry = main_info.entry;
+    uint64_t aux_phdr = main_info.phdr;
+    uint64_t aux_phent = main_info.phent;
+    uint64_t aux_phnum = main_info.phnum;
+    uint64_t aux_base = 0;
 
-    /* If this ELF is ET_DYN (PIE) we loaded it at a fixed base; reflect that
-       in aux_phdr/aux_entry so libc startup code sees correct addresses. */
-    {
-        struct fs_file *f3 = fs_open(path);
-        if (f3) {
-            Elf64_Ehdr eh3;
-            ssize_t r3 = fs_read(f3, &eh3, sizeof(eh3), 0);
-            if (r3 == (ssize_t)sizeof(eh3) && eh3.e_type == 3) {
-                uint64_t dyn_base = elf_et_dyn_base();
-                aux_phdr += dyn_base;
-                aux_entry += dyn_base;
-            }
-            fs_file_free(f3);
+    if (main_info.has_interp) {
+        uint64_t interp_base = elf_interp_base();
+        uint64_t min_interp_base = main_info.loaded_hi + (uint64_t)PAGE_SIZE_2M - 1;
+        min_interp_base &= ~((uint64_t)PAGE_SIZE_2M - 1);
+        if (interp_base < min_interp_base)
+            interp_base = min_interp_base;
+        r = elf_load_from_path_info(main_info.interp_path, interp_base, &interp_info, NULL);
+        if (r != 0) {
+            qemu_debug_printf("execve: failed to load interpreter '%s' for '%s': %d\n",
+                              main_info.interp_path, path, r);
+            return r;
         }
+        entry = interp_info.entry;
+        aux_base = interp_info.load_base;
+        if (interp_info.brk_end > loaded_brk_end)
+            loaded_brk_end = (uintptr_t)interp_info.brk_end;
+        if (interp_info.loaded_hi > loaded_image_hi)
+            loaded_image_hi = interp_info.loaded_hi;
+        qemu_debug_printf("execve: dynamic '%s' interp='%s' entry=0x%llx AT_BASE=0x%llx main_entry=0x%llx\n",
+                          path, main_info.interp_path,
+                          (unsigned long long)entry,
+                          (unsigned long long)aux_base,
+                          (unsigned long long)aux_entry);
     }
 
     /* Determine which tid we are preparing the stack/TLS for.
@@ -1022,6 +1171,18 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
            The actual blocked thread is created later, after all fallible setup is done,
            to avoid leaking half-initialized threads on early execve failures. */
         planned_tid = (uint64_t)thread_get_count();
+    }
+
+    if (cur_user) {
+        uint64_t exec_tid = (uint64_t)(cur_user->tid ? cur_user->tid : 1);
+        user_vma_remove_all_for_tid(exec_tid);
+        exec_register_loaded_range_vma(exec_tid, &main_info);
+        if (aux_base != 0)
+            exec_register_loaded_range_vma(exec_tid, &interp_info);
+    } else {
+        /* The actual user thread is created later. Do not pin ELF VMAs to the
+           predicted tid; thread slots can be reused and thread_count is only a hint. */
+        user_vma_remove_all_for_tid(planned_tid);
     }
 
     /* Build argv strings and pointers in kernel, then copy into user stack area.
@@ -1044,9 +1205,9 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
               envp[0..], NULL
               auxv pairs (a_type,a_val) ending with AT_NULL
        Many libc start routines expect auxv to exist; without AT_NULL they may parse garbage. */
-    enum { AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_PAGESZ = 6, AT_ENTRY = 9,
-           AT_CLKTCK = 17, AT_RANDOM = 25, AT_NPROCESSORS_ONLN = 84 };
-    const size_t aux_pairs = 9; /* PHDR,PHENT,PHNUM,ENTRY,PAGESZ,RANDOM,NULL */
+    enum { AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5, AT_PAGESZ = 6, AT_BASE = 7, AT_ENTRY = 9,
+           AT_CLKTCK = 17, AT_RANDOM = 25 };
+    const size_t aux_pairs = 9; /* PHDR,PHENT,PHNUM,BASE,ENTRY,PAGESZ,RANDOM,CLKTCK,NULL */
     const size_t aux_qwords = aux_pairs * 2;
     /* pointer area: argv pointers + NULL + env pointers + NULL + auxv */
     size_t ptrs = (size_t)(argc + 1 + envc + 1) + aux_qwords;
@@ -1064,7 +1225,9 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     uintptr_t stack_top = user_stack_top_for_tid(planned_tid);
     stack_top &= ~((uintptr_t)0xFULL);
 
-    /* RSP ≡ 0 (mod 16) at process start; crt0 call chains keep 16-byte alignment in nested C functions. */
+    /* Linux process entry starts with RSP ≡ 0 (mod 16). The dynamic loader is an
+       entry point, not a normally-called function; giving it function-entry
+       alignment makes early SSE stores (movaps/movdqa) fault on unaligned locals. */
     uintptr_t final_stack = (stack_top - total) & ~((uintptr_t)0xFULL);
     uintptr_t ptrs_addr = final_stack + 8u;
     uintptr_t base = ptrs_addr;
@@ -1120,12 +1283,11 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     sp64[ax + 0] = (uint64_t)AT_PHDR;   sp64[ax + 1] = aux_phdr;
     sp64[ax + 2] = (uint64_t)AT_PHENT;  sp64[ax + 3] = aux_phent ? aux_phent : (uint64_t)sizeof(Elf64_Phdr);
     sp64[ax + 4] = (uint64_t)AT_PHNUM;  sp64[ax + 5] = aux_phnum;
-    sp64[ax + 6] = (uint64_t)AT_ENTRY;  sp64[ax + 7] = aux_entry;
-    sp64[ax + 8] = (uint64_t)AT_PAGESZ; sp64[ax + 9] = 4096ULL;
-    sp64[ax +10] = (uint64_t)AT_RANDOM; sp64[ax +11] = (uint64_t)random_addr;
-    sp64[ax +12] = (uint64_t)AT_CLKTCK; sp64[ax +13] = 100ULL;
-    sp64[ax +14] = (uint64_t)AT_NPROCESSORS_ONLN;
-    sp64[ax +15] = (uint64_t)(smp_cpu_count() > 0 ? smp_cpu_count() : 1);
+    sp64[ax + 6] = (uint64_t)AT_BASE;   sp64[ax + 7] = aux_base;
+    sp64[ax + 8] = (uint64_t)AT_ENTRY;  sp64[ax + 9] = aux_entry;
+    sp64[ax +10] = (uint64_t)AT_PAGESZ; sp64[ax +11] = 4096ULL;
+    sp64[ax +12] = (uint64_t)AT_RANDOM; sp64[ax +13] = (uint64_t)random_addr;
+    sp64[ax +14] = (uint64_t)AT_CLKTCK; sp64[ax +15] = 100ULL;
     sp64[ax +16] = (uint64_t)AT_NULL;   sp64[ax +17] = 0;
 
     /* write argc at final_stack (RSP will point here) */
@@ -1157,10 +1319,11 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
          zeroed specifics array starting at +0x80. This makes pthread_getspecific() return NULL
          instead of crashing, which is enough for glibc/busybox to continue bootstrap. */
     enum { MSR_FS_BASE_LOCAL = 0xC0000100u };
-    const uintptr_t tls_region_base = user_tls_base_for_stack_top(stack_top);
-    uintptr_t fs_base = tls_region_base + 0x1000u;      /* keep -0x78 and +0x28 in-range */
-    const uintptr_t pthread_fake = tls_region_base + 0x2000u; /* within first few pages */
-    {
+    uintptr_t fs_base = 0;
+    if (aux_base == 0) {
+        const uintptr_t tls_region_base = user_tls_base_for_stack_top(stack_top);
+        fs_base = tls_region_base + 0x1000u;      /* keep -0x78 and +0x28 in-range */
+        const uintptr_t pthread_fake = tls_region_base + 0x2000u; /* within first few pages */
         thread_t *tc = thread_current();
         if (elf_needs_private_user_pages(tc)) {
             mm_t *share = tc->mm_ptemplate ? tc->mm_ptemplate : mm_kernel();
@@ -1195,17 +1358,24 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
            Some early code uses pthread_getspecific(5) and expects a non-NULL pointer whose
            first byte can be compared to 'C'. Provide a minimal default "C" string. */
         {
-            const uintptr_t c_str = tls_region_base + 0x2800u;
-            if (c_str + 2 < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                *(volatile uint8_t*)(uintptr_t)(c_str + 0) = (uint8_t)'C';
-                *(volatile uint8_t*)(uintptr_t)(c_str + 1) = 0;
-                /* specifics array base is at +0x80 in glibc's struct pthread */
-                const uintptr_t specific5_slot = pthread_fake + 0x80u + (uintptr_t)(5u * 8u);
-                *(volatile uint64_t*)(uintptr_t)specific5_slot = (uint64_t)c_str;
+            const uintptr_t fake_locale = tls_region_base + 0x2800u;
+            if (fake_locale + 0x100u < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+                *(volatile uint8_t*)(uintptr_t)(fake_locale + 0) = (uint8_t)'C';
+                *(volatile uint8_t*)(uintptr_t)(fake_locale + 1) = 0;
+                /* Make early pthread_getspecific() callers get a valid object, not NULL.
+                   This avoids NULL+offset locale probes before full glibc TLS exists. */
+                for (uintptr_t key = 0; key < 32; key++) {
+                    const uintptr_t slot = pthread_fake + 0x80u + key * sizeof(uint64_t);
+                    *(volatile uint64_t*)(uintptr_t)slot = (uint64_t)fake_locale;
+                }
             }
         }
 
         msr_write_u64_local(MSR_FS_BASE_LOCAL, (uint64_t)fs_base);
+    } else {
+        /* Dynamic ELF enters the interpreter first. Let ld.so install the real
+           TLS/TCB with arch_prctl instead of exposing the static-glibc fake TCB. */
+        msr_write_u64_local(MSR_FS_BASE_LOCAL, 0);
     }
 
 
@@ -1240,11 +1410,8 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
             syscall_bind_kstack_for_thread(cur_user);
         }
         if (loaded_brk_end != 0) {
-            uintptr_t brk_base = loaded_brk_end;
-            if (brk_base < (8u * 1024u * 1024u)) brk_base = 8u * 1024u * 1024u;
-            brk_base = (brk_base + 4095u) & ~(uintptr_t)4095u;
-            cur_user->user_brk_base = brk_base;
-            cur_user->user_brk_cur = brk_base;
+            user_as_set_brk_after_load(cur_user, loaded_brk_end,
+                loaded_image_hi > 0 ? (uintptr_t)loaded_image_hi : 0);
         }
     } else {
         /* Spawn a scheduled user thread and block caller until it exits.
@@ -1253,6 +1420,16 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         extern void user_thread_entry(void);
         thread_t *ut = thread_create_blocked(user_thread_entry, path ? path : "user");
         if (!ut) return -1;
+        user_as_reset_on_exec(ut, loaded_brk_end ? loaded_brk_end : (8u * 1024u * 1024u));
+        {
+            uint64_t actual_tid = (uint64_t)(ut->tid ? ut->tid : 1);
+            user_vma_remove_all_for_tid(planned_tid);
+            if (actual_tid != planned_tid)
+                user_vma_remove_all_for_tid(actual_tid);
+            exec_register_loaded_range_vma(actual_tid, &main_info);
+            if (aux_base != 0)
+                exec_register_loaded_range_vma(actual_tid, &interp_info);
+        }
         if ((uint64_t)ut->tid != planned_tid) {
             qemu_debug_printf("execve: warning: planned tid=%llu, actual tid=%llu\n",
                               (unsigned long long)planned_tid,
@@ -1260,7 +1437,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
             /* Rebuild layout for actual tid to avoid per-thread region overlap. */
             if (exec_prepare_layout_for_tid((uint64_t)ut->tid,
                                             argv, envp,
-                                            aux_phdr, aux_phent, aux_phnum, aux_entry,
+                                            aux_phdr, aux_phent, aux_phnum, aux_entry, aux_base,
                                             &final_stack, &stack_top, &fs_base) != 0) {
                 ut->state = THREAD_TERMINATED;
                 return -3; /* transient exec setup race; caller may retry */
@@ -1273,11 +1450,8 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         ut->user_stack_limit = stack_top;
         ut->user_fs_base = (uint64_t)fs_base;
         if (loaded_brk_end != 0) {
-            uintptr_t brk_base = loaded_brk_end;
-            if (brk_base < (8u * 1024u * 1024u)) brk_base = 8u * 1024u * 1024u;
-            brk_base = (brk_base + 4095u) & ~(uintptr_t)4095u;
-            ut->user_brk_base = brk_base;
-            ut->user_brk_cur = brk_base;
+            user_as_set_brk_after_load(ut, loaded_brk_end,
+                loaded_image_hi > 0 ? (uintptr_t)loaded_image_hi : 0);
         }
         /* Mark PID 1 only for kernel-launched init candidates */
         if (strcmp(path, "/linuxrc") == 0 || strcmp(path, "/init") == 0 ||

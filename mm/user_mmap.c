@@ -19,7 +19,8 @@ extern void kprintf(const char *fmt, ...);
 
 static int user_mmap_watch(thread_t *t) {
     if (!t || !t->name[0]) return 0;
-    return (strstr(t->name, "wget") || strstr(t->name, "busybox") || strstr(t->name, "uget") ||
+    return (strstr(t->name, "linuxrc") || strstr(t->name, "busybox") ||
+            strstr(t->name, "wget") || strstr(t->name, "uget") ||
             strstr(t->name, "adduser") || strstr(t->name, "addgroup")) ? 1 : 0;
 }
 
@@ -30,6 +31,21 @@ enum {
     MAP_SHARED = 0x01,
     MAP_FIXED_NOREPLACE = 0x100000,
 };
+
+static int user_mmap_install_pages(uintptr_t addr, size_t len, uintptr_t top_limit) {
+    if ((uint64_t)addr + (uint64_t)len > (uint64_t)top_limit)
+        return -1;
+    uintptr_t map_begin = addr & ~((uintptr_t)PAGE_SIZE_2M - 1);
+    uintptr_t map_end = (uintptr_t)(((uint64_t)addr + (uint64_t)len + PAGE_SIZE_2M - 1) &
+                                    ~((uint64_t)PAGE_SIZE_2M - 1));
+    if (map_begin >= map_end || map_end > top_limit)
+        return -1;
+    for (uintptr_t va = map_begin; va < map_end; va += PAGE_SIZE_2M) {
+        if (map_page_2m(va, va, PG_PRESENT | PG_RW | PG_US) != 0)
+            return -1;
+    }
+    return 0;
+}
 
 uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
     uint64_t a4, uint64_t a5, uint64_t a6) {
@@ -87,17 +103,6 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
         return user_mm_ret_err(USER_MM_ENOMEM);
     }
 
-    if (user_mmap_watch(tcur)) {
-        kprintf("mmap-enter: pid=%s tid=%llu len=0x%016llx (~%lluMiB) USER_STACK_TOP=0x%016llx next=0x%016llx brk=0x%016llx floor=0x%016llx stk=[0x%016llx..0x%016llx] top=0x%016llx\n",
-            tcur->name, (unsigned long long)(tcur->tid ? tcur->tid : 1),
-            (unsigned long long)len_u64, (unsigned long long)(len_u64 >> 20),
-            (unsigned long long)(uint64_t)USER_STACK_TOP, (unsigned long long)*p_mmap_next,
-            (unsigned long long)brk_cur_for_mmap, (unsigned long long)brk_guard_floor,
-            (unsigned long long)(tcur ? tcur->user_stack_base : 0),
-            (unsigned long long)(tcur ? tcur->user_stack_limit : 0),
-            (unsigned long long)top_limit);
-    }
-
     if (*p_mmap_next == 0) {
         uintptr_t def = 32u * 1024u * 1024u;
         if (def >= top_limit && top_limit > (8u * 1024u * 1024u)) {
@@ -149,6 +154,17 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
         }
     }
     if (addr < brk_guard_floor) return user_mm_ret_err(USER_MM_EINVAL);
+    if ((uint64_t)addr + len_u64 < (uint64_t)addr)
+        return user_mm_ret_err(USER_MM_ENOMEM);
+    if (addr >= (uintptr_t)USER_TLS_BASE ||
+        (uint64_t)addr + len_u64 > (uint64_t)USER_TLS_BASE) {
+        kprintf("mmap: ENOMEM outside user mmap cap addr=0x%llx len=0x%llx cap=0x%llx fixed=%d\n",
+            (unsigned long long)addr,
+            (unsigned long long)len_u64,
+            (unsigned long long)(uint64_t)USER_TLS_BASE,
+            fixed_mapping);
+        return user_mm_ret_err(USER_MM_ENOMEM);
+    }
     if (!fixed_mapping && user_as_mmap_overlaps_kernel_heap(addr, len)) {
         const uintptr_t hgap = 0x10000u;
         uintptr_t hhi = heap_region_end_exclusive();
@@ -190,33 +206,19 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
         return user_mm_ret_err(USER_MM_ENOMEM);
     }
 
-    uintptr_t map_hwm = top_limit & ~((uintptr_t)PAGE_SIZE_2M - 1);
-    if (addr < 0x200000 || (uint64_t)addr + len_u64 > (uint64_t)USER_STACK_TOP) {
-        if (addr >= (uintptr_t)USER_TLS_BASE ||
-            (uint64_t)addr + len_u64 > (uint64_t)USER_TLS_BASE ||
-            user_as_mmap_overlaps_kernel_heap(addr, len))
+    uint64_t vtid = (uint64_t)(tcur ? (tcur->tid ? tcur->tid : 1) : 1);
+    if (fixed_mapping) {
+        if ((flags & MAP_FIXED_NOREPLACE) && user_vma_mmap_range_overlaps(tcur, addr, len))
             return user_mm_ret_err(USER_MM_ENOMEM);
-        if (user_map_mark_identity_2m((uint64_t)addr, (uint64_t)addr + len_u64) != 0)
-            return user_mm_ret_err(USER_MM_EFAULT);
-    } else if (tcur && tcur->user_stack_base != 0) {
-        uintptr_t map_begin = addr & ~((uintptr_t)PAGE_SIZE_2M - 1);
-        uintptr_t map_end = (uintptr_t)(((uint64_t)addr + len_u64 + PAGE_SIZE_2M - 1) & ~(PAGE_SIZE_2M - 1));
-        if (map_end > map_hwm) map_end = map_hwm;
-        if (map_begin >= map_end) return user_mm_ret_err(USER_MM_ENOMEM);
-        for (uintptr_t va = map_begin; va < map_end; va += PAGE_SIZE_2M) {
-            if (map_page_2m(va, va, PG_PRESENT | PG_RW | PG_US) != 0)
-                return user_mm_ret_err(USER_MM_EFAULT);
-        }
-    } else if (addr >= 0x200000 && (uint64_t)addr + len_u64 <= (uint64_t)USER_STACK_TOP) {
-        uintptr_t map_begin = addr & ~((uintptr_t)PAGE_SIZE_2M - 1);
-        uintptr_t map_end = (uintptr_t)(((uint64_t)addr + len_u64 + PAGE_SIZE_2M - 1) & ~(PAGE_SIZE_2M - 1));
-        if (map_end > map_hwm) map_end = map_hwm;
-        if (map_begin >= map_end) return user_mm_ret_err(USER_MM_ENOMEM);
-        for (uintptr_t va = map_begin; va < map_end; va += PAGE_SIZE_2M) {
-            if (map_page_2m(va, va, PG_PRESENT | PG_RW | PG_US) != 0)
-                return user_mm_ret_err(USER_MM_EFAULT);
-        }
+        user_vma_unmap_range(vtid, addr, len);
     }
+
+    if (addr < 0x200000 ||
+        user_as_mmap_overlaps_kernel_heap(addr, len)) {
+        return user_mm_ret_err(USER_MM_ENOMEM);
+    }
+    if (user_mmap_install_pages(addr, len, top_limit) != 0)
+        return user_mm_ret_err(USER_MM_EFAULT);
 
     int mmap_vma_kind = USER_VMA_KIND_MMAP;
     if (flags & MAP_ANONYMOUS) {
@@ -235,12 +237,13 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
         int fd = (int)(int64_t)a5;
         off_t file_off = (off_t)(int64_t)a6;
         if (fd < 0 || fd >= THREAD_MAX_FD) return user_mm_ret_err(USER_MM_EBADF);
-        struct fs_file *f = cur->fds[fd];
+        struct fs_file *f = tcur ? tcur->fds[fd] : cur->fds[fd];
+        if (!f) f = cur->fds[fd];
         if (!f) return user_mm_ret_err(USER_MM_EBADF);
         if (f->type != FS_TYPE_REG) return user_mm_ret_err(USER_MM_EBADF);
+        if (file_off < 0) return user_mm_ret_err(USER_MM_EINVAL);
         if (fbdev_is_fb0_file(f)) {
             if (!fbdev_is_active()) return user_mm_ret_err(USER_MM_ENODEV);
-            if (file_off < 0) return user_mm_ret_err(USER_MM_EINVAL);
             size_t fo = (size_t)file_off;
             if (fo > f->size) return user_mm_ret_err(USER_MM_EINVAL);
             size_t maxl = f->size - fo;
@@ -248,16 +251,57 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
             if (maplen > 0 && fbdev_mmap_user(addr, maplen, fo) != 0)
                 return user_mm_ret_err(USER_MM_EFAULT);
         } else {
-            user_as_mmap_memset_zero_chunked(addr, len);
+            if (f->size == 0) {
+                klogprintf("mmap: empty file fd=%d addr=0x%llx path=%s\n",
+                    fd, (unsigned long long)addr, f->path ? f->path : "(null)");
+                return user_mm_ret_err(USER_MM_EINVAL);
+            }
+            size_t pg_off = (size_t)((uint64_t)file_off & ~4095ULL);
+            uintptr_t inpage = (uintptr_t)((uint64_t)file_off - (uint64_t)pg_off);
+            uintptr_t map_lo = addr - inpage;
             size_t file_avail = 0;
-            if ((size_t)file_off < f->size) file_avail = f->size - (size_t)file_off;
-            size_t to_read = len < file_avail ? len : file_avail;
-            if (to_read > 0)
-                (void)fs_read(f, (void *)addr, to_read, (size_t)file_off);
+            if (pg_off < f->size) file_avail = f->size - pg_off;
+            size_t want = inpage + len;
+            size_t to_read = want < file_avail ? want : file_avail;
+            if (to_read > 0) {
+                ssize_t nr = fs_read(f, (void *)map_lo, to_read, pg_off);
+                if (nr != (ssize_t)to_read) {
+                    klogprintf("mmap: fs_read fail fd=%d map=0x%llx off=0x%zx want=0x%zx got=%zd path=%s\n",
+                        fd, (unsigned long long)map_lo, pg_off, to_read, (long long)nr,
+                        f->path ? f->path : "(null)");
+                    return user_mm_ret_err(USER_MM_EFAULT);
+                }
+            } else if ((size_t)file_off < f->size) {
+                klogprintf("mmap: no bytes read fd=%d addr=0x%llx off=0x%llx len=0x%zx size=%zu path=%s\n",
+                    fd, (unsigned long long)addr, (unsigned long long)(uint64_t)file_off, len,
+                    (size_t)f->size, f->path ? f->path : "(null)");
+                return user_mm_ret_err(USER_MM_EFAULT);
+            }
+            {
+                uintptr_t map_end = addr + len;
+                uintptr_t zlo = map_lo + to_read;
+                if (map_end > zlo)
+                    user_as_mmap_memset_zero_chunked(zlo, (size_t)(map_end - zlo));
+            }
+            if (fixed_mapping && pg_off == 0 && to_read >= 4) {
+                const unsigned char *eh = (const unsigned char *)(uintptr_t)map_lo;
+                if (eh[0] != 0x7f || eh[1] != 'E' || eh[2] != 'L' || eh[3] != 'F') {
+                    klogprintf("mmap: missing ELF magic map=0x%llx path=%s\n",
+                        (unsigned long long)map_lo, f->path ? f->path : "(null)");
+                    return user_mm_ret_err(USER_MM_EFAULT);
+                }
+            }
+            if (user_mmap_watch(tcur) && fixed_mapping) {
+                const unsigned char *p = (const unsigned char *)(uintptr_t)addr;
+                klogprintf("mmap-fixed: addr=0x%llx len=0x%zx off=0x%llx map=0x%llx read=0x%zx path=%s b0=%02x%02x%02x%02x\n",
+                    (unsigned long long)addr, len, (unsigned long long)(uint64_t)file_off,
+                    (unsigned long long)map_lo, to_read, f->path ? f->path : "(null)",
+                    to_read >= 4 ? p[0] : 0, to_read >= 4 ? p[1] : 0,
+                    to_read >= 4 ? p[2] : 0, to_read >= 4 ? p[3] : 0);
+            }
         }
     }
 
-    uint64_t vtid = (uint64_t)(tcur ? (tcur->tid ? tcur->tid : 1) : 1);
     if (!fixed_mapping && user_vma_mmap_range_overlaps(tcur, addr, len)) {
         kprintf("mmap: ENOMEM overlap addr=0x%llx len=0x%llx\n",
             (unsigned long long)addr, (unsigned long long)len_u64);
@@ -271,8 +315,6 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
         return user_mm_ret_err(USER_MM_ENOMEM);
     if (!fixed_mapping)
         *p_mmap_next = (uintptr_t)sum_next;
-    else if ((uint64_t)*p_mmap_next < sum_next)
-        *p_mmap_next = (uintptr_t)sum_next;
 
     uint64_t he64 = (uint64_t)addr + len_u64;
     if (tcur) {
@@ -282,12 +324,6 @@ uint64_t user_syscall_mmap(thread_t *cur, uint64_t a1, uint64_t a2, uint64_t a3,
         user_as_mmap_hi = (uintptr_t)he64;
     }
 
-    if (user_mmap_watch(tcur)) {
-        kprintf("mmap: pid=%s tid=%llu addr=0x%016llx len=0x%016llx end=0x%016llx next=0x%016llx top=0x%016llx\n",
-            tcur->name, (unsigned long long)(tcur->tid ? tcur->tid : 1),
-            (unsigned long long)addr, (unsigned long long)len_u64, (unsigned long long)he64,
-            (unsigned long long)*p_mmap_next, (unsigned long long)top_limit);
-    }
     if (!user_mm_range_fits(addr, len_u64, top_limit))
         return user_mm_ret_err(USER_MM_ENOMEM);
     if (user_as_mmap_overlaps_kernel_heap(addr, len))
@@ -344,13 +380,14 @@ uint64_t user_syscall_mprotect(uint64_t a1, uint64_t a2, uint64_t a3) {
     if (!tcur) tcur = thread_current();
     uint64_t tid = (uint64_t)(tcur ? (tcur->tid ? tcur->tid : 1) : 1);
     if (!user_vma_is_fully_mapped(tid, addr, len)) {
+        if (user_map_ensure_present_us_2m((uint64_t)addr, (uint64_t)addr + len) != 0)
+            return user_mm_ret_err(USER_MM_EFAULT);
         user_vma_unmap_range(tid, addr, len);
         if (user_vma_add(tid, addr, len, prot & 7, USER_VMA_KIND_MMAP) != 0)
-            return 0;
-        return 0;
-    }
-    if (user_vma_set_prot(tid, addr, len, prot & 7) != 0)
+            return user_mm_ret_err(USER_MM_ENOSPC);
+    } else if (user_vma_set_prot(tid, addr, len, prot & 7) != 0) {
         return user_mm_ret_err(USER_MM_ENOSPC);
+    }
     if (user_map_mprotect_range((uint64_t)addr, (uint64_t)addr + len, prot & 7) != 0)
         return user_mm_ret_err(USER_MM_EFAULT);
     return 0;

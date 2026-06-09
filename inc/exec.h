@@ -26,6 +26,9 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
 /* ET_DYN (PIE) load base: 2MiB-aligned above kernel _end (grows with BSS e.g. kstack pool). */
 uint64_t elf_et_dyn_base(void);
 
+/* Default ET_DYN interpreter base. The exec path may move it upward to avoid the main image. */
+uint64_t elf_interp_base(void);
+
 /* Ensure user mappings (PG_US) for low memory and GOT region before entering user mode.
    Must be called from user_thread_entry for init path (elf exec path may skip it). */
 void exec_ensure_user_mappings(void);

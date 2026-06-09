@@ -1,6 +1,7 @@
 #include <user_vma.h>
 #include <user_as.h>
 #include <user_mm.h>
+#include <user_map.h>
 #include <exec.h>
 #include <mm.h>
 #include <mmio.h>
@@ -11,6 +12,12 @@
 
 static user_vma_t g_user_vmas[USER_VMA_MAX];
 static spinlock_t g_user_vma_lock;
+
+static int user_vma_kind_is_mmap_like(int kind) {
+    return kind == USER_VMA_KIND_MMAP ||
+           kind == USER_VMA_KIND_MMAP_LAZY ||
+           kind == USER_VMA_KIND_ELF_LOAD;
+}
 
 static user_vma_t *user_vma_find_containing_nolock(uint64_t tid, uintptr_t va) {
     for (int i = 0; i < USER_VMA_MAX; i++) {
@@ -140,8 +147,7 @@ uintptr_t user_vma_max_mmap_like_end_nolock(uint64_t tid) {
     uintptr_t mx = 0;
     for (int i = 0; i < USER_VMA_MAX; i++) {
         if (!g_user_vmas[i].used || g_user_vmas[i].tid != tid) continue;
-        int k = g_user_vmas[i].kind;
-        if (k != USER_VMA_KIND_MMAP && k != USER_VMA_KIND_MMAP_LAZY) continue;
+        if (!user_vma_kind_is_mmap_like(g_user_vmas[i].kind)) continue;
         uintptr_t e = g_user_vmas[i].addr + g_user_vmas[i].len;
         if (e > mx) mx = e;
     }
@@ -162,8 +168,7 @@ uintptr_t user_vma_max_mmap_like_end_for_mm_nolock(thread_t *runner) {
     if (!runner) return 0;
     for (int i = 0; i < USER_VMA_MAX; i++) {
         if (!g_user_vmas[i].used) continue;
-        int k = g_user_vmas[i].kind;
-        if (k != USER_VMA_KIND_MMAP && k != USER_VMA_KIND_MMAP_LAZY) continue;
+        if (!user_vma_kind_is_mmap_like(g_user_vmas[i].kind)) continue;
         if (!user_vma_tid_matches_runner_mm_nolock(runner, (uint64_t)g_user_vmas[i].tid))
             continue;
         uintptr_t e = g_user_vmas[i].addr + g_user_vmas[i].len;
@@ -185,8 +190,7 @@ uintptr_t user_vma_min_mmap_like_for_thread_nolock(thread_t *tcur, uintptr_t brk
     uintptr_t best = (uintptr_t)-1;
     for (int i = 0; i < USER_VMA_MAX; i++) {
         if (!g_user_vmas[i].used) continue;
-        int k = g_user_vmas[i].kind;
-        if (k != USER_VMA_KIND_MMAP && k != USER_VMA_KIND_MMAP_LAZY) continue;
+        if (!user_vma_kind_is_mmap_like(g_user_vmas[i].kind)) continue;
         if (!user_vma_tid_matches_runner_mm_nolock(tcur, (uint64_t)g_user_vmas[i].tid)) continue;
         uintptr_t a = g_user_vmas[i].addr;
         if (a < 0x200000u) continue;
@@ -204,6 +208,30 @@ uintptr_t user_vma_min_mmap_like_for_thread(thread_t *tcur, uintptr_t brk_base) 
     return v;
 }
 
+int user_vma_overlaps_thread_range(thread_t *runner, uintptr_t addr, size_t len) {
+    if (len == 0 || !runner) return 0;
+    unsigned long fl = 0;
+    int rc = 0;
+    uint64_t a0 = (uint64_t)addr;
+    uint64_t a1 = a0 + (uint64_t)len;
+    if (a1 < a0) return 1;
+    acquire_irqsave(&g_user_vma_lock, &fl);
+    for (int i = 0; i < USER_VMA_MAX; i++) {
+        if (!g_user_vmas[i].used) continue;
+        if (!user_vma_tid_matches_runner_mm_nolock(runner, (uint64_t)g_user_vmas[i].tid))
+            continue;
+        uint64_t b0 = (uint64_t)g_user_vmas[i].addr;
+        uint64_t b1 = b0 + (uint64_t)g_user_vmas[i].len;
+        if (b1 < b0) continue;
+        if (!(a1 <= b0 || a0 >= b1)) {
+            rc = 1;
+            break;
+        }
+    }
+    release_irqrestore(&g_user_vma_lock, fl);
+    return rc;
+}
+
 int user_vma_mmap_range_overlaps_nolock(thread_t *runner, uintptr_t addr, size_t len) {
     if (len == 0 || !runner) return 0;
     uint64_t a0 = (uint64_t)addr;
@@ -211,8 +239,7 @@ int user_vma_mmap_range_overlaps_nolock(thread_t *runner, uintptr_t addr, size_t
     if (a1 < a0) return 1;
     for (int i = 0; i < USER_VMA_MAX; i++) {
         if (!g_user_vmas[i].used) continue;
-        int k = g_user_vmas[i].kind;
-        if (k != USER_VMA_KIND_MMAP && k != USER_VMA_KIND_MMAP_LAZY) continue;
+        if (!user_vma_kind_is_mmap_like(g_user_vmas[i].kind)) continue;
         if (!user_vma_tid_matches_runner_mm_nolock(runner, (uint64_t)g_user_vmas[i].tid))
             continue;
         uint64_t b0 = (uint64_t)g_user_vmas[i].addr;
@@ -237,6 +264,24 @@ void user_vma_remove_all_for_tid(uint64_t tid) {
     acquire_irqsave(&g_user_vma_lock, &fl);
     for (int i = 0; i < USER_VMA_MAX; i++) {
         if (g_user_vmas[i].used && g_user_vmas[i].tid == tid) g_user_vmas[i].used = 0;
+    }
+    release_irqrestore(&g_user_vma_lock, fl);
+}
+
+void user_vma_teardown_unmap_for_exec(thread_t *runner) {
+    unsigned long fl = 0;
+    acquire_irqsave(&g_user_vma_lock, &fl);
+    for (int i = 0; i < USER_VMA_MAX; i++) {
+        if (!g_user_vmas[i].used) continue;
+        if (runner && !user_vma_tid_matches_runner_mm_nolock(runner, (uint64_t)g_user_vmas[i].tid))
+            continue;
+        uintptr_t a = g_user_vmas[i].addr;
+        uintptr_t e = a + g_user_vmas[i].len;
+        if (e > a && a >= 0x200000u && e <= (uintptr_t)MMIO_IDENTITY_LIMIT) {
+            (void)user_map_ensure_present_us_2m((uint64_t)a, (uint64_t)e);
+            user_as_mmap_memset_zero_chunked(a, (size_t)(e - a));
+        }
+        g_user_vmas[i].used = 0;
     }
     release_irqrestore(&g_user_vma_lock, fl);
 }
@@ -345,7 +390,66 @@ int user_vma_fault_lazy_anon(uint64_t cr2) {
     return 1;
 }
 
+int user_vma_fault_nonpresent(uint64_t cr2, uint64_t err) {
+    if (cr2 < 0x200000ULL || cr2 >= (uint64_t)MMIO_IDENTITY_LIMIT)
+        return 0;
+    thread_t *t = thread_current();
+    if (!t || t->ring != 3) {
+        t = thread_get_current_user();
+        if (!t) return 0;
+    }
+
+    unsigned long fl = 0;
+    uintptr_t va2m = (uintptr_t)(cr2 & ~(uint64_t)(PAGE_SIZE_2M - 1));
+    user_vma_t hit_copy;
+    int found = 0;
+    acquire_irqsave(&g_user_vma_lock, &fl);
+    for (int i = 0; i < USER_VMA_MAX; i++) {
+        if (!g_user_vmas[i].used) continue;
+        if (!user_vma_tid_matches_runner_mm_nolock(t, (uint64_t)g_user_vmas[i].tid)) continue;
+        uint64_t a64 = (uint64_t)g_user_vmas[i].addr;
+        uint64_t end64 = a64 + (uint64_t)g_user_vmas[i].len;
+        if (end64 < a64) continue;
+        if ((uint64_t)cr2 >= a64 && (uint64_t)cr2 < end64) {
+            hit_copy = g_user_vmas[i];
+            found = 1;
+            break;
+        }
+    }
+    release_irqrestore(&g_user_vma_lock, fl);
+    if (!found) return 0;
+
+    int is_write = (err & 2u) != 0;
+    int is_exec = (err & 16u) != 0;
+    if (hit_copy.prot == 0) return 0;
+    if (is_write && !(hit_copy.prot & 2)) return 0;
+    if (is_exec && !(hit_copy.prot & 4) && hit_copy.kind != USER_VMA_KIND_ELF_LOAD) return 0;
+
+    if (err & 1u) {
+        if (user_map_mark_identity_2m((uint64_t)va2m, (uint64_t)(va2m + PAGE_SIZE_2M)) != 0)
+            return 0;
+    } else {
+        if (map_page_2m((uint64_t)va2m, (uint64_t)va2m, PG_PRESENT | PG_RW | PG_US) != 0)
+            return 0;
+    }
+    if (hit_copy.kind == USER_VMA_KIND_MMAP_LAZY) {
+        uint64_t hit_end = (uint64_t)hit_copy.addr + (uint64_t)hit_copy.len;
+        uint64_t chunk_end = (uint64_t)va2m + (uint64_t)PAGE_SIZE_2M;
+        size_t zlen = (size_t)PAGE_SIZE_2M;
+        if (chunk_end > hit_end) {
+            if (hit_end <= (uint64_t)va2m) return 1;
+            zlen = (size_t)(hit_end - (uint64_t)va2m);
+        }
+        memset((void *)(uintptr_t)va2m, 0, zlen);
+    }
+    return 1;
+}
+
 /* axonos.h / idt.c */
 int fault_try_mmap_lazy_anon(uint64_t cr2) {
     return user_vma_fault_lazy_anon(cr2);
+}
+
+int fault_try_user_vma_nonpresent(uint64_t cr2, uint64_t err) {
+    return user_vma_fault_nonpresent(cr2, err);
 }

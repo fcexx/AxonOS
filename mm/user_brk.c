@@ -10,6 +10,7 @@
 #include <string.h>
 #include <thread.h>
 #include <axonos.h>
+#include <klog.h>
 
 extern void kprintf(const char *fmt, ...);
 
@@ -22,7 +23,7 @@ static int user_brk_watch(thread_t *t) {
 void syscall_set_user_brk(uintptr_t base) {
     thread_t *tcur = thread_get_current_user();
     if (!tcur) tcur = thread_current();
-    user_as_reset_on_exec(tcur, base);
+    user_as_set_brk_after_load(tcur, base, 0);
 }
 
 int fault_try_grow_user_heap(uint64_t cr2) {
@@ -132,6 +133,12 @@ uint64_t user_syscall_brk(uint64_t req) {
             return (uint64_t)(*p_cur);
         if (user_as_mmap_overlaps_kernel_heap((uintptr_t)(*p_cur), (uintptr_t)(req - *p_cur)))
             return (uint64_t)(*p_cur);
+        if (tcur && user_vma_overlaps_thread_range(tcur, (uintptr_t)(*p_cur),
+                (uintptr_t)(req - *p_cur))) {
+            klogprintf("brk: refuse extend 0x%llx..0x%llx overlaps mapped VMA\n",
+                (unsigned long long)(*p_cur), (unsigned long long)req);
+            return (uint64_t)(*p_cur);
+        }
         user_as_mmap_memset_zero_chunked((uintptr_t)(*p_cur), (size_t)(req - *p_cur));
     }
     *p_cur = (uintptr_t)req;

@@ -249,15 +249,18 @@ static int apply_exec_trampoline(thread_t *t) {
     uintptr_t base = (uintptr_t)t->saved_syscall_frame;
     uintptr_t rcx_slot = base + 13u * sizeof(uint64_t); /* frame[13] saved rcx (user RIP) */
     uintptr_t rax_slot = base + 14u * sizeof(uint64_t); /* frame[14] saved rax */
+    uintptr_t rsp_slot = base + 15u * sizeof(uint64_t); /* frame[15] saved user RSP */
 
     /* safety: ensure writing within identity map */
     if (rcx_slot + 8 > (uintptr_t)MMIO_IDENTITY_LIMIT) return -1;
     if (rax_slot + 8 > (uintptr_t)MMIO_IDENTITY_LIMIT) return -1;
+    if (rsp_slot + 8 > (uintptr_t)MMIO_IDENTITY_LIMIT) return -1;
 
     /* Write the desired return RIP into saved rcx slot so iret will use it */
     *(uint64_t*)(uintptr_t)rcx_slot = (uint64_t)t->exec_trampoline_rip;
 
-    /* Set global saved user rsp so assembly builds IRET frame with this RSP */
+    /* syscall_entry64 returns through the saved frame, not the legacy global. */
+    *(uint64_t*)(uintptr_t)rsp_slot = (uint64_t)t->exec_trampoline_rsp;
     syscall_user_rsp_saved = t->exec_trampoline_rsp;
 
     /* Also set saved rax so final popped rax becomes our chosen value */
@@ -4945,7 +4948,8 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
     /* record last syscall for debug logging of ENOSYS */
     last_syscall_debug = num;
 
-    //if (num != 1) kprintf("syscall: num=%llu\n", (unsigned long long)num);
+    // Uncomment if there is some syscall issue
+    /*if (num != 1) kprintf("syscall: num=%llu\n", (unsigned long long)num);*/
 
     switch (num) {
         case SYS_clone: {
@@ -11035,11 +11039,10 @@ static uint64_t syscall_do_inner(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                    Keep the guard stable by copying old fs:0x28 into new TLS fs:0x28. */
                 uint64_t old_fs = msr_read_u64(MSR_FS_BASE);
                 uint64_t old_guard = 0;
-                if (old_fs + 0x30 < (uint64_t)MMIO_IDENTITY_LIMIT) {
+                if (old_fs >= 0x200000ULL && old_fs + 0x30 < (uint64_t)MMIO_IDENTITY_LIMIT) {
                     (void)copy_from_user_raw(&old_guard, (const void *)(uintptr_t)(old_fs + 0x28), sizeof(old_guard));
-                } else if (0x30 < (uint64_t)MMIO_IDENTITY_LIMIT) {
-                    /* common boot case: old_fs==0 */
-                    (void)copy_from_user_raw(&old_guard, (const void *)(uintptr_t)0x28, sizeof(old_guard));
+                } else {
+                    old_guard = 0x8b13f00d2a11c000ULL;
                 }
 
                 cur->user_fs_base = addr;

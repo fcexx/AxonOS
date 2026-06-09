@@ -26,3 +26,7 @@ void user_as_mmap_memset_zero_chunked(uintptr_t addr, size_t len);
 void user_as_mmap_lazy_drop_present_pages(uintptr_t addr, size_t len);
 
 void user_as_reset_on_exec(thread_t *tcur, uintptr_t brk_base);
+/* Set program break after ELF load; zero [image_hi,brk) so glibc heap metadata is clean. */
+void user_as_set_brk_after_load(thread_t *tcur, uintptr_t elf_brk, uintptr_t image_hi);
+/* Tear down prior mmap/brk/ELF mappings before loading a new program (Linux execve). */
+void user_as_teardown_for_exec(thread_t *tcur, uintptr_t new_brk_base);

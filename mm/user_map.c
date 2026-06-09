@@ -53,6 +53,9 @@ int user_map_mprotect_range(uint64_t va_begin, uint64_t va_end, int prot) {
     if (va_end < va_begin) return -1;
     if (va_begin >= (uint64_t)MMIO_IDENTITY_LIMIT) return -1;
     if (va_end > (uint64_t)MMIO_IDENTITY_LIMIT) va_end = (uint64_t)MMIO_IDENTITY_LIMIT;
+    uint64_t prot_begin = va_begin & ~0xFFFULL;
+    uint64_t prot_end = (va_end + 0xFFFULL) & ~0xFFFULL;
+    if (prot_end > (uint64_t)MMIO_IDENTITY_LIMIT) prot_end = (uint64_t)MMIO_IDENTITY_LIMIT;
     uint64_t begin = va_begin & ~((uint64_t)(PAGE_SIZE_2M - 1));
     uint64_t end = (va_end + PAGE_SIZE_2M - 1) & ~((uint64_t)(PAGE_SIZE_2M - 1));
     if (end > (uint64_t)MMIO_IDENTITY_LIMIT) end = (uint64_t)MMIO_IDENTITY_LIMIT;
@@ -80,13 +83,24 @@ int user_map_mprotect_range(uint64_t va_begin, uint64_t va_end, int prot) {
         if (!(l2[l2i] & PG_PRESENT)) return -1;
         uint64_t l2e = l2[l2i];
         if (l2e & PG_PS_2M) {
+            if (prot_begin > va || prot_end < va + PAGE_SIZE_2M) {
+                /* We cannot express sub-2MiB permissions on a large page without
+                 * splitting it. Return success for ld.so RELRO-style mprotects,
+                 * but do not accidentally NX the neighbouring executable text. */
+                invlpg((void *)(uintptr_t)va);
+                continue;
+            }
             uint64_t pa = l2e & ~(PAGE_SIZE_2M - 1) & ~0xFFFULL;
             l2[l2i] = pa | new_flags;
         } else {
             uint64_t *l1 = (uint64_t *)(uintptr_t)(l2e & ~0xFFFULL);
-            for (uint64_t v = va; v < va + PAGE_SIZE_2M && v < (uint64_t)MMIO_IDENTITY_LIMIT; v += 0x1000ULL) {
+            uint64_t chunk_lo = va;
+            uint64_t chunk_hi = va + PAGE_SIZE_2M;
+            if (chunk_lo < prot_begin) chunk_lo = prot_begin;
+            if (chunk_hi > prot_end) chunk_hi = prot_end;
+            for (uint64_t v = chunk_lo; v < chunk_hi && v < (uint64_t)MMIO_IDENTITY_LIMIT; v += 0x1000ULL) {
                 uint64_t l1i = (v >> 12) & 0x1FF;
-                uint64_t pa = l1[l1i] & ~0xFFFULL;
+                uint64_t pa = (l1[l1i] & PG_PRESENT) ? (l1[l1i] & ~0xFFFULL) : (v & ~0xFFFULL);
                 uint64_t f = new_flags & ~PG_PS_2M;
                 l1[l1i] = pa | f;
                 invlpg((void *)(uintptr_t)v);
@@ -148,9 +162,16 @@ int user_map_mark_identity_2m(uint64_t va_begin, uint64_t va_end) {
             continue;
         }
         uint64_t *l1 = (uint64_t *)(uintptr_t)(l2e & ~0xFFFULL);
-        l1[(va >> 12) & 0x1FF] |= PG_US | PG_RW;
-        l1[(va >> 12) & 0x1FF] &= ~PG_NX;
-        invlpg((void *)(uintptr_t)va);
+        uint64_t chunk_end = va + PAGE_SIZE_2M;
+        if (chunk_end > end) chunk_end = end;
+        for (uint64_t p = va; p < chunk_end; p += PAGE_SIZE_4K) {
+            uint64_t idx = (p >> 12) & 0x1FF;
+            if (l1[idx] & PG_PRESENT) {
+                l1[idx] |= PG_US | PG_RW;
+                l1[idx] &= ~PG_NX;
+            }
+            invlpg((void *)(uintptr_t)p);
+        }
     }
     return 0;
 }
