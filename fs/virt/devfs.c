@@ -49,6 +49,17 @@ static int devfs_unlink(const char *path) {
     return -3; /* ENOENT */
 }
 
+static int devfs_chmod(const char *path, mode_t mode) {
+    (void)mode;
+    if (!path) return -1;
+    struct fs_file *f = NULL;
+    if (devfs_open(path, &f) == 0 && f) {
+        devfs_release(f);
+        return 0;
+    }
+    return -1;
+}
+
 static inline uint32_t devfs_tty_cols(void) {
     int c = console_max_cols();
     if (c <= 0) c = MAX_COLS;
@@ -807,7 +818,7 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                 nm = "console";
             } else if (i <= DEVFS_TTY_COUNT) {
                 tmpn[0] = 't'; tmpn[1] = 't'; tmpn[2] = 'y';
-                tmpn[3] = '0' + (char)(i-1);
+                tmpn[3] = '0' + (char)i;
                 tmpn[4] = '\0';
                 nm = tmpn;
             } else if (i <= DEVFS_TTY_COUNT + devfs_special_count) {
@@ -899,10 +910,11 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
     while (got < size) {
         unsigned long flags = 0;
         acquire_irqsave(&t->in_lock, &flags);
+        int is_canonical = (t->term_lflag & 0x00000002u) ? 1 : 0; /* ICANON bit (kernel mapping) */
+        uint8_t vtime = t->term_vtime;
         if (t->in_count > 0) {
             /* pop one */
             /* Decide mode: canonical vs non-canonical */
-            int is_canonical = (t->term_lflag & 0x00000002u) ? 1 : 0; /* ICANON bit (kernel mapping) */
             if (is_canonical) {
                 /* canonical: deliver one char, stop on newline */
                 char c = t->inbuf[t->in_head];
@@ -928,6 +940,10 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
         /* no data: block current thread until pushed */
         thread_t* cur = thread_current();
         if (cur) {
+            if (!is_canonical && t->term_vmin == 0 && vtime == 0) {
+                release_irqrestore(&t->in_lock, flags);
+                return (ssize_t)got;
+            }
             /* If current is main kernel thread (tid 0), fall back to direct blocking kgetc */
             if (cur->tid == 0) {
                 release_irqrestore(&t->in_lock, flags);
@@ -946,7 +962,10 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                 t->waiters[t->waiters_count++] = tid;
             }
             release_irqrestore(&t->in_lock, flags);
-            thread_block((int)cur->tid);
+            if (!is_canonical && vtime > 0 && got == 0)
+                thread_block_with_timeout((int)cur->tid, (uint32_t)vtime * 100u);
+            else
+                thread_block((int)cur->tid);
             thread_yield();
             /* Woke: if still no data but have pending SIGINT (Ctrl+C), return EINTR
                so read() returns and maybe_deliver_pending_signal can terminate the process. */
@@ -956,6 +975,10 @@ static ssize_t devfs_read(struct fs_file *file, void *buf, size_t size, size_t o
                 if (me && (me->pending_signals & (1ULL << 1))) { /* SIGINT=2, bit 1 */
                     release_irqrestore(&t->in_lock, flags);
                     return got > 0 ? (ssize_t)got : (ssize_t)-4; /* -EINTR */
+                }
+                if (!is_canonical && vtime > 0) {
+                    release_irqrestore(&t->in_lock, flags);
+                    return (ssize_t)got;
                 }
             }
             release_irqrestore(&t->in_lock, flags);
@@ -1415,43 +1438,36 @@ static ssize_t devfs_write(struct fs_file *file, const void *buf, size_t size, s
                         }
                     } else if (final_byte == 'K') {
                         /* Erase in line: 0=from cursor to EOL, 1=BOL to cursor, 2=whole line.
-                         * For active tty: clear on VGA so sh (and other apps) can redraw the line. */
+                         * EL never moves the cursor; ncurses relies on this when repainting rows. */
                         int param = (tty->ansi_param_count > 0) ? tty->ansi_param[0] : 0;
-                        if (tty_on_vga) {
-                            uint32_t cy = tty->cursor_y;
-                            uint32_t tty_cols = devfs_tty_cols();
+                        uint32_t saved_x = tty->cursor_x;
+                        uint32_t saved_y = tty->cursor_y;
+                        uint32_t cy = tty->cursor_y;
+                        uint32_t tty_cols = devfs_tty_cols();
+                        if (tty_cols > 0) {
                             uint32_t x0 = 0, x1 = tty_cols - 1;
-                            if (param == 0) {
+                            if (param == 0)
                                 x0 = tty->cursor_x;
-                            } else if (param == 1) {
+                            else if (param == 1)
                                 x1 = tty->cursor_x;
-                                tty->cursor_x = 0;
-                            } else {
-                                /* param == 2 or default: whole line */
-                                tty->cursor_x = 0;
-                            }
-                            console_clear_line_segment(x0, x1, cy, tty->current_attr);
-                            console_set_cursor(tty->cursor_x, tty->cursor_y);
-                        } else {
-                            uint32_t cy = tty->cursor_y;
-                            uint32_t tty_cols = devfs_tty_cols();
-                            uint32_t x0 = 0, x1 = (tty_cols > 0) ? tty_cols - 1 : 0;
-                            if (param == 0) {
-                                x0 = tty->cursor_x;
-                            } else if (param == 1) {
-                                x1 = tty->cursor_x;
-                                tty->cursor_x = 0;
-                            } else {
-                                tty->cursor_x = 0;
-                            }
-                            if (tty->screen && tty_cols > 0) {
-                                for (uint32_t rx = x0; rx <= x1 && rx < tty_cols; rx++) {
-                                    uint16_t off = (uint16_t)((cy * tty_cols + rx) * 2);
+                            if (x0 >= tty_cols)
+                                x0 = tty_cols - 1;
+                            if (x1 >= tty_cols)
+                                x1 = tty_cols - 1;
+                            if (tty->screen) {
+                                for (uint32_t rx = x0; rx <= x1; rx++) {
+                                    size_t off = ((size_t)cy * tty_cols + rx) * 2;
                                     tty->screen[off] = ' ';
                                     tty->screen[off + 1] = tty->current_attr;
                                 }
                             }
+                            if (tty_on_vga)
+                                console_clear_line_segment(x0, x1, cy, tty->current_attr);
                         }
+                        tty->cursor_x = saved_x;
+                        tty->cursor_y = saved_y;
+                        if (tty_on_vga)
+                            console_set_cursor(tty->cursor_x, tty->cursor_y);
                     } else if (final_byte == 'A' || final_byte == 'B' || final_byte == 'C' || final_byte == 'D') {
                         /* Cursor movement: CUU A=up, CUD B=down, CUF C=forward/right, CUB D=back/left */
                         int n = (tty->ansi_param_count > 0 && tty->ansi_param[0] > 0) ? tty->ansi_param[0] : 1;
@@ -1730,6 +1746,9 @@ int devfs_register(void) {
         dev_ttys[i].ansi_param_count = 0;
         dev_ttys[i].ansi_current_param = 0;
         dev_ttys[i].controlling_sid = -1;
+        dev_ttys[i].term_lflag = 0x00000002u /* ICANON */ | 0x00000008u /* ECHO */ | 0x00000001u /* ISIG */;
+        dev_ttys[i].term_vmin = 1;
+        dev_ttys[i].term_vtime = 0;
         dev_ttys[i].echo_escape_state = 0;
         dev_ttys[i].unget_char = -1;
     }
@@ -1750,6 +1769,7 @@ int devfs_register(void) {
     devfs_ops.open = devfs_open;
     devfs_ops.read = devfs_read;
     devfs_ops.write = devfs_write;
+    devfs_ops.chmod = devfs_chmod;
     devfs_ops.unlink = devfs_unlink;
     devfs_ops.release = devfs_release;
     devfs_driver.ops = &devfs_ops;
@@ -1892,6 +1912,46 @@ void devfs_tty_push_input(int tty, char c) {
 }
 
 int devfs_get_active(void) { return devfs_active; }
+
+ssize_t devfs_tty_debug_dump(char *buf, size_t size) {
+    if (!buf || size == 0) return 0;
+    size_t w = 0;
+    uint32_t cols = devfs_tty_cols();
+    uint32_t rows = devfs_tty_rows();
+    w += (size_t)snprintf(buf + w, (w < size) ? size - w : 0,
+                          "active=%d cols=%u rows=%u\n", devfs_active + 1, cols, rows);
+    for (int i = 0; i < DEVFS_TTY_COUNT; i++) {
+        struct devfs_tty *t = &dev_ttys[i];
+        size_t cells = (size_t)cols * (size_t)rows;
+        size_t nonspace = 0;
+        char preview[65];
+        size_t pi = 0;
+        if (t->screen) {
+            for (size_t c = 0; c < cells; c++) {
+                uint8_t ch = t->screen[c * 2];
+                if (ch != ' ' && ch != '\0') {
+                    nonspace++;
+                    if (pi + 1 < sizeof(preview)) {
+                        preview[pi++] = (ch >= 32 && ch <= 126) ? (char)ch : '.';
+                    }
+                }
+            }
+        }
+        preview[pi] = '\0';
+        w += (size_t)snprintf(buf + w, (w < size) ? size - w : 0,
+                              "tty%d cur=%u,%u attr=0x%02x fg=%d sid=%d nonspace=%llu preview=\"%s\"\n",
+                              i + 1,
+                              (unsigned)t->cursor_x,
+                              (unsigned)t->cursor_y,
+                              (unsigned)t->current_attr,
+                              t->fg_pgrp,
+                              t->controlling_sid,
+                              (unsigned long long)nonspace,
+                              preview);
+        if (w >= size) return (ssize_t)size;
+    }
+    return (ssize_t)w;
+}
 
 /* Non-blocking push from ISR: try lock; on failure drop char and wake waiters */
 void devfs_tty_push_input_noblock(int tty, char c) {

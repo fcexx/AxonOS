@@ -3,6 +3,7 @@
 #include <klog.h>
 #include <mmio.h>
 #include <string.h>
+#include <stdio.h>
 #include <vbe.h>
 
 char sys_cpu_name[64] = "Unknown CPU";
@@ -11,6 +12,12 @@ int sys_pc_type = 0;
 static char dmi_manufacturer[64];
 static char dmi_product[128];
 static char dmi_board[128];
+static char sys_boot_mode_name[32] = "unknown";
+static char sys_hv_name[64] = "none";
+static char sys_hv_prefix[32] = "native";
+static int sys_hv_present = 0;
+static uint64_t sys_tsc_hz_hint_value = 0;
+static int sys_tsc_hz_hint_exact = 0;
 
 /* Normalize hypervisor vendor string to human-friendly name and prefix. */
 static void normalize_hv_vendor(const char *raw, char *out_name, size_t out_name_sz, char *out_prefix, size_t out_prefix_sz) {
@@ -118,6 +125,26 @@ static int mb2_total_ram_mb(uint64_t multiboot_info_ptr) {
     return -1;
 }
 
+static int mb2_has_efi_tag(uint64_t multiboot_info_ptr) {
+    if (multiboot_info_ptr == 0) return 0;
+    uint8_t *p = (uint8_t*)(uintptr_t)multiboot_info_ptr;
+    uint32_t total_size = *(uint32_t*)p;
+    if (total_size < 16 || total_size > (64u * 1024u * 1024u)) return 0;
+    uint32_t off = 8;
+    while (off + 8 <= total_size) {
+        uint32_t tag_type = *(uint32_t*)(p + off);
+        uint32_t tag_size = *(uint32_t*)(p + off + 4);
+        if (tag_size < 8) break;
+        if ((uint64_t)off + (uint64_t)tag_size > (uint64_t)total_size) break;
+        if (tag_type == 0) break;
+        if (tag_type == 11 || tag_type == 12 || tag_type == 17 ||
+            tag_type == 18 || tag_type == 19 || tag_type == 20)
+            return 1;
+        off += (tag_size + 7) & ~7u;
+    }
+    return 0;
+}
+
 /* Print BIOS e820-like map from Multiboot2 MEMORY_MAP (tag 6).
    Prints lines similar to Linux: "BIOS-e820: [mem 0x...-0x...] usable" */
 void sysinfo_print_e820(uint32_t multiboot_magic, uint64_t multiboot_info_ptr) {
@@ -201,11 +228,55 @@ void sysinfo_init(uint32_t multiboot_magic, uint64_t multiboot_info_ptr) {
         sys_cpu_name[12] = '\0';
     }
 
-    // Определяем тип загрузки: если multiboot_info_ptr != 0, считаем, что загрузчик (BIOS/GRUB) передал инфо
-    if (multiboot_info_ptr != 0) sys_pc_type = 1; else sys_pc_type = 0;
+    // Определяем тип загрузки: Multiboot2 может прийти как через BIOS, так и через UEFI.
+    if (multiboot_magic == 0x36d76289u && multiboot_info_ptr != 0 && mb2_has_efi_tag(multiboot_info_ptr)) {
+        sys_pc_type = 0;
+        strncpy(sys_boot_mode_name, "UEFI/Multiboot2", sizeof(sys_boot_mode_name) - 1);
+    } else if (multiboot_magic == 0x36d76289u && multiboot_info_ptr != 0) {
+        sys_pc_type = 1;
+        strncpy(sys_boot_mode_name, "BIOS/Multiboot2", sizeof(sys_boot_mode_name) - 1);
+    } else if (multiboot_magic == 0x2BADB002u && multiboot_info_ptr != 0) {
+        sys_pc_type = 1;
+        strncpy(sys_boot_mode_name, "BIOS/Multiboot", sizeof(sys_boot_mode_name) - 1);
+    } else {
+        sys_pc_type = 0;
+        strncpy(sys_boot_mode_name, "unknown", sizeof(sys_boot_mode_name) - 1);
+    }
+    sys_boot_mode_name[sizeof(sys_boot_mode_name) - 1] = '\0';
 
-    /* Detect hypervisor via CPUID and try to read TSC/clock info from CPUID leaves. */
-    
+    /* Detect hypervisor via CPUID and read a TSC frequency hint if the platform exposes one. */
+    {
+        uint32_t max_std = 0, hv_max = 0;
+        asm volatile("cpuid" : "=a"(max_std) : "a"(0) : "ebx","ecx","edx");
+        cpuid(1, 0, &a, &b, &c, &d);
+        if (c & (1u << 31)) {
+            cpuid(0x40000000u, 0, &a, &b, &c, &d);
+            hv_max = a;
+            char hvname[13];
+            *(uint32_t*)&hvname[0] = b;
+            *(uint32_t*)&hvname[4] = c;
+            *(uint32_t*)&hvname[8] = d;
+            hvname[12] = '\0';
+            normalize_hv_vendor(hvname, sys_hv_name, sizeof(sys_hv_name),
+                                sys_hv_prefix, sizeof(sys_hv_prefix));
+            sys_hv_present = 1;
+            (void)hv_max;
+        }
+        if (max_std >= 0x15) {
+            uint32_t a15, b15, c15, d15;
+            cpuid(0x15u, 0, &a15, &b15, &c15, &d15);
+            if (a15 != 0 && b15 != 0 && c15 != 0) {
+                sys_tsc_hz_hint_value = ((uint64_t)c15 * (uint64_t)b15) / (uint64_t)a15;
+                sys_tsc_hz_hint_exact = 1;
+            }
+        }
+        if (sys_tsc_hz_hint_value == 0 && max_std >= 0x16) {
+            uint32_t a16, b16, c16, d16;
+            cpuid(0x16u, 0, &a16, &b16, &c16, &d16);
+            if (a16 != 0)
+                sys_tsc_hz_hint_value = (uint64_t)a16 * 1000000ULL;
+        }
+    }
 
     // Попробуем извлечь объём памяти из multiboot structures
     sys_ram_mb = -1;
@@ -424,8 +495,34 @@ void sysinfo_print_dmi(void) {
     }
 }
 
+void sysinfo_print_platform(void) {
+    if (sys_ram_mb >= 0)
+        klogprintf("platform: boot=%s cpu=\"%s\" ram=%d MiB\n",
+                   sys_boot_mode_name, sys_cpu_name, sys_ram_mb);
+    else
+        klogprintf("platform: boot=%s cpu=\"%s\" ram=unknown\n",
+                   sys_boot_mode_name, sys_cpu_name);
+    if (sys_hv_present)
+        klogprintf("platform: hypervisor=%s\n", sys_hv_name);
+    else
+        klogprintf("platform: hypervisor=none\n");
+    if (sys_tsc_hz_hint_value != 0) {
+        uint64_t mhz_whole = sys_tsc_hz_hint_value / 1000000ULL;
+        uint64_t mhz_frac = (sys_tsc_hz_hint_value % 1000000ULL) / 1000ULL;
+        klogprintf("platform: TSC frequency hint=%llu.%03llu MHz%s\n",
+                   (unsigned long long)mhz_whole,
+                   (unsigned long long)mhz_frac,
+                   sys_tsc_hz_hint_exact ? " (CPUID.15 exact)" : " (CPUID.16 nominal)");
+    }
+}
+
 const char* sysinfo_cpu_name(void) { return sys_cpu_name; }
 int sysinfo_ram_mb(void) { return sys_ram_mb; }
 int sysinfo_pc_type(void) { return sys_pc_type; }
+const char* sysinfo_boot_mode(void) { return sys_boot_mode_name; }
+const char* sysinfo_hypervisor_name(void) { return sys_hv_name; }
+int sysinfo_is_hypervisor(void) { return sys_hv_present; }
+uint64_t sysinfo_tsc_hz_hint(void) { return sys_tsc_hz_hint_value; }
+int sysinfo_tsc_hz_hint_is_exact(void) { return sys_tsc_hz_hint_exact; }
 
 

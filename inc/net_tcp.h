@@ -24,6 +24,7 @@ typedef struct {
     int established;
     int connect_pending; /* nonblocking connect: SYN sent, awaiting SYN-ACK */
     int connect_peer_pkts; /* RX TCP segments from peer during connect (debug) */
+    int connect_refused; /* valid RST while connecting: SO_ERROR/errno = ECONNREFUSED */
     int peer_fin;
     int peer_rst;
     uint32_t dst_ip_be;

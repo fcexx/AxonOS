@@ -182,8 +182,11 @@ void thread_block(int pid);
 /* Atomically mark current thread BLOCKED (with no timeout) under scheduler lock.
    Returns 1 if state changed to BLOCKED, 0 otherwise. */
 int thread_block_current_atomic(void);
-/* Block until unblock OR timeout_ms expires. block_until stored in sleep_until. */
+/* Block until unblock OR timeout_ms expires. sleep_until stores a monotonic-ms deadline. */
 void thread_block_with_timeout(int pid, uint32_t timeout_ms);
+/* Mark sleeping/timeout-blocked threads READY when their monotonic-ms deadline expires.
+   IRQ-safe and does not context-switch; timer handlers call this before returning. */
+void thread_wake_expired_timeouts(void);
 void thread_unblock(int pid);
 /* Send SIGINT to foreground process group (Ctrl+C → terminate blocking program) */
 void thread_send_sigint_to_pgrp(int pgrp);

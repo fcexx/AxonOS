@@ -20,6 +20,8 @@
 #include <vga.h>
 #include <pit.h>
 #include <loadavg.h>
+#include <exec.h>
+#include <user_vma.h>
 
 struct procfs_handle {
 	int kind; /* 1=root, 2=pid_dir, 3=pid_file, 4=symlink, 5=pid_fd_dir, 6=pid_fd_link, 7=plain, 8=proc_sys_dir, 9=proc_sys_file */
@@ -59,6 +61,95 @@ static char procfs_state_char(const thread_t *t) {
     }
 }
 
+struct procfs_proc_mem {
+    uint64_t vsize_bytes;
+    unsigned long size_pages;
+    unsigned long rss_pages;
+    unsigned long data_pages;
+    unsigned long stack_pages;
+};
+
+static unsigned long procfs_bytes_to_pages(uint64_t bytes) {
+    return (unsigned long)((bytes + 4095ull) / 4096ull);
+}
+
+static void procfs_calc_proc_mem(thread_t *t, struct procfs_proc_mem *m) {
+    memset(m, 0, sizeof(*m));
+    if (!t)
+        return;
+
+    uint64_t vma_bytes = (uint64_t)user_vma_total_size_for_mm(t);
+    uint64_t bytes = vma_bytes;
+    uint64_t data_bytes = 0;
+    if (t->user_brk_cur > t->user_brk_base)
+        data_bytes = (uint64_t)(t->user_brk_cur - t->user_brk_base);
+
+    uint64_t stack_bytes = 0;
+    if (t->user_stack_limit > t->user_stack_base)
+        stack_bytes = t->user_stack_limit - t->user_stack_base;
+    else if (t->ring == 3)
+        stack_bytes = USER_STACK_SIZE;
+
+    uint64_t tls_bytes = (t->ring == 3 && t->user_fs_base != 0) ? USER_TLS_SIZE : 0;
+    bytes += data_bytes + stack_bytes + tls_bytes;
+    if (bytes == 0 && t->ring == 3)
+        bytes = 16ull * 4096ull;
+
+    uint64_t rss_bytes = 0;
+    if (t->ring == 3) {
+        uint64_t resident_vma = vma_bytes;
+        if (resident_vma > (4ull * 1024ull * 1024ull))
+            resident_vma = 4ull * 1024ull * 1024ull;
+        uint64_t resident_stack = stack_bytes;
+        if (resident_stack > (256ull * 1024ull))
+            resident_stack = 256ull * 1024ull;
+        uint64_t resident_tls = tls_bytes ? (64ull * 1024ull) : 0;
+        rss_bytes = resident_vma + data_bytes + resident_stack + resident_tls;
+        if (rss_bytes < 16ull * 1024ull)
+            rss_bytes = 16ull * 1024ull;
+        if (rss_bytes > bytes)
+            rss_bytes = bytes;
+    }
+
+    m->vsize_bytes = bytes;
+    m->size_pages = procfs_bytes_to_pages(bytes);
+    m->rss_pages = procfs_bytes_to_pages(rss_bytes);
+    m->data_pages = procfs_bytes_to_pages(data_bytes + tls_bytes);
+    m->stack_pages = procfs_bytes_to_pages(stack_bytes);
+}
+
+static uint64_t procfs_sum_unique_user_rss_kb(void) {
+    void *seen_mm[128];
+    int seen_count = 0;
+    uint64_t rss_kb = 0;
+    int n = thread_get_count();
+
+    for (int i = 0; i < n; i++) {
+        thread_t *t = thread_get_by_index(i);
+        if (!t || t->ring != 3 || t->state == THREAD_TERMINATED)
+            continue;
+
+        void *key = t->mm ? (void *)t->mm : (void *)t;
+        int seen = 0;
+        for (int j = 0; j < seen_count; j++) {
+            if (seen_mm[j] == key) {
+                seen = 1;
+                break;
+            }
+        }
+        if (seen)
+            continue;
+        if (seen_count < (int)(sizeof(seen_mm) / sizeof(seen_mm[0])))
+            seen_mm[seen_count++] = key;
+
+        struct procfs_proc_mem mem;
+        procfs_calc_proc_mem(t, &mem);
+        rss_kb += ((uint64_t)mem.rss_pages * 4096ull) / 1024ull;
+    }
+
+    return rss_kb;
+}
+
 static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
     int pid = (int)(uintptr_t)priv;
     if (!buf || size == 0) return 0;
@@ -80,25 +171,24 @@ static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
     int prio = 20 + t->nice;
     if (prio < 1) prio = 1;
     if (prio > 39) prio = 39;
-    uint64_t now_ticks = timer_ticks;
     uint64_t hz = pit_get_frequency();
     if (hz == 0) hz = 1000;
-    uint64_t elapsed_ticks = (now_ticks >= t->start_ticks) ? (now_ticks - t->start_ticks) : 0;
+    uint64_t now_ms = pit_get_time_ms();
+    uint64_t start_ms = (t->start_ticks * 1000ull) / hz;
+    uint64_t elapsed_ms = (now_ms >= start_ms) ? (now_ms - start_ms) : 0;
     /* /proc/<pid>/stat expects USER_HZ units (typically 100). */
-    uint64_t utime = (elapsed_ticks * 100ull) / hz;
+    uint64_t utime = elapsed_ms / 10ull;
     uint64_t stime = 0;
     uint64_t starttime = (t->start_ticks * 100ull) / hz;
-    uint64_t vsize = (t->user_mmap_next > 0x10000u)
-                         ? (uint64_t)t->user_mmap_next
-                         : 4096ull * 256ull;
-    unsigned long rss_pages = (vsize + 4095ull) / 4096ull;
-    if (rss_pages < 4) rss_pages = 4;
+    struct procfs_proc_mem mem;
+    procfs_calc_proc_mem(t, &mem);
     int written = snprintf(
         buf, size,
         "%d (%s) %c %d %d %d %d %d "
         "%u %llu %llu %llu %llu %llu %llu %lld %lld "
         "%d %d %d %d %llu %llu %lu "
-        "%llu %lu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %d %d\n",
+        "%llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu "
+        "%d %d %llu %llu %lld %llu %llu %llu %llu %llu %llu %llu %d\n",
         (int)t->tid, comm, procfs_state_char(t), ppid, pgrp, sid, tty_nr, tpgid,
         0u,
         0ull, 0ull, 0ull, 0ull,
@@ -108,11 +198,14 @@ static ssize_t procfs_show_stat(char *buf, size_t size, void *priv) {
         prio, t->nice,
         1, 0,
         (unsigned long long)starttime,
-        (unsigned long long)vsize,
-        rss_pages,
-        0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull,
-        17,
-        0
+        (unsigned long long)mem.vsize_bytes,
+        mem.rss_pages,
+        ~0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull,
+        17, 0,
+        0ull, 0ull, 0ll,
+        0ull, 0ull,
+        (unsigned long long)t->user_brk_base,
+        0ull, 0ull, 0ull, 0ull, 0
     );
     if (written < 0) return 0;
     size_t w = (size_t)written;
@@ -137,12 +230,23 @@ static ssize_t procfs_show_status(char *buf, size_t size, void *priv) {
     int pgrp = (t->pgid >= 0) ? t->pgid : (int)t->tid;
     int sid = (t->sid >= 0) ? t->sid : pgrp;
     const char *cap_hex = (t->euid == 0) ? "000001ffffffffff" : "0000000000000000";
+    struct procfs_proc_mem mem;
+    procfs_calc_proc_mem(t, &mem);
+    unsigned long vm_size_kb = (unsigned long)(mem.vsize_bytes / 1024ull);
+    unsigned long vm_rss_kb = (unsigned long)(((uint64_t)mem.rss_pages * 4096ull) / 1024ull);
+    unsigned long vm_data_kb = (unsigned long)(((uint64_t)mem.data_pages * 4096ull) / 1024ull);
+    unsigned long vm_stk_kb = (unsigned long)(((uint64_t)mem.stack_pages * 4096ull) / 1024ull);
     int written = snprintf(
         buf, size,
         "Name:\t%s\n"
         "State:\t%c\n"
         "Pid:\t%d\n"
         "PPid:\t%d\n"
+        "VmPeak:\t%lu kB\n"
+        "VmSize:\t%lu kB\n"
+        "VmRSS:\t%lu kB\n"
+        "VmData:\t%lu kB\n"
+        "VmStk:\t%lu kB\n"
         "Uid:\t%u\t%u\t%u\t%u\n"
         "Gid:\t%u\t%u\t%u\t%u\n"
         "CapInh:\t%s\n"
@@ -154,6 +258,7 @@ static ssize_t procfs_show_status(char *buf, size_t size, void *priv) {
         "NSpgid:\t%d\n"
         "NSsid:\t%d\n",
         comm, procfs_state_char(t), (int)t->tid, ppid,
+        vm_size_kb, vm_size_kb, vm_rss_kb, vm_data_kb, vm_stk_kb,
         (unsigned)t->uid, (unsigned)t->euid, (unsigned)t->suid, (unsigned)t->euid,
         (unsigned)t->gid, (unsigned)t->egid, (unsigned)t->sgid, (unsigned)t->egid,
         cap_hex, cap_hex, cap_hex, cap_hex,
@@ -170,9 +275,11 @@ static ssize_t procfs_show_statm(char *buf, size_t size, void *priv) {
     if (!buf || size == 0) return 0;
     thread_t *t = thread_get(pid);
     if (!t) return 0;
-    (void)t;
+    struct procfs_proc_mem mem;
+    procfs_calc_proc_mem(t, &mem);
     /* size resident shared text lib data dt (pages) */
-    int written = snprintf(buf, size, "0 0 0 0 0 0 0\n");
+    int written = snprintf(buf, size, "%lu %lu 0 0 0 %lu 0\n",
+                           mem.size_pages, mem.rss_pages, mem.data_pages);
     if (written < 0) return 0;
     size_t w = (size_t)written;
     if (w > size) w = size;
@@ -185,9 +292,14 @@ static ssize_t procfs_show_meminfo(char *buf, size_t size, void *priv) {
 	int mb = sysinfo_ram_mb();
 	if (mb < 0) mb = 0;
 	int total_kb = mb * 1024;
-	int used_kb = (int)(heap_used_bytes() / 1024u);
-	if (used_kb < 0) used_kb = 0;
-	if (used_kb > total_kb) used_kb = total_kb;
+	uint64_t user_rss_kb = procfs_sum_unique_user_rss_kb();
+	uint64_t heap_kb = heap_used_bytes() / 1024u;
+	uint64_t kernel_visible_kb = heap_kb;
+	if (kernel_visible_kb > 16u * 1024u)
+		kernel_visible_kb = 16u * 1024u;
+	uint64_t used64 = user_rss_kb + kernel_visible_kb;
+	if (used64 > (uint64_t)total_kb) used64 = (uint64_t)total_kb;
+	int used_kb = (int)used64;
 	int free_kb = total_kb - used_kb;
 	int written = snprintf(buf, size,
 		"MemTotal:       %d kB\n"
@@ -195,9 +307,21 @@ static ssize_t procfs_show_meminfo(char *buf, size_t size, void *priv) {
 		"MemAvailable:   %d kB\n"
 		"Buffers:          0 kB\n"
 		"Cached:           0 kB\n"
+		"SwapCached:       0 kB\n"
+		"Active:        %llu kB\n"
+		"Inactive:         0 kB\n"
+		"Shmem:            0 kB\n"
+		"Slab:          %llu kB\n"
+		"SReclaimable:     0 kB\n"
+		"SUnreclaim:    %llu kB\n"
+		"KernelStack:      0 kB\n"
+		"PageTables:       0 kB\n"
 		"SwapTotal:        0 kB\n"
 		"SwapFree:         0 kB\n",
-		total_kb, free_kb, free_kb);
+		total_kb, free_kb, free_kb,
+		(unsigned long long)user_rss_kb,
+		(unsigned long long)heap_kb,
+		(unsigned long long)heap_kb);
 	if (written < 0) return 0;
 	size_t w = (size_t)written;
 	if (w > size) w = size;
@@ -633,6 +757,13 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
             if (first_len == 3 && strncmp(p, "tty", 3) == 0) {
                 /* /proc/tty root directory (minimal) */
                 h->kind = 12; f->type = FS_TYPE_DIR; f->size = 0;
+                f->driver_private = h;
+                *out_file = f;
+                return 0;
+            }
+            if (first_len == 8 && strncmp(p, "ttydebug", 8) == 0) {
+                h->kind = 7; h->file_id = 31; f->type = FS_TYPE_REG; f->size = 4096;
+                f->driver_private = h;
                 *out_file = f;
                 return 0;
             }
@@ -695,7 +826,7 @@ static int procfs_open(const char *path, struct fs_file **out_file) {
             /* /proc/tty/... */
             if (first_len == 3 && strncmp(p, "tty", 3) == 0) {
                 if (strcmp(rest, "drivers") == 0) {
-                    h->kind = 7; h->file_id = 31; f->type = FS_TYPE_REG; f->size = 0;
+                    h->kind = 7; h->file_id = 31; f->type = FS_TYPE_REG; f->size = 4096;
                     f->driver_private = h;
                     *out_file = f;
                     return 0;
@@ -883,7 +1014,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
         size_t pos = 0;
         size_t written = 0;
         uint8_t *out = (uint8_t*)buf;
-        const char *top[] = { "meminfo", "cpuinfo", "uptime", "loadavg", "mounts", "stat", "partitions", "sys", "bus", "tty", "net", "scsi" };
+        const char *top[] = { "meminfo", "cpuinfo", "uptime", "loadavg", "mounts", "stat", "partitions", "sys", "bus", "tty", "ttydebug", "net", "scsi" };
         for (size_t ti = 0; ti < sizeof(top)/sizeof(top[0]); ti++) {
             const char *name = top[ti];
             size_t namelen = strlen(name);
@@ -900,7 +1031,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
                 de.inode = (uint32_t)(1000 + (uint32_t)ti); /* pseudo inode */
                 de.rec_len = (uint16_t)rec_len;
                 de.name_len = (uint8_t)namelen;
-                /* sys, bus, tty, scsi are directories */
+                /* sys, bus, tty, net, scsi are directories */
                 de.file_type = (strcmp(name, "sys") == 0 || strcmp(name, "bus") == 0 || strcmp(name, "tty") == 0 || strcmp(name, "net") == 0 || strcmp(name, "scsi") == 0)
                                ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
                 memcpy(tmpent, &de, 8);
@@ -1397,7 +1528,7 @@ static ssize_t procfs_read(struct fs_file *file, void *buf, size_t size, size_t 
 		else if (h->file_id == 40) full = procfs_show_scsi(tmpbuf, cap, NULL);
 		else if (h->file_id == 41 || h->file_id == 42) full = procfs_show_pci(tmpbuf, cap, NULL);
         else if (h->file_id == 30) full = usb_proc_bus_devices_show(tmpbuf, cap, NULL);
-        else if (h->file_id == 31) full = (ssize_t)snprintf(tmpbuf, cap, "pty_slave            /dev/tty\n");
+        else if (h->file_id == 31) full = devfs_tty_debug_dump(tmpbuf, cap);
         else if (h->file_id == 50) full = procfs_net_snap_tcp(tmpbuf, cap);
         else if (h->file_id == 51) full = procfs_net_snap_udp(tmpbuf, cap);
         else if (h->file_id == 52) full = procfs_net_snap_tcp6(tmpbuf, cap);

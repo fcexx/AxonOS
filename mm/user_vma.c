@@ -186,6 +186,27 @@ uintptr_t user_vma_max_mmap_like_end_for_mm(thread_t *runner) {
     return mx;
 }
 
+size_t user_vma_total_size_for_mm(thread_t *runner) {
+    if (!runner)
+        return 0;
+    unsigned long fl = 0;
+    size_t total = 0;
+    acquire_irqsave(&g_user_vma_lock, &fl);
+    for (int i = 0; i < USER_VMA_MAX; i++) {
+        if (!g_user_vmas[i].used)
+            continue;
+        if (!user_vma_tid_matches_runner_mm_nolock(runner, (uint64_t)g_user_vmas[i].tid))
+            continue;
+        if ((size_t)-1 - total < g_user_vmas[i].len) {
+            total = (size_t)-1;
+            break;
+        }
+        total += g_user_vmas[i].len;
+    }
+    release_irqrestore(&g_user_vma_lock, fl);
+    return total;
+}
+
 uintptr_t user_vma_min_mmap_like_for_thread_nolock(thread_t *tcur, uintptr_t brk_base) {
     uintptr_t best = (uintptr_t)-1;
     for (int i = 0; i < USER_VMA_MAX; i++) {

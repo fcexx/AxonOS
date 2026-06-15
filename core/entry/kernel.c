@@ -386,6 +386,8 @@ void kernel_main(uint32_t multiboot_magic, uint64_t multiboot_info) {
 
     klog_init(); // for logging into /var/log/kernel file
     klogprintf(OS_NAME " v" OS_VERSION ".\n");
+    sysinfo_print_platform();
+    sysinfo_print_dmi();
     sysinfo_print_e820(multiboot_magic, multiboot_info);
     if (vbe_is_available() == 1) klogprintf("screen: Set mode: %ux%u@%u.\n", vbe_get_width(), vbe_get_height(), vbe_get_bpp());
     else klogprintf("screen: Set VGA+ 80x25 16 colors\n");

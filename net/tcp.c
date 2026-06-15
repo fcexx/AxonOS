@@ -47,6 +47,13 @@ static int tcp_seq_after(uint32_t a, uint32_t b) {
     return (int32_t)(a - b) > 0;
 }
 
+static int tcp_seq_in_window(uint32_t seq, uint32_t rcv_nxt, uint32_t wnd) {
+    if (wnd == 0)
+        return seq == rcv_nxt;
+    uint32_t last = rcv_nxt + wnd - 1u;
+    return !tcp_seq_after(rcv_nxt, seq) && !tcp_seq_after(seq, last);
+}
+
 static void tcp_apply_ack(net_tcp_conn_t *c, uint32_t ack) {
     if (ack == 0)
         return;
@@ -272,41 +279,53 @@ int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget) {
         const uint8_t *payload = frame + sizeof(eth_hdr_t) + ihl + doff;
 
         if (th->flags & 0x04u) {
+            int rst_ok = 0;
+            if (c->connect_pending && !c->established) {
+                if ((th->flags & 0x10u) && ack == c->syn_isn + 1u) {
+                    rst_ok = 1;
+                    c->connect_refused = 1;
+                }
+            } else if (c->established) {
+                uint32_t wnd = (uint32_t)(sizeof(c->rx_buf) - c->rx_len);
+                if (wnd > 65535u)
+                    wnd = 65535u;
+                if (seq == c->rcv_nxt) {
+                    rst_ok = 1;
+                } else if (tcp_seq_in_window(seq, c->rcv_nxt, wnd)) {
+                    /* Linux/RFC5961-style: in-window but non-exact RST gets a challenge ACK. */
+                    (void)tcp_send_seg(c, ops, 0x10u, NULL, 0);
+                    got = 1;
+                    continue;
+                }
+            }
+            if (!rst_ok) {
+                got = 1;
+                continue;
+            }
             klogprintf("tcp: peer rst sport=%u dport=%u\n", (unsigned)sport, (unsigned)dport);
             c->established = 0;
-            c->peer_fin = 1;
+            c->connect_pending = 0;
             c->peer_rst = 1;
-            c->used = 0;
             got = 1;
             continue;
         }
 
         /* Handshake before tcp_apply_ack — stray large ack must not move snd_una early. */
         if ((th->flags & 0x02u) && (th->flags & 0x10u) && !c->established) {
+            if (!c->connect_pending || ack != c->syn_isn + 1u) {
+                klogprintf("tcp: ignored syn-ack seq=%u ack=%u syn=%u\n",
+                    (unsigned)seq, (unsigned)ack, (unsigned)c->syn_isn);
+                got = 1;
+                continue;
+            }
             klogprintf("tcp: syn-ack seq=%u ack=%u sport=%u dport=%u\n",
                 (unsigned)seq, (unsigned)ack, (unsigned)sport, (unsigned)dport);
             c->rcv_nxt = seq + 1;
             c->snd_una = ack;
             c->snd_nxt = ack;
-            (void)tcp_send_seg(c, ops, 0x10u, NULL, 0);
             c->established = 1;
             c->connect_pending = 0;
-            got = 1;
-            continue;
-        }
-
-        if (!c->established && c->connect_pending && payload_len == 0 &&
-            (th->flags & 0x10u) && !(th->flags & 0x02u) && !(th->flags & 0x04u) && !(th->flags & 0x01u)) {
-            uint32_t syn = c->syn_isn;
-            klogprintf("tcp: handshake ack-only seq=%u ack=%u syn=%u snd_nxt=%u\n",
-                (unsigned)seq, (unsigned)ack, (unsigned)syn, (unsigned)c->snd_nxt);
-            /* Peer seq on empty ACK is their snd_nxt (typically server ISN+1 after SYN). */
-            c->rcv_nxt = seq + 1u;
-            c->snd_una = ack;
-            c->snd_nxt = ack;
             (void)tcp_send_seg(c, ops, 0x10u, NULL, 0);
-            c->established = 1;
-            c->connect_pending = 0;
             got = 1;
             continue;
         }
@@ -335,16 +354,25 @@ int net_tcp_service(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int budget) {
         }
 
         if (th->flags & 0x01u) {
+            if (!c->established) {
+                got = 1;
+                continue;
+            }
             uint32_t fin_seq = seq + (uint32_t)payload_len;
             klogprintf("tcp: peer fin seq=%u rcv_nxt=%u\n", (unsigned)fin_seq, (unsigned)c->rcv_nxt);
+            int fin_ok = 0;
             if (fin_seq == c->rcv_nxt) {
                 c->peer_fin = 1;
                 c->rcv_nxt++;
+                fin_ok = 1;
             } else if (fin_seq < c->rcv_nxt) {
                 c->peer_fin = 1;
+                fin_ok = 1;
             }
-            c->established = 0;
-            (void)tcp_send_seg(c, ops, 0x10u, NULL, 0);
+            if (fin_ok) {
+                c->established = 0;
+                (void)tcp_send_seg(c, ops, 0x10u, NULL, 0);
+            }
             got = 1;
         }
     }
@@ -447,6 +475,10 @@ int net_tcp_connect_poll(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t t
         c->connect_pending = 0;
         return 0;
     }
+    if (c->connect_refused && !c->established) {
+        c->connect_pending = 0;
+        return -3;
+    }
     if (!c->connect_pending && !c->used) return -1;
     uint64_t start = ops->time_ms();
     uint64_t last_syn = start;
@@ -457,7 +489,7 @@ int net_tcp_connect_poll(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t t
                 c->connect_pending = 0;
                 return 0;
             }
-            if (c->peer_fin && !c->established) {
+            if (c->connect_refused && !c->established) {
                 c->connect_pending = 0;
                 return -3;
             }
@@ -473,7 +505,7 @@ int net_tcp_connect_poll(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint32_t t
                 c->connect_pending = 0;
                 return 0;
             }
-            if (c->peer_fin && !c->established) {
+            if (c->connect_refused && !c->established) {
                 c->connect_pending = 0;
                 return -3;
             }
@@ -516,7 +548,7 @@ int net_tcp_send(net_tcp_conn_t *c, const net_tcp_ops_t *ops, const uint8_t *dat
         uint32_t seq0 = c->snd_nxt;
         if (tcp_send_seg(c, ops, 0x18u, data + off, chunk) != 0) return (off > 0) ? (int)off : -1;
         c->snd_nxt += (uint32_t)chunk;
-        /* Do not block until peer ACK (wget hung 30s here). Pump RX briefly; ACK/data handled on read(). */
+        /* Do not block until peer ACK here: HTTP servers may reply+close before send() returns. */
         for (int poll = 0; poll < 256; poll++) {
             (void)net_tcp_service(c, ops, 32);
             if (c->snd_una >= seq0 + (uint32_t)chunk)
@@ -557,7 +589,6 @@ static void net_tcp_drain_rx(net_tcp_conn_t *c, const net_tcp_ops_t *ops, int ma
 
 int net_tcp_recv(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint8_t *out, size_t cap, uint32_t timeout_ms) {
     if (!c || !ops || !out || cap == 0) return -1;
-    if (c->peer_rst) return -4;
     if (c->rx_len > 0) {
         size_t n = (c->rx_len > cap) ? cap : c->rx_len;
         memcpy(out, c->rx_buf, n);
@@ -568,7 +599,7 @@ int net_tcp_recv(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint8_t *out, size
     }
     uint64_t start = ops->time_ms();
     uint64_t last_win = start;
-    while ((ops->time_ms() - start) < timeout_ms) {
+    do {
         net_tcp_drain_rx(c, ops, 32);
         if (c->rx_len > 0) {
             size_t n = (c->rx_len > cap) ? cap : c->rx_len;
@@ -586,7 +617,7 @@ int net_tcp_recv(net_tcp_conn_t *c, const net_tcp_ops_t *ops, uint8_t *out, size
             last_win = now;
         }
         ops->yield();
-    }
+    } while ((ops->time_ms() - start) < timeout_ms);
     return -2;
 }
 

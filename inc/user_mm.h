@@ -24,7 +24,7 @@ static inline uintptr_t user_mm_align_up(uintptr_t v, uintptr_t a) {
 }
 
 /* Single anonymous/file mmap must fit below this VA (matches exec.h USER_STACK_TOP). */
-#define USER_MM_SINGLE_MAP_CAP 0x10000000ULL
+#define USER_MM_SINGLE_MAP_CAP 0x40000000ULL
 
 static inline int user_mm_len_exceeds_cap(uint64_t len) {
     return len >= USER_MM_SINGLE_MAP_CAP;

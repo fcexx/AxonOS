@@ -13,6 +13,8 @@ int ramfs_remove(const char *path);
 int ramfs_symlink(const char *path, const char *target);
 /* create a hard link: newpath points to same inode as oldpath */
 int ramfs_link(const char *oldpath, const char *newpath);
+/* create a regular file backed by immutable boot-time data; copied on first write */
+int ramfs_create_borrowed_file(const char *path, const void *data, size_t size);
 
 #ifdef __cplusplus
 extern "C" {

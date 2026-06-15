@@ -3,10 +3,10 @@
 #include <stdint.h>
 
 /* User stack constants for simple exec (must be below identity limit) */
-/* User virtual memory ceiling for mmap/brk (AxonOS exec layout). Linux x86_64 uses a
- * much larger TASK_SIZE; we intentionally keep a low fixed bound — glibc arenas above
- * this size get ENOMEM from mmap, same class of failure as Linux under RLIMIT_AS. */
-#define USER_STACK_TOP ((uintptr_t)0x10000000ULL) /* 256MiB; heap 8..~252MiB; was 128MiB */
+/* User virtual memory ceiling for mmap/brk (AxonOS exec layout).
+ * Keep it below the 4GiB identity window, but leave enough room for large static
+ * glibc binaries (OpenSSL reaches ~192MiB) plus per-tid stack/TLS slots. */
+#define USER_STACK_TOP ((uintptr_t)0x40000000ULL) /* 1GiB */
 #define USER_STACK_SIZE (8 * 1024 * 1024) /* 8MiB; linuxrc/glibc need >2MiB stack */
 
 /* Reserve a separate user TLS region just below the stack guard area.

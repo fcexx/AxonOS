@@ -14,6 +14,7 @@ struct ramfs_node {
     char *name;
     int is_dir;
     char *data;
+    int data_borrowed;
     size_t size;
     /* Serialize read/write/size for this file (SMP + kernel klog vs userspace write). */
     spinlock_t io_lock;
@@ -35,6 +36,7 @@ struct ramfs_node {
 static void ramfs_free_node_shallow(struct ramfs_node *n);
 static struct ramfs_node *ramfs_find_child(struct ramfs_node *parent, const char *name);
 static struct ramfs_node *ramfs_lookup(const char *path);
+static void ramfs_release(struct fs_file *file);
 
 struct ramfs_file_handle {
     struct ramfs_node *node;
@@ -189,8 +191,23 @@ static struct ramfs_node *ramfs_resolve_link(struct ramfs_node *n) {
 static void ramfs_free_node_shallow(struct ramfs_node *n) {
     if (!n) return;
     if (n->name) kfree(n->name);
-    if (n->data) kfree(n->data);
+    if (n->data && !n->data_borrowed) kfree(n->data);
     kfree(n);
+}
+
+static int ramfs_materialize_node_locked(struct ramfs_node *n) {
+    if (!n || n->is_dir || !n->data_borrowed) return 0;
+    if (n->size == 0) {
+        n->data = NULL;
+        n->data_borrowed = 0;
+        return 0;
+    }
+    char *copy = (char *)kmalloc(n->size);
+    if (!copy) return -12;
+    memcpy(copy, n->data, n->size);
+    n->data = copy;
+    n->data_borrowed = 0;
+    return 0;
 }
 
 static struct ramfs_node *ramfs_find_child(struct ramfs_node *parent, const char *name) {
@@ -457,6 +474,31 @@ static int ramfs_create(const char *path, struct fs_file **out_file) {
     return 0;
 }
 
+int ramfs_create_borrowed_file(const char *path, const void *data, size_t size) {
+    struct fs_file *f = NULL;
+    int rc = ramfs_create(path, &f);
+    if (rc != 0) return rc;
+    if (!f || !f->driver_private) {
+        if (f) ramfs_release(f);
+        return -1;
+    }
+    struct ramfs_file_handle *fh = (struct ramfs_file_handle*)f->driver_private;
+    struct ramfs_node *n = fh->node;
+    if (!n || n->is_dir) {
+        ramfs_release(f);
+        return -1;
+    }
+    unsigned long irqf;
+    acquire_irqsave(&n->io_lock, &irqf);
+    n->data = (char *)data;
+    n->data_borrowed = (data && size > 0) ? 1 : 0;
+    n->size = size;
+    f->size = (off_t)size;
+    release_irqrestore(&n->io_lock, irqf);
+    ramfs_release(f);
+    return 0;
+}
+
 static int ramfs_open(const char *path, struct fs_file **out_file) {
     /* IMPORTANT: do NOT follow symlinks here.
        VFS (`fs_open`) is responsible for resolving symlinks in paths.
@@ -633,14 +675,19 @@ int ramfs_ftruncate(struct fs_file *file, off_t length) {
         return 0;
     }
     if (newsize == 0) {
-        if (n->data) {
+        if (n->data && !n->data_borrowed) {
             kfree(n->data);
-            n->data = NULL;
         }
+        n->data = NULL;
+        n->data_borrowed = 0;
         n->size = 0;
         file->size = 0;
         release_irqrestore(&n->io_lock, irqf);
         return 0;
+    }
+    if (n->data_borrowed && ramfs_materialize_node_locked(n) != 0) {
+        release_irqrestore(&n->io_lock, irqf);
+        return -12;
     }
     if (newsize < n->size) {
         char *d = (char *)krealloc(n->data, newsize);
@@ -711,6 +758,10 @@ static ssize_t ramfs_write(struct fs_file *file, const void *buf, size_t size, s
     }
     unsigned long irqf;
     acquire_irqsave(&n->io_lock, &irqf);
+    if (n->data_borrowed && ramfs_materialize_node_locked(n) != 0) {
+        release_irqrestore(&n->io_lock, irqf);
+        return -1;
+    }
     /* Grow and copy in chunks to avoid one-shot large reallocs where possible.
        This may allow progress when large contiguous allocations fail. */
     const size_t CHUNK = 64 * 1024; /* 64 KiB */
@@ -884,7 +935,7 @@ int ramfs_remove(const char *path) {
             if (sp < 64) stack[sp++] = c;
         }
         if (cur->name) kfree(cur->name);
-        if (cur->data) kfree(cur->data);
+        if (cur->data && !cur->data_borrowed) kfree(cur->data);
         kfree(cur);
     }
     return 0;

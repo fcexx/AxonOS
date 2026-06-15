@@ -12,6 +12,8 @@
 
 extern void klogprintf(const char *fmt, ...);
 static int g_dns_dbg_left = 2;
+extern uint16_t axonos_dns_alloc_src_port(void);
+extern uint64_t axonos_dns_time_ms(void);
 
 static inline uint16_t get16(const uint8_t *p) {
     return (uint16_t)((p[0] << 8) | p[1]);
@@ -143,12 +145,13 @@ int net_dns_resolve(const char *hostname, uint32_t dns_ip_be,
     if (!hostname || !hostname[0] || !send_udp || !recv_udp || !out_ip_be) return -1;
 
     uint8_t query[512];
-    uint16_t id = (uint16_t)0xD351; /* fixed ID for simplicity; matches in reply */
+    uint16_t src_port = axonos_dns_alloc_src_port();
+    if (src_port == 0)
+        src_port = 54321;
+    uint64_t now = axonos_dns_time_ms();
+    uint16_t id = (uint16_t)(0xD351u ^ (uint16_t)src_port ^ (uint16_t)now ^ (uint16_t)(now >> 16));
     int qlen = build_query(hostname, id, query, sizeof(query));
     if (qlen < 0) return -1;
-
-    /* Ephemeral src port in high range */
-    uint16_t src_port = 54321;
 
     if (g_dns_dbg_left-- > 0) {
         klogprintf("dns: query host=%s dns=%u.%u.%u.%u qlen=%d sport=%u\n",
@@ -158,15 +161,14 @@ int net_dns_resolve(const char *hostname, uint32_t dns_ip_be,
             qlen, (unsigned)src_port);
     }
 
-    if (send_udp(dns_ip_be, src_port, DNS_PORT, query, (size_t)qlen, ctx) != 0) {
-        if (g_dns_dbg_left > 0) klogprintf("dns: send_udp failed\n");
-        return -1;
-    }
-
     uint8_t reply[512];
-    int rlen;
+    int rlen = 0;
     /* Retry: VMware NAT and slow networks need longer wait; 5s single shot often fails */
     for (int retry = 0; retry < 3; retry++) {
+        if (send_udp(dns_ip_be, src_port, DNS_PORT, query, (size_t)qlen, ctx) != 0) {
+            if (g_dns_dbg_left > 0) klogprintf("dns: send_udp failed\n");
+            return -1;
+        }
         rlen = recv_udp(src_port, dns_ip_be, DNS_PORT, reply, sizeof(reply), 8000, ctx);
         if (g_dns_dbg_left > 0) klogprintf("dns: recv_udp retry=%d rlen=%d\n", retry, rlen);
         if (rlen > 0) break;

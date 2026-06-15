@@ -235,8 +235,14 @@ static void* krealloc_nolock(void* ptr, size_t new_size) {
 #endif
     if (new_size <= old_size) {
         split_block(blk, new_size);
-        size_t diff = old_size - new_size;
-        if (heap_used_now >= diff) heap_used_now -= diff; else heap_used_now = 0;
+        /* split_block() may leave the block unchanged when the tail cannot hold
+           a free header. Account the actual allocated payload size, not the
+           requested rounded size, or repeated small shrinks underflow heap_used. */
+        size_t new_alloc_size = blk->size;
+        if (old_size > new_alloc_size) {
+            size_t diff = old_size - new_alloc_size;
+            if (heap_used_now >= diff) heap_used_now -= diff; else heap_used_now = 0;
+        }
 #if HEAP_GUARD
         /* refresh canary at the new requested end */
         blk->req_size = new_req;

@@ -27,6 +27,7 @@
 // function declarations
 void pit_init();
 void pit_disable(void);  // Добавь эту строку
+int pit_is_enabled(void);
 void pit_set_frequency(uint32_t frequency);
 void pit_set_divisor(uint16_t divisor);
 uint16_t pit_get_current_count();
@@ -39,8 +40,10 @@ uint64_t pit_get_frequency();
 // global variables
 extern volatile uint64_t pit_ticks;
 extern volatile uint32_t pit_frequency;
+extern volatile int pit_enabled;
 /* Common timer tick counter (monotonic). This continues to tick even when PIT is disabled
    (e.g., when APIC timer is used), so subsystems should prefer this over pit_ticks. */
 extern volatile uint64_t timer_ticks;
+extern volatile uint32_t timer_frequency;
 
 #endif // PIT_H

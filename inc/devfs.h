@@ -66,6 +66,8 @@ struct devfs_tty {
     int controlling_sid;
     /* POSIX termios local flags (c_lflag) for this tty */
     uint32_t term_lflag;
+    uint8_t term_vmin;
+    uint8_t term_vtime; /* deciseconds */
     /* echo: skip escape sequences (0=normal, 1=after ESC, 2=after ESC [ or ESC O) */
     uint8_t echo_escape_state;
     /* single-byte pushback for readers (e.g. kgetc escape handling); -1 = none */
@@ -123,6 +125,7 @@ int devfs_get_tty_fg_pgrp(int tty);
 void devfs_set_tty_fg_pgrp(int tty, int pgrp);
 int devfs_tty_get_fg_pgrp(struct fs_file *file);
 int devfs_tty_set_fg_pgrp(struct fs_file *file, int pgrp);
+ssize_t devfs_tty_debug_dump(char *buf, size_t size);
 int devfs_tty_attach_thread(struct fs_file *file, thread_t *th);
 int devfs_get_tty_controlling_sid(struct fs_file *file);
 int devfs_set_tty_controlling_sid(struct fs_file *file, int sid);

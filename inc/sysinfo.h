@@ -15,6 +15,7 @@ void sysinfo_print_e820(uint32_t multiboot_magic, uint64_t multiboot_info_ptr);
 
 /* Print SMBIOS/DMI system vendor/product info if available. */
 void sysinfo_print_dmi(void);
+void sysinfo_print_platform(void);
 
 /* Detect hypervisor and read TSC info (CPUID-based). */
 void detect_hv_and_read_tsc(void);
@@ -23,5 +24,10 @@ void detect_hv_and_read_tsc(void);
 const char* sysinfo_cpu_name(void);
 int sysinfo_ram_mb(void);
 int sysinfo_pc_type(void);
+const char* sysinfo_boot_mode(void);
+const char* sysinfo_hypervisor_name(void);
+int sysinfo_is_hypervisor(void);
+uint64_t sysinfo_tsc_hz_hint(void);
+int sysinfo_tsc_hz_hint_is_exact(void);
 
 

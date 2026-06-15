@@ -16,8 +16,10 @@
 // Global variables
 volatile uint64_t pit_ticks = 0;
 volatile uint32_t pit_frequency = 1000; // Default 100 Hz
+volatile int pit_enabled = 0;
 /* Common tick source used by scheduler/userspace timeouts (monotonic). */
 volatile uint64_t timer_ticks = 0;
+volatile uint32_t timer_frequency = 1000;
 
 // PIT handler - called on IRQ 0
 void pit_handler(cpu_registers_t* regs) {
@@ -34,6 +36,7 @@ void pit_handler(cpu_registers_t* regs) {
                 loadavg_second_tick();
 
         if (!init) return;
+        thread_wake_expired_timeouts();
         /* Avoid full schedule from ring-3 IRQ on SMP; on UP, yield spinners when others wait. */
         if (regs && ((regs->cs & 3) == 3)) {
                 if (smp_cpu_count() <= 1)
@@ -59,6 +62,7 @@ void pit_init() {
         
         // Set default frequency (1000 Hz)
         int freq = 1000;
+        pit_enabled = 1;
         pit_set_frequency(freq);
         // Set up PIT handler for IRQ 0
         idt_set_handler(32, pit_handler); // IRQ 0 = vector 32
@@ -66,6 +70,7 @@ void pit_init() {
 
 // Disable PIT - stop timer interrupts
 void pit_disable(void) {
+    pit_enabled = 0;
     // Stop PIT by setting channel 0 to mode 0 (interrupt on terminal count)
     // with maximum divisor (0 = 65536) which effectively stops the timer
     outb(PIT_COMMAND, PIT_CMD_CHANNEL0 | PIT_CMD_ACCESS_BOTH | PIT_CMD_MODE0 | PIT_CMD_BINARY);
@@ -88,6 +93,7 @@ void pit_set_frequency(uint32_t frequency) {
         
         // Recalculate actual frequency
         pit_frequency = PIT_FREQUENCY / divisor;
+        timer_frequency = pit_frequency;
         
         // Set the divisor
         pit_set_divisor((uint16_t)divisor);
@@ -136,18 +142,16 @@ uint64_t pit_get_ticks() {
 
 // Get time in milliseconds since boot
 uint64_t pit_get_time_ms() {
-        /* Match klog timestamps (TSC); APIC-only ms can run ~10x slow on VMware. */
-        if (klog_tsc_per_us != 0)
-                return time_monotonic_ms();
-        if (apic_timer_is_running())
-                return apic_timer_get_time_ms();
-        if (pit_frequency == 0)
+        uint64_t freq = timer_frequency;
+        if (freq == 0)
                 return 0;
-        return (timer_ticks * 1000) / pit_frequency;
+        return (timer_ticks * 1000) / freq;
 }
 
 uint64_t pit_get_frequency() {
-        if (apic_timer_is_running())
-                return apic_timer_get_frequency();
-        return pit_frequency;
+        return timer_frequency ? timer_frequency : pit_frequency;
+}
+
+int pit_is_enabled(void) {
+        return pit_enabled;
 }

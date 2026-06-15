@@ -114,6 +114,80 @@ static inline uintptr_t user_tls_base_for_stack_top(uintptr_t stack_top) {
     return (uintptr_t)stack_top - (uintptr_t)USER_STACK_SIZE - (uintptr_t)USER_TLS_SIZE;
 }
 
+static int elf_needs_private_user_pages(thread_t *tc);
+static int mark_user_identity_range_2m(uint64_t va_begin, uint64_t va_end);
+
+static inline uintptr_t exec_align_up_ptr(uintptr_t v, uintptr_t a) {
+    if (a == 0) return v;
+    return (v + (a - 1u)) & ~(a - 1u);
+}
+
+static int exec_seed_static_tls(uintptr_t stack_top, uintptr_t random_addr,
+                                const elf_tls_info_t *tls, uintptr_t *out_fs_base) {
+    if (!out_fs_base) return -1;
+    const uintptr_t tls_region_base = user_tls_base_for_stack_top(stack_top);
+    uintptr_t tls_align = (tls && tls->align) ? (uintptr_t)tls->align : 16u;
+    if (tls_align < 16u) tls_align = 16u;
+    uintptr_t tls_memsz = (tls && tls->memsz) ? (uintptr_t)tls->memsz : 0;
+    uintptr_t tls_filesz = (tls && tls->filesz) ? (uintptr_t)tls->filesz : 0;
+    if (tls_filesz > tls_memsz) return -1;
+    uintptr_t tls_block_size = exec_align_up_ptr(tls_memsz, tls_align);
+    uintptr_t fs_base = tls_region_base + exec_align_up_ptr(tls_block_size + 0x1000u, 16u);
+    if (fs_base < tls_region_base + 0x1000u)
+        fs_base = tls_region_base + 0x1000u;
+    const uintptr_t tls_block = fs_base - tls_block_size;
+    const uintptr_t used_hi = fs_base + 0x3000u;
+
+    if (tls_block < tls_region_base) return -1;
+    if (used_hi <= fs_base || used_hi >= (uintptr_t)MMIO_IDENTITY_LIMIT) return -1;
+    if (used_hi > tls_region_base + (uintptr_t)USER_TLS_SIZE) return -1;
+
+    thread_t *tc = thread_current();
+    if (elf_needs_private_user_pages(tc)) {
+        mm_t *share = tc->mm_ptemplate ? tc->mm_ptemplate : mm_kernel();
+        if (mm_make_private_range(tc->mm, (uint64_t)tls_region_base, (uint64_t)used_hi, 0, share) != 0)
+            return -1;
+    }
+    if (mark_user_identity_range_2m((uint64_t)tls_region_base, (uint64_t)used_hi) != 0)
+        return -1;
+
+    memset((void *)tls_region_base, 0, (size_t)(used_hi - tls_region_base));
+    if (tls_block_size != 0) {
+        if (!tls || tls->vaddr + tls_filesz > (uint64_t)MMIO_IDENTITY_LIMIT)
+            return -1;
+        if (tls_filesz)
+            memcpy((void *)tls_block, (const void *)(uintptr_t)tls->vaddr, (size_t)tls_filesz);
+    }
+
+    uint64_t guard = 0;
+    if (random_addr + 16 <= (uintptr_t)MMIO_IDENTITY_LIMIT) guard = *(uint64_t*)(uintptr_t)random_addr;
+    else guard = 0x8b13f00d2a11c0deULL;
+    guard &= ~0xFFULL;
+
+    /* glibc x86_64 static TLS uses variant II: TLS lives below the TCB,
+       and helpers like __errno_location compute from %fs:0. */
+    *(volatile uint64_t *)(uintptr_t)(fs_base + 0x00u) = (uint64_t)fs_base;
+    *(volatile uint64_t *)(uintptr_t)(fs_base + 0x08u) = (uint64_t)(fs_base + 0x800u);
+    *(volatile uint64_t *)(uintptr_t)(fs_base + 0x10u) = (uint64_t)fs_base;
+    *(volatile uint64_t *)(uintptr_t)(fs_base + 0x28u) = guard;
+    *(volatile uint64_t *)(uintptr_t)(fs_base + 0x30u) = guard ^ 0x5a5a5a5a5a5a5a5aULL;
+
+    {
+        const uintptr_t fake_locale = fs_base + 0x1800u;
+        if (fake_locale + 0x100u < (uintptr_t)MMIO_IDENTITY_LIMIT) {
+            *(volatile uint8_t *)(uintptr_t)(fake_locale + 0) = (uint8_t)'C';
+            *(volatile uint8_t *)(uintptr_t)(fake_locale + 1) = 0;
+            for (uintptr_t key = 0; key < 32; key++) {
+                const uintptr_t slot = fs_base + 0x80u + key * sizeof(uint64_t);
+                *(volatile uint64_t *)(uintptr_t)slot = (uint64_t)fake_locale;
+            }
+        }
+    }
+
+    *out_fs_base = fs_base;
+    return 0;
+}
+
 static inline uint64_t msr_read_u64_local(uint32_t msr) {
     uint32_t lo = 0, hi = 0;
     asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
@@ -903,6 +977,7 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
                                        uint64_t aux_phnum,
                                        uint64_t aux_entry,
                                        uint64_t aux_base,
+                                       const elf_tls_info_t *main_tls,
                                        uintptr_t *out_final_stack,
                                        uintptr_t *out_stack_top,
                                        uintptr_t *out_fs_base) {
@@ -996,36 +1071,8 @@ static int exec_prepare_layout_for_tid(uint64_t target_tid,
     enum { MSR_FS_BASE_LOCAL = 0xC0000100u };
     uintptr_t fs_base = 0;
     if (aux_base == 0) {
-        const uintptr_t tls_region_base = user_tls_base_for_stack_top(stack_top);
-        fs_base = tls_region_base + 0x1000u;
-        const uintptr_t pthread_fake = tls_region_base + 0x2000u;
-        thread_t *tc = thread_current();
-        if (elf_needs_private_user_pages(tc)) {
-            mm_t *share = tc->mm_ptemplate ? tc->mm_ptemplate : mm_kernel();
-            if (mm_make_private_range(tc->mm, (uint64_t)tls_region_base, (uint64_t)(pthread_fake + 0x1000u), 0, share) != 0) {
-                return -1;
-            }
-        }
-        if (pthread_fake + 0x1000u >= (uintptr_t)MMIO_IDENTITY_LIMIT) return -1;
-        if (mark_user_identity_range_2m((uint64_t)tls_region_base, (uint64_t)(pthread_fake + 0x1000u)) != 0) return -1;
-        memset((void*)tls_region_base, 0, 0x3000u);
-        uint64_t guard = 0;
-        if (random_addr + 16 <= (uintptr_t)MMIO_IDENTITY_LIMIT) guard = *(uint64_t*)(uintptr_t)random_addr;
-        else guard = 0x8b13f00d2a11c0deULL;
-        guard &= ~0xFFULL;
-        *(volatile uint64_t*)(uintptr_t)(fs_base + 0x28u) = guard;
-        *(volatile uint64_t*)(uintptr_t)(fs_base - 0x78u) = (uint64_t)pthread_fake;
-        {
-            const uintptr_t fake_locale = tls_region_base + 0x2800u;
-            if (fake_locale + 0x100u < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                *(volatile uint8_t*)(uintptr_t)(fake_locale + 0) = (uint8_t)'C';
-                *(volatile uint8_t*)(uintptr_t)(fake_locale + 1) = 0;
-                for (uintptr_t key = 0; key < 32; key++) {
-                    const uintptr_t slot = pthread_fake + 0x80u + key * sizeof(uint64_t);
-                    *(volatile uint64_t*)(uintptr_t)slot = (uint64_t)fake_locale;
-                }
-            }
-        }
+        if (exec_seed_static_tls(stack_top, random_addr, main_tls, &fs_base) != 0)
+            return -1;
         msr_write_u64_local(MSR_FS_BASE_LOCAL, (uint64_t)fs_base);
     } else {
         /* Dynamic ELF starts in ld.so. Linux enters it with FS unset; ld.so will
@@ -1105,10 +1152,12 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
     const char *curpath = path;
     elf_load_info_t main_info;
     elf_load_info_t interp_info;
+    elf_tls_info_t main_tls;
     memset(&main_info, 0, sizeof(main_info));
     memset(&interp_info, 0, sizeof(interp_info));
+    memset(&main_tls, 0, sizeof(main_tls));
     exec_reset_shared_user_space(thread_get_current_user(), 8u * 1024u * 1024u);
-    int r = elf_load_from_path_info(curpath, 0, &main_info, NULL);
+    int r = elf_load_from_path_info(curpath, 0, &main_info, &main_tls);
     if (r == -2) {
         /* unsupported ELF format */
         return -2;
@@ -1304,73 +1353,14 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
         }
     }
 
-    /* Seed a minimal TLS/TCB layout before entering userspace.
-       Why: busybox in your initfs is **glibc static**, and glibc expects some TLS/TCB
-       fields to exist immediately. In particular, early code may call pthread_getspecific(),
-       which on x86_64 glibc reads a pointer from %fs:-0x78 and then indexes at +0x80.
-       If %fs points to an uninitialized area, this turns into a NULL/low-memory deref
-       (exactly the CR2=0xa8 fault you saw).
-
-       Strategy (minimal, single-thread-friendly):
-       - Reserve a TLS region of size USER_TLS_SIZE (already carved in layout).
-       - Place %fs base one page *inside* the region so both positive offsets (e.g. canary at +0x28)
-         and negative offsets (e.g. -0x78) stay inside mapped memory.
-       - Write a pointer at %fs:-0x78 to a zeroed "fake pthread" structure which contains a
-         zeroed specifics array starting at +0x80. This makes pthread_getspecific() return NULL
-         instead of crashing, which is enough for glibc/busybox to continue bootstrap. */
+    /* Seed a minimal Linux-compatible static TLS/TCB layout before entering userspace. */
     enum { MSR_FS_BASE_LOCAL = 0xC0000100u };
     uintptr_t fs_base = 0;
     if (aux_base == 0) {
-        const uintptr_t tls_region_base = user_tls_base_for_stack_top(stack_top);
-        fs_base = tls_region_base + 0x1000u;      /* keep -0x78 and +0x28 in-range */
-        const uintptr_t pthread_fake = tls_region_base + 0x2000u; /* within first few pages */
-        thread_t *tc = thread_current();
-        if (elf_needs_private_user_pages(tc)) {
-            mm_t *share = tc->mm_ptemplate ? tc->mm_ptemplate : mm_kernel();
-            if (mm_make_private_range(tc->mm, (uint64_t)tls_region_base, (uint64_t)(pthread_fake + 0x1000u), 0, share) != 0) {
-                kprintf("execve: failed to private-map TLS range\n");
-                return -1;
-            }
-        }
-        /* Need a few pages inside the TLS region for our minimal layout. */
-        if (pthread_fake + 0x1000u >= (uintptr_t)MMIO_IDENTITY_LIMIT) {
-            kprintf("execve: tls base outside identity map\n");
+        if (exec_seed_static_tls(stack_top, random_addr, &main_tls, &fs_base) != 0) {
+            kprintf("execve: failed to seed static TLS\n");
             return -1;
         }
-        if (mark_user_identity_range_2m((uint64_t)tls_region_base, (uint64_t)(pthread_fake + 0x1000u)) != 0) {
-            kprintf("execve: failed to mark TLS range user-accessible\n");
-            return -1;
-
-        }
-        /* Clear the first 3 pages we use */
-        memset((void*)tls_region_base, 0, 0x3000u);
-        uint64_t guard = 0;
-        if (random_addr + 16 <= (uintptr_t)MMIO_IDENTITY_LIMIT) guard = *(uint64_t*)(uintptr_t)random_addr;
-        else guard = 0x8b13f00d2a11c0deULL;
-        /* glibc uses a "terminator canary": least-significant byte is 0 */
-        guard &= ~0xFFULL;
-        *(volatile uint64_t*)(uintptr_t)(fs_base + 0x28u) = guard;
-
-        /* pthread_getspecific() expects *(%fs:-0x78) to be a valid pointer. */
-        *(volatile uint64_t*)(uintptr_t)(fs_base - 0x78u) = (uint64_t)pthread_fake;
-
-        /* glibc locale bootstrap:
-           Some early code uses pthread_getspecific(5) and expects a non-NULL pointer whose
-           first byte can be compared to 'C'. Provide a minimal default "C" string. */
-        {
-            const uintptr_t fake_locale = tls_region_base + 0x2800u;
-            if (fake_locale + 0x100u < (uintptr_t)MMIO_IDENTITY_LIMIT) {
-                *(volatile uint8_t*)(uintptr_t)(fake_locale + 0) = (uint8_t)'C';
-                *(volatile uint8_t*)(uintptr_t)(fake_locale + 1) = 0;
-                /* Make early pthread_getspecific() callers get a valid object, not NULL.
-                   This avoids NULL+offset locale probes before full glibc TLS exists. */
-                for (uintptr_t key = 0; key < 32; key++) {
-                    const uintptr_t slot = pthread_fake + 0x80u + key * sizeof(uint64_t);
-                    *(volatile uint64_t*)(uintptr_t)slot = (uint64_t)fake_locale;
-                }
-            }
-        }
-
         msr_write_u64_local(MSR_FS_BASE_LOCAL, (uint64_t)fs_base);
     } else {
         /* Dynamic ELF enters the interpreter first. Let ld.so install the real
@@ -1438,6 +1428,7 @@ int kernel_execve_from_path(const char *path, const char *const argv[], const ch
             if (exec_prepare_layout_for_tid((uint64_t)ut->tid,
                                             argv, envp,
                                             aux_phdr, aux_phent, aux_phnum, aux_entry, aux_base,
+                                            &main_tls,
                                             &final_stack, &stack_top, &fs_base) != 0) {
                 ut->state = THREAD_TERMINATED;
                 return -3; /* transient exec setup race; caller may retry */

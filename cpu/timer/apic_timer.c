@@ -9,10 +9,12 @@
 #include <smp.h>
 #include <power.h>
 #include <loadavg.h>
+#include <sysinfo.h>
 #include <stdio.h>
 #include <string.h>
 /* common ticks */
 extern volatile uint64_t timer_ticks;
+extern volatile uint32_t timer_frequency;
 
 volatile uint64_t apic_timer_ticks = 0;
 apic_timer_state_t apic_timer_state = {0};
@@ -42,9 +44,9 @@ static uint8_t find_best_divider(uint32_t target_freq, uint32_t base_freq, uint3
    This is far more stable across machines than CPUID/busy-loop heuristics. */
 static uint32_t quick_calibrate(void) {
     const uint32_t divider = 16;
-    const uint32_t sample_ms = 50; /* long enough to average jitter */
+    const uint32_t sample_ms = sysinfo_is_hypervisor() ? 250u : 100u;
     uint64_t pit_start = pit_get_ticks();
-    uint64_t wait_guard = pit_start + 200; /* avoid infinite wait if PIT broken */
+    uint64_t wait_guard = pit_start + sample_ms + 1000; /* avoid infinite wait if PIT broken */
     uint32_t spin_guard = 0;
     const uint32_t max_spins = 5000000;
 
@@ -217,7 +219,8 @@ uint64_t apic_timer_get_uptime_seconds(void) {
 void apic_timer_handler(cpu_registers_t* regs) {
     apic_timer_ticks++;
     apic_timer_state.ticks = apic_timer_ticks;
-    timer_ticks++;
+    if (!pit_is_enabled())
+        timer_ticks++;
     if (init && smp_sched_cpu_id() == 0 && apic_timer_state.frequency > 0 &&
         apic_timer_ticks > 0 &&
         (apic_timer_ticks % (uint64_t)apic_timer_state.frequency) == 0)
@@ -227,6 +230,8 @@ void apic_timer_handler(cpu_registers_t* regs) {
     if (power_is_pending() && (!regs || ((regs->cs & 3) == 0))) {
         power_poll();
     }
+
+    thread_wake_expired_timeouts();
 
     /* Never call the scheduler from an interrupt handler.
        Switching context while running on an IRQ stack frame corrupts return context.
@@ -286,6 +291,8 @@ void apic_timer_start(uint32_t freq_hz) {
     
     // Update state
     apic_timer_state.frequency = freq_hz;
+    if (!pit_is_enabled())
+        timer_frequency = freq_hz ? freq_hz : 1000u;
     apic_timer_state.running = true;
     apic_timer_state.mode = APIC_TIMER_PERIODIC;
     apic_timer_ticks = 0;

@@ -311,31 +311,20 @@ static void ensure_parent_dirs(const char *path) {
 
 /* Create file at path and write data (size bytes). Returns 0 on success. */
 static int create_file_with_data(const char *path, const void *data, size_t size) {
-    struct fs_file *f = fs_create_file(path);
-    if (!f) {
+    int cr = ramfs_create_borrowed_file(path, data, size);
+    if (cr != 0) {
         /* Common in busybox/initramfs trees: duplicates / overwrites. If the path already
            exists, treat it as success to avoid spam and partial extracts. */
         struct stat st;
         if (vfs_stat(path, &st) == 0) {
             return 0;
         }
-        klogprintf("initfs: create_file_with_data: fs_create_file returned NULL for %s (heap_used=%llu heap_total=%llu heap_peak=%llu)\n",
+        klogprintf("initfs: create_file_with_data: ramfs_create_borrowed_file failed for %s rc=%d (heap_used=%llu heap_total=%llu heap_peak=%llu)\n",
                    path,
+                   cr,
                    (unsigned long long)heap_used_bytes(),
                    (unsigned long long)heap_total_bytes(),
                    (unsigned long long)heap_peak_bytes());
-        return -12;
-    }
-    /* Ensure the created handle is recognized as a regular file by VFS/drivers.
-       Some drivers may return ambiguous types; force FS_TYPE_REG for initfs-created files. */
-    f->type = FS_TYPE_REG;
-    ssize_t written = fs_write(f, data, size, 0);
-    fs_file_free(f);
-    if (written < 0 || (size_t)written != size) {
-        klogprintf("initfs: write failed %s (size=%u written=%d heap_used=%llu heap_total=%llu)\n",
-                   path, (unsigned)size, (int)written,
-                   (unsigned long long)heap_used_bytes(),
-                   (unsigned long long)heap_total_bytes());
         return -12;
     }
     return 0;

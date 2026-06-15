@@ -217,10 +217,10 @@ void keyboard_process_scancode(uint8_t scancode) {
         }
 
         // Клавиша нажата
-        // determine target tty for user processes (prefer user's attached tty)
-        thread_t *tu_for_tty = thread_get_current_user();
+        /* Keyboard IRQ belongs to the visible virtual console. Using the
+           scheduler's current user thread here can keep sending input to tty1
+           after Alt+Fn switches the active display. */
         int target_tty_for_user = devfs_get_active();
-        if (tu_for_tty && tu_for_tty->attached_tty >= 0) target_tty_for_user = tu_for_tty->attached_tty;
 
         if (kbd_extended_prefix) {
                 /* extended make codes (E0 xx) — always send ANSI sequences to TTY (ISR has no user context) */

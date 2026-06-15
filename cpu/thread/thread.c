@@ -34,6 +34,38 @@ static thread_t* idle_thread_by_cpu[SMP_MAX_CPUS];
 int init = 0;
 static int init_user_tid = -1;
 
+static void thread_note_ready_nolock(thread_t *t);
+
+static inline int thread_time_after_eq32(uint32_t now, uint32_t deadline) {
+        return (int32_t)(now - deadline) >= 0;
+}
+
+static uint32_t thread_ms_to_timer_ticks(uint32_t ms) {
+        uint32_t freq = (uint32_t)pit_get_frequency();
+        if (freq == 0) freq = 1000u;
+        uint64_t ticks64 = ((uint64_t)ms * (uint64_t)freq + 999u) / 1000u;
+        if (ticks64 == 0) ticks64 = 1;
+        if (ticks64 > 0x7FFFFFFFULL) ticks64 = 0x7FFFFFFFULL;
+        return (uint32_t)ticks64;
+}
+
+void thread_wake_expired_timeouts(void) {
+        uint32_t now = (uint32_t)timer_ticks;
+        unsigned long irqf;
+        acquire_irqsave(&sched_lock, &irqf);
+        for (int i = 0; i < thread_count; ++i) {
+                thread_t *t = threads[i];
+                if (!t || t->sleep_until == 0)
+                        continue;
+                if ((t->state == THREAD_SLEEPING || t->state == THREAD_BLOCKED) &&
+                    thread_time_after_eq32(now, t->sleep_until)) {
+                        t->sleep_until = 0;
+                        thread_note_ready_nolock(t);
+                }
+        }
+        release_irqrestore(&sched_lock, irqf);
+}
+
 /* forward declaration */
 thread_t* thread_get(int pid);
 thread_t* thread_current(void);
@@ -834,14 +866,14 @@ int thread_block_current_atomic(void) {
 }
 
 void thread_block_with_timeout(int pid, uint32_t timeout_ms) {
-        extern volatile uint64_t timer_ticks;
         uint32_t now = (uint32_t)timer_ticks;
+        uint32_t deadline = timeout_ms ? now + thread_ms_to_timer_ticks(timeout_ms) : 0xFFFFFFFFu;
         unsigned long irqf;
         acquire_irqsave(&sched_lock, &irqf);
         for (int i = 0; i < thread_count; ++i) {
                 if (threads[i] && threads[i]->tid == pid && threads[i]->state != THREAD_BLOCKED) {
                         threads[i]->state = THREAD_BLOCKED;
-                        threads[i]->sleep_until = now + (timeout_ms ? timeout_ms : 0xFFFFFFFFu);
+                        threads[i]->sleep_until = deadline;
                         release_irqrestore(&sched_lock, irqf);
                         return;
                 }
@@ -856,12 +888,7 @@ void thread_sleep(uint32_t ms) {
         thread_t *c = thread_current();
         if (!c)
                 return;
-        uint32_t now = (uint32_t)timer_ticks;
-        uint32_t freq = (uint32_t)pit_get_frequency();
-        if (freq == 0) freq = 1000u;
-        uint32_t ticks = (uint32_t)(((uint64_t)ms * (uint64_t)freq + 999u) / 1000u);
-        if (ticks == 0) ticks = 1;
-        c->sleep_until = (uint32_t)(now + ticks);
+        c->sleep_until = (uint32_t)timer_ticks + thread_ms_to_timer_ticks(ms);
         c->state = THREAD_SLEEPING;
         thread_yield();
 }
@@ -880,6 +907,8 @@ void thread_schedule() {
                 if (t->state != THREAD_TERMINATED) continue;
                 if (thread_is_any_idle(t)) continue;
                 if (t->waiter_tid >= 0) continue;
+                if (t->parent_tid >= 0 && t->exit_status != (int)0x80000000)
+                        continue;
                 /* Remove from table under lock; free after releasing lock. */
                 threads[i] = NULL;
                 /* shrink high-water mark when top slots are empty */
@@ -895,11 +924,12 @@ void thread_schedule() {
         uint32_t now = (uint32_t)timer_ticks;
         for (int i = 0; i < thread_count; ++i) {
                 if (threads[i] && threads[i]->state == THREAD_SLEEPING) {
-                        if (now >= threads[i]->sleep_until) {
+                        if (thread_time_after_eq32(now, threads[i]->sleep_until)) {
+                                threads[i]->sleep_until = 0;
                                 thread_note_ready_nolock(threads[i]);
                         }
                 } else if (threads[i] && threads[i]->state == THREAD_BLOCKED && threads[i]->sleep_until != 0) {
-                        if (now >= threads[i]->sleep_until) {
+                        if (thread_time_after_eq32(now, threads[i]->sleep_until)) {
                                 threads[i]->sleep_until = 0;
                                 thread_note_ready_nolock(threads[i]);
                         }

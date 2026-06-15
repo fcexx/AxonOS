@@ -328,6 +328,10 @@ static void page_fault_handler(cpu_registers_t* regs) {
         if (user && fault_try_user_vma_nonpresent(cr2, regs->error_code))
                 return;
         if (user && fault_try_grow_user_heap(cr2)) return;
+        if (user && cr2 >= 0x10000ULL && cr2 < 0x200000ULL) {
+                if (map_page_2m(0, 0, PG_PRESENT | PG_RW | PG_US) == 0)
+                        return;
+        }
         /* fork COW: first write to a still-shared writable page (Linux-style). */
         if (user && (regs->error_code & 0x7u) == 0x7u) {
                 extern thread_t *thread_current(void);
